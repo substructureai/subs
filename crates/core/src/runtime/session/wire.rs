@@ -484,6 +484,7 @@ async fn lower_actions(
                 },
                 DecisionAction::SyncConnector { path } => Action::SyncConnector { path },
                 DecisionAction::Done { data } => Action::Done { data },
+                DecisionAction::Fail { error } => Action::Fail { error },
             })
         }?);
     }

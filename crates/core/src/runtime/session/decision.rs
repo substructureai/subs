@@ -372,4 +372,6 @@ pub enum Action {
         #[serde(default)]
         data: serde_json::Value,
     },
+    #[serde(rename = "fail")]
+    Fail { error: ErrorInfo },
 }

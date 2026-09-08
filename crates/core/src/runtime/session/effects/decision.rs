@@ -55,7 +55,7 @@ impl KindSpec for DecisionSpec {
         if turnless {
             return Vec::new();
         }
-        state.fail_run(e)
+        state.fail_run(&e.error)
     }
 
     fn requeues_on_retry(&self) -> bool {

@@ -6,8 +6,8 @@ use super::tool_contract::{declared_tool, violates, DeclaredTool};
 use crate::protocol::StoredContent;
 use crate::protocol::{
     AgentConfig, ClientContext, ConnectorTool, ConnectorToolKind, Content, DecisionAction,
-    DecisionResponse, DecisionTrigger, DraftMessage, ErrorInfo, Message, Role, SpawnMode,
-    StoredResult, ToolCall,
+    DecisionResponse, DecisionTrigger, DraftMessage, ErrorCode, ErrorInfo, Message, Role,
+    SpawnMode, StoredResult, ToolCall,
 };
 
 pub struct Proposing<'a> {
@@ -17,11 +17,12 @@ pub struct Proposing<'a> {
 
 pub fn propose(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionResponse> {
     let proposed = derive(trigger, p)?;
-    if proposed
-        .actions
-        .iter()
-        .any(|a| matches!(a, DecisionAction::Interrupt { .. }))
-    {
+    if proposed.actions.iter().any(|a| {
+        matches!(
+            a,
+            DecisionAction::Interrupt { .. } | DecisionAction::Fail { .. }
+        )
+    }) {
         return Some(proposed);
     }
     Some(match stopped_for_auth(trigger, p) {
@@ -71,19 +72,14 @@ fn derive(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionRespon
             ..
         } => Some(llm_finished(message, transcript, connector_tools)),
         DecisionTrigger::LlmFinished {
-            id,
             ok,
             truncated,
             refused,
             error,
             ..
-        } if !*ok || *truncated || *refused => Some(llm_failed(
-            id,
-            error.as_ref(),
-            *truncated,
-            *refused,
-            transcript,
-        )),
+        } if !*ok || *truncated || *refused => {
+            Some(llm_failed(error.as_ref(), *truncated, *refused, transcript))
+        }
         DecisionTrigger::ToolFinished {
             id,
             ok,
@@ -413,32 +409,22 @@ fn settled_text(ok: bool, result: &Option<String>, error: &Option<ErrorInfo>) ->
     }
 }
 
+/// A model call with no usable reply ends the turn as a failed run.
 fn llm_failed(
-    id: &str,
     error: Option<&ErrorInfo>,
     truncated: bool,
     refused: bool,
     transcript: &[Message],
 ) -> DecisionResponse {
-    let reason = match error {
-        Some(error) => format!("llm call failed: {error}"),
-        None if truncated => "llm call truncated".to_string(),
-        None if refused => "llm call refused".to_string(),
-        None => "llm call failed".to_string(),
+    let error = match error {
+        Some(error) => error.clone(),
+        None if truncated => ErrorInfo::new(ErrorCode::InvalidResponse, "llm call truncated"),
+        None if refused => ErrorInfo::new(ErrorCode::Refused, "llm call refused"),
+        None => ErrorInfo::new(ErrorCode::ProviderError, "llm call failed"),
     };
     DecisionResponse {
         messages: recorded(transcript),
-        actions: vec![DecisionAction::Interrupt {
-            interrupt_id: None,
-            reason,
-            payload: serde_json::json!({
-                "type": "llm.failed",
-                "id": id,
-                "error": error,
-                "truncated": truncated,
-                "refused": refused,
-            }),
-        }],
+        actions: vec![DecisionAction::Fail { error }],
         ..Default::default()
     }
 }
@@ -845,14 +831,11 @@ mod tests {
         )
         .expect("proposes");
         match &p.actions[..] {
-            [DecisionAction::Interrupt {
-                reason, payload, ..
-            }] => {
-                assert!(reason.starts_with("llm call refused"), "got {reason:?}");
-                assert_eq!(payload["refused"], serde_json::json!(true));
-                assert_eq!(payload["truncated"], serde_json::json!(false));
+            [DecisionAction::Fail { error }] => {
+                assert_eq!(error.message, "llm call refused");
+                assert_eq!(error.code, ErrorCode::Refused);
             }
-            other => panic!("expected an interrupt; got {other:?}"),
+            other => panic!("expected a fail; got {other:?}"),
         }
     }
 
@@ -1008,36 +991,35 @@ mod tests {
     }
 
     #[test]
-    fn failed_or_truncated_llm_finished_proposes_interrupt() {
+    fn failed_or_truncated_llm_finished_proposes_fail() {
         let transcript = vec![msg("u1", Role::User, "hi")];
         let assistant = DraftMessage::from(msg("call-1", Role::Assistant, "partial"));
-        for (trigger, reason) in [
+        for (trigger, message, code) in [
             (
                 llm_finished_trigger(assistant.clone(), false, false),
                 "llm call failed",
+                ErrorCode::ProviderError,
             ),
             (
                 llm_finished_trigger(assistant, true, true),
                 "llm call truncated",
+                ErrorCode::InvalidResponse,
             ),
         ] {
             let p = propose(&trigger, &transcript, &HashMap::new(), 0, None).expect("proposes");
             assert_eq!(p.messages.len(), 1, "nothing recorded, not even a partial");
             match &p.actions[..] {
-                [DecisionAction::Interrupt {
-                    reason: r, payload, ..
-                }] => {
-                    assert!(r.starts_with(reason), "got reason {r:?}");
-                    assert_eq!(payload["type"], serde_json::json!("llm.failed"));
-                    assert_eq!(payload["id"], serde_json::json!("call-1"));
+                [DecisionAction::Fail { error }] => {
+                    assert_eq!(error.message, message);
+                    assert_eq!(error.code, code);
                 }
-                other => panic!("expected an interrupt; got {other:?}"),
+                other => panic!("expected a fail; got {other:?}"),
             }
         }
     }
 
     #[test]
-    fn a_terminal_llm_error_carries_its_context_in_the_interrupt() {
+    fn a_terminal_llm_error_fails_the_turn_as_it_is() {
         let trigger = DecisionTrigger::LlmFinished {
             id: "call-1".to_string(),
             ok: false,
@@ -1050,14 +1032,11 @@ mod tests {
         };
         let p = propose(&trigger, &[], &HashMap::new(), 0, None).expect("proposes");
         match &p.actions[..] {
-            [DecisionAction::Interrupt {
-                reason, payload, ..
-            }] => {
-                assert_eq!(reason, "llm call failed: rate limited");
-                assert_eq!(payload["error"]["message"], "rate limited");
-                assert_eq!(payload["error"]["code"], "rate_limited");
+            [DecisionAction::Fail { error }] => {
+                assert_eq!(error.message, "rate limited");
+                assert_eq!(error.code, ErrorCode::RateLimited);
             }
-            other => panic!("expected an interrupt; got {other:?}"),
+            other => panic!("expected a fail; got {other:?}"),
         }
     }
 
@@ -2611,7 +2590,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pause_is_never_replaced_by_the_auth_prompt() {
+    fn a_failed_turn_is_never_replaced_by_the_auth_prompt() {
         let transcript = [msg("u1", Role::User, "hi")];
         let reply = DraftMessage::from(msg("a1", Role::Assistant, "half an ans"));
         for (label, trigger) in [
@@ -2619,17 +2598,9 @@ mod tests {
             ("failed", llm_finished_trigger(reply.clone(), false, false)),
         ] {
             let p = propose_needing_auth(&trigger, &transcript, None).expect("a proposal");
-            let interrupt = p
-                .actions
-                .iter()
-                .find_map(|a| match a {
-                    DecisionAction::Interrupt { interrupt_id, .. } => interrupt_id.as_deref(),
-                    _ => None,
-                })
-                .unwrap_or_default();
             assert!(
-                !interrupt.starts_with(auth::PREFIX),
-                "{label}: the model's own pause survives; got {:?}",
+                matches!(&p.actions[..], [DecisionAction::Fail { .. }]),
+                "{label}: the failure ends the turn; got {:?}",
                 p.actions
             );
         }

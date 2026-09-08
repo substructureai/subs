@@ -126,6 +126,10 @@ When any call ends, on the worker or on the engine, the engine sends
 `llm.finished`. Its `proposed` records the assistant message, then starts the
 tool calls or ends the turn. Return `proposed`.
 
+A call that fails after its retries, or that is truncated or refused, fails the
+turn. The session stays open, and the next message starts a new turn over the
+same transcript.
+
 ## Where the key is stored
 
 The block's `type` decides who holds the key.

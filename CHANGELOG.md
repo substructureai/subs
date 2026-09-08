@@ -9,6 +9,11 @@ together at the same version.
 
 ## [Unreleased]
 
+### Changed
+
+- A model call that fails, is truncated, or is refused now fails the turn instead of pausing the session.
+- Add a `fail` action that ends the turn as a failed run.
+
 ### Fixed
 
 - The key and token prompts no longer show a pasted secret and no longer corrupt the display.

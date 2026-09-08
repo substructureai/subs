@@ -1238,6 +1238,24 @@
             "type"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "End the turn as a failed run.",
+          "properties": {
+            "error": {
+              "$ref": "#/$defs/ErrorInfo"
+            },
+            "type": {
+              "const": "fail",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "error"
+          ],
+          "type": "object"
         }
       ],
       "title": "DecisionAction"

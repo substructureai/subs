@@ -185,7 +185,7 @@ What fires, what the engine proposes, and what you return.
 | `tool.execute` | The model called your tool. | Empty. A `tool.error` when the arguments failed validation or the tool is undeclared. | `tool.result` or `tool.error`. |
 | `tool.finished` | A tool call ended, after retries. | Record the result, then call the model. Waits when other calls are in flight. | `proposed` |
 | `llm.execute` | The agent's LLM block is `type = "worker"`. | Empty. | `llm.result` or `llm.error`, or a stream. |
-| `llm.finished` | A model call ended. | Record the reply, then start its tool calls or end the turn. | `proposed` |
+| `llm.finished` | A model call ended. | Record the reply, then start its tool calls or end the turn. A failed, truncated, or refused call fails the turn. | `proposed` |
 | `subagent.finished` | A child session's turn ended. | Record the child's result as the tool result, then call the model. | `proposed` |
 | `interrupt.resumed` | Someone resumed a paused branch. | Call the model again over the transcript. | `proposed` |
 | `turn.finished` | A turn completed. Carries its cost and output. | `done`. | `proposed` |
@@ -281,6 +281,7 @@ type ClientContext = {
 | `message.send` | Write a message into a session. | Any trigger. |
 | `interrupt` | Pause the active branch. | Any trigger. |
 | `interrupt.resolve` | Clear an open interrupt and resume. | Any trigger. |
+| `fail` | End the turn as a failed run. | Any trigger. |
 | `connector.sync` | Fetch a connection's tools again. | Any trigger. |
 | `done` | End the turn. | Any trigger. |
 
@@ -357,6 +358,7 @@ type Action =
     | { type: "interrupt.resolve"; interrupt_id: string; payload?: unknown }
     | { type: "connector.sync"; path: string }   // "mcp.<id>" or "plugin.<id>.mcp.<server>"
     | { type: "done"; data?: unknown }
+    | { type: "fail"; error: ErrorInfo }
 ```
 
 `{ "type": "llm.call" }` on its own prompts the model with the agent's config

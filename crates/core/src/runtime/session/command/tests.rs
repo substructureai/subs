@@ -11301,6 +11301,43 @@ fn a_queued_turn_starts_in_the_batch_that_ends_the_one_before_it() {
 }
 
 #[test]
+fn a_fail_completes_the_turn_with_the_error_and_takes_the_next_message() {
+    let mut agg = session_mid_turn();
+    let error = ErrorInfo::new(crate::protocol::ErrorCode::RateLimited, "rate limited");
+    let events = decide(
+        &mut agg,
+        vec![Action::Fail {
+            error: error.clone(),
+        }],
+    );
+    let completed = events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::TurnCompleted(p) => Some(p),
+            _ => None,
+        })
+        .expect("the turn completes");
+    assert_eq!(completed.turn_id, "turn-1");
+    assert_eq!(completed.error, Some(error));
+    assert_eq!(agg.state.status, SessionStatus::Idle);
+    assert_eq!(agg.state.phase.turn_id(), None);
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: node_msg("", Role::User, "again"),
+                stream: false,
+            }),
+            turn: TurnTarget::Open("turn-2".to_string()),
+            queue: false,
+        },
+        &frontend(),
+    );
+    assert_eq!(started_turns(&events), vec!["turn-2"]);
+}
+
+#[test]
 fn a_queued_submit_defers_while_the_turn_before_it_finalizes() {
     let mut agg = session_mid_turn();
     decide(

@@ -126,7 +126,7 @@ export type ToolContentType = "text" | "image" | "audio" | "resource" | "resourc
  * recorded.
  */
 export interface DraftMessage {
-    content?: StoredContent[] | null | string;
+    content?: ContentPartWire[] | null | string;
     id?: null | string;
     name?: null | string;
     reasoning?: Reasoning | null;
@@ -135,15 +135,37 @@ export interface DraftMessage {
     tool_calls?: ToolCall[] | null;
 }
 
-export interface StoredContent {
+export interface ContentPartWire {
     text?: string;
-    type: StoredContentType;
+    type?: ContentPartWireType;
     uri?: string;
     mimeType?: null | string;
     name?: null | string;
+    image_url?: ImageURL;
+    file?: FileData;
+    input_audio?: AudioData;
+    video_url?: VideoURL;
 }
 
-export type StoredContentType = "text" | "blob" | "link";
+export interface FileData {
+    file_data: string;
+    filename: string;
+}
+
+export interface ImageURL {
+    url: string;
+}
+
+export interface AudioData {
+    data: string;
+    format: string;
+}
+
+export type ContentPartWireType = "text" | "blob" | "link" | "image_url" | "file" | "input_audio" | "video_url";
+
+export interface VideoURL {
+    url: string;
+}
 
 /**
  * What the model thought before it answered. `text` is for a reader.
@@ -240,6 +262,11 @@ export interface DecisionRequest {
     state: unknown;
     trigger: DecisionTrigger;
     turn_id?: null | string;
+    /**
+     * The worker this session is pinned to. `null` when the file's own
+     * routing decides.
+     */
+    worker?: WorkerRef | null;
 }
 
 /**
@@ -251,6 +278,7 @@ export interface DecisionRequest {
  * when the engine resolves a call.
  */
 export interface AgentConfig {
+    attachments?: null | Attachments;
     /**
      * Defer every tool this agent offers, whatever its source. A tool or a
      * connection overrides this with its own `defer`. Absent, the agent defers
@@ -265,6 +293,11 @@ export interface AgentConfig {
      * The `[llm.*]` block this agent's calls run on.
      */
     llm?: null | string;
+    /**
+     * How deep this agent's subagents may nest. A session whose depth
+     * reaches it may not delegate. `0` never delegates.
+     */
+    max_subagent_depth?: number | null;
     /**
      * MCP servers this agent draws tools from.
      */
@@ -284,6 +317,10 @@ export interface AgentConfig {
      */
     retry?: RetryConfig | null;
     /**
+     * What shape the subagents take as tools. Absent ⇒ one tool per agent.
+     */
+    subagent_tools?: null | SubagentTools;
+    /**
      * Subagents the model can delegate to. The model sees them as tools.
      * Each call starts a child session.
      */
@@ -294,6 +331,17 @@ export interface AgentConfig {
      */
     tools?: AgentTool[];
 }
+
+export interface Attachments {
+    max_inline?: number | null | string;
+    rules?: { [key: string]: Disposition };
+    tools?: AttachmentTool[];
+    [property: string]: unknown;
+}
+
+export type Disposition = "inline" | "attachment";
+
+export type AttachmentTool = "read" | "view";
 
 /**
  * How an agent's deferred tools reach the model.
@@ -328,13 +376,13 @@ export type DeferToolsStrategy = "search";
 export type ReasoningEffort = "xhigh" | "high" | "medium" | "low" | "minimal" | "none";
 
 /**
- * An MCP server the agent draws tools from. `path` names a connection the
- * engine holds. A worker never writes a URL or a credential.
+ * An MCP server the agent draws tools from. `id` names an `[mcp.*]`
+ * connection the engine holds. A worker never writes a URL or a credential.
  */
 export interface MCPServer {
     approve?: Approve;
     auth_failure?: MCPAuthFailure;
-    path: string;
+    id: string;
     tool_sync_failure?: MCPToolSyncFailure;
     /**
      * Narrows what the model sees. Absent ⇒ every tool the connection grants.
@@ -419,7 +467,7 @@ export interface AgentPlugin {
     description?: string;
     id: string;
     /**
-     * Where each of this plugin's servers is declared.
+     * The plugin's server names, from its bundle.
      */
     servers?: string[];
     skills?: SkillMeta[];
@@ -464,13 +512,47 @@ export interface RetryOverride {
 }
 
 /**
- * A subagent the model can delegate to. `id` is both the child agent and the
- * tool name the model calls. Its input is one `message`.
+ * What shape an agent's subagents take as tools.
+ */
+export interface SubagentTools {
+    strategy?: SubagentToolsStrategy;
+    wait?: boolean | null;
+    [property: string]: unknown;
+}
+
+/**
+ * How the model reaches an agent's subagents.
+ *
+ * One tool per subagent, named by the agent.
+ *
+ * One `subagent` tool for all of them. The call names the agent.
+ */
+export type SubagentToolsStrategy = "per_agent" | "single";
+
+/**
+ * A subagent the model can delegate to. `id` names the child agent; the model
+ * calls the tool [`Subagent::offered_name`] gives. Its input is one `message`.
  */
 export interface Subagent {
+    /**
+     * Keep this tool out of the request. See [`LlmTool::defer`]. Absent ⇒
+     * the agent's `defer_tools`.
+     */
+    defer?: boolean | null;
     description?: string;
     id: string;
+    mode?: SubagentMode | null;
+    /**
+     * Offer the tool as `agent__<id>` instead of `<id>`.
+     */
+    prefix?: boolean | null;
 }
+
+/**
+ * How calls to a subagent return. Configuration; each call carries a
+ * [`SpawnMode`].
+ */
+export type SubagentMode = "blocking" | "detached" | "any";
 
 /**
  * An effect still running, shown on each worker decision. A flat envelope
@@ -490,13 +572,13 @@ export interface Effect {
     id: string;
     kind: EffectKind;
     name?: null | string;
+    /**
+     * The child session a subagent runs in. Its `id` is the model tool call
+     * the subagent answers.
+     */
+    session_id?: null | string;
     status: EffectStatus;
     stream?: boolean | null;
-    /**
-     * The model tool call a delegation answers. Its `id` is the child
-     * session.
-     */
-    tool_call_id?: null | string;
 }
 
 /**
@@ -514,7 +596,7 @@ export interface Effect {
 export type EffectKind = "tool_call" | "subagent" | "llm_call" | "connector_sync" | "decision" | "turn_end";
 
 /**
- * Running, waiting for its result. Off the deadline clock. A delegation
+ * Running, waiting for its result. Off the deadline clock. A subagent
  * stays here for as long as its child turn takes.
  */
 export type EffectStatus = "pending" | "completed" | "failed" | "retry_scheduled" | "queued" | "running";
@@ -560,7 +642,7 @@ export interface Node {
 }
 
 export interface Message {
-    content?: StoredContent[] | null | string;
+    content?: ContentPartWire[] | null | string;
     id: string;
     name?: null | string;
     reasoning?: Reasoning | null;
@@ -628,6 +710,8 @@ export interface DecisionResponse {
  *
  * Fetch a connection's tools again, after a person replaced its
  * credential.
+ *
+ * End the turn as a failed run.
  */
 export interface DecisionAction {
     id?: null | string;
@@ -669,7 +753,7 @@ export interface DecisionAction {
     response?: unknown;
     code?: ErrorCode | null;
     detail?: unknown;
-    error?: string;
+    error?: ErrorInfo | string;
     /**
      * Omitted ⇒ terminal.
      */
@@ -680,9 +764,10 @@ export interface DecisionAction {
      * cannot arrive before the session exists.
      */
     message?: DraftMessage | null;
-    session_id?: string;
+    mode?: SpawnMode | null;
+    session_id?: null | string;
     /**
-     * The model tool call this delegation answers. Required.
+     * The model tool call this subagent answers. Required.
      */
     tool_call_id?: string;
     interrupt_id?: null | string;
@@ -714,6 +799,37 @@ export type ErrorCode =
     | "worker_unreachable"
     | "unroutable"
     | "internal";
+
+/**
+ * Why something failed. One shape on every event and on the wire.
+ *
+ * There is no `retryable` field. Whether to try again is a decision about one
+ * attempt, not a fact about the failure. The events that settle an attempt
+ * carry it instead.
+ */
+export interface ErrorInfo {
+    code: ErrorCode;
+    /**
+     * Small structured details, such as a status or the llm blocks that
+     * exist.
+     */
+    detail?: unknown;
+    /**
+     * One sentence the engine wrote, safe to show a human. Never a raw
+     * document. An unbounded body belongs in the log.
+     */
+    message: string;
+    /**
+     * The one input to fix, when the failure names one. For example
+     * `agent.llm` or `actions[0].type`.
+     */
+    param?: null | string;
+}
+
+/**
+ * How one subagent call returns.
+ */
+export type SpawnMode = "blocking" | "detached" | "wait";
 
 export interface ReasoningConfig {
     effort?: ReasoningEffort | null;
@@ -764,7 +880,8 @@ export type DecisionActionType =
     | "interrupt"
     | "interrupt.resolve"
     | "connector.sync"
-    | "done";
+    | "done"
+    | "fail";
 
 /**
  * The trigger a worker sees on the wire. There is no `ClientMessage`: the
@@ -832,32 +949,6 @@ export interface DecisionTrigger {
 }
 
 /**
- * Why something failed. One shape on every event and on the wire.
- *
- * There is no `retryable` field. Whether to try again is a decision about one
- * attempt, not a fact about the failure. The events that settle an attempt
- * carry it instead.
- */
-export interface ErrorInfo {
-    code: ErrorCode;
-    /**
-     * Small structured details, such as a status or the llm blocks that
-     * exist.
-     */
-    detail?: unknown;
-    /**
-     * One sentence the engine wrote, safe to show a human. Never a raw
-     * document. An unbounded body belongs in the log.
-     */
-    message: string;
-    /**
-     * The one input to fix, when the failure names one. For example
-     * `agent.llm` or `actions[0].type`.
-     */
-    param?: null | string;
-}
-
-/**
  * OpenAI Chat Completions.
  *
  * Anthropic Messages API.
@@ -891,6 +982,16 @@ export interface StoredResult {
     isError?: boolean;
     structuredContent?: unknown;
 }
+
+export interface StoredContent {
+    text?: string;
+    type?: StoredContentType;
+    uri?: string;
+    mimeType?: null | string;
+    name?: null | string;
+}
+
+export type StoredContentType = "text" | "blob" | "link";
 
 export type DecisionTriggerType =
     | "session.start"
@@ -939,6 +1040,15 @@ export interface Usage {
      * The part of `input` the provider read fresh.
      */
     uncached_input: number;
+}
+
+/**
+ * Which worker identity decides for a session, and optionally at what
+ * address. `url` fills in when the declared block has none, or overrides it.
+ */
+export interface WorkerRef {
+    id: string;
+    url?: null | string;
 }
 
 /**

@@ -257,7 +257,8 @@ impl Action {
             | Action::Interrupt { .. }
             | Action::ResolveInterrupt { .. }
             | Action::SyncConnector { .. }
-            | Action::Done { .. } => None,
+            | Action::Done { .. }
+            | Action::Fail { .. } => None,
         }
     }
 }
@@ -727,6 +728,10 @@ impl Working {
                         CommandPayload::FinishTurn { data }
                     };
                     self.run_active(cmd, &system)
+                }
+                Action::Fail { error } => {
+                    self.then(|s| s.fail_run(&error));
+                    Ok(())
                 }
                 other => match other.into_command(decision_id) {
                     Some(cmd) => self.run_active(cmd, &system),

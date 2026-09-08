@@ -178,6 +178,12 @@ return { actions: [{ type: "interrupt", reason: "confirm", payload: { message: "
 return { actions: [{ type: "done" }] };
 ```
 
+**Fail the turn.**
+
+```javascript
+return { actions: [{ type: "fail", error: { message: "no data for that account", code: "handler_error" } }] };
+```
+
 **Answer a tool later.** Return an empty decision and report the result when the
 work finishes. See [Async tools](./110-async-tools.md).
 

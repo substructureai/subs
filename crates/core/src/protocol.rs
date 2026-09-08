@@ -2532,6 +2532,9 @@ pub enum DecisionAction {
         #[serde(default)]
         data: Value,
     },
+    /// End the turn as a failed run.
+    #[serde(rename = "fail")]
+    Fail { error: ErrorInfo },
 }
 
 /// The messages and actions to author, plus optional state and agent writes.
