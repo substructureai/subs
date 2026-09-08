@@ -9,6 +9,10 @@ together at the same version.
 
 ## [Unreleased]
 
+### Fixed
+
+- The key and token prompts no longer show a pasted secret and no longer corrupt the display.
+
 ## [0.9.4] - 2026-09-02
 
 ### Added
