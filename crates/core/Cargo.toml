@@ -1,6 +1,6 @@
 [package]
 name = "substructure-core"
-version = "0.9.4"
+version = "0.9.5"
 edition = "2021"
 description = "Core runtime for Substructure"
 license = "MIT"

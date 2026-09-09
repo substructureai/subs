@@ -9,6 +9,8 @@ together at the same version.
 
 ## [Unreleased]
 
+## [0.9.5] - 2026-09-09
+
 ### Changed
 
 - A model call that fails, is truncated, or is refused now fails the turn instead of pausing the session.
@@ -226,7 +228,8 @@ together at the same version.
 - The changelog starts again at this release. For the changes before it, refer
   to the git history.
 
-[Unreleased]: https://github.com/substructureai/substructure/compare/v0.9.4...HEAD
+[Unreleased]: https://github.com/substructureai/substructure/compare/v0.9.5...HEAD
+[0.9.5]: https://github.com/substructureai/substructure/compare/v0.9.4...v0.9.5
 [0.9.4]: https://github.com/substructureai/substructure/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/substructureai/substructure/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/substructureai/substructure/compare/v0.9.1...v0.9.2
