@@ -115,6 +115,7 @@ fn create_session_with_config(
             worker_retry: RetryPolicy::no_retry(),
             agent: None,
             worker: None,
+            state: None,
         },
         &Caller::System {
             tenant_id: "tenant-a".to_string(),
@@ -2887,6 +2888,7 @@ fn the_default_depth_limit_stops_a_spawn_five_deep() {
             worker_retry: RetryPolicy::no_retry(),
             agent: None,
             worker: None,
+            state: None,
         },
         &system(),
     );
@@ -5441,6 +5443,7 @@ fn frontend_caller_with_mismatched_tenant_on_create_session_is_denied() {
                 worker_retry: RetryPolicy::no_retry(),
                 agent: None,
                 worker: None,
+                state: None,
             },
             &caller,
         )
@@ -5475,6 +5478,7 @@ fn a_session_opens_with_the_config_its_creation_carries() {
             worker_retry: RetryPolicy::no_retry(),
             agent: Some(agent_config("inline-model")),
             worker: None,
+            state: None,
         },
         &machine(),
     );
@@ -5517,6 +5521,7 @@ fn a_session_records_the_worker_its_creation_names() {
             worker_retry: RetryPolicy::no_retry(),
             agent: None,
             worker: Some(named.clone()),
+            state: None,
         },
         &machine(),
     );
@@ -5542,6 +5547,7 @@ fn a_session_records_the_worker_its_creation_names() {
             worker_retry: RetryPolicy::no_retry(),
             agent: None,
             worker: Some(named.clone()),
+            state: None,
         },
         &frontend(),
     )
@@ -5573,6 +5579,7 @@ fn a_session_records_the_worker_its_creation_names() {
             worker_retry: RetryPolicy::no_retry(),
             agent: None,
             worker: Some(bare.clone()),
+            state: None,
         },
         &frontend(),
     );
@@ -5606,6 +5613,7 @@ fn a_frontend_cannot_open_a_session_with_its_own_config() {
                 worker_retry: RetryPolicy::no_retry(),
                 agent: Some(agent_config("inline-model")),
                 worker: None,
+                state: None,
             },
             &frontend(),
         )
@@ -6446,6 +6454,7 @@ fn create_session_with_retry(retry: RetryPolicy) -> SessionAggregate {
             worker_retry: retry,
             agent: None,
             worker: None,
+            state: None,
         },
         &system(),
     );
@@ -9441,6 +9450,7 @@ fn create_session_emits_session_start_before_client_input() {
             worker_retry: RetryPolicy::no_retry(),
             agent: None,
             worker: None,
+            state: None,
         },
         &system(),
     );
@@ -9455,6 +9465,122 @@ fn create_session_emits_session_start_before_client_input() {
         ),
         "CreateSession opens session.start as the first decision; got {events:?}"
     );
+}
+
+#[test]
+fn create_session_writes_seeded_state_before_session_start() {
+    let mut agg = SessionAggregate::new(
+        "sess-1".to_string(),
+        "tenant-a".to_string(),
+        SessionState::new("sess-1".to_string()),
+    );
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::CreateSession {
+            agent_id: "agent-1".to_string(),
+            owner: SessionOwner {
+                tenant_id: "tenant-a".to_string(),
+                requester: Requester::new(
+                    Subject::new(Issuer::app(), "user-1".to_string()),
+                    Default::default(),
+                ),
+                metadata: HashMap::new(),
+            },
+            ancestry: vec![],
+            worker_retry: RetryPolicy::no_retry(),
+            agent: None,
+            state: Some(WorkerState(json!({ "plan": "pro" }))),
+            worker: None,
+        },
+        &system(),
+    );
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                EventPayload::SessionCreated(_),
+                EventPayload::WorkerStateUpdated(_),
+                EventPayload::DecisionQueued(q),
+                EventPayload::DecisionDispatched(_),
+            ] if matches!(q.trigger, Trigger::SessionStart)
+        ),
+        "the seed is written before session.start; got {events:?}"
+    );
+    assert_eq!(
+        agg.state.at_head().resolve_state_for().0,
+        json!({ "plan": "pro" }),
+        "session.start reads the seeded state"
+    );
+}
+
+#[test]
+fn create_session_without_a_seed_writes_no_state() {
+    let mut agg = SessionAggregate::new(
+        "sess-1".to_string(),
+        "tenant-a".to_string(),
+        SessionState::new("sess-1".to_string()),
+    );
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::CreateSession {
+            agent_id: "agent-1".to_string(),
+            owner: SessionOwner {
+                tenant_id: "tenant-a".to_string(),
+                requester: Requester::new(
+                    Subject::new(Issuer::app(), "user-1".to_string()),
+                    Default::default(),
+                ),
+                metadata: HashMap::new(),
+            },
+            ancestry: vec![],
+            worker_retry: RetryPolicy::no_retry(),
+            agent: None,
+            state: None,
+            worker: None,
+        },
+        &system(),
+    );
+    assert!(state_updates(&events).is_empty());
+    assert_eq!(
+        agg.state.at_head().resolve_state_for(),
+        WorkerState::default()
+    );
+}
+
+#[test]
+fn a_frontend_cannot_seed_state() {
+    let agg = SessionAggregate::new(
+        "sess-1".to_string(),
+        "tenant-a".to_string(),
+        SessionState::new("sess-1".to_string()),
+    );
+    let owner = SessionOwner {
+        tenant_id: "tenant-a".to_string(),
+        requester: Requester::new(
+            Subject::new(Issuer::app(), "user-1".to_string()),
+            Default::default(),
+        ),
+        metadata: HashMap::new(),
+    };
+    let err = agg
+        .try_handle(
+            CommandPayload::CreateSession {
+                agent_id: "agent-1".to_string(),
+                owner,
+                ancestry: vec![],
+                worker_retry: RetryPolicy::no_retry(),
+                agent: None,
+                state: Some(WorkerState(json!({ "plan": "pro" }))),
+                worker: None,
+            },
+            &Caller::Frontend {
+                tenant_id: "tenant-a".to_string(),
+                subject: Subject::new(Issuer::app(), "user-1".to_string()),
+                attrs: HashMap::new(),
+            },
+        )
+        .expect_err("a browser may not write agent state");
+    assert!(matches!(err, SessionError::SessionAccessDenied));
 }
 
 #[test]
@@ -9480,6 +9606,7 @@ fn session_start_config_is_visible_to_a_queued_client_decision() {
             worker_retry: RetryPolicy::no_retry(),
             agent: None,
             worker: None,
+            state: None,
         },
         &system(),
     );
@@ -9572,6 +9699,7 @@ fn client_message_parks_while_session_start_retry_is_scheduled() {
             },
             agent: None,
             worker: None,
+            state: None,
         },
         &system(),
     );
@@ -9694,6 +9822,7 @@ fn terminal_session_start_failure_restarts_on_the_next_message() {
             worker_retry: RetryPolicy::no_retry(),
             agent: None,
             worker: None,
+            state: None,
         },
         &system(),
     );
@@ -10520,6 +10649,7 @@ fn fork_drops_a_retrying_settle_decision() {
             },
             agent: None,
             worker: None,
+            state: None,
         },
         &system(),
     );
@@ -11055,6 +11185,7 @@ fn escape_decision_retry_fires_while_the_head_is_parked() {
             },
             agent: None,
             worker: None,
+            state: None,
         },
         &system(),
     );

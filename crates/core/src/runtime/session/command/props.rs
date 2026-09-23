@@ -176,6 +176,7 @@ impl World {
                 worker_retry: policy(),
                 agent: None,
                 worker: None,
+                state: None,
             },
             &system(),
         );

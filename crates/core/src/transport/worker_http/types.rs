@@ -121,6 +121,8 @@ pub struct SubmitClientPayloadRequest {
     pub session_id: Option<String>,
     #[serde(default)]
     pub turn_id: Option<String>,
+    #[serde(default)]
+    pub state: Option<crate::protocol::WorkerState>,
     /// Hold a message-shaped payload for the next turn instead of refusing it
     /// when one is already running.
     #[serde(default)]
@@ -159,6 +161,24 @@ pub struct StreamSessionEventsParams {
 mod tests {
     use super::*;
     use crate::protocol::DecisionAction;
+
+    #[test]
+    fn a_submit_carries_an_optional_state_seed() {
+        let body = r#"{"agent_id":"a","identity":{"id":"u"},"state":{"plan":"pro"},
+            "payload":{"type":"client.message","message":{"role":"user","content":"hi"}}}"#;
+        let req: SubmitClientPayloadRequest =
+            serde_json::from_str(body).expect("the submit deserializes");
+        assert_eq!(
+            req.state.expect("state is read").0,
+            serde_json::json!({"plan": "pro"})
+        );
+
+        let body = r#"{"agent_id":"a","identity":{"id":"u"},
+            "payload":{"type":"client.message","message":{"role":"user","content":"hi"}}}"#;
+        let req: SubmitClientPayloadRequest =
+            serde_json::from_str(body).expect("the submit deserializes");
+        assert!(req.state.is_none(), "an absent seed stays absent");
+    }
 
     #[test]
     fn worker_surface_settles_an_llm_result() {

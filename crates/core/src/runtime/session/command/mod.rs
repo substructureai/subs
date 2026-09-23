@@ -29,6 +29,7 @@ pub enum CommandPayload {
         ancestry: Vec<String>,
         worker_retry: RetryPolicy,
         agent: Option<AgentConfig>,
+        state: Option<WorkerState>,
         worker: Option<WorkerRef>,
     },
     SubmitClientPayload {
@@ -753,6 +754,7 @@ impl Working {
                     ancestry,
                     worker_retry,
                     agent,
+                    state,
                     worker,
                 },
             ) => {
@@ -760,7 +762,10 @@ impl Working {
                 if matches!(caller, Caller::Frontend { .. }) && !caller.owns(&owner) {
                     return Err(SessionError::SessionAccessDenied);
                 }
-                if agent.is_some() || worker.as_ref().is_some_and(|w| w.url.is_some()) {
+                if agent.is_some()
+                    || state.is_some()
+                    || worker.as_ref().is_some_and(|w| w.url.is_some())
+                {
                     SessionState::ensure_operator_or_system(caller)?;
                 }
                 self.emit(EventPayload::SessionCreated(Box::new(SessionCreated {
@@ -771,6 +776,7 @@ impl Working {
                     worker,
                 })));
                 self.then(|s| s.agent_config_events(agent));
+                self.then(|s| s.worker_state_events(state));
                 self.queue_decision(Trigger::SessionStart);
             }
             (true, CommandPayload::CreateSession { .. }) => {

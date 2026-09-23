@@ -29,7 +29,9 @@ use substructure_core::transport::ag_ui::translator::run_ag_ui_translation;
 use substructure_core::transport::channel::ChannelContext;
 use substructure_core::transport::push::PushAdapter;
 use substructure_core::worker::ChannelProposer;
-use substructure_core::worker::{AgentEntry, Hosting, StaticAgentDirectory, WorkerBlock};
+use substructure_core::worker::{
+    AgentEntry, Hosting, SessionSeed, StaticAgentDirectory, WorkerBlock,
+};
 use substructure_core::{Caller, HandleClientInput, Runtime, RuntimeConfig, RuntimeDeps};
 use tokio_util::sync::CancellationToken;
 
@@ -555,11 +557,13 @@ async fn a_session_brings_its_own_address_to_a_declared_worker() {
             &caller,
             "acme-support".to_string(),
             owner,
-            None,
-            Some(WorkerRef {
-                id: "w".to_string(),
-                url: Some(worker.url()),
-            }),
+            SessionSeed {
+                worker: Some(WorkerRef {
+                    id: "w".to_string(),
+                    url: Some(worker.url()),
+                }),
+                ..Default::default()
+            },
         )
         .await
         .expect("the session opens");
@@ -620,8 +624,10 @@ async fn a_session_opened_with_its_own_config_runs_in_engine() {
             &caller,
             "ad-hoc".to_string(),
             owner,
-            Some(config("claude")),
-            None,
+            SessionSeed {
+                agent: Some(config("claude")),
+                ..Default::default()
+            },
         )
         .await
         .expect("the session opens");

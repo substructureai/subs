@@ -10,6 +10,7 @@ use crate::connectors::registry::Connections;
 use crate::protocol::{
     AgentConfig, ClientAction, ClientAppend, ClientInput, ClientMessage, ClientMessages,
     ClientPayload, ErrorCode, ErrorInfo, InterruptResumption, SessionOwner, TokenDelta, WorkerRef,
+    WorkerState,
 };
 use crate::providers::memory_queue::TaskQueue;
 use crate::runtime::blob::BlobStore;
@@ -37,7 +38,8 @@ use subagent::{spawn_subagent_dispatch_processor, spawn_subagent_task_executor, 
 use wake::{spawn_boot_reconciler, spawn_wake_dispatcher, spawn_wake_processor, WakeScheduleStore};
 use worker::spawn_worker_processor;
 use worker::{
-    AgentDirectory, DequeueFilter, FailDecision, SubmitDecision, WorkerDecisionRequest, WorkerQueue,
+    AgentDirectory, DequeueFilter, FailDecision, SessionSeed, SubmitDecision,
+    WorkerDecisionRequest, WorkerQueue,
 };
 
 pub mod blob;
@@ -113,6 +115,8 @@ pub struct SubmitClientPayload {
     pub payload: ClientPayload,
 
     pub agent: Option<AgentConfig>,
+
+    pub state: Option<WorkerState>,
 
     pub worker: Option<WorkerRef>,
 
@@ -240,8 +244,7 @@ impl Runtime {
         caller: &Caller,
         agent_id: String,
         owner: SessionOwner,
-        agent: Option<AgentConfig>,
-        worker: Option<WorkerRef>,
+        seed: SessionSeed,
     ) -> Result<bool, RuntimeError> {
         let worker_retry = self.worker_retry_resolver.resolve(caller.tenant_id()).await;
         let result = execute(
@@ -255,8 +258,7 @@ impl Runtime {
                     owner,
                     vec![],
                     worker_retry,
-                    agent,
-                    worker,
+                    seed,
                 )
                 .await,
                 span: SpanContext::root().child("create_session"),
@@ -295,8 +297,11 @@ impl Runtime {
             &input.caller,
             input.agent_id,
             input.owner,
-            input.agent,
-            input.worker,
+            SessionSeed {
+                agent: input.agent,
+                state: input.state,
+                worker: input.worker,
+            },
         )
         .await?;
 
@@ -520,6 +525,7 @@ impl Runtime {
                 agent_id,
                 payload,
                 agent,
+                state: None,
                 worker,
                 turn_id,
                 continue_turn: false,

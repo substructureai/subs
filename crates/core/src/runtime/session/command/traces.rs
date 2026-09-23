@@ -207,6 +207,7 @@ impl Trace {
                 worker_retry,
                 agent: None,
                 worker: None,
+                state: None,
             },
             &system(),
         );

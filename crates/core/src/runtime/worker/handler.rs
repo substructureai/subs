@@ -457,6 +457,7 @@ mod tests {
                 worker_retry: RetryPolicy::no_retry(),
                 agent: None,
                 worker: None,
+                state: None,
             },
             &system(),
         );
@@ -534,6 +535,7 @@ mod tests {
                 worker_retry: RetryPolicy::no_retry(),
                 agent: None,
                 worker: None,
+                state: None,
             },
             &system(),
         )
@@ -701,6 +703,7 @@ mod tests {
                 worker_retry: RetryPolicy::no_retry(),
                 agent: None,
                 worker: None,
+                state: None,
             },
             &system(),
         );

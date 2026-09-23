@@ -12,7 +12,7 @@ use crate::runtime::session::command::{CommandPayload, Outcome, SessionError, Se
 use crate::runtime::session::state::EffectKind;
 use crate::runtime::session::{execute, ConflictRetry, ExecuteError, ExecuteInput};
 use crate::runtime::span::SpanContext;
-use crate::runtime::worker::{directory::create_session_command, AgentDirectory};
+use crate::runtime::worker::{directory::create_session_command, AgentDirectory, SessionSeed};
 use crate::runtime::Caller;
 
 use super::SubagentTask;
@@ -104,7 +104,12 @@ async fn handle_task(store: &dyn EventStore, agents: &dyn AgentDirectory, task: 
                         tenant_id: tenant_id.clone(),
                     },
                     command: create_session_command(
-                        agents, agent_id, owner, ancestry, retry, None, None,
+                        agents,
+                        agent_id,
+                        owner,
+                        ancestry,
+                        retry,
+                        SessionSeed::default(),
                     )
                     .await,
                     span: span.child("create_subagent"),

@@ -185,6 +185,7 @@ async fn run(
                 owner,
                 agent_id,
                 agent: None,
+                state: None,
                 worker: None,
                 payload: ClientPayload::Messages(ClientMessages {
                     // Full client view so edits/branches reconcile into the tree.

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::protocol::{AgentConfig, RetryPolicy, SessionOwner, WorkerRef};
+use crate::protocol::{AgentConfig, RetryPolicy, SessionOwner, WorkerRef, WorkerState};
 use crate::runtime::llm::LlmBlocks;
 use crate::runtime::session::command::CommandPayload;
 use crate::runtime::worker::WorkerDecisionRequest;
@@ -107,25 +107,32 @@ pub trait AgentDirectory: Send + Sync {
     async fn tenants(&self) -> Vec<String>;
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct SessionSeed {
+    pub agent: Option<AgentConfig>,
+    pub state: Option<WorkerState>,
+    pub worker: Option<WorkerRef>,
+}
+
 pub async fn create_session_command(
     agents: &dyn AgentDirectory,
     agent_id: String,
     owner: SessionOwner,
     ancestry: Vec<String>,
     worker_retry: RetryPolicy,
-    agent: Option<AgentConfig>,
-    worker: Option<WorkerRef>,
+    seed: SessionSeed,
 ) -> CommandPayload {
     CommandPayload::CreateSession {
         worker: agents
             .tenant(&owner.tenant_id)
             .await
-            .resolve_worker(&agent_id, worker),
+            .resolve_worker(&agent_id, seed.worker),
         agent_id,
         owner,
         ancestry,
         worker_retry,
-        agent,
+        agent: seed.agent,
+        state: seed.state,
     }
 }
 

@@ -39,6 +39,37 @@ The engine sends the current state on every request. To change it, return a new
 Writing the same value again records no new version. A session with no state
 reads as `null`, so check for it.
 
+## Start a session with state
+
+Your backend can put the first state on the session. Send `state` on the machine
+API's [`submit`](./250-api.md#post-apimachinesessionssubmit). The engine writes
+it before the first decision, so `session.start` reads it.
+
+```sh
+curl $BASE/api/machine/sessions/submit \
+    -H "Authorization: Bearer $API_KEY" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "agent_id": "my-agent",
+      "identity": { "id": "user_42" },
+      "state": { "plan": "pro", "turns": 0 },
+      "payload": { "type": "client.message", "message": { "role": "user", "content": "hi" } }
+    }'
+```
+
+```javascript title="server.mjs"
+function decide({ trigger, state }) {
+    if (trigger.type === "session.start") {
+        return { agent: { model: state.plan === "pro" ? "claude-opus-5" : "claude-haiku-4-5" } };
+    }
+}
+```
+
+The engine reads `state` only on the submit that creates the session. A later
+submit ignores it. The worker owns the state after the start.
+
+The client API does not take `state`. A browser must not write agent state.
+
 ## State on a branch
 
 The engine attaches state to the message tree. If you edit an earlier message or

@@ -9,6 +9,10 @@ together at the same version.
 
 ## [Unreleased]
 
+### Added
+
+- A machine submit can set the agent state when it creates the session.
+
 ## [0.9.5] - 2026-09-09
 
 ### Changed
