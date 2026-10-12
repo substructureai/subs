@@ -45,7 +45,7 @@ func decide(req DecisionRequest) DecisionResponse {
 		res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: *req.Trigger.Name, Arguments: args})
 		if err != nil {
 			msg := err.Error()
-			return DecisionResponse{Actions: []DecisionAction{{Type: FluffyToolError, Error: &msg}}}
+			return DecisionResponse{Actions: []DecisionAction{{Type: FluffyToolError, Error: &Error{String: &msg}}}}
 		}
 		var text []string
 		for _, c := range res.Content {
@@ -55,7 +55,7 @@ func decide(req DecisionRequest) DecisionResponse {
 		}
 		out := strings.Join(text, "\n")
 		if res.IsError {
-			return DecisionResponse{Actions: []DecisionAction{{Type: FluffyToolError, Error: &out}}}
+			return DecisionResponse{Actions: []DecisionAction{{Type: FluffyToolError, Error: &Error{String: &out}}}}
 		}
 		return DecisionResponse{Actions: []DecisionAction{{Type: FluffyToolResult, Result: out}}}
 	}

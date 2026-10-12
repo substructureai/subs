@@ -19,7 +19,7 @@ The workflow publishes that section as the GitHub Release body. It falls back to
 
 ## Cutting a release
 
-The CLI package and the `substructure-core` crate share a version.
+The CLI package and the `subs`, `substructure-host` and `substructure-session` crates share a version.
 
 ```sh
 pnpm run release 0.1.1   # or: patch | minor | major

@@ -1,0 +1,33 @@
+[package]
+name = "substructure-session"
+version = "0.9.5"
+edition = "2021"
+description = "One Substructure agent session: its rules, state and data"
+license = "MIT"
+
+[dependencies]
+async-trait = "0.1.89"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+hex = "0.4"
+percent-encoding = "2"
+rand = "0.9"
+rust_decimal = { version = "1.40.0", features = ["serde-with-str"] }
+schemars = { version = "1", features = ["chrono04", "rust_decimal1"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+serde_path_to_error = "0.1"
+serde_urlencoded = "0.7"
+strum = { version = "0.27", features = ["derive"] }
+sha2 = "0.10"
+thiserror = "2"
+tracing = "0.1"
+jsonschema = { version = "0.47.0", default-features = false }
+uuid = { version = "1", features = ["serde", "v5", "v7"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[dev-dependencies]
+proptest = "1.11.0"
+toml = "0.8"
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }

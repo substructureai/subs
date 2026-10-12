@@ -295,7 +295,7 @@ class InterruptPayload(BaseModel):
     metadata: Annotated[
         Any | None,
         Field(
-            description='Free-form, delivered to clients unchanged. `metadata.options` is a\nlist of [`InterruptOption`], which Slack shows as buttons.'
+            description='Free-form, delivered to clients unchanged. `metadata.options` is a\nlist of [`InterruptOption`], which a channel can show as buttons.'
         ),
     ] = None
     responseSchema: Annotated[
@@ -311,9 +311,7 @@ class InterruptResponder(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
     )
-    channel: Annotated[
-        str, Field(description='The channel kind, e.g. `slack`, `ag-ui`.')
-    ]
+    channel: Annotated[str, Field(description='The channel that resolved it.')]
     label: Annotated[
         str | None,
         Field(description="The chosen option's label, when the resolution was a pick."),
@@ -388,6 +386,10 @@ class McpTools(BaseModel):
     include: list[str] | None = None
     non_destructive: bool | None = None
     read_only: bool | None = None
+
+
+class QueueMode1(Enum):
+    merge = 'merge'
 
 
 class ReasoningEffort(Enum):
@@ -541,7 +543,7 @@ class Subject(BaseModel):
     issuer: Annotated[
         str,
         Field(
-            description="Where a person's name comes from: `slack`, `app`, `cli`, or another source\na deployment registers. Set by whatever authenticated the request, never\nread from the request.",
+            description="Where a person's name comes from: `app`, `cli`, or another source a\ndeployment registers. Set by whatever authenticated the request, never\nread from the request.",
             title='Issuer',
         ),
     ]
@@ -1293,6 +1295,7 @@ class Node(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
     )
+    copied_from: str | None = None
     message: Message
     parent_id: str | None = None
 
@@ -1312,9 +1315,9 @@ class ClientInput1(BaseModel):
     agent_id: str
     message: DraftMessage
     queue: Annotated[
-        bool | None,
+        bool | QueueMode1 | None,
         Field(
-            description='Hold this message for the next turn instead of refusing it while a\nturn is running. Off by default.'
+            description='What a message does while a turn runs. `false` or `null` refuses it. `true` holds it for a turn of its own. `"merge"` adds it to the turn waiting last when that turn also merges, so messages sent during a turn become one turn.'
         ),
     ] = None
     stream: bool | None = None
@@ -1342,9 +1345,9 @@ class ClientInput3(BaseModel):
     client: ClientContext | None = None
     messages: list[DraftMessage]
     queue: Annotated[
-        bool | None,
+        bool | QueueMode1 | None,
         Field(
-            description='Hold this batch for the next turn instead of refusing it while a\nturn is running. Off by default.'
+            description='What a message does while a turn runs. `false` or `null` refuses it. `true` holds it for a turn of its own. `"merge"` adds it to the turn waiting last when that turn also merges, so messages sent during a turn become one turn.'
         ),
     ] = None
     stream: bool | None = None
@@ -1470,12 +1473,6 @@ class DecisionResponse(BaseModel):
             description='A new agent config write; omitted keeps the current config.'
         ),
     ] = None
-    channels: Annotated[
-        dict[str, Any] | None,
-        Field(
-            description='How each channel shows this decision, keyed by channel kind. The engine\ndoes not read it.'
-        ),
-    ] = None
     messages: list[DraftMessage] | None = None
     state: Annotated[
         Any,
@@ -1537,7 +1534,6 @@ class DecisionRequest(BaseModel):
     deadline: AwareDatetime | None = None
     decision_id: str
     identity: WorkerIdentity
-    message_tree: MessageTree
     messages: list[Message]
     pending_calls: Annotated[
         int, Field(description='Count of in-flight `tool_call`/`subagent` calls.', ge=0)

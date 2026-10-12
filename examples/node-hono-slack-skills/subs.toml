@@ -6,10 +6,14 @@ type = "openrouter"
 [worker.app]
 url = "http://localhost:4444"
 
+[events.app]
+url = "http://localhost:4444/events"
+
 [agent.oncall]
 llm = "openrouter"
 model = "deepseek/deepseek-v4-flash-0731"
 worker = "app"
+events = "app"
 
 [agent.oncall.slack]
 name = "Oncall"

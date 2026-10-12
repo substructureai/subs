@@ -56,7 +56,7 @@ Render a chat from these.
 | Event | Payload |
 | --- | --- |
 | `session.created` | The session exists. |
-| `message.new` | A message joined the tree: `{ message, parent_id? }`. |
+| `message.new` | A message joined the tree: `{ message, parent_id?, copied_from? }`. `copied_from` names the original of a copy. |
 | `head.moved` | The active leaf changed. A client branched or edited. |
 | `turn.started` | A turn began: `{ turn_id }`. |
 | `turn.completed` | A turn ended, with its cost and output. |
@@ -126,7 +126,6 @@ stream with that to watch the child.
 | --- | --- |
 | `worker.state.updated` | A decision wrote new state. |
 | `agent.updated` | A decision wrote a new config. |
-| `channels.updated` | A decision wrote a frontend view. |
 
 ## Decisions
 
@@ -141,6 +140,34 @@ Engine bookkeeping. Useful for monitoring.
 | `decision.dropped` | The decision was abandoned. |
 | `call.voided` | A call was canceled before it settled. |
 | `session.message_requested` | A `message.send` targeted another session. |
+
+## Delivery
+
+The engine hands events to its own readers: the session list, messages to
+other sessions, Slack, and the agent's [events URL](./55-events-url.md). A reader that fails retries with backoff, and each failure is
+logged. These events go to no reader.
+
+Work goes to queues. Work that cannot be queued waits and goes out again as
+the same attempt.
+
+| Event | Payload |
+| --- | --- |
+| `work.unsent` | `{ kind, id, attempt?, error, retry_at }`. The work goes out again at `retry_at`. |
+| `delivery.failed` | `{ subscription, seq, attempt, error, retry_at }`. A retry follows at `retry_at`. |
+| `delivery.recovered` | `{ subscription, through, attempts }`. Delivery works again. |
+| `delivery.skipped` | `{ subscription, seq, attempt, error }`. The reader gave up on that event. |
+| `delivery.parked` | `{ subscription, seq, attempt, error }`. The reader stopped until it is resumed. |
+| `delivery.resumed` | `{ subscription }`. A parked reader runs again. |
+
+## Branches
+
+Engine bookkeeping. The engine keeps the active branch in memory and loads other
+branches from the log when a view needs them. These events go to no reader.
+
+| Event | Meaning |
+| --- | --- |
+| `branch.loaded` | A branch came back into memory from the log. |
+| `branch.unloaded` | Branches off the active path left memory. They stay in the log. |
 
 ## AG-UI
 

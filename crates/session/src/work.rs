@@ -1,0 +1,430 @@
+use std::fmt;
+
+use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+
+use crate::command::{CommandPayload, Outcome};
+use crate::connectors::{ConnectionPath, Requester};
+use crate::decision::{LlmHandler, ToolHandler};
+use crate::entry::{Command, CommandId};
+use crate::events::{ConnectorTarget, EventPayload};
+use crate::protocol::{
+    DeferToolsStrategy, DraftMessage, EffectKind, EffectStatus, LlmRequest, RetryPolicy,
+    SessionOwner,
+};
+use crate::request::{PendingPrompt, WorkerDecisionRequest};
+use crate::session::{Session, SessionEvent};
+use crate::state::{EffectState, SessionStatus};
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct WorkId {
+    pub kind: EffectKind,
+    pub id: String,
+    pub attempt: Option<u32>,
+}
+
+impl WorkId {
+    pub fn new(kind: EffectKind, id: impl Into<String>, attempt: Option<u32>) -> Self {
+        Self {
+            kind,
+            id: id.into(),
+            attempt,
+        }
+    }
+
+    pub fn settle_id(&self) -> CommandId {
+        CommandId(format!("settle:{self}"))
+    }
+}
+
+impl Work {
+    pub fn id(&self) -> &WorkId {
+        match self {
+            Work::CallLlm { work, .. }
+            | Work::CallTool { work, .. }
+            | Work::ListTools { work, .. }
+            | Work::AskWorker { work, .. }
+            | Work::StartSubagent { work, .. } => work,
+        }
+    }
+}
+
+impl fmt::Display for WorkId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.attempt {
+            Some(attempt) => write!(f, "{}:{}:{attempt}", self.kind.label(), self.id),
+            None => write!(f, "{}:{}", self.kind.label(), self.id),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmCall {
+    pub call_id: String,
+    pub attempt: u32,
+    pub llm: String,
+    pub request: LlmRequest,
+    pub defer_tools_strategy: DeferToolsStrategy,
+    pub stream: bool,
+    pub owner: SessionOwner,
+    pub agent_id: String,
+    pub ancestry: Vec<String>,
+    pub turn_id: Option<String>,
+    pub retry: RetryPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "target", rename_all = "snake_case")]
+pub enum ToolTarget {
+    Remote {
+        path: ConnectionPath,
+        name: String,
+        arguments: serde_json::Value,
+        requester: Requester,
+    },
+    Local,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub tool_call_id: String,
+    pub attempt: u32,
+    pub target: ToolTarget,
+    pub retry: RetryPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Subagent {
+    pub child: String,
+    pub agent_id: String,
+    pub owner: SessionOwner,
+    pub ancestry: Vec<String>,
+    pub message: Option<DraftMessage>,
+    pub retry: RetryPolicy,
+    pub events: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Summary {
+    pub session_id: String,
+    pub tenant_id: String,
+    pub seq: u64,
+    pub status: SessionStatus,
+    pub agent_id: Option<String>,
+    pub top_level: bool,
+    pub turn_id: Option<String>,
+    pub cost: Decimal,
+    pub subagent_cost: Decimal,
+    pub first_event_at: Option<DateTime<Utc>>,
+    pub last_event_at: Option<DateTime<Utc>>,
+    pub wake_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Work {
+    CallLlm {
+        work: WorkId,
+        call: Box<LlmCall>,
+    },
+    CallTool {
+        work: WorkId,
+        call: ToolCall,
+    },
+    ListTools {
+        work: WorkId,
+        path: ConnectionPath,
+        requester: Requester,
+        retry: RetryPolicy,
+    },
+    AskWorker {
+        work: WorkId,
+        request: Box<WorkerDecisionRequest>,
+        prompt: Option<Box<PendingPrompt>>,
+        seq: u64,
+    },
+    StartSubagent {
+        work: WorkId,
+        subagent: Box<Subagent>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Mail {
+    pub to: String,
+    pub command: Command,
+}
+
+impl Session {
+    pub fn summary(&self) -> Summary {
+        let state = &self.state;
+        let meta = state.event_meta(self.last_event_at.unwrap_or_default());
+        Summary {
+            session_id: self.id.clone(),
+            tenant_id: self.tenant_id.clone(),
+            seq: self.seq,
+            status: state.status.clone(),
+            agent_id: state.agent_id.clone(),
+            top_level: state.ancestry.is_empty(),
+            turn_id: state.turn_id().map(str::to_string),
+            cost: meta.cost,
+            subagent_cost: meta.subagent_cost,
+            first_event_at: self.first_event_at,
+            last_event_at: self.last_event_at,
+            wake_at: self.wake_at,
+        }
+    }
+
+    pub fn open_work(&self) -> Vec<Work> {
+        let state = &self.state;
+        state
+            .effects
+            .iter()
+            .filter_map(|((kind, id), effect)| {
+                let attempt = effect.tracking.retry.attempts;
+                match kind {
+                    EffectKind::LlmCall => self.llm(id, attempt),
+                    EffectKind::ToolCall => self.tool(id, attempt),
+                    EffectKind::Subagent if effect.tracking.status() == EffectStatus::Pending => {
+                        self.subagent(id)
+                    }
+                    EffectKind::Decision => {
+                        let seq = self
+                            .open(EffectKind::Decision, id, None)?
+                            .decision()?
+                            .built_at();
+                        let (request, prompt) = self.resumed_request(id, seq)?;
+                        Some(Work::AskWorker {
+                            work: WorkId::new(EffectKind::Decision, id.clone(), Some(attempt)),
+                            request: Box::new(request),
+                            prompt: prompt.map(Box::new),
+                            seq,
+                        })
+                    }
+                    EffectKind::ConnectorSync => {
+                        self.open(EffectKind::ConnectorSync, id, Some(attempt))?;
+                        Some(Work::ListTools {
+                            work: WorkId::new(EffectKind::ConnectorSync, id.clone(), Some(attempt)),
+                            path: ConnectionPath::parse(id)?,
+                            requester: Requester::of_owner(state.owner.as_ref()),
+                            retry: effect.tracking.retry_policy.clone(),
+                        })
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    pub fn work(&self, events: &[SessionEvent]) -> Vec<Work> {
+        events
+            .iter()
+            .flat_map(|event| self.work_for(event))
+            .collect()
+    }
+
+    fn work_for(&self, event: &SessionEvent) -> Vec<Work> {
+        let state = &self.state;
+        match &event.payload {
+            EventPayload::LlmCallDispatched(d) => self.llm(&d.id, d.attempt).into_iter().collect(),
+            EventPayload::ToolCallDispatched(d) => {
+                self.tool(&d.id, d.attempt).into_iter().collect()
+            }
+            EventPayload::ConnectorSyncRequested(req) => self
+                .open(
+                    EffectKind::ConnectorSync,
+                    &req.path.to_string(),
+                    Some(req.attempt),
+                )
+                .map(|_| Work::ListTools {
+                    work: WorkId::new(
+                        EffectKind::ConnectorSync,
+                        req.path.to_string(),
+                        Some(req.attempt),
+                    ),
+                    path: req.path.clone(),
+                    requester: Requester::of_owner(state.owner.as_ref()),
+                    retry: req.retry.clone(),
+                })
+                .into_iter()
+                .collect(),
+            EventPayload::DecisionDispatched(d) => self
+                .open(EffectKind::Decision, &d.id, None)
+                .and_then(|effect| {
+                    let attempt = effect.tracking.retry.attempts;
+                    let request =
+                        self.decision_request(&d.id, event.seq, &event.meta, &event.span)?;
+                    Some((attempt, request))
+                })
+                .map(|(attempt, (request, prompt))| Work::AskWorker {
+                    work: WorkId::new(EffectKind::Decision, d.id.clone(), Some(attempt)),
+                    request: Box::new(request),
+                    prompt: prompt.map(Box::new),
+                    seq: event.seq,
+                })
+                .into_iter()
+                .collect(),
+            EventPayload::SubagentDispatched(d) => self.subagent(&d.id).into_iter().collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn mail(&self, events: &[SessionEvent]) -> Vec<Mail> {
+        events
+            .iter()
+            .flat_map(|event| self.mail_for(event))
+            .collect()
+    }
+
+    fn mail_for(&self, event: &SessionEvent) -> Vec<Mail> {
+        let state = &self.state;
+        match &event.payload {
+            EventPayload::SessionMessageRequested(req) => vec![Mail {
+                to: req.target_session_id.clone(),
+                command: self.caused_by(
+                    event,
+                    CommandPayload::SendMessage {
+                        message: req.message.clone(),
+                        stream: false,
+                        turn_id: Some(event.id.to_string()),
+                        parent_id: None,
+                    },
+                ),
+            }],
+            EventPayload::CallVoided(v) if v.kind == EffectKind::Subagent => state
+                .subagent(&v.id)
+                .map(|sa| Mail {
+                    to: sa.session_id.clone(),
+                    command: self.caused_by(event, CommandPayload::CancelSession),
+                })
+                .into_iter()
+                .collect(),
+            EventPayload::TurnCompleted(tc) => event
+                .meta
+                .ancestry
+                .last()
+                .map(|parent| Mail {
+                    to: parent.clone(),
+                    command: self.caused_by(
+                        event,
+                        CommandPayload::CompleteSubagentTurn {
+                            session_id: self.id().to_string(),
+                            agent_id: event.meta.agent_id.clone().unwrap_or_default(),
+                            turn_id: tc.turn_id.clone(),
+                            data: tc.data.clone(),
+                            cost: tc.turn_cost,
+                            token_usage: tc.turn_token_usage.clone(),
+                            error: tc.error.clone(),
+                        },
+                    ),
+                })
+                .into_iter()
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn is_open(&self, work: &WorkId) -> bool {
+        self.open(work.kind, &work.id, work.attempt).is_some()
+    }
+
+    fn caused_by(&self, event: &SessionEvent, payload: CommandPayload) -> Command {
+        Command::system(event.id.to_string(), self.tenant_id(), payload)
+    }
+
+    fn open(&self, kind: EffectKind, id: &str, attempt: Option<u32>) -> Option<&EffectState> {
+        let effect = self.state.effect(kind, id)?;
+        let running = matches!(
+            effect.tracking.status(),
+            EffectStatus::Pending | EffectStatus::Running
+        );
+        let current = attempt.is_none_or(|a| a == effect.tracking.retry.attempts);
+        (running && current).then_some(effect)
+    }
+
+    fn llm(&self, id: &str, attempt: u32) -> Option<Work> {
+        let state = &self.state;
+        let effect = self.open(EffectKind::LlmCall, id, Some(attempt))?;
+        let call = effect.llm()?;
+        if call.handler == LlmHandler::Worker {
+            return None;
+        }
+        Some(Work::CallLlm {
+            work: WorkId::new(EffectKind::LlmCall, id, Some(attempt)),
+            call: Box::new(LlmCall {
+                call_id: id.to_string(),
+                attempt,
+                llm: call.llm.clone(),
+                request: call.spec.to_request(call.prompt.clone()),
+                defer_tools_strategy: call.defer_tools_strategy,
+                stream: call.stream,
+                owner: state.owner.clone()?,
+                agent_id: state.agent_id.clone()?,
+                ancestry: state.ancestry.clone(),
+                turn_id: state.turn_id().map(str::to_string),
+                retry: effect.tracking.retry_policy.clone(),
+            }),
+        })
+    }
+
+    fn tool(&self, id: &str, attempt: u32) -> Option<Work> {
+        let state = &self.state;
+        let effect = self.open(EffectKind::ToolCall, id, Some(attempt))?;
+        let tc = effect.tool()?;
+        if tc.handler != ToolHandler::Server {
+            return None;
+        }
+        let target = match tc.target.as_ref()? {
+            ConnectorTarget::Remote { path, remote_name } => ToolTarget::Remote {
+                path: path.clone(),
+                name: remote_name.clone(),
+                arguments: serde_json::from_str(&tc.arguments)
+                    .unwrap_or_else(|_| serde_json::json!({})),
+                requester: Requester::of_owner(state.owner.as_ref()),
+            },
+            _ => ToolTarget::Local,
+        };
+        Some(Work::CallTool {
+            work: WorkId::new(EffectKind::ToolCall, id, Some(attempt)),
+            call: ToolCall {
+                tool_call_id: id.to_string(),
+                attempt,
+                target,
+                retry: effect.tracking.retry_policy.clone(),
+            },
+        })
+    }
+
+    fn subagent(&self, id: &str) -> Option<Work> {
+        let state = &self.state;
+        let effect = self.open(EffectKind::Subagent, id, None)?;
+        let sa = effect.subagent()?;
+        let mut ancestry = state.ancestry.clone();
+        ancestry.push(self.id.clone());
+        Some(Work::StartSubagent {
+            work: WorkId::new(
+                EffectKind::Subagent,
+                id,
+                Some(effect.tracking.retry.attempts),
+            ),
+            subagent: Box::new(Subagent {
+                child: sa.session_id.clone(),
+                agent_id: sa.agent_id.clone(),
+                owner: state.owner.clone()?,
+                ancestry,
+                message: sa.message.clone(),
+                retry: effect.tracking.retry_policy.clone(),
+                events: state.events.clone(),
+            }),
+        })
+    }
+}
+
+pub fn settle(work: &WorkId, tenant_id: &str, outcome: Outcome) -> Command {
+    Command::system(
+        work.settle_id(),
+        tenant_id,
+        CommandPayload::settle(work.kind, work.id.clone(), work.attempt, outcome),
+    )
+}

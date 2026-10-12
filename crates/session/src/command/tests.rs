@@ -1,0 +1,12076 @@
+use crate::connectors::ConnectionPath;
+use crate::protocol::StoredResult;
+use std::collections::HashMap;
+
+use crate::protocol::{
+    ClientAppend, ClientMessage, ClientMessages, DeferTools, McpAnnounce, NewMessage,
+};
+use crate::reconcile::plan_reconcile;
+use chrono::Utc;
+
+use super::super::state::{AgentVersion, Logged};
+use super::*;
+use crate::connectors::{AuthNeed, RemoteTool};
+use crate::decision::ToolHandler;
+use crate::events::EventPayload;
+use crate::protocol::{
+    AgentTool, DeferToolsStrategy, Handler, LlmTool, McpServer, McpTools, Message, RetryConfig,
+    RetryOverride,
+};
+use crate::protocol::{Content, LlmResponse};
+use crate::retry::RetryTarget;
+use crate::span::SpanContext;
+use crate::Caller;
+use crate::{CommitContext, Session};
+
+fn dispatch(agg: &mut Session, cmd: CommandPayload, caller: &Caller) -> Vec<EventPayload> {
+    let now = Utc::now();
+    let events = agg.handle(cmd, caller, now).expect("setup command failed");
+    let ctx = CommitContext {
+        span: SpanContext::root(),
+        occurred_at: now,
+    };
+    agg.commit(events.clone(), &ctx);
+    events
+}
+
+fn create_session(session_id: &str, tenant_id: &str, user_id: &str) -> Session {
+    create_session_with_config(session_id, tenant_id, user_id, None)
+}
+
+const SPAWN_DECISION: &str = "d-spawn";
+
+fn child_of(agg: &Session, call: &str) -> String {
+    agg.state
+        .subagent(call)
+        .expect("the spawn recorded a child")
+        .session_id
+        .clone()
+}
+
+fn spawn_as(agent: &str, call: &str) -> CommandPayload {
+    CommandPayload::RequestSubagent {
+        session_id: None,
+        agent_id: agent.to_string(),
+        tool_call_id: call.to_string(),
+        message: None,
+        retry: RetryPolicy::no_retry(),
+        decision_id: SPAWN_DECISION.to_string(),
+        mode: None,
+    }
+}
+
+fn continue_as(agent: &str, child: &str, call: &str) -> CommandPayload {
+    CommandPayload::RequestSubagent {
+        session_id: Some(child.to_string()),
+        agent_id: agent.to_string(),
+        tool_call_id: call.to_string(),
+        message: None,
+        retry: RetryPolicy::no_retry(),
+        decision_id: SPAWN_DECISION.to_string(),
+        mode: None,
+    }
+}
+
+fn spawn(call: &str) -> CommandPayload {
+    spawn_as("agent-2", call)
+}
+
+fn answer(child: &str, turn: &str, cost: rust_decimal::Decimal) -> CommandPayload {
+    CommandPayload::CompleteSubagentTurn {
+        session_id: child.to_string(),
+        agent_id: "agent-2".to_string(),
+        turn_id: turn.to_string(),
+        data: serde_json::json!("done"),
+        cost,
+        token_usage: Default::default(),
+        error: None,
+    }
+}
+
+fn create_session_with_config(
+    session_id: &str,
+    tenant_id: &str,
+    user_id: &str,
+    agent: Option<AgentConfig>,
+) -> Session {
+    let mut agg = Session::with_state(
+        session_id.to_string(),
+        tenant_id.to_string(),
+        SessionState::new(session_id.to_string()),
+    );
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::CreateSession {
+            agent_id: "agent-1".to_string(),
+            owner: SessionOwner {
+                tenant_id: tenant_id.to_string(),
+                requester: Requester::new(
+                    Subject::new(Issuer::app(), user_id.to_string()),
+                    Default::default(),
+                ),
+                metadata: HashMap::new(),
+            },
+            ancestry: vec![],
+            worker_retry: RetryPolicy::no_retry(),
+            agent: None,
+            worker: None,
+            events: None,
+            state: None,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+    let start = events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionDispatched(w) => Some(w.id.clone()),
+            _ => None,
+        })
+        .expect("CreateSession opens a session.start decision");
+    dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: start,
+            transcript: vec![],
+            actions: vec![],
+            state: None,
+            agent,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+    agg
+}
+
+fn drain_session_start(agg: &mut Session) {
+    let start = agg
+        .state
+        .effects_of(EffectKind::Decision)
+        .find(|d| {
+            d.decision()
+                .is_some_and(|d| matches!(d.trigger, Trigger::SessionStart))
+        })
+        .map(|d| d.id.clone())
+        .expect("a pending session.start decision");
+    dispatch(
+        agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: start,
+            transcript: vec![],
+            actions: vec![],
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    );
+}
+
+#[test]
+fn frontend_can_complete_own_client_handled_tool_call() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    declare_client_tool(&mut agg, "my_tool");
+    dispatch(
+        &mut agg,
+        CommandPayload::RequestToolCall {
+            tool_call_id: "tc-1".to_string(),
+            name: "my_tool".to_string(),
+            arguments: "{}".to_string(),
+            retry: None,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::ToolCall,
+            "tc-1".to_string(),
+            Some(0),
+            Outcome::Tool {
+                result: StoredResult::text("ok".to_string()),
+            },
+        ),
+        &Caller::Frontend {
+            tenant_id: "tenant-a".to_string(),
+            subject: Subject::new(Issuer::app(), "user-1".to_string()),
+            attrs: HashMap::new(),
+        },
+    );
+
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                EventPayload::ToolCallCompleted(_),
+                EventPayload::DecisionQueued(_),
+                EventPayload::DecisionDispatched(_),
+            ]
+        ),
+        "expected [ToolCallCompleted, DecisionDispatched]; got {events:?}"
+    );
+    assert_eq!(fired_tool_result(&events), vec!["tc-1".to_string()]);
+
+    let tc = agg
+        .state
+        .effect(EffectKind::ToolCall, "tc-1")
+        .expect("tool call present");
+    assert_eq!(tc.tracking.status(), EffectStatus::Completed);
+    assert_eq!(tc.tool().unwrap().result.as_deref(), Some("ok"));
+    assert!(!tc.tool().unwrap().is_error);
+}
+
+#[test]
+fn frontend_with_mismatched_user_id_is_denied() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    dispatch(
+        &mut agg,
+        CommandPayload::RequestToolCall {
+            tool_call_id: "tc-1".to_string(),
+            name: "my_tool".to_string(),
+            arguments: "{}".to_string(),
+            retry: None,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+
+    let caller = Caller::Frontend {
+        tenant_id: "tenant-a".to_string(),
+        subject: Subject::new(Issuer::app(), "other-user".to_string()),
+        attrs: HashMap::new(),
+    };
+
+    let err = agg
+        .try_handle(
+            CommandPayload::settle(
+                EffectKind::ToolCall,
+                "tc-1".to_string(),
+                Some(0),
+                Outcome::Tool {
+                    result: StoredResult::text("ok".to_string()),
+                },
+            ),
+            &caller,
+        )
+        .expect_err("mismatched user_id should be rejected");
+
+    assert!(
+        matches!(err, SessionError::SessionAccessDenied),
+        "expected SessionAccessDenied; got {err:?}"
+    );
+}
+
+#[test]
+fn frontend_cannot_complete_worker_handled_tool_call() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    dispatch(
+        &mut agg,
+        CommandPayload::RequestToolCall {
+            tool_call_id: "tc-1".to_string(),
+            name: "my_tool".to_string(),
+            arguments: "{}".to_string(),
+            retry: None,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+
+    let caller = Caller::Frontend {
+        tenant_id: "tenant-a".to_string(),
+        subject: Subject::new(Issuer::app(), "user-1".to_string()),
+        attrs: HashMap::new(),
+    };
+
+    let err = agg
+        .try_handle(
+            CommandPayload::settle(
+                EffectKind::ToolCall,
+                "tc-1".to_string(),
+                Some(0),
+                Outcome::Tool {
+                    result: StoredResult::text("ok".to_string()),
+                },
+            ),
+            &caller,
+        )
+        .expect_err("frontend should not complete worker-handled tool calls");
+
+    assert!(
+        matches!(err, SessionError::EffectWrongHandler),
+        "expected EffectWrongHandler; got {err:?}"
+    );
+}
+
+fn settle_with_output_contract(result: &str) -> (Session, Vec<EventPayload>) {
+    use crate::protocol::{LlmTool, ToolCall, ToolCallFunction};
+
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    dispatch(
+        &mut agg,
+        CommandPayload::RequestLlmCall {
+            llm: "claude".to_string(),
+            call_id: "call-1".to_string(),
+            request: LlmRequest {
+                model: "test-model".to_string(),
+                messages: vec![],
+                tools: Some(vec![LlmTool {
+                    name: "get_weather".to_string(),
+                    description: "d".to_string(),
+                    input: None,
+                    output: Some(serde_json::json!({
+                        "type": "object",
+                        "properties": { "temp_c": { "type": "number" } },
+                        "required": ["temp_c"],
+                    })),
+                    defer: false,
+                }]),
+                temperature: None,
+                max_completion_tokens: None,
+                reasoning: None,
+            },
+            stream: false,
+            retry: RetryPolicy::no_retry(),
+            handler: LlmHandler::Server,
+            format: None,
+        },
+        &system(),
+    );
+    let tool_call = ToolCall {
+        id: "tc-1".to_string(),
+        call_type: "function".to_string(),
+        function: ToolCallFunction {
+            name: "get_weather".to_string(),
+            arguments: "{}".to_string(),
+        },
+    };
+    let finished = dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::LlmCall,
+            "call-1".to_string(),
+            Some(0),
+            Outcome::Llm(Box::new(LlmResponse {
+                model: "test-model".to_string(),
+                content: None,
+                tool_calls: vec![tool_call.clone()],
+                finish_reason: None,
+                usage: None,
+                cost: None,
+                images: vec![],
+                reasoning: None,
+            })),
+        ),
+        &system(),
+    );
+    let decision_id = finished
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionDispatched(p) => Some(p.id.clone()),
+            _ => None,
+        })
+        .expect("llm.finished opens a decision");
+    dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id,
+            transcript: vec![DraftMessage {
+                id: Some("call-1".to_string()),
+                role: Role::Assistant,
+                content: None,
+                tool_calls: Some(vec![tool_call]),
+                tool_call_id: None,
+                name: None,
+                reasoning: None,
+            }],
+            actions: vec![Action::CallTool {
+                id: "tc-1".to_string(),
+                name: "get_weather".to_string(),
+                arguments: "{}".to_string(),
+                retry: None,
+            }],
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    );
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::ToolCall,
+            "tc-1".to_string(),
+            Some(0),
+            Outcome::Tool {
+                result: StoredResult::text(result),
+            },
+        ),
+        &machine(),
+    );
+    (agg, events)
+}
+
+#[test]
+fn a_result_violating_the_declared_output_schema_settles_as_an_error() {
+    let (agg, events) = settle_with_output_contract(r#"{"temp_c": "warm"}"#);
+
+    assert!(
+        matches!(events.as_slice(), [EventPayload::ToolCallErrored(_), ..]),
+        "the completion becomes a terminal failure; got {events:?}"
+    );
+    assert!(
+        decision_with(&events, |t| matches!(
+            t,
+            Trigger::ToolFinished { id, ok: false, error: Some(e), .. }
+                if id == "tc-1" && e.message.contains("tool output violated its declared schema")
+        ))
+        .is_some(),
+        "the violation reaches the model as the tool's error; got {events:?}"
+    );
+    let tc = agg
+        .state
+        .effect(EffectKind::ToolCall, "tc-1")
+        .expect("tool call present");
+    assert!(tc.tool().unwrap().is_error);
+}
+
+#[test]
+fn a_result_satisfying_the_declared_output_schema_settles_normally() {
+    let (agg, events) = settle_with_output_contract(r#"{"temp_c": 21}"#);
+
+    assert!(
+        matches!(events.as_slice(), [EventPayload::ToolCallCompleted(_), ..]),
+        "a conforming result completes; got {events:?}"
+    );
+    let tc = agg
+        .state
+        .effect(EffectKind::ToolCall, "tc-1")
+        .expect("tool call present");
+    assert!(!tc.tool().unwrap().is_error);
+    assert_eq!(
+        tc.tool().unwrap().result.as_deref(),
+        Some(r#"{"temp_c": 21}"#)
+    );
+}
+
+#[test]
+fn request_tool_call_with_client_handler_does_not_queue_worker_decision() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    declare_client_tool(&mut agg, "my_tool");
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::RequestToolCall {
+            tool_call_id: "tc-1".to_string(),
+            name: "my_tool".to_string(),
+            arguments: "{}".to_string(),
+            retry: None,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                EventPayload::ToolCallRequested(_),
+                EventPayload::ToolCallDispatched(_),
+            ]
+        ),
+        "client-handled tool call dispatches with no worker decision; got {events:?}"
+    );
+
+    let tc = agg
+        .state
+        .effect(EffectKind::ToolCall, "tc-1")
+        .expect("tool call present");
+    assert_eq!(tc.tracking.status(), EffectStatus::Pending);
+    assert_eq!(tc.tool().unwrap().handler, ToolHandler::Client);
+    assert_eq!(agg.state.status, SessionStatus::Idle);
+}
+
+#[test]
+fn request_tool_call_with_worker_handler_emits_decision_to_execute() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::RequestToolCall {
+            tool_call_id: "tc-1".to_string(),
+            name: "my_tool".to_string(),
+            arguments: "{}".to_string(),
+            retry: None,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                EventPayload::ToolCallRequested(_),
+                EventPayload::ToolCallDispatched(_),
+                EventPayload::DecisionQueued(_),
+                EventPayload::DecisionDispatched(_),
+            ]
+        ),
+        "worker-handled tool call should also queue a worker decision; got {events:?}"
+    );
+
+    let tc = agg
+        .state
+        .effect(EffectKind::ToolCall, "tc-1")
+        .expect("tool call present");
+    assert_eq!(tc.tool().unwrap().handler, ToolHandler::Worker);
+}
+
+#[test]
+fn machine_completes_worker_handled_tool_call_after_worker_releases_decision() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let request_events = dispatch(
+        &mut agg,
+        CommandPayload::RequestToolCall {
+            tool_call_id: "tc-1".to_string(),
+            name: "my_tool".to_string(),
+            arguments: "{}".to_string(),
+            retry: None,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+    let d1 = request_events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionDispatched(p) => Some(p.id.clone()),
+            _ => None,
+        })
+        .expect("worker-handled tool call emits a tool.execute decision");
+
+    let machine = Caller::ApiKey {
+        tenant_id: "tenant-a".to_string(),
+        key_id: "prod-key-1".to_string(),
+    };
+
+    dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: d1,
+            transcript: vec![],
+            actions: vec![],
+            state: None,
+            agent: None,
+        },
+        &machine,
+    );
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::ToolCall,
+            "tc-1".to_string(),
+            Some(0),
+            Outcome::Tool {
+                result: StoredResult::text("ok".to_string()),
+            },
+        ),
+        &machine,
+    );
+
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                EventPayload::ToolCallCompleted(_),
+                EventPayload::DecisionQueued(_),
+                EventPayload::DecisionDispatched(_),
+            ]
+        ),
+        "expected [ToolCallCompleted, DecisionDispatched]; got {events:?}"
+    );
+    assert_eq!(fired_tool_result(&events), vec!["tc-1".to_string()]);
+
+    let tc = agg
+        .state
+        .effect(EffectKind::ToolCall, "tc-1")
+        .expect("tool call present");
+    assert_eq!(tc.tracking.status(), EffectStatus::Completed);
+}
+
+#[test]
+fn machine_completes_worker_handled_tool_call_before_worker_releases_decision() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    dispatch(
+        &mut agg,
+        CommandPayload::RequestToolCall {
+            tool_call_id: "tc-1".to_string(),
+            name: "my_tool".to_string(),
+            arguments: "{}".to_string(),
+            retry: None,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::ToolCall,
+            "tc-1".to_string(),
+            Some(0),
+            Outcome::Tool {
+                result: StoredResult::text("ok".to_string()),
+            },
+        ),
+        &Caller::ApiKey {
+            tenant_id: "tenant-a".to_string(),
+            key_id: "prod-key-1".to_string(),
+        },
+    );
+
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                EventPayload::ToolCallCompleted(_),
+                EventPayload::DecisionQueued(_),
+            ]
+        ),
+        "expected [ToolCallCompleted, DecisionQueued]; got {events:?}"
+    );
+    assert_eq!(fired_tool_result(&events), vec!["tc-1".to_string()]);
+
+    let tc = agg
+        .state
+        .effect(EffectKind::ToolCall, "tc-1")
+        .expect("tool call present");
+    assert_eq!(tc.tracking.status(), EffectStatus::Completed);
+}
+
+#[test]
+fn complete_tool_call_with_wrong_attempt_fails() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    dispatch(
+        &mut agg,
+        CommandPayload::RequestToolCall {
+            tool_call_id: "tc-1".to_string(),
+            name: "my_tool".to_string(),
+            arguments: "{}".to_string(),
+            retry: None,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+
+    let caller = Caller::ApiKey {
+        tenant_id: "tenant-a".to_string(),
+        key_id: "prod-key-1".to_string(),
+    };
+
+    let err = agg
+        .try_handle(
+            CommandPayload::settle(
+                EffectKind::ToolCall,
+                "tc-1".to_string(),
+                Some(7),
+                Outcome::Tool {
+                    result: StoredResult::text("ok".to_string()),
+                },
+            ),
+            &caller,
+        )
+        .expect_err("wrong attempt should be rejected");
+
+    assert!(
+        matches!(err, SessionError::EffectAttemptMismatch),
+        "expected EffectAttemptMismatch; got {err:?}"
+    );
+}
+
+#[test]
+fn submit_client_payload_with_active_turn_id_is_rejected() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let payload = ClientPayload::Message(ClientMessage {
+        message: DraftMessage {
+            id: None,
+            role: Role::User,
+            content: Some(Content::Text("hello".to_string())),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            reasoning: None,
+        },
+        stream: false,
+    });
+
+    dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: payload.clone(),
+            turn: TurnTarget::Open("turn-1".to_string()),
+            queue: QueueMode::Refuse,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+
+    let err = agg
+        .try_handle(
+            CommandPayload::SubmitClientPayload {
+                payload,
+                turn: TurnTarget::Open("turn-1".to_string()),
+                queue: QueueMode::Refuse,
+            },
+            &Caller::System {
+                tenant_id: "tenant-a".to_string(),
+            },
+        )
+        .expect_err("re-submitting an active turn_id should be rejected");
+
+    match err {
+        SessionError::TurnAlreadyActive { turn_id } => assert_eq!(turn_id, "turn-1"),
+        other => panic!("expected TurnAlreadyActive; got {other:?}"),
+    }
+}
+
+#[test]
+fn submit_worker_decision_dispatches_action_and_completes_decision() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let setup_events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: DraftMessage {
+                    id: None,
+                    role: Role::User,
+                    content: Some(Content::Text("hi".to_string())),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                    reasoning: None,
+                },
+                stream: false,
+            }),
+            turn: TurnTarget::Open("turn-1".to_string()),
+            queue: QueueMode::Refuse,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+    let decision_id = setup_events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionDispatched(p) => Some(p.id.clone()),
+            _ => None,
+        })
+        .expect("user message should request a worker decision");
+
+    let machine = Caller::ApiKey {
+        tenant_id: "tenant-a".to_string(),
+        key_id: "prod-key-1".to_string(),
+    };
+
+    let events = agg
+        .try_handle(
+            CommandPayload::SubmitWorkerDecision {
+                decision_id,
+                transcript: vec![],
+                actions: vec![Action::CallTool {
+                    id: "tc-1".to_string(),
+                    name: "my_tool".to_string(),
+                    arguments: "{}".to_string(),
+                    retry: None,
+                }],
+                state: None,
+                agent: None,
+            },
+            &machine,
+        )
+        .expect("submit worker decision should succeed");
+
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::DecisionCompleted(_))),
+        "expected DecisionCompleted; got {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::ToolCallRequested(_))),
+        "CallTool action should expand into a ToolCallRequested event; got {events:?}"
+    );
+}
+
+#[test]
+fn duplicate_submit_worker_decision_is_no_op() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let setup_events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: DraftMessage {
+                    id: None,
+                    role: Role::User,
+                    content: Some(Content::Text("hi".to_string())),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                    reasoning: None,
+                },
+                stream: false,
+            }),
+            turn: TurnTarget::Open("turn-1".to_string()),
+            queue: QueueMode::Refuse,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+    let decision_id = setup_events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionDispatched(p) => Some(p.id.clone()),
+            _ => None,
+        })
+        .expect("user message should request a worker decision");
+
+    let machine = Caller::ApiKey {
+        tenant_id: "tenant-a".to_string(),
+        key_id: "prod-key-1".to_string(),
+    };
+
+    dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: decision_id.clone(),
+            transcript: vec![],
+            actions: vec![],
+            state: None,
+            agent: None,
+        },
+        &machine,
+    );
+
+    let events = agg
+        .try_handle(
+            CommandPayload::SubmitWorkerDecision {
+                decision_id,
+                transcript: vec![],
+                actions: vec![Action::CallTool {
+                    id: "tc-1".to_string(),
+                    name: "my_tool".to_string(),
+                    arguments: "{}".to_string(),
+                    retry: None,
+                }],
+                state: None,
+                agent: None,
+            },
+            &machine,
+        )
+        .expect("duplicate submission should not error");
+
+    assert!(
+        events.is_empty(),
+        "duplicate worker decision submission should emit no events; got {events:?}"
+    );
+}
+
+#[test]
+fn user_message_rejected_while_session_interrupted() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    dispatch(
+        &mut agg,
+        CommandPayload::Interrupt {
+            interrupt_id: "int-1".to_string(),
+            reason: "paused".to_string(),
+            payload: serde_json::Value::Null,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+
+    let user_message = ClientPayload::Message(ClientMessage {
+        message: DraftMessage {
+            id: None,
+            role: Role::User,
+            content: Some(Content::Text("hello".to_string())),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            reasoning: None,
+        },
+        stream: false,
+    });
+
+    let err = agg
+        .try_handle(
+            CommandPayload::SubmitClientPayload {
+                payload: user_message,
+                turn: TurnTarget::Open("turn-1".to_string()),
+                queue: QueueMode::Refuse,
+            },
+            &Caller::System {
+                tenant_id: "tenant-a".to_string(),
+            },
+        )
+        .expect_err("user messages should be rejected while interrupted");
+
+    assert!(
+        matches!(err, SessionError::SessionInterrupted),
+        "expected SessionInterrupted; got {err:?}"
+    );
+}
+
+#[test]
+fn complete_unknown_tool_call_fails() {
+    let agg = create_session("sess-1", "tenant-a", "user-1");
+
+    let caller = Caller::ApiKey {
+        tenant_id: "tenant-a".to_string(),
+        key_id: "prod-key-1".to_string(),
+    };
+
+    let err = agg
+        .try_handle(
+            CommandPayload::settle(
+                EffectKind::ToolCall,
+                "tc-unknown".to_string(),
+                Some(0),
+                Outcome::Tool {
+                    result: StoredResult::text("ok".to_string()),
+                },
+            ),
+            &caller,
+        )
+        .expect_err("unknown tool call should be rejected");
+
+    assert!(
+        matches!(err, SessionError::EffectNotFound),
+        "expected EffectNotFound; got {err:?}"
+    );
+}
+
+#[test]
+fn send_message_wakes_a_decision() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SendMessage {
+            message: DraftMessage {
+                id: None,
+                role: Role::User,
+                content: Some(Content::Text("hi".to_string())),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                reasoning: None,
+            },
+            stream: false,
+            turn_id: None,
+            parent_id: None,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                EventPayload::DecisionQueued(_),
+                EventPayload::DecisionDispatched(_)
+            ]
+        ),
+        "expected [DecisionDispatched]; got {events:?}"
+    );
+    assert_eq!(agg.state.status, SessionStatus::Idle);
+}
+
+#[test]
+fn cancel_session_emits_cancelled() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::CancelSession,
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+
+    assert!(
+        matches!(events.as_slice(), [EventPayload::SessionCancelled]),
+        "expected [SessionCancelled]; got {events:?}"
+    );
+    assert_eq!(agg.state.status, SessionStatus::Done);
+}
+
+#[test]
+fn mark_done_emits_session_done() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::FinishTurn {
+            data: serde_json::Value::Null,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+
+    assert!(
+        matches!(events.as_slice(), [EventPayload::SessionDone(_)]),
+        "expected [SessionDone]; got {events:?}"
+    );
+    assert_eq!(agg.state.status, SessionStatus::Idle);
+}
+
+#[test]
+fn wake_with_no_pending_effects_is_noop() {
+    let agg = create_session("sess-1", "tenant-a", "user-1");
+
+    let events = agg
+        .try_handle(
+            CommandPayload::Wake { now: Utc::now() },
+            &Caller::System {
+                tenant_id: "tenant-a".to_string(),
+            },
+        )
+        .expect("wake should succeed");
+
+    assert!(
+        events.is_empty(),
+        "wake on idle session should be a no-op; got {events:?}"
+    );
+}
+
+#[test]
+fn request_llm_call_emits_requested() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::RequestLlmCall {
+            llm: "claude".to_string(),
+            call_id: "llm-1".to_string(),
+            request: LlmRequest {
+                model: "test-model".to_string(),
+                messages: vec![],
+                tools: None,
+                temperature: None,
+                max_completion_tokens: None,
+                reasoning: None,
+            },
+            stream: false,
+            retry: RetryPolicy::no_retry(),
+            handler: LlmHandler::Server,
+            format: None,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                EventPayload::LlmCallRequested(_),
+                EventPayload::LlmCallDispatched(_),
+            ]
+        ),
+        "expected [LlmCallRequested, LlmCallDispatched]; got {events:?}"
+    );
+    let call = agg
+        .state
+        .effect(EffectKind::LlmCall, "llm-1")
+        .expect("llm call present");
+    assert_eq!(call.tracking.status(), EffectStatus::Pending);
+}
+
+fn node_msg(id: &str, role: Role, content: &str) -> DraftMessage {
+    DraftMessage {
+        id: (!id.is_empty()).then(|| id.to_string()),
+        role,
+        content: Some(Content::Text(content.into())),
+        tool_calls: None,
+        tool_call_id: None,
+        name: None,
+        reasoning: None,
+    }
+}
+
+fn request_with(messages: Vec<DraftMessage>) -> LlmRequest {
+    LlmRequest {
+        model: "test-model".to_string(),
+        messages,
+        tools: None,
+        temperature: None,
+        max_completion_tokens: None,
+        reasoning: None,
+    }
+}
+
+fn append_via_worker(agg: &mut Session, transcript: Vec<DraftMessage>) {
+    let setup = dispatch(
+        agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: node_msg("seed", Role::User, "seed"),
+                stream: false,
+            }),
+            turn: TurnTarget::Detached,
+            queue: QueueMode::Refuse,
+        },
+        &system(),
+    );
+    let decision_id = setup
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionDispatched(p) => Some(p.id.clone()),
+            _ => None,
+        })
+        .expect("user message requests a worker decision");
+    dispatch(
+        agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id,
+            transcript,
+            actions: vec![],
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    );
+}
+
+#[test]
+fn request_llm_call_stores_prompt_without_minting_nodes() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::RequestLlmCall {
+            llm: "claude".to_string(),
+            call_id: "llm-1".to_string(),
+            request: request_with(vec![
+                node_msg("sys", Role::System, "be helpful"),
+                node_msg("u1", Role::User, "hi"),
+            ]),
+            stream: false,
+            retry: RetryPolicy::no_retry(),
+            handler: LlmHandler::Server,
+            format: None,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, EventPayload::NewMessage(_))),
+        "request mints no tree nodes; got {events:?}"
+    );
+    let call = agg
+        .state
+        .effect(EffectKind::LlmCall, "llm-1")
+        .expect("llm call present");
+    assert_eq!(
+        call.llm()
+            .unwrap()
+            .prompt
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["sys", "u1"]
+    );
+}
+
+#[test]
+fn submit_messages_forwards_a_replace_submission() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Messages(ClientMessages {
+                messages: vec![
+                    node_msg("c1", Role::User, "hi"),
+                    node_msg("a1", Role::Assistant, "hello"),
+                    node_msg("c2", Role::User, "more"),
+                ],
+                stream: false,
+                client: Default::default(),
+            }),
+            turn: TurnTarget::Detached,
+            queue: QueueMode::Refuse,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, EventPayload::NewMessage(_))));
+    let trigger = events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionQueued(q) => Some(&q.trigger),
+            _ => None,
+        })
+        .expect("a decision request");
+    match trigger {
+        Trigger::ClientTranscript { messages, .. } => {
+            assert_eq!(
+                messages.iter().map(|m| m.id.as_deref()).collect::<Vec<_>>(),
+                vec![Some("c1"), Some("a1"), Some("c2")]
+            );
+        }
+        t => panic!("expected a UserTranscript trigger; got {t:?}"),
+    }
+}
+
+#[test]
+fn submit_append_queues_the_batch_as_a_client_message_trigger() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Append(ClientAppend {
+                messages: vec![
+                    node_msg("c1", Role::User, "hi"),
+                    node_msg("c2", Role::User, "more"),
+                ],
+                stream: false,
+                client: Default::default(),
+            }),
+            turn: TurnTarget::Detached,
+            queue: QueueMode::Refuse,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, EventPayload::NewMessage(_))));
+    let trigger = events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionQueued(q) => Some(&q.trigger),
+            _ => None,
+        })
+        .expect("a decision request");
+    match trigger {
+        Trigger::ClientMessage { messages, .. } => {
+            assert_eq!(
+                messages.iter().map(|m| m.id.as_deref()).collect::<Vec<_>>(),
+                vec![Some("c1"), Some("c2")]
+            );
+        }
+        t => panic!("expected a ClientMessage trigger; got {t:?}"),
+    }
+}
+
+fn tool_msg(tool_call_id: &str, content: &str) -> DraftMessage {
+    DraftMessage {
+        id: None,
+        role: Role::Tool,
+        content: Some(Content::Text(content.into())),
+        tool_calls: None,
+        tool_call_id: Some(tool_call_id.into()),
+        name: None,
+        reasoning: None,
+    }
+}
+
+fn tool_node(id: &str, tool_call_id: &str, content: &str) -> DraftMessage {
+    DraftMessage {
+        id: Some(id.into()),
+        ..tool_msg(tool_call_id, content)
+    }
+}
+
+fn seed_tree(agg: &mut Session, transcript: Vec<DraftMessage>) {
+    let events = dispatch(
+        agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: node_msg("", Role::User, "seed"),
+                stream: false,
+            }),
+            turn: TurnTarget::Detached,
+            queue: QueueMode::Refuse,
+        },
+        &system(),
+    );
+    let decision_id = decision_with(&events, |_| true).expect("a decision");
+    dispatch(
+        agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id,
+            transcript,
+            actions: vec![],
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    );
+}
+
+fn transcript_messages(events: &[EventPayload]) -> Option<Vec<DraftMessage>> {
+    events.iter().find_map(|e| {
+        let trigger = match e {
+            EventPayload::DecisionQueued(p) => &p.trigger,
+            _ => return None,
+        };
+        match trigger {
+            Trigger::ClientTranscript { messages, .. } => Some(messages.clone()),
+            _ => None,
+        }
+    })
+}
+
+fn submit_messages(agg: &mut Session, messages: Vec<DraftMessage>) -> Vec<EventPayload> {
+    dispatch(
+        agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Messages(ClientMessages {
+                messages,
+                stream: false,
+                client: Default::default(),
+            }),
+            turn: TurnTarget::Detached,
+            queue: QueueMode::Refuse,
+        },
+        &system(),
+    )
+}
+
+#[test]
+fn submit_messages_single_answer_takes_the_fast_path() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    request_client_tool(&mut agg, "tc-1");
+
+    let events = submit_messages(&mut agg, vec![tool_msg("tc-1", "the answer")]);
+
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, EventPayload::ToolCallCompleted(_))));
+    assert_eq!(fired_tool_result(&events), vec!["tc-1".to_string()]);
+    assert!(
+        decision_with(&events, |t| matches!(t, Trigger::ClientTranscript { .. })).is_none(),
+        "the fast path fires tool.finished, not a transcript; got {events:?}"
+    );
+
+    let tc = agg
+        .state
+        .effect(EffectKind::ToolCall, "tc-1")
+        .expect("tool call present");
+    assert_eq!(tc.tracking.status(), EffectStatus::Completed);
+    assert_eq!(tc.tool().unwrap().result.as_deref(), Some("the answer"));
+}
+
+#[test]
+fn submit_messages_settles_client_tools_across_submissions() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    request_client_tool(&mut agg, "a");
+    request_client_tool(&mut agg, "b");
+
+    let first = submit_messages(&mut agg, vec![tool_msg("a", "RA")]);
+    assert_eq!(fired_tool_result(&first), vec!["a".to_string()]);
+    assert_eq!(
+        agg.state.tool_call("a").unwrap().result.as_deref(),
+        Some("RA")
+    );
+    assert_eq!(
+        agg.state
+            .effect(EffectKind::ToolCall, "b")
+            .unwrap()
+            .tracking
+            .status(),
+        EffectStatus::Pending
+    );
+
+    let second = submit_messages(&mut agg, vec![tool_msg("b", "RB")]);
+    assert_eq!(fired_tool_result(&second), vec!["b".to_string()]);
+    assert_eq!(
+        agg.state.tool_call("b").unwrap().result.as_deref(),
+        Some("RB")
+    );
+}
+
+#[test]
+fn submit_messages_settles_all_client_tools_with_one_decision() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    request_client_tool(&mut agg, "a");
+    request_client_tool(&mut agg, "b");
+
+    let events = submit_messages(&mut agg, vec![tool_msg("a", "RA"), tool_msg("b", "RB")]);
+    let sequence: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            EventPayload::ToolCallCompleted(_) => Some("complete"),
+            EventPayload::DecisionDispatched(_) => Some("live"),
+            EventPayload::DecisionQueued(_) => Some("queued"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sequence, vec!["complete", "complete", "queued", "live"]);
+    assert_eq!(
+        agg.state.tool_call("a").unwrap().result.as_deref(),
+        Some("RA")
+    );
+    assert_eq!(
+        agg.state.tool_call("b").unwrap().result.as_deref(),
+        Some("RB")
+    );
+}
+
+#[test]
+fn submit_messages_echoing_a_resolved_tool_result_settles_nothing() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    request_client_tool(&mut agg, "tc-1");
+    submit_messages(&mut agg, vec![tool_msg("tc-1", "done")]);
+
+    let echo = submit_messages(&mut agg, vec![tool_msg("tc-1", "done")]);
+    assert!(
+        !echo
+            .iter()
+            .any(|e| matches!(e, EventPayload::ToolCallCompleted(_))),
+        "nothing to complete; got {echo:?}"
+    );
+    assert!(
+        decision_with(&echo, |t| matches!(t, Trigger::ClientTranscript { .. })).is_some(),
+        "the submission still delivers as a transcript decision; got {echo:?}"
+    );
+}
+
+#[test]
+fn submit_messages_with_tool_results_and_a_user_message_settles_and_delivers_once() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    request_client_tool(&mut agg, "tc-1");
+
+    let events = submit_messages(
+        &mut agg,
+        vec![tool_msg("tc-1", "R"), node_msg("", Role::User, "and also")],
+    );
+
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, EventPayload::ToolCallCompleted(_))));
+    assert_eq!(fired_tool_result(&events), Vec::<String>::new());
+    let transcript_decisions = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                EventPayload::DecisionQueued(p)
+                    if matches!(p.trigger, Trigger::ClientTranscript { .. })
+            )
+        })
+        .count();
+    assert_eq!(
+        transcript_decisions, 1,
+        "one decision carries the whole submission"
+    );
+
+    let tc = agg
+        .state
+        .effect(EffectKind::ToolCall, "tc-1")
+        .expect("tool call present");
+    assert_eq!(tc.tracking.status(), EffectStatus::Completed);
+    assert_eq!(tc.tool().unwrap().result.as_deref(), Some("R"));
+}
+
+#[test]
+fn transcript_with_completions_passes_the_interrupt_gate_and_queues() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    request_client_tool(&mut agg, "tc-1");
+    dispatch(
+        &mut agg,
+        CommandPayload::Interrupt {
+            interrupt_id: "int-1".to_string(),
+            reason: "paused".to_string(),
+            payload: serde_json::Value::Null,
+        },
+        &system(),
+    );
+
+    let events = submit_messages(&mut agg, vec![tool_msg("tc-1", "R")]);
+
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, EventPayload::ToolCallCompleted(_))));
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            EventPayload::DecisionQueued(p)
+                if matches!(p.trigger, Trigger::ToolFinished { .. })
+        )),
+        "the decision queues until resume; got {events:?}"
+    );
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, EventPayload::DecisionDispatched(_))));
+}
+
+#[test]
+fn plain_transcript_rejected_while_interrupted() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    dispatch(
+        &mut agg,
+        CommandPayload::Interrupt {
+            interrupt_id: "int-1".to_string(),
+            reason: "paused".to_string(),
+            payload: serde_json::Value::Null,
+        },
+        &system(),
+    );
+
+    let err = agg
+        .try_handle(
+            CommandPayload::SubmitClientPayload {
+                payload: ClientPayload::Messages(ClientMessages {
+                    messages: vec![node_msg("", Role::User, "hello")],
+                    stream: false,
+                    client: Default::default(),
+                }),
+                turn: TurnTarget::Detached,
+                queue: QueueMode::Refuse,
+            },
+            &system(),
+        )
+        .expect_err("a transcript that settles nothing is rejected while interrupted");
+    assert!(matches!(err, SessionError::SessionInterrupted));
+}
+
+#[test]
+fn normalize_folds_a_client_tool_echo_onto_its_recorded_node() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    seed_tree(
+        &mut agg,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("a1", Role::Assistant, "calling"),
+            tool_node("w1", "tc-1", "result"),
+        ],
+    );
+
+    let events = submit_messages(
+        &mut agg,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("a1", Role::Assistant, "calling"),
+            tool_node("client-tm", "tc-1", "result"),
+            node_msg("", Role::User, "next"),
+        ],
+    );
+
+    let messages = transcript_messages(&events).expect("a transcript decision");
+    assert_eq!(
+        messages[2].id.as_deref(),
+        Some("w1"),
+        "tool echo adopts the recorded node id"
+    );
+    let known: std::collections::HashSet<&str> = agg
+        .state
+        .nodes
+        .iter()
+        .map(|n| n.message.id.as_str())
+        .collect();
+    let plan = plan_reconcile(&known, &messages);
+    assert_eq!(
+        plan.len(),
+        1,
+        "only the new user turn is news; got {plan:?}"
+    );
+    assert_eq!(plan.first().map(|w| w.index), Some(3));
+}
+
+#[test]
+fn tool_echo_frozen_before_recording_folds_at_the_write_seam() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    seed_tree(
+        &mut agg,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("a1", Role::Assistant, "calling"),
+            tool_node("w1", "tc-1", "result"),
+        ],
+    );
+
+    let d = open_decision(&mut agg, "resubmit");
+    let events = submit_state(
+        &mut agg,
+        d,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("a1", Role::Assistant, "calling"),
+            tool_node("client-tm", "tc-1", "result"),
+            node_msg("u2", Role::User, "next"),
+        ],
+        None,
+    );
+
+    let new_ids: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            EventPayload::NewMessage(m) => Some(m.message.id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(new_ids, ["u2"], "only the new turn is news; got {events:?}");
+    let tree = agg.state.message_tree();
+    let u2 = tree.nodes.iter().find(|n| n.message.id == "u2").unwrap();
+    assert_eq!(
+        u2.parent_id.as_deref(),
+        Some("w1"),
+        "no fork at the tool node"
+    );
+}
+
+#[test]
+fn edit_with_tail_replay_keeps_the_tool_result() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    seed_tree(
+        &mut agg,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("a1", Role::Assistant, "calling"),
+            tool_node("w1", "tc-1", "result"),
+            node_msg("a2", Role::Assistant, "done"),
+        ],
+    );
+
+    let events = submit_messages(
+        &mut agg,
+        vec![
+            node_msg("u1b", Role::User, "hi (edited)"),
+            node_msg("a1", Role::Assistant, "calling"),
+            tool_node("client-tm", "tc-1", "result"),
+            node_msg("a2", Role::Assistant, "done"),
+        ],
+    );
+
+    let messages = transcript_messages(&events).expect("a transcript decision");
+    assert_eq!(
+        messages[2].id.as_deref(),
+        Some("w1"),
+        "the replayed tool result folds onto w1"
+    );
+    let known: std::collections::HashSet<&str> = agg
+        .state
+        .nodes
+        .iter()
+        .map(|n| n.message.id.as_str())
+        .collect();
+    let plan = plan_reconcile(&known, &messages);
+    assert_eq!(
+        plan.len(),
+        4,
+        "the whole edited branch is news; got {plan:?}"
+    );
+    assert!(
+        plan.iter().any(|w| w.index == 2),
+        "the tool result is part of the re-recorded branch"
+    );
+}
+
+#[test]
+fn scrambled_answer_takes_the_bedrock_path() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    request_client_tool(&mut agg, "tc-1");
+
+    let events = submit_messages(
+        &mut agg,
+        vec![
+            tool_msg("tc-1", "R"),
+            node_msg("", Role::Assistant, "scrambled"),
+        ],
+    );
+
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, EventPayload::ToolCallCompleted(_))));
+    assert_eq!(fired_tool_result(&events), Vec::<String>::new());
+    assert!(
+        transcript_messages(&events).is_some(),
+        "a scrambled view delivers as a transcript; got {events:?}"
+    );
+    assert_eq!(
+        agg.state
+            .effect(EffectKind::ToolCall, "tc-1")
+            .unwrap()
+            .tracking
+            .status(),
+        EffectStatus::Completed
+    );
+}
+
+#[test]
+fn duplicate_answers_in_one_view_settle_once() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    request_client_tool(&mut agg, "tc-1");
+
+    let events = submit_messages(
+        &mut agg,
+        vec![tool_msg("tc-1", "first"), tool_msg("tc-1", "second")],
+    );
+
+    let completions = events
+        .iter()
+        .filter(|e| matches!(e, EventPayload::ToolCallCompleted(_)))
+        .count();
+    assert_eq!(
+        completions, 1,
+        "one settle for the one call; got {events:?}"
+    );
+    assert_eq!(
+        agg.state.tool_call("tc-1").unwrap().result.as_deref(),
+        Some("first")
+    );
+}
+
+#[test]
+fn recorded_echo_beside_a_new_answer_fast_paths_the_new_one() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    seed_tree(
+        &mut agg,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("a1", Role::Assistant, "calling"),
+            tool_node("w1", "tc-1", "RA"),
+        ],
+    );
+    request_client_tool(&mut agg, "tc-2");
+
+    let events = submit_messages(
+        &mut agg,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("a1", Role::Assistant, "calling"),
+            tool_node("client-tm", "tc-1", "RA"),
+            tool_msg("tc-2", "RB"),
+        ],
+    );
+
+    assert_eq!(fired_tool_result(&events), vec!["tc-2".to_string()]);
+    assert!(
+        transcript_messages(&events).is_none(),
+        "run 2 reduces to a single live answer; got {events:?}"
+    );
+    assert_eq!(
+        agg.state.tool_call("tc-2").unwrap().result.as_deref(),
+        Some("RB")
+    );
+}
+
+#[test]
+fn mixed_answer_and_message_while_interrupted_queues_bedrock() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    request_client_tool(&mut agg, "tc-1");
+    dispatch(
+        &mut agg,
+        CommandPayload::Interrupt {
+            interrupt_id: "int-1".to_string(),
+            reason: "paused".to_string(),
+            payload: serde_json::Value::Null,
+        },
+        &system(),
+    );
+
+    let events = submit_messages(
+        &mut agg,
+        vec![tool_msg("tc-1", "R"), node_msg("", Role::User, "and also")],
+    );
+
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, EventPayload::ToolCallCompleted(_))));
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            EventPayload::DecisionQueued(p)
+                if matches!(p.trigger, Trigger::ClientTranscript { .. })
+        )),
+        "the bedrock transcript queues until resume; got {events:?}"
+    );
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, EventPayload::DecisionDispatched(_))));
+}
+
+#[test]
+fn queued_client_message_stays_a_delta_until_delivery() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let first = dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: node_msg("", Role::User, "A"),
+                stream: false,
+            }),
+            turn: TurnTarget::Detached,
+            queue: QueueMode::Refuse,
+        },
+        &system(),
+    );
+    assert!(first
+        .iter()
+        .any(|e| matches!(e, EventPayload::DecisionQueued(p)
+                if matches!(p.trigger, Trigger::ClientMessage { .. }))));
+
+    let second = dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: node_msg("", Role::User, "B"),
+                stream: false,
+            }),
+            turn: TurnTarget::Detached,
+            queue: QueueMode::Refuse,
+        },
+        &system(),
+    );
+    assert!(
+        second
+            .iter()
+            .any(|e| matches!(e, EventPayload::DecisionQueued(p)
+                    if matches!(p.trigger, Trigger::ClientMessage { .. }))),
+        "the stored trigger keeps the bare message; got {second:?}"
+    );
+}
+
+#[test]
+fn reconcile_re_records_known_ids_past_the_first_new_node() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: node_msg("", Role::User, "hi"),
+                stream: false,
+            }),
+            turn: TurnTarget::Detached,
+            queue: QueueMode::Refuse,
+        },
+        &system(),
+    );
+    let d1 = decision_with(&events, |_| true).expect("a decision");
+    dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: d1,
+            transcript: vec![
+                node_msg("u1", Role::User, "hi"),
+                node_msg("a1", Role::Assistant, "yo"),
+                node_msg("u2", Role::User, "more"),
+            ],
+            actions: vec![],
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    );
+    assert_eq!(agg.state.head_id.as_deref(), Some("u2"));
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: node_msg("", Role::User, "again"),
+                stream: false,
+            }),
+            turn: TurnTarget::Detached,
+            queue: QueueMode::Refuse,
+        },
+        &system(),
+    );
+    let d2 = decision_with(&events, |_| true).expect("a decision");
+    let submit = dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: d2,
+            transcript: vec![
+                node_msg("u1", Role::User, "hi"),
+                node_msg("e1", Role::Assistant, "edited"),
+                node_msg("u2", Role::User, "more"),
+            ],
+            actions: vec![],
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    );
+
+    let new_nodes: Vec<(&str, Option<&str>, &Message)> = submit
+        .iter()
+        .filter_map(|e| match e {
+            EventPayload::NewMessage(m) => {
+                Some((m.message.id.as_str(), m.parent_id.as_deref(), &m.message))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        new_nodes.len(),
+        2,
+        "e1 and the u2 re-record; got {submit:?}"
+    );
+    assert_eq!((new_nodes[0].0, new_nodes[0].1), ("e1", Some("u1")));
+    let (copy_id, copy_parent, copy) = new_nodes[1];
+    assert_ne!(
+        copy_id, "u2",
+        "the known id past the fork gets a fresh node id"
+    );
+    assert_eq!(copy_parent, Some("e1"));
+    assert_eq!(
+        copy.content.as_ref().map(Content::text_owned).as_deref(),
+        Some("more")
+    );
+    assert_eq!(agg.state.head_id.as_deref(), Some(copy_id));
+}
+
+#[test]
+fn complete_llm_call_emits_completed() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    dispatch(
+        &mut agg,
+        CommandPayload::RequestLlmCall {
+            llm: "claude".to_string(),
+            call_id: "llm-1".to_string(),
+            request: LlmRequest {
+                model: "test-model".to_string(),
+                messages: vec![],
+                tools: None,
+                temperature: None,
+                max_completion_tokens: None,
+                reasoning: None,
+            },
+            stream: false,
+            retry: RetryPolicy::no_retry(),
+            handler: LlmHandler::Server,
+            format: None,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::LlmCall,
+            "llm-1".to_string(),
+            Some(0),
+            Outcome::Llm(Box::new(LlmResponse {
+                model: "test-model".to_string(),
+                content: Some("hello".to_string()),
+                tool_calls: vec![],
+                finish_reason: Some("stop".to_string()),
+                usage: None,
+                cost: None,
+                images: vec![],
+                reasoning: None,
+            })),
+        ),
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                EventPayload::LlmCallCompleted(_),
+                EventPayload::DecisionQueued(_),
+                EventPayload::DecisionDispatched(_),
+            ]
+        ),
+        "expected [LlmCallCompleted, DecisionDispatched]; got {events:?}"
+    );
+    assert!(
+        decision_with(&events, |t| matches!(
+            t,
+            Trigger::LlmFinished { id, ok: true, .. } if id == "llm-1"
+        ))
+        .is_some(),
+        "completion fires an llm.finished trigger; got {events:?}"
+    );
+    let call = agg
+        .state
+        .effect(EffectKind::LlmCall, "llm-1")
+        .expect("llm call present");
+    assert_eq!(call.tracking.status(), EffectStatus::Completed);
+}
+
+#[test]
+fn llm_completion_records_the_assistant_under_the_call_id() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    request_llm(&mut agg, "call-1", LlmHandler::Server);
+    let events = complete_llm(&mut agg, "call-1", 0, &system());
+
+    let msg_id = events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionQueued(p) => match &p.trigger {
+                Trigger::LlmFinished {
+                    message: Some(m), ..
+                } => m.id.clone(),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("an llm.finished trigger carrying the assistant");
+    assert_eq!(msg_id, "call-1");
+}
+
+#[test]
+fn a_resend_of_a_prior_assistant_turn_appends_without_forking() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let d1 = decision_with(
+        &submit_messages(&mut agg, vec![node_msg("u1", Role::User, "hi")]),
+        |_| true,
+    )
+    .expect("a client decision");
+    dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: d1,
+            transcript: vec![node_msg("u1", Role::User, "hi")],
+            actions: vec![],
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    );
+    request_llm(&mut agg, "call-1", LlmHandler::Server);
+    let done = complete_llm(&mut agg, "call-1", 0, &system());
+    let (d2, assistant) = done
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionQueued(p) => match &p.trigger {
+                Trigger::LlmFinished {
+                    message: Some(m), ..
+                } => Some((p.id.clone(), m.clone())),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("an llm.finished decision carrying the assistant");
+    dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: d2,
+            transcript: vec![node_msg("u1", Role::User, "hi"), assistant],
+            actions: vec![],
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    );
+    assert_eq!(agg.state.head_id.as_deref(), Some("call-1"));
+
+    let events = submit_messages(
+        &mut agg,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("call-1", Role::Assistant, "hello"),
+            node_msg("", Role::User, "again"),
+        ],
+    );
+    let messages = transcript_messages(&events).expect("a transcript decision");
+    let known: std::collections::HashSet<&str> = agg
+        .state
+        .nodes
+        .iter()
+        .map(|n| n.message.id.as_str())
+        .collect();
+    let plan = plan_reconcile(&known, &messages);
+    assert_eq!(
+        plan.len(),
+        1,
+        "only the new user turn is news; got {plan:?}"
+    );
+    assert_eq!(plan.first().map(|w| w.index), Some(2));
+}
+
+#[test]
+fn fail_llm_call_emits_errored() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    dispatch(
+        &mut agg,
+        CommandPayload::RequestLlmCall {
+            llm: "claude".to_string(),
+            call_id: "llm-1".to_string(),
+            request: LlmRequest {
+                model: "test-model".to_string(),
+                messages: vec![],
+                tools: None,
+                temperature: None,
+                max_completion_tokens: None,
+                reasoning: None,
+            },
+            stream: false,
+            retry: RetryPolicy::no_retry(),
+            handler: LlmHandler::Server,
+            format: None,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::LlmCall,
+            "llm-1".to_string(),
+            Some(0),
+            SettleError::new(ErrorInfo::internal("provider down".to_string()), false),
+        ),
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                EventPayload::LlmCallErrored(_),
+                EventPayload::DecisionQueued(_),
+                EventPayload::DecisionDispatched(_),
+            ]
+        ),
+        "expected [LlmCallErrored, DecisionDispatched]; got {events:?}"
+    );
+    let call = agg
+        .state
+        .effect(EffectKind::LlmCall, "llm-1")
+        .expect("llm call present");
+    assert_eq!(call.tracking.status(), EffectStatus::Failed);
+}
+
+#[test]
+fn llm_retry_reuses_the_stored_prompt() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let retry = RetryPolicy {
+        queue_timeout_secs: None,
+        run_timeout_secs: None,
+        total_timeout_secs: None,
+        max_attempts: 3,
+        backoff_base_secs: 1,
+        backoff_max_secs: 1,
+    };
+    append_via_worker(
+        &mut agg,
+        vec![
+            node_msg("sys", Role::System, "sys prompt"),
+            node_msg("u1", Role::User, "hi"),
+        ],
+    );
+    dispatch(
+        &mut agg,
+        CommandPayload::RequestLlmCall {
+            llm: "claude".to_string(),
+            call_id: "llm-1".to_string(),
+            request: request_with(vec![
+                node_msg("sys", Role::System, "sys prompt"),
+                node_msg("u1", Role::User, "hi"),
+            ]),
+            stream: false,
+            retry,
+            handler: LlmHandler::Server,
+            format: None,
+        },
+        &system(),
+    );
+
+    let call = agg
+        .state
+        .effect(EffectKind::LlmCall, "llm-1")
+        .expect("call present");
+    assert_eq!(
+        call.llm()
+            .unwrap()
+            .prompt
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["sys", "u1"]
+    );
+
+    dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::LlmCall,
+            "llm-1".to_string(),
+            Some(0),
+            SettleError::new(ErrorInfo::internal("provider hiccup".to_string()), true),
+        ),
+        &system(),
+    );
+    assert_eq!(
+        agg.state
+            .tracking(EffectKind::LlmCall, "llm-1")
+            .map(|c| c.status()),
+        Some(EffectStatus::RetryScheduled)
+    );
+
+    let later = Utc::now() + chrono::Duration::seconds(120);
+    let events = dispatch(&mut agg, CommandPayload::Wake { now: later }, &system());
+    let reissued = events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::LlmCallRequested(p) => Some(p),
+            _ => None,
+        })
+        .expect("retry re-issues the llm call");
+
+    assert_eq!(reissued.request.model, "test-model");
+    assert_eq!(reissued.request.messages.len(), 2);
+    assert_eq!(reissued.request.messages[0].id.as_deref(), Some("sys"));
+    assert_eq!(reissued.request.messages[1].id.as_deref(), Some("u1"));
+    assert!(matches!(
+        &reissued.request.messages[1].content,
+        Some(Content::Text(t)) if t == "hi"
+    ));
+}
+
+fn test_llm_request() -> LlmRequest {
+    LlmRequest {
+        model: "test-model".to_string(),
+        messages: vec![],
+        tools: None,
+        temperature: None,
+        max_completion_tokens: None,
+        reasoning: None,
+    }
+}
+
+#[test]
+fn worker_handled_llm_call_emits_request_trigger() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::RequestLlmCall {
+            llm: "claude".to_string(),
+            call_id: "llm-1".to_string(),
+            request: test_llm_request(),
+            stream: false,
+            retry: RetryPolicy::no_retry(),
+            handler: LlmHandler::Worker,
+            format: None,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                EventPayload::LlmCallRequested(_),
+                EventPayload::LlmCallDispatched(_),
+                EventPayload::DecisionQueued(_),
+                EventPayload::DecisionDispatched(_),
+            ]
+        ),
+        "expected the call queued, dispatched, then its execute decision; got {events:?}"
+    );
+    let trigger = events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionQueued(p) => Some(&p.trigger),
+            _ => None,
+        })
+        .expect("worker decision present");
+    assert!(
+        matches!(
+            trigger,
+            Trigger::LlmExecute { id, .. } if id == "llm-1"
+        ),
+        "expected an llm.execute trigger for the llm call; got {trigger:?}"
+    );
+    let call = agg
+        .state
+        .effect(EffectKind::LlmCall, "llm-1")
+        .expect("llm call present");
+    assert_eq!(call.llm().unwrap().handler, LlmHandler::Worker);
+    assert_eq!(call.tracking.status(), EffectStatus::Pending);
+}
+
+#[test]
+fn server_handled_llm_call_does_not_emit_request_trigger() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::RequestLlmCall {
+            llm: "claude".to_string(),
+            call_id: "llm-1".to_string(),
+            request: test_llm_request(),
+            stream: false,
+            retry: RetryPolicy::no_retry(),
+            handler: LlmHandler::Server,
+            format: None,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                EventPayload::LlmCallRequested(_),
+                EventPayload::LlmCallDispatched(_),
+            ]
+        ),
+        "expected the call queued and dispatched, no execute decision; got {events:?}"
+    );
+    let call = agg
+        .state
+        .effect(EffectKind::LlmCall, "llm-1")
+        .expect("llm call present");
+    assert_eq!(call.llm().unwrap().handler, LlmHandler::Server);
+}
+
+#[test]
+fn return_llm_result_completes_worker_handled_call() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let request_events = dispatch(
+        &mut agg,
+        CommandPayload::RequestLlmCall {
+            llm: "claude".to_string(),
+            call_id: "llm-1".to_string(),
+            request: test_llm_request(),
+            stream: false,
+            retry: RetryPolicy::no_retry(),
+            handler: LlmHandler::Worker,
+            format: None,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+    let decision_id = request_events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionDispatched(p) => Some(p.id.clone()),
+            _ => None,
+        })
+        .expect("worker-handled llm call emits an llm.execute decision");
+
+    let machine = Caller::ApiKey {
+        tenant_id: "tenant-a".to_string(),
+        key_id: "prod-key-1".to_string(),
+    };
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id,
+            transcript: vec![],
+            actions: vec![Action::LlmResult {
+                id: "llm-1".to_string(),
+                attempt: Some(0),
+                response: LlmResponse {
+                    model: "test-model".to_string(),
+                    content: Some("hello from the worker".to_string()),
+                    tool_calls: vec![],
+                    finish_reason: Some("stop".to_string()),
+                    usage: None,
+                    cost: None,
+                    images: vec![],
+                    reasoning: None,
+                },
+            }],
+            state: None,
+            agent: None,
+        },
+        &machine,
+    );
+
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::LlmCallCompleted(_))),
+        "expected an LlmCallCompleted event; got {events:?}"
+    );
+    assert!(
+        decision_with(&events, |t| matches!(
+            t,
+            Trigger::LlmFinished { id, ok: true, .. } if id == "llm-1"
+        ))
+        .is_some(),
+        "completion fires an llm.finished trigger; got {events:?}"
+    );
+    let call = agg
+        .state
+        .effect(EffectKind::LlmCall, "llm-1")
+        .expect("llm call present");
+    assert_eq!(call.tracking.status(), EffectStatus::Completed);
+}
+
+#[test]
+fn fail_tool_call_emits_errored() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let request_events = dispatch(
+        &mut agg,
+        CommandPayload::RequestToolCall {
+            tool_call_id: "tc-1".to_string(),
+            name: "my_tool".to_string(),
+            arguments: "{}".to_string(),
+            retry: None,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+    let d1 = request_events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionDispatched(p) => Some(p.id.clone()),
+            _ => None,
+        })
+        .expect("worker-handled tool call emits a tool.execute decision");
+
+    let machine = Caller::ApiKey {
+        tenant_id: "tenant-a".to_string(),
+        key_id: "prod-key-1".to_string(),
+    };
+
+    dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: d1,
+            transcript: vec![],
+            actions: vec![],
+            state: None,
+            agent: None,
+        },
+        &machine,
+    );
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::ToolCall,
+            "tc-1".to_string(),
+            Some(0),
+            SettleError::new(ErrorInfo::internal("boom".to_string()), false),
+        ),
+        &machine,
+    );
+
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                EventPayload::ToolCallErrored(_),
+                EventPayload::DecisionQueued(_),
+                EventPayload::DecisionDispatched(_),
+            ]
+        ),
+        "expected [ToolCallErrored, DecisionDispatched]; got {events:?}"
+    );
+    let trigger = events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionQueued(p) => Some(&p.trigger),
+            _ => None,
+        })
+        .expect("a tool.finished decision");
+    assert!(
+        matches!(
+            trigger,
+            Trigger::ToolFinished { id, ok: false, .. } if id == "tc-1"
+        ),
+        "expected an errored tool.finished for tc-1; got {trigger:?}"
+    );
+    let tc = agg
+        .state
+        .effect(EffectKind::ToolCall, "tc-1")
+        .expect("tool call present");
+    assert_eq!(tc.tracking.status(), EffectStatus::Failed);
+    assert!(tc.tool().unwrap().is_error);
+    assert_eq!(tc.tool().unwrap().result.as_deref(), Some("boom"));
+}
+
+#[test]
+fn request_subagent_emits_requested() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+
+    let events = dispatch(
+        &mut agg,
+        spawn("call-sa"),
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                EventPayload::SubagentRequested(_),
+                EventPayload::SubagentDispatched(_),
+            ]
+        ),
+        "expected [SubagentRequested, SubagentDispatched]; got {events:?}"
+    );
+    let sa = agg
+        .state
+        .effect(EffectKind::Subagent, "call-sa")
+        .expect("subagent recorded");
+    assert_eq!(sa.tracking.status(), EffectStatus::Pending);
+}
+
+#[test]
+fn request_subagent_holds_the_opening_message() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::RequestSubagent {
+            session_id: None,
+            agent_id: "agent-2".to_string(),
+            tool_call_id: "call-sa".to_string(),
+            mode: None,
+            message: Some(DraftMessage {
+                id: None,
+                role: Role::User,
+                content: Some(Content::Text("find X".to_string())),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                reasoning: None,
+            }),
+            retry: RetryPolicy::no_retry(),
+            decision_id: SPAWN_DECISION.to_string(),
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, EventPayload::SessionMessageRequested(_))),
+        "the subagent sends nothing of its own; got {events:?}"
+    );
+    let held = agg
+        .state
+        .subagent("call-sa")
+        .expect("subagent recorded")
+        .message
+        .clone()
+        .expect("the subagent holds its opening message");
+    assert_eq!(
+        held.content.as_ref().and_then(Content::text),
+        Some("find X")
+    );
+}
+
+#[test]
+fn start_subagent_emits_started() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    dispatch(
+        &mut agg,
+        spawn("call-sa"),
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::Subagent,
+            "call-sa".to_string(),
+            None,
+            Outcome::SubagentStarted,
+        ),
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+
+    assert!(
+        matches!(events.as_slice(), [EventPayload::SubagentStarted(_)]),
+        "expected [SubagentStarted]; got {events:?}"
+    );
+}
+
+#[test]
+fn fail_subagent_emits_errored() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    dispatch(
+        &mut agg,
+        spawn("call-sa"),
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::Subagent,
+            "call-sa".to_string(),
+            None,
+            SettleError::new(ErrorInfo::internal("child crashed".to_string()), false),
+        ),
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                EventPayload::SubagentErrored(_),
+                EventPayload::DecisionQueued(_),
+                EventPayload::DecisionDispatched(_),
+            ]
+        ),
+        "expected [SubagentErrored, DecisionDispatched]; got {events:?}"
+    );
+    assert_eq!(fired_tool_result(&events), vec!["call-sa".to_string()]);
+    let sa = agg
+        .state
+        .effect(EffectKind::Subagent, "call-sa")
+        .expect("subagent present");
+    assert_eq!(sa.tracking.status(), EffectStatus::Failed);
+    let sa = sa.subagent().unwrap();
+    assert_eq!(sa.result.as_deref(), Some("child crashed"));
+    assert!(sa.is_error);
+}
+
+#[test]
+fn a_spawn_past_the_depth_limit_settles_as_a_tool_error() {
+    let mut agg = create_session_with_config(
+        "sess-1",
+        "tenant-a",
+        "user-1",
+        Some(AgentConfig {
+            max_subagent_depth: Some(0),
+            ..agent_config("m1")
+        }),
+    );
+
+    let events = dispatch(&mut agg, spawn("call-sa"), &system());
+
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, EventPayload::SubagentRequested(_))),
+        "the spawn is rejected; got {events:?}"
+    );
+    let trigger = events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionQueued(p) => Some(p.trigger.clone()),
+            _ => None,
+        })
+        .expect("the rejection folds back as the subagent's result");
+    match trigger {
+        Trigger::SubagentFinished {
+            id,
+            ok: false,
+            error: Some(error),
+            ..
+        } => {
+            assert_eq!(id, "call-sa");
+            assert_eq!(error.code, crate::protocol::ErrorCode::BudgetExceeded);
+            assert!(
+                error
+                    .message
+                    .contains("subagent depth limit reached: max_subagent_depth is 0"),
+                "{}",
+                error.message
+            );
+        }
+        other => panic!("expected a failed subagent.finished; got {other:?}"),
+    }
+    assert!(
+        agg.state.effect(EffectKind::Subagent, "call-sa").is_none(),
+        "no subagent effect, so no child starts"
+    );
+}
+
+#[test]
+fn the_default_depth_limit_stops_a_spawn_five_deep() {
+    let mut agg = Session::with_state(
+        "sess-4".to_string(),
+        "tenant-a".to_string(),
+        SessionState::new("sess-4".to_string()),
+    );
+    dispatch(
+        &mut agg,
+        CommandPayload::CreateSession {
+            agent_id: "agent-1".to_string(),
+            owner: SessionOwner {
+                tenant_id: "tenant-a".to_string(),
+                requester: Requester::new(
+                    Subject::new(Issuer::app(), "user-1".to_string()),
+                    Default::default(),
+                ),
+                metadata: HashMap::new(),
+            },
+            ancestry: vec![
+                "sess-1".to_string(),
+                "sess-2".to_string(),
+                "sess-3".to_string(),
+                "sess-4a".to_string(),
+                "sess-5".to_string(),
+            ],
+            worker_retry: RetryPolicy::no_retry(),
+            agent: None,
+            worker: None,
+            events: None,
+            state: None,
+        },
+        &system(),
+    );
+
+    let events = dispatch(&mut agg, spawn("call-sa"), &system());
+
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, EventPayload::SubagentRequested(_))),
+        "the default limit is 5; got {events:?}"
+    );
+    assert!(
+        agg.state.effect(EffectKind::Subagent, "call-sa").is_none(),
+        "no child starts"
+    );
+}
+
+#[test]
+fn a_subagent_carries_its_parents_events_url() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    agg.state.events = Some("app".to_string());
+    dispatch(&mut agg, spawn("call-sa"), &system());
+
+    let subagent = agg
+        .open_work()
+        .into_iter()
+        .find_map(|work| match work {
+            crate::work::Work::StartSubagent { subagent, .. } => Some(subagent),
+            _ => None,
+        })
+        .expect("the child goes out");
+    assert_eq!(subagent.events.as_deref(), Some("app"));
+}
+
+#[test]
+fn cancelling_voids_a_running_subagent() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    dispatch(&mut agg, spawn("call-sa"), &system());
+    dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::Subagent,
+            "call-sa".to_string(),
+            None,
+            Outcome::SubagentStarted,
+        ),
+        &system(),
+    );
+    assert_eq!(
+        agg.state
+            .effect(EffectKind::Subagent, "call-sa")
+            .expect("subagent present")
+            .tracking
+            .status(),
+        EffectStatus::Running
+    );
+
+    let events = dispatch(&mut agg, CommandPayload::CancelSession, &system());
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            EventPayload::CallVoided(v) if v.kind == EffectKind::Subagent && v.id == "call-sa"
+        )),
+        "the void cancels the child session; got {events:?}"
+    );
+    assert!(
+        agg.state.subagent("call-sa").is_some(),
+        "the void names the tool call, so the state still says which child to cancel"
+    );
+}
+
+#[test]
+fn complete_subagent_turn_emits_completed() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    dispatch(
+        &mut agg,
+        spawn("call-sa"),
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+
+    let child = child_of(&agg, "call-sa");
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::CompleteSubagentTurn {
+            session_id: child,
+            agent_id: "agent-2".to_string(),
+            turn_id: "turn-x".to_string(),
+            data: serde_json::json!("done"),
+            cost: rust_decimal::Decimal::ZERO,
+            token_usage: Default::default(),
+            error: None,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                EventPayload::SubagentTurnCompleted(_),
+                EventPayload::DecisionQueued(_),
+                EventPayload::DecisionDispatched(_),
+            ]
+        ),
+        "expected [SubagentTurnCompleted, DecisionDispatched]; got {events:?}"
+    );
+    assert_eq!(fired_tool_result(&events), vec!["call-sa".to_string()]);
+    let sa = agg
+        .state
+        .effect(EffectKind::Subagent, "call-sa")
+        .expect("subagent present");
+    let sa = sa.subagent().unwrap();
+    assert_eq!(sa.result.as_deref(), Some("done"));
+    assert!(!sa.is_error);
+}
+
+#[test]
+fn two_calls_to_one_child_are_two_effects() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    dispatch(&mut agg, spawn("call-a"), &system());
+    let child = child_of(&agg, "call-a");
+    dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::Subagent,
+            "call-a".to_string(),
+            None,
+            Outcome::SubagentStarted,
+        ),
+        &system(),
+    );
+    dispatch(
+        &mut agg,
+        answer(&child, "turn-a", rust_decimal::Decimal::new(2, 0)),
+        &system(),
+    );
+
+    let events = dispatch(
+        &mut agg,
+        continue_as("agent-2", &child, "call-b"),
+        &system(),
+    );
+
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::SubagentRequested(_))),
+        "the finished call does not settle the second one; got {events:?}"
+    );
+    for (call, status) in [
+        ("call-a", EffectStatus::Completed),
+        ("call-b", EffectStatus::Pending),
+    ] {
+        let e = agg
+            .state
+            .effect(EffectKind::Subagent, call)
+            .unwrap_or_else(|| panic!("{call} is its own effect"));
+        assert_eq!(e.tracking.status(), status);
+        assert_eq!(
+            e.subagent().unwrap().session_id,
+            child,
+            "both calls answer one child"
+        );
+    }
+
+    dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::Subagent,
+            "call-b".to_string(),
+            None,
+            Outcome::SubagentStarted,
+        ),
+        &system(),
+    );
+    dispatch(
+        &mut agg,
+        answer(&child, "turn-b", rust_decimal::Decimal::new(3, 0)),
+        &system(),
+    );
+    assert_eq!(
+        agg.state
+            .effect(EffectKind::Subagent, "call-b")
+            .expect("second call present")
+            .tracking
+            .status(),
+        EffectStatus::Completed,
+        "the child's answer settles the call it is answering"
+    );
+    assert_eq!(
+        agg.state.subagent_cost,
+        rust_decimal::Decimal::new(5, 0),
+        "a continued turn rolls its cost up like the first one"
+    );
+}
+
+fn spawn_detached(call: &str) -> CommandPayload {
+    let CommandPayload::RequestSubagent {
+        session_id,
+        agent_id,
+        tool_call_id,
+        message,
+        retry,
+        decision_id,
+        ..
+    } = spawn(call)
+    else {
+        unreachable!()
+    };
+    CommandPayload::RequestSubagent {
+        session_id,
+        agent_id,
+        tool_call_id,
+        message,
+        retry,
+        decision_id,
+        mode: Some(SpawnMode::Detached),
+    }
+}
+
+fn queued_trigger(events: &[EventPayload]) -> Trigger {
+    events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionQueued(p) => Some(p.trigger.clone()),
+            _ => None,
+        })
+        .expect("a decision was queued")
+}
+
+fn start_detached(agg: &mut Session, call: &str) -> String {
+    dispatch(agg, spawn_detached(call), &system());
+    let child = child_of(agg, call);
+    dispatch(
+        agg,
+        CommandPayload::settle(
+            EffectKind::Subagent,
+            call.to_string(),
+            None,
+            Outcome::SubagentStarted,
+        ),
+        &system(),
+    );
+    child
+}
+
+#[test]
+fn a_detached_spawn_answers_at_start_and_frees_the_turn() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    dispatch(&mut agg, spawn_detached("call-d"), &system());
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::Subagent,
+            "call-d".to_string(),
+            None,
+            Outcome::SubagentStarted,
+        ),
+        &system(),
+    );
+
+    match queued_trigger(&events) {
+        Trigger::SubagentFinished {
+            id,
+            ok: true,
+            result: Some(result),
+            ..
+        } => {
+            assert_eq!(id, "call-d");
+            assert!(result.contains("detached"), "{result}");
+        }
+        other => panic!("expected the started acknowledgement; got {other:?}"),
+    }
+    assert_eq!(
+        agg.state
+            .effect(EffectKind::Subagent, "call-d")
+            .expect("subagent present")
+            .tracking
+            .status(),
+        EffectStatus::Completed,
+        "a settled call holds nothing open"
+    );
+}
+
+#[test]
+fn a_detached_result_arrives_as_a_message_not_a_tool_result() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let child = start_detached(&mut agg, "call-d");
+
+    let events = dispatch(
+        &mut agg,
+        answer(&child, "turn-1", rust_decimal::Decimal::new(2, 0)),
+        &system(),
+    );
+
+    match queued_trigger(&events) {
+        Trigger::SubagentNotice { messages, .. } => {
+            let text = messages[0]
+                .content
+                .as_ref()
+                .and_then(Content::text)
+                .expect("the notice has text");
+            assert!(text.contains("<subagent_result"), "{text}");
+            assert!(text.contains(&child), "{text}");
+            assert!(text.contains("done"), "{text}");
+        }
+        other => panic!("expected an injected message; got {other:?}"),
+    }
+    assert_eq!(
+        agg.state.subagent_cost,
+        rust_decimal::Decimal::new(2, 0),
+        "a detached turn still rolls its cost up"
+    );
+
+    let replayed = dispatch(
+        &mut agg,
+        answer(&child, "turn-1", rust_decimal::Decimal::new(2, 0)),
+        &system(),
+    );
+    assert!(
+        !replayed
+            .iter()
+            .any(|e| matches!(e, EventPayload::SubagentTurnCompleted(_))),
+        "a redelivered turn is a no-op; got {replayed:?}"
+    );
+}
+
+#[test]
+fn results_landing_mid_turn_share_one_notice() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let first = start_detached(&mut agg, "call-a");
+    let second = start_detached(&mut agg, "call-b");
+    dispatch(
+        &mut agg,
+        CommandPayload::SendMessage {
+            message: DraftMessage {
+                id: None,
+                role: Role::User,
+                content: Some(Content::Text("busy".to_string())),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                reasoning: None,
+            },
+            stream: false,
+            turn_id: Some("turn-p".to_string()),
+            parent_id: None,
+        },
+        &system(),
+    );
+
+    dispatch(
+        &mut agg,
+        answer(&first, "turn-1", rust_decimal::Decimal::ZERO),
+        &system(),
+    );
+    let events = dispatch(
+        &mut agg,
+        answer(&second, "turn-2", rust_decimal::Decimal::ZERO),
+        &system(),
+    );
+
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::DecisionDropped(_))),
+        "the second result folds into the first notice; got {events:?}"
+    );
+    let notice = agg
+        .state
+        .queued_subagent_notice()
+        .expect("one notice holds while the turn runs");
+    let texts: Vec<&str> = notice
+        .messages
+        .iter()
+        .filter_map(|m| m.content.as_ref().and_then(Content::text))
+        .collect();
+    assert_eq!(texts.len(), 2, "both results ride one wake-up");
+    assert!(texts[0].contains(&first) && texts[1].contains(&second));
+}
+
+#[test]
+fn a_wait_withdraws_that_childs_pending_message_and_keeps_the_rest() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let first = start_detached(&mut agg, "call-a");
+    let second = start_detached(&mut agg, "call-b");
+    dispatch(
+        &mut agg,
+        CommandPayload::SendMessage {
+            message: DraftMessage {
+                id: None,
+                role: Role::User,
+                content: Some(Content::Text("busy".to_string())),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                reasoning: None,
+            },
+            stream: false,
+            turn_id: Some("turn-p".to_string()),
+            parent_id: None,
+        },
+        &system(),
+    );
+    dispatch(
+        &mut agg,
+        answer(&first, "turn-1", rust_decimal::Decimal::ZERO),
+        &system(),
+    );
+    dispatch(
+        &mut agg,
+        answer(&second, "turn-2", rust_decimal::Decimal::ZERO),
+        &system(),
+    );
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::RequestSubagent {
+            session_id: Some(first.clone()),
+            agent_id: String::new(),
+            tool_call_id: "call-w".to_string(),
+            message: None,
+            retry: RetryPolicy::no_retry(),
+            decision_id: SPAWN_DECISION.to_string(),
+            mode: Some(SpawnMode::Wait),
+        },
+        &system(),
+    );
+
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::DecisionDropped(_))),
+        "the answered result leaves the mailbox; got {events:?}"
+    );
+    let notice = agg
+        .state
+        .queued_subagent_notice()
+        .expect("the other child's message still waits");
+    assert_eq!(notice.sessions, std::slice::from_ref(&second));
+    assert!(
+        notice.messages[0]
+            .content
+            .as_ref()
+            .and_then(Content::text)
+            .is_some_and(|t| t.contains(&second) && !t.contains(&first)),
+        "only the unclaimed result is left to deliver"
+    );
+}
+
+#[test]
+fn wait_answers_at_once_when_the_detached_result_is_in() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let child = start_detached(&mut agg, "call-d");
+    dispatch(
+        &mut agg,
+        answer(&child, "turn-1", rust_decimal::Decimal::ZERO),
+        &system(),
+    );
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::RequestSubagent {
+            session_id: Some(child.clone()),
+            agent_id: String::new(),
+            tool_call_id: "call-w".to_string(),
+            message: None,
+            retry: RetryPolicy::no_retry(),
+            decision_id: SPAWN_DECISION.to_string(),
+            mode: Some(SpawnMode::Wait),
+        },
+        &system(),
+    );
+
+    match queued_trigger(&events) {
+        Trigger::SubagentFinished {
+            id,
+            ok: true,
+            result: Some(result),
+            session_id,
+            agent_id,
+            ..
+        } => {
+            assert_eq!(id, "call-w");
+            assert_eq!(result, "done");
+            assert_eq!(session_id, child);
+            assert_eq!(agent_id, "agent-2", "the session names the agent");
+        }
+        other => panic!("expected the stored result; got {other:?}"),
+    }
+    assert!(
+        agg.state.effect(EffectKind::Subagent, "call-w").is_none(),
+        "an answered wait opens nothing"
+    );
+}
+
+#[test]
+fn wait_holds_until_the_next_detached_result() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let child = start_detached(&mut agg, "call-d");
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::RequestSubagent {
+            session_id: Some(child.clone()),
+            agent_id: "agent-2".to_string(),
+            tool_call_id: "call-w".to_string(),
+            message: None,
+            retry: RetryPolicy::no_retry(),
+            decision_id: SPAWN_DECISION.to_string(),
+            mode: Some(SpawnMode::Wait),
+        },
+        &system(),
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::SubagentRequested(r) if r.message.is_none())),
+        "the wait opens a call that sends nothing; got {events:?}"
+    );
+    dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::Subagent,
+            "call-w".to_string(),
+            None,
+            Outcome::SubagentStarted,
+        ),
+        &system(),
+    );
+
+    let events = dispatch(
+        &mut agg,
+        answer(&child, "turn-1", rust_decimal::Decimal::ZERO),
+        &system(),
+    );
+
+    match queued_trigger(&events) {
+        Trigger::SubagentFinished {
+            id,
+            ok: true,
+            result: Some(result),
+            ..
+        } => {
+            assert_eq!(id, "call-w", "the child's answer settles the wait");
+            assert_eq!(result, "done");
+        }
+        other => panic!("expected the wait's result; got {other:?}"),
+    }
+}
+
+#[test]
+fn a_busy_detached_child_refuses_another_message() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let child = start_detached(&mut agg, "call-d");
+
+    let events = dispatch(
+        &mut agg,
+        continue_as("agent-2", &child, "call-b"),
+        &system(),
+    );
+
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, EventPayload::SubagentRequested(_))),
+        "a working detached child takes no second message; got {events:?}"
+    );
+    match queued_trigger(&events) {
+        Trigger::SubagentFinished {
+            ok: false,
+            error: Some(error),
+            ..
+        } => assert!(
+            error.message.contains("still working detached"),
+            "{}",
+            error.message
+        ),
+        other => panic!("expected a failed subagent.finished; got {other:?}"),
+    }
+}
+
+#[test]
+fn a_configured_mode_overrides_the_requested_one() {
+    let mut agg = create_session_with_config(
+        "sess-1",
+        "tenant-a",
+        "user-1",
+        Some(AgentConfig {
+            subagents: vec![crate::protocol::Subagent {
+                id: "agent-2".to_string(),
+                description: "Does the work.".to_string(),
+                defer: None,
+                prefix: None,
+                mode: Some(crate::protocol::SubagentMode::Detached),
+            }],
+            ..agent_config("m1")
+        }),
+    );
+
+    let events = dispatch(&mut agg, spawn("call-d"), &system());
+
+    assert!(
+        events.iter().any(
+            |e| matches!(e, EventPayload::SubagentRequested(r) if r.mode == SpawnMode::Detached)
+        ),
+        "the pin decides, not the call; got {events:?}"
+    );
+}
+
+#[test]
+fn a_second_call_to_a_busy_child_is_a_tool_error() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    dispatch(&mut agg, spawn("call-a"), &system());
+    let child = child_of(&agg, "call-a");
+
+    let events = dispatch(
+        &mut agg,
+        continue_as("agent-2", &child, "call-b"),
+        &system(),
+    );
+
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, EventPayload::SubagentRequested(_))),
+        "the child answers one call at a time; got {events:?}"
+    );
+    let trigger = events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionQueued(p) => Some(p.trigger.clone()),
+            _ => None,
+        })
+        .expect("the refusal folds back as the second call's result");
+    match trigger {
+        Trigger::SubagentFinished {
+            id,
+            ok: false,
+            error: Some(error),
+            ..
+        } => {
+            assert_eq!(id, "call-b");
+            assert!(
+                error.message.contains("is already answering"),
+                "{}",
+                error.message
+            );
+        }
+        other => panic!("expected a failed subagent.finished; got {other:?}"),
+    }
+}
+
+#[test]
+fn a_spawn_naming_a_session_this_parent_never_started_is_a_tool_error() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+
+    let events = dispatch(
+        &mut agg,
+        continue_as("agent-2", "another-parents-child", "call-a"),
+        &system(),
+    );
+
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, EventPayload::SubagentRequested(_))),
+        "a named session the parent does not hold is never opened; got {events:?}"
+    );
+    let trigger = events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionQueued(p) => Some(p.trigger.clone()),
+            _ => None,
+        })
+        .expect("the refusal folds back as the call's result");
+    match trigger {
+        Trigger::SubagentFinished {
+            id,
+            ok: false,
+            error: Some(error),
+            ..
+        } => {
+            assert_eq!(id, "call-a");
+            assert!(
+                error.message.contains("names no session this agent"),
+                "{}",
+                error.message
+            );
+        }
+        other => panic!("expected a failed subagent.finished; got {other:?}"),
+    }
+}
+
+#[test]
+fn a_spawn_mints_one_child_per_call_and_repeats_it_on_replay() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    dispatch(&mut agg, spawn("call-a"), &system());
+    dispatch(&mut agg, spawn("call-b"), &system());
+
+    assert_ne!(
+        child_of(&agg, "call-a"),
+        child_of(&agg, "call-b"),
+        "each call gets its own child"
+    );
+
+    let before = child_of(&agg, "call-a");
+    dispatch(&mut agg, spawn("call-a"), &system());
+    assert_eq!(
+        child_of(&agg, "call-a"),
+        before,
+        "a replayed spawn keeps its child"
+    );
+}
+
+#[test]
+fn a_returned_subagent_waits_for_its_running_sibling() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+
+    for call in ["call-a", "call-b"] {
+        dispatch(&mut agg, spawn(call), &system());
+        dispatch(
+            &mut agg,
+            CommandPayload::settle(
+                EffectKind::Subagent,
+                call.to_string(),
+                None,
+                Outcome::SubagentStarted,
+            ),
+            &system(),
+        );
+    }
+
+    let running = agg
+        .state
+        .event_meta(Utc::now())
+        .calls
+        .iter()
+        .filter(|c| c.kind == EffectKind::Subagent && c.status == EffectStatus::Running)
+        .count();
+    assert_eq!(running, 2, "both subagents stay in flight once started");
+    let first = child_of(&agg, "call-a");
+    let second = child_of(&agg, "call-b");
+
+    let complete = |child: &str, turn: &str| CommandPayload::CompleteSubagentTurn {
+        session_id: child.to_string(),
+        agent_id: "agent-2".to_string(),
+        turn_id: turn.to_string(),
+        data: serde_json::json!("done"),
+        cost: rust_decimal::Decimal::ZERO,
+        token_usage: Default::default(),
+        error: None,
+    };
+
+    dispatch(&mut agg, complete(&first, "turn-a"), &system());
+    let (decision_id, _) = live_decision(&agg);
+    assert_eq!(
+        agg.state.event_meta(Utc::now()).pending_work(&decision_id),
+        1,
+        "call-b is still running, so this turn must not re-prompt yet"
+    );
+
+    dispatch(&mut agg, complete(&second, "turn-b"), &system());
+    let still_running = agg
+        .state
+        .event_meta(Utc::now())
+        .calls
+        .iter()
+        .filter(|c| c.kind == EffectKind::Subagent && c.status == EffectStatus::Running)
+        .count();
+    assert_eq!(still_running, 0, "a returned subagent is settled");
+}
+
+fn machine() -> Caller {
+    Caller::ApiKey {
+        tenant_id: "tenant-a".to_string(),
+        key_id: "prod-key-1".to_string(),
+    }
+}
+
+fn system() -> Caller {
+    Caller::System {
+        tenant_id: "tenant-a".to_string(),
+    }
+}
+
+fn frontend() -> Caller {
+    Caller::Frontend {
+        tenant_id: "tenant-a".to_string(),
+        subject: Subject::new(Issuer::app(), "user-1".to_string()),
+        attrs: HashMap::new(),
+    }
+}
+
+fn admin() -> Caller {
+    Caller::Operator {
+        tenant_id: "tenant-a".to_string(),
+        subject: Subject::new(Issuer::operator(), "alex@example.test".to_string()),
+    }
+}
+
+fn declare_client_tool(agg: &mut Session, name: &str) {
+    let mut agent = agent_config("m1");
+    agent.tools.push(AgentTool {
+        name: name.to_string(),
+        description: String::new(),
+        input: None,
+        output: None,
+        handler: Some(Handler::Client),
+        defer: None,
+    });
+    agg.state.agent_versions.push(Logged {
+        seq: agg.state.agent_versions.last().map_or(0, |v| v.seq),
+        entry: AgentVersion {
+            value: agent,
+            anchor: None,
+        },
+    });
+}
+
+fn request_client_tool(agg: &mut Session, id: &str) {
+    let name = format!("tool_{id}");
+    declare_client_tool(agg, &name);
+    dispatch(
+        agg,
+        CommandPayload::RequestToolCall {
+            tool_call_id: id.to_string(),
+            name,
+            arguments: "{}".to_string(),
+            retry: None,
+        },
+        &system(),
+    );
+}
+
+fn complete_tool(agg: &mut Session, id: &str, result: &str) -> Vec<EventPayload> {
+    dispatch(
+        agg,
+        CommandPayload::settle(
+            EffectKind::ToolCall,
+            id.to_string(),
+            Some(0),
+            Outcome::Tool {
+                result: StoredResult::text(result.to_string()),
+            },
+        ),
+        &machine(),
+    )
+}
+
+fn wake(agg: &mut Session) -> Vec<EventPayload> {
+    dispatch(agg, CommandPayload::Wake { now: Utc::now() }, &system())
+}
+
+fn fired_tool_result(events: &[EventPayload]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    events
+        .iter()
+        .filter_map(|e| {
+            let (decision_id, trigger) = match e {
+                EventPayload::DecisionQueued(p) => (&p.id, &p.trigger),
+                _ => return None,
+            };
+            let tool_call_id = match trigger {
+                Trigger::ToolFinished { id, .. } | Trigger::SubagentFinished { id, .. } => id,
+                _ => return None,
+            };
+            seen.insert(decision_id.clone())
+                .then(|| tool_call_id.clone())
+        })
+        .collect()
+}
+
+fn decision_with(events: &[EventPayload], pred: impl Fn(&Trigger) -> bool) -> Option<String> {
+    events.iter().find_map(|e| {
+        let (id, trigger) = match e {
+            EventPayload::DecisionQueued(p) => (&p.id, &p.trigger),
+            _ => return None,
+        };
+        pred(trigger).then(|| id.clone())
+    })
+}
+
+#[test]
+fn each_completion_fires_a_tool_result() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    request_client_tool(&mut agg, "a");
+    request_client_tool(&mut agg, "b");
+
+    let first = complete_tool(&mut agg, "a", "RA");
+    assert_eq!(fired_tool_result(&first), vec!["a".to_string()]);
+    assert_eq!(
+        agg.state.tool_call("a").unwrap().result.as_deref(),
+        Some("RA")
+    );
+
+    let second = complete_tool(&mut agg, "b", "RB");
+    assert_eq!(fired_tool_result(&second), vec!["b".to_string()]);
+    assert_eq!(
+        agg.state.tool_call("b").unwrap().result.as_deref(),
+        Some("RB")
+    );
+}
+
+#[test]
+fn worker_tool_fires_tool_result_in_the_completion_commit() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let setup = dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: DraftMessage {
+                    id: None,
+                    role: Role::User,
+                    content: Some(Content::Text("go".to_string())),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                    reasoning: None,
+                },
+                stream: false,
+            }),
+            turn: TurnTarget::Open("turn-1".to_string()),
+            queue: QueueMode::Refuse,
+        },
+        &system(),
+    );
+    let decision_id = decision_with(&setup, |t| matches!(t, Trigger::ClientMessage { .. }))
+        .expect("user message decision");
+
+    let dispatched = dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id,
+            transcript: vec![],
+            actions: vec![Action::CallTool {
+                id: "t1".to_string(),
+                name: "getWeather".to_string(),
+                arguments: "{}".to_string(),
+                retry: None,
+            }],
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    );
+    let exec = decision_with(&dispatched, |t| matches!(t, Trigger::ToolExecute { .. }))
+        .expect("tool.execute decision");
+
+    let completed = dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: exec,
+            transcript: vec![],
+            actions: vec![Action::ToolResult {
+                id: "t1".to_string(),
+                attempt: Some(0),
+                result: StoredResult::text("RA".to_string()),
+            }],
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    );
+    assert_eq!(
+        fired_tool_result(&completed),
+        vec!["t1".to_string()],
+        "the finished trigger fires in the completion commit; got {completed:?}"
+    );
+    assert_eq!(
+        agg.state.tool_call("t1").unwrap().result.as_deref(),
+        Some("RA")
+    );
+    assert!(
+        fired_tool_result(&wake(&mut agg)).is_empty(),
+        "no wake needed"
+    );
+}
+
+#[test]
+fn batch_mixes_tool_and_subagent() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    request_client_tool(&mut agg, "t1");
+    dispatch(&mut agg, spawn_as("researcher", "s1"), &system());
+    dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::Subagent,
+            "s1".to_string(),
+            None,
+            Outcome::SubagentStarted,
+        ),
+        &system(),
+    );
+
+    let tool_done = complete_tool(&mut agg, "t1", "TOOL");
+    assert_eq!(fired_tool_result(&tool_done), vec!["t1".to_string()]);
+    assert_eq!(
+        agg.state.tool_call("t1").unwrap().result.as_deref(),
+        Some("TOOL")
+    );
+
+    let child = child_of(&agg, "s1");
+    let sub_done = dispatch(
+        &mut agg,
+        CommandPayload::CompleteSubagentTurn {
+            session_id: child,
+            agent_id: "researcher".to_string(),
+            turn_id: "turn-1".to_string(),
+            data: serde_json::json!("FINDINGS"),
+            cost: rust_decimal::Decimal::ZERO,
+            token_usage: Default::default(),
+            error: None,
+        },
+        &system(),
+    );
+
+    assert_eq!(fired_tool_result(&sub_done), vec!["s1".to_string()]);
+    let sa = agg
+        .state
+        .effect(EffectKind::Subagent, "s1")
+        .expect("subagent present");
+    let sa = sa.subagent().unwrap();
+    assert_eq!(sa.agent_id, "researcher");
+    assert_eq!(sa.result.as_deref(), Some("FINDINGS"));
+}
+
+#[test]
+fn tool_and_subagent_from_one_turn_dispatch_concurrently() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let setup = dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: DraftMessage {
+                    id: None,
+                    role: Role::User,
+                    content: Some(Content::Text("go".to_string())),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                    reasoning: None,
+                },
+                stream: false,
+            }),
+            turn: TurnTarget::Open("turn-1".to_string()),
+            queue: QueueMode::Refuse,
+        },
+        &system(),
+    );
+    let decision_id = setup
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionDispatched(p) => Some(p.id.clone()),
+            _ => None,
+        })
+        .expect("user message requests a worker decision");
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id,
+            transcript: vec![],
+            actions: vec![
+                Action::CallTool {
+                    id: "t1".to_string(),
+                    name: "getWeather".to_string(),
+                    arguments: "{}".to_string(),
+                    retry: None,
+                },
+                Action::SpawnSubagent {
+                    session_id: None,
+                    agent_id: "researcher".to_string(),
+                    tool_call_id: "s1".to_string(),
+                    message: None,
+                    retry: RetryPolicy::no_retry(),
+                    mode: None,
+                },
+            ],
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    );
+
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::ToolCallRequested(_))),
+        "tool dispatched; got {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::SubagentRequested(_))),
+        "subagent dispatched; got {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            EventPayload::DecisionQueued(p)
+                if matches!(p.trigger, Trigger::ToolExecute { .. })
+        )),
+        "tool's tool.execute decision dispatched; got {events:?}"
+    );
+
+    assert_eq!(
+        agg.state
+            .tracking(EffectKind::ToolCall, "t1")
+            .map(|t| t.status()),
+        Some(EffectStatus::Pending)
+    );
+    assert_eq!(
+        agg.state
+            .tracking(EffectKind::Subagent, "s1")
+            .map(|s| s.status()),
+        Some(EffectStatus::Pending)
+    );
+    assert!(
+        fired_tool_result(&events).is_empty(),
+        "nothing has completed yet"
+    );
+}
+
+#[test]
+fn timed_out_effect_fires_tool_result_via_wake() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    dispatch(
+        &mut agg,
+        CommandPayload::RequestToolCall {
+            tool_call_id: "t1".to_string(),
+            name: "tool_t1".to_string(),
+            arguments: "{}".to_string(),
+            retry: Some(RetryOverride {
+                queue_timeout_secs: None,
+                run_timeout_secs: Some(60),
+                total_timeout_secs: None,
+                max_attempts: Some(0),
+                backoff_base_secs: Some(0),
+                backoff_max_secs: Some(0),
+            }),
+        },
+        &system(),
+    );
+
+    let past = Utc::now() + chrono::Duration::seconds(120);
+    let errored = dispatch(&mut agg, CommandPayload::Wake { now: past }, &system());
+    assert!(
+        errored
+            .iter()
+            .any(|e| matches!(e, EventPayload::ToolCallErrored(_))),
+        "deadline exceeded errors the tool; got {errored:?}"
+    );
+    assert_eq!(
+        fired_tool_result(&errored),
+        vec!["t1".to_string()],
+        "the timed-out call fires a tool.finished"
+    );
+    assert!(
+        fired_tool_result(&wake(&mut agg)).is_empty(),
+        "the next wake does not re-fire"
+    );
+}
+
+#[test]
+fn a_tool_call_takes_the_default_for_where_it_runs() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let d = open_decision(&mut agg, "hi");
+    submit_agent(
+        &mut agg,
+        d,
+        vec![node_msg("u1", Role::User, "hi")],
+        Some(AgentConfig {
+            tools: vec![
+                tool_named("worker_side", None),
+                tool_named("client_side", Some(Handler::Client)),
+            ],
+            ..agent_config("m1")
+        }),
+    );
+
+    let worker = requested_tool_retry(&mut agg, "t-worker", "worker_side", None);
+    let client = requested_tool_retry(&mut agg, "t-client", "client_side", None);
+
+    assert_eq!(worker, RetryPolicy::default_for(RetryTarget::WorkerTool));
+    assert_eq!(client, RetryPolicy::default_for(RetryTarget::ClientTool));
+    assert!(
+        worker.run_timeout_secs.is_some(),
+        "a dead worker must not hang the turn"
+    );
+    assert_eq!(
+        client.run_timeout_secs, None,
+        "an async call waits for a human, however long that takes"
+    );
+}
+
+#[test]
+fn the_agent_config_binds_tool_calls_not_just_llm_calls() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let declared = RetryOverride {
+        queue_timeout_secs: None,
+        run_timeout_secs: Some(7),
+        total_timeout_secs: Some(70),
+        max_attempts: Some(4),
+        backoff_base_secs: Some(1),
+        backoff_max_secs: Some(2),
+    };
+    let d = open_decision(&mut agg, "hi");
+    submit_agent(
+        &mut agg,
+        d,
+        vec![node_msg("u1", Role::User, "hi")],
+        Some(AgentConfig {
+            tools: vec![tool_named("worker_side", None)],
+            retry: Some(Box::new(RetryConfig {
+                tool: Some(declared.clone()),
+                ..Default::default()
+            })),
+            ..agent_config("m1")
+        }),
+    );
+
+    assert_eq!(
+        requested_tool_retry(&mut agg, "t1", "worker_side", None),
+        RetryPolicy::default_for(RetryTarget::WorkerTool).with_override(&declared),
+        "the declared `tool` policy wins over the engine default"
+    );
+    let asked = RetryOverride {
+        max_attempts: Some(9),
+        ..Default::default()
+    };
+    assert_eq!(
+        requested_tool_retry(&mut agg, "t2", "worker_side", Some(asked)).max_attempts,
+        9,
+        "an action that names a field still wins over the config"
+    );
+}
+
+fn tool_named(name: &str, handler: Option<Handler>) -> AgentTool {
+    AgentTool {
+        name: name.to_string(),
+        description: String::new(),
+        input: None,
+        output: None,
+        handler,
+        defer: None,
+    }
+}
+
+fn requested_tool_retry(
+    agg: &mut Session,
+    id: &str,
+    name: &str,
+    retry: Option<RetryOverride>,
+) -> RetryPolicy {
+    let events = dispatch(
+        agg,
+        CommandPayload::RequestToolCall {
+            tool_call_id: id.to_string(),
+            name: name.to_string(),
+            arguments: "{}".to_string(),
+            retry,
+        },
+        &system(),
+    );
+    events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::ToolCallRequested(r) if r.id == id => Some(r.retry.clone()),
+            _ => None,
+        })
+        .expect("the call is requested")
+}
+
+#[test]
+fn completion_fires_tool_result_once_and_wake_does_not_re_fire() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    request_client_tool(&mut agg, "a");
+
+    assert!(
+        !fired_tool_result(&complete_tool(&mut agg, "a", "RA")).is_empty(),
+        "fires on completion"
+    );
+    assert!(
+        fired_tool_result(&wake(&mut agg)).is_empty(),
+        "wake does not re-fire"
+    );
+}
+
+#[test]
+fn resume_interrupt_emits_resumed() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    dispatch(
+        &mut agg,
+        CommandPayload::Interrupt {
+            interrupt_id: "int-1".to_string(),
+            reason: "paused".to_string(),
+            payload: serde_json::Value::Null,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::ResumeInterrupt {
+            interrupt_id: "int-1".to_string(),
+            payload: serde_json::Value::Null,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                EventPayload::InterruptResumed(_),
+                EventPayload::DecisionQueued(_),
+                EventPayload::DecisionDispatched(_),
+            ]
+        ),
+        "expected [InterruptResumed, DecisionDispatched]; got {events:?}"
+    );
+    assert_eq!(agg.state.status, SessionStatus::Idle);
+}
+
+#[test]
+fn machine_cannot_resume_system_interrupt() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    dispatch(
+        &mut agg,
+        CommandPayload::Interrupt {
+            interrupt_id: "int-1".to_string(),
+            reason: "budget_exhausted".to_string(),
+            payload: serde_json::Value::Null,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+
+    let err = agg
+        .try_handle(
+            CommandPayload::ResumeInterrupt {
+                interrupt_id: "int-1".to_string(),
+                payload: serde_json::Value::Null,
+            },
+            &Caller::ApiKey {
+                tenant_id: "tenant-a".to_string(),
+                key_id: "prod-key-1".to_string(),
+            },
+        )
+        .expect_err("machine caller should not resume a system interrupt");
+    assert!(
+        matches!(err, SessionError::SessionAccessDenied),
+        "expected SessionAccessDenied; got {err:?}"
+    );
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::ResumeInterrupt {
+            interrupt_id: "int-1".to_string(),
+            payload: serde_json::Value::Null,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                EventPayload::InterruptResumed(_),
+                EventPayload::DecisionQueued(_),
+                EventPayload::DecisionDispatched(_),
+            ]
+        ),
+        "system caller should resume a system interrupt; got {events:?}"
+    );
+}
+
+#[test]
+fn machine_resumes_machine_interrupt() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let machine = Caller::ApiKey {
+        tenant_id: "tenant-a".to_string(),
+        key_id: "prod-key-1".to_string(),
+    };
+    dispatch(
+        &mut agg,
+        CommandPayload::Interrupt {
+            interrupt_id: "int-1".to_string(),
+            reason: "awaiting approval".to_string(),
+            payload: serde_json::Value::Null,
+        },
+        &machine,
+    );
+    assert!(matches!(
+        agg.state.projected_status(),
+        SessionStatus::Interrupted {
+            origin: InterruptOrigin::Machine,
+            ..
+        }
+    ));
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::ResumeInterrupt {
+            interrupt_id: "int-1".to_string(),
+            payload: serde_json::Value::Null,
+        },
+        &machine,
+    );
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                EventPayload::InterruptResumed(_),
+                EventPayload::DecisionQueued(_),
+                EventPayload::DecisionDispatched(_),
+            ]
+        ),
+        "machine caller should resume its own interrupt; got {events:?}"
+    );
+    assert_eq!(agg.state.status, SessionStatus::Idle);
+}
+
+fn frontend_caller(tenant_id: &str, user_id: &str) -> Caller {
+    Caller::Frontend {
+        tenant_id: tenant_id.to_string(),
+        subject: Subject::new(Issuer::app(), user_id.to_string()),
+        attrs: HashMap::new(),
+    }
+}
+
+#[test]
+fn frontend_interrupts_and_resumes_own_session() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let frontend = frontend_caller("tenant-a", "user-1");
+
+    dispatch(
+        &mut agg,
+        CommandPayload::Interrupt {
+            interrupt_id: "int-1".to_string(),
+            reason: "user paused".to_string(),
+            payload: serde_json::Value::Null,
+        },
+        &frontend,
+    );
+    assert!(matches!(
+        agg.state.projected_status(),
+        SessionStatus::Interrupted {
+            origin: InterruptOrigin::Frontend,
+            ..
+        }
+    ));
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::ResumeInterrupt {
+            interrupt_id: "int-1".to_string(),
+            payload: serde_json::Value::Null,
+        },
+        &frontend,
+    );
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                EventPayload::InterruptResumed(_),
+                EventPayload::DecisionQueued(_),
+                EventPayload::DecisionDispatched(_),
+            ]
+        ),
+        "frontend owner should resume its own interrupt; got {events:?}"
+    );
+    assert_eq!(agg.state.status, SessionStatus::Idle);
+}
+
+#[test]
+fn non_owner_frontend_cannot_interrupt() {
+    let agg = create_session("sess-1", "tenant-a", "user-1");
+
+    let err = agg
+        .try_handle(
+            CommandPayload::Interrupt {
+                interrupt_id: "int-1".to_string(),
+                reason: "user paused".to_string(),
+                payload: serde_json::Value::Null,
+            },
+            &frontend_caller("tenant-a", "user-2"),
+        )
+        .expect_err("frontend caller should not interrupt another user's session");
+    assert!(
+        matches!(err, SessionError::SessionAccessDenied),
+        "expected SessionAccessDenied; got {err:?}"
+    );
+}
+
+#[test]
+fn non_owner_frontend_cannot_resume() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    dispatch(
+        &mut agg,
+        CommandPayload::Interrupt {
+            interrupt_id: "int-1".to_string(),
+            reason: "user paused".to_string(),
+            payload: serde_json::Value::Null,
+        },
+        &frontend_caller("tenant-a", "user-1"),
+    );
+
+    let err = agg
+        .try_handle(
+            CommandPayload::ResumeInterrupt {
+                interrupt_id: "int-1".to_string(),
+                payload: serde_json::Value::Null,
+            },
+            &frontend_caller("tenant-a", "user-2"),
+        )
+        .expect_err("frontend caller should not resume another user's session");
+    assert!(
+        matches!(err, SessionError::SessionAccessDenied),
+        "expected SessionAccessDenied; got {err:?}"
+    );
+
+    let err = agg
+        .try_handle(
+            CommandPayload::ResumeInterrupt {
+                interrupt_id: "int-1".to_string(),
+                payload: serde_json::Value::Null,
+            },
+            &frontend_caller("tenant-b", "user-1"),
+        )
+        .expect_err("frontend caller from another tenant should be denied");
+    assert!(
+        matches!(err, SessionError::SessionAccessDenied),
+        "expected SessionAccessDenied; got {err:?}"
+    );
+}
+
+#[test]
+fn frontend_cannot_resume_machine_interrupt() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    dispatch(
+        &mut agg,
+        CommandPayload::Interrupt {
+            interrupt_id: "int-1".to_string(),
+            reason: "awaiting approval".to_string(),
+            payload: serde_json::Value::Null,
+        },
+        &Caller::ApiKey {
+            tenant_id: "tenant-a".to_string(),
+            key_id: "prod-key-1".to_string(),
+        },
+    );
+
+    let err = agg
+        .try_handle(
+            CommandPayload::ResumeInterrupt {
+                interrupt_id: "int-1".to_string(),
+                payload: serde_json::Value::Null,
+            },
+            &frontend_caller("tenant-a", "user-1"),
+        )
+        .expect_err("frontend caller should not resume a machine interrupt");
+    assert!(
+        matches!(err, SessionError::SessionAccessDenied),
+        "expected SessionAccessDenied; got {err:?}"
+    );
+}
+
+#[test]
+fn machine_resumes_frontend_interrupt() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    dispatch(
+        &mut agg,
+        CommandPayload::Interrupt {
+            interrupt_id: "int-1".to_string(),
+            reason: "user paused".to_string(),
+            payload: serde_json::Value::Null,
+        },
+        &frontend_caller("tenant-a", "user-1"),
+    );
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::ResumeInterrupt {
+            interrupt_id: "int-1".to_string(),
+            payload: serde_json::Value::Null,
+        },
+        &Caller::ApiKey {
+            tenant_id: "tenant-a".to_string(),
+            key_id: "prod-key-1".to_string(),
+        },
+    );
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                EventPayload::InterruptResumed(_),
+                EventPayload::DecisionQueued(_),
+                EventPayload::DecisionDispatched(_),
+            ]
+        ),
+        "machine caller should resume a frontend interrupt; got {events:?}"
+    );
+}
+
+#[test]
+fn client_action_dispatches_while_interrupted() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    dispatch(
+        &mut agg,
+        CommandPayload::Interrupt {
+            interrupt_id: "int-1".to_string(),
+            reason: "paused".to_string(),
+            payload: serde_json::Value::Null,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Action(crate::protocol::ClientAction {
+                name: "refresh".to_string(),
+                args: None,
+            }),
+            turn: TurnTarget::Detached,
+            queue: QueueMode::Refuse,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::DecisionDispatched(_))),
+        "the action decision goes live past the interrupt; got {events:?}"
+    );
+}
+
+fn dispatched_action_decision(agg: &mut Session) -> String {
+    dispatch(
+        agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Action(crate::protocol::ClientAction {
+                name: "summarize".to_string(),
+                args: None,
+            }),
+            turn: TurnTarget::Detached,
+            queue: QueueMode::Refuse,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    )
+    .iter()
+    .find_map(|e| match e {
+        EventPayload::DecisionDispatched(p) => Some(p.id.clone()),
+        _ => None,
+    })
+    .expect("the action decision dispatches")
+}
+
+#[test]
+fn an_action_answer_with_work_opens_a_turn() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let decision_id = dispatched_action_decision(&mut agg);
+
+    let events = agg
+        .try_handle(
+            CommandPayload::SubmitWorkerDecision {
+                decision_id: decision_id.clone(),
+                transcript: vec![],
+                actions: vec![Action::CallTool {
+                    id: "tc-1".to_string(),
+                    name: "my_tool".to_string(),
+                    arguments: "{}".to_string(),
+                    retry: None,
+                }],
+                state: None,
+                agent: None,
+            },
+            &Caller::System {
+                tenant_id: "tenant-a".to_string(),
+            },
+        )
+        .expect("submit succeeds");
+    let turn = events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::TurnStarted(t) => Some(t.turn_id.clone()),
+            _ => None,
+        })
+        .expect("work opens a turn");
+    assert_eq!(turn, format!("action:{decision_id}"));
+}
+
+#[test]
+fn an_action_answer_without_work_opens_no_turn() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let decision_id = dispatched_action_decision(&mut agg);
+
+    let events = agg
+        .try_handle(
+            CommandPayload::SubmitWorkerDecision {
+                decision_id,
+                transcript: vec![],
+                actions: vec![],
+                state: Some(crate::protocol::WorkerState(serde_json::json!({
+                    "handled": ["click-1"]
+                }))),
+                agent: None,
+            },
+            &Caller::System {
+                tenant_id: "tenant-a".to_string(),
+            },
+        )
+        .expect("submit succeeds");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, EventPayload::TurnStarted(_))),
+        "no work, no turn; got {events:?}"
+    );
+}
+
+#[test]
+fn an_action_answer_can_resolve_an_open_interrupt() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let raise = dispatched_action_decision(&mut agg);
+    dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: raise,
+            transcript: vec![],
+            actions: vec![Action::Interrupt {
+                interrupt_id: "int-1".to_string(),
+                reason: "hold".to_string(),
+                payload: serde_json::Value::Null,
+            }],
+            state: None,
+            agent: None,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+    let decision_id = dispatched_action_decision(&mut agg);
+
+    let events = agg
+        .try_handle(
+            CommandPayload::SubmitWorkerDecision {
+                decision_id,
+                transcript: vec![],
+                actions: vec![Action::ResolveInterrupt {
+                    interrupt_id: "int-1".to_string(),
+                    payload: serde_json::json!({"status": "resolved"}),
+                }],
+                state: None,
+                agent: None,
+            },
+            &Caller::System {
+                tenant_id: "tenant-a".to_string(),
+            },
+        )
+        .expect("submit succeeds");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::InterruptResumed(p) if p.interrupt_id == "int-1")),
+        "the resolve resumes the interrupt; got {events:?}"
+    );
+}
+
+#[test]
+fn a_worker_resolve_cannot_answer_a_system_interrupt() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    dispatch(
+        &mut agg,
+        CommandPayload::Interrupt {
+            interrupt_id: "int-1".to_string(),
+            reason: "ops hold".to_string(),
+            payload: serde_json::Value::Null,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+    let decision_id = dispatched_action_decision(&mut agg);
+
+    let events = agg
+        .try_handle(
+            CommandPayload::SubmitWorkerDecision {
+                decision_id,
+                transcript: vec![],
+                actions: vec![Action::ResolveInterrupt {
+                    interrupt_id: "int-1".to_string(),
+                    payload: serde_json::json!({"status": "resolved"}),
+                }],
+                state: None,
+                agent: None,
+            },
+            &Caller::System {
+                tenant_id: "tenant-a".to_string(),
+            },
+        )
+        .expect("submit succeeds; the refused action is dropped");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, EventPayload::InterruptResumed(_))),
+        "a system interrupt outranks a worker resolve; got {events:?}"
+    );
+}
+
+#[test]
+fn a_failed_action_decision_does_not_end_the_running_turn() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let setup_events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: DraftMessage {
+                    id: None,
+                    role: Role::User,
+                    content: Some(Content::Text("hi".to_string())),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                    reasoning: None,
+                },
+                stream: false,
+            }),
+            turn: TurnTarget::Open("turn-1".to_string()),
+            queue: QueueMode::Refuse,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+    let first = setup_events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionDispatched(p) => Some(p.id.clone()),
+            _ => None,
+        })
+        .expect("the message decision dispatches");
+    dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: first,
+            transcript: vec![],
+            actions: vec![Action::CallLlm {
+                id: "call-1".to_string(),
+                llm: "claude".to_string(),
+                request: LlmRequest {
+                    model: "m".to_string(),
+                    messages: vec![],
+                    tools: None,
+                    temperature: None,
+                    max_completion_tokens: None,
+                    reasoning: None,
+                },
+                stream: false,
+                retry: RetryPolicy::no_retry(),
+                handler: LlmHandler::Server,
+                format: None,
+            }],
+            state: None,
+            agent: None,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+    let action_decision = dispatched_action_decision(&mut agg);
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::Decision,
+            action_decision,
+            None,
+            SettleError::new(ErrorInfo::internal("no proposal"), false),
+        ),
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::DecisionErrored(_))),
+        "the failure is recorded; got {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            EventPayload::TurnCompleted(_) | EventPayload::CallVoided(_)
+        )),
+        "the running turn and its work survive; got {events:?}"
+    );
+}
+
+#[test]
+fn cancel_voids_pending_effects() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let setup_events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: DraftMessage {
+                    id: None,
+                    role: Role::User,
+                    content: Some(Content::Text("hi".to_string())),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                    reasoning: None,
+                },
+                stream: false,
+            }),
+            turn: TurnTarget::Open("turn-1".to_string()),
+            queue: QueueMode::Refuse,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+    let decision_id = setup_events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionDispatched(p) => Some(p.id.clone()),
+            _ => None,
+        })
+        .expect("user message should request a worker decision");
+    request_client_tool(&mut agg, "tc-1");
+    request_llm(&mut agg, "llm-1", LlmHandler::Server);
+    dispatch(&mut agg, spawn_as("helper", "call-1"), &system());
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::CancelSession,
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+    let mut voided = voided_ids(&events);
+    voided.sort_unstable();
+    assert_eq!(voided, vec!["call-1", "llm-1", "tc-1"], "got {events:?}");
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            EventPayload::CallVoided(v)
+                if v.kind == EffectKind::Subagent && v.id == "call-1"
+        )),
+        "the subagent void names the child session for the cascade; got {events:?}"
+    );
+    assert!(!agg.state.has_pending_worker_decision());
+
+    let again = dispatch(
+        &mut agg,
+        CommandPayload::CancelSession,
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+    assert!(again.is_empty(), "got {again:?}");
+
+    let stale = dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id,
+            transcript: vec![],
+            actions: vec![Action::Done {
+                data: serde_json::Value::Null,
+            }],
+            state: None,
+            agent: None,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+    assert!(
+        stale.is_empty(),
+        "stale submission after cancel should no-op; got {stale:?}"
+    );
+}
+
+#[test]
+fn interrupt_voids_llm_calls_but_spares_tools() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    request_client_tool(&mut agg, "tc-1");
+    request_llm(&mut agg, "llm-1", LlmHandler::Server);
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::Interrupt {
+            interrupt_id: "int-1".to_string(),
+            reason: String::new(),
+            payload: serde_json::Value::Null,
+        },
+        &system(),
+    );
+    assert_eq!(voided_ids(&events), vec!["llm-1"], "got {events:?}");
+    assert_eq!(
+        agg.state
+            .effect(EffectKind::ToolCall, "tc-1")
+            .unwrap()
+            .tracking
+            .status(),
+        EffectStatus::Pending,
+        "tools settle during an interrupt and queue"
+    );
+}
+
+#[test]
+fn interrupt_action_voids_llm_calls_requested_in_the_same_submit() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let d1 = open_decision(&mut agg, "hi");
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: d1,
+            transcript: vec![node_msg("u1", Role::User, "hi")],
+            actions: vec![
+                Action::CallLlm {
+                    llm: "claude".to_string(),
+                    id: "llm-1".to_string(),
+                    request: request_with(vec![]),
+                    stream: false,
+                    retry: RetryPolicy::no_retry(),
+                    handler: LlmHandler::Server,
+                    format: None,
+                },
+                Action::Interrupt {
+                    interrupt_id: "int-1".to_string(),
+                    reason: "hold".to_string(),
+                    payload: serde_json::Value::Null,
+                },
+            ],
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    );
+    assert_eq!(voided_ids(&events), vec!["llm-1"], "got {events:?}");
+    assert_eq!(
+        agg.state
+            .effect(EffectKind::LlmCall, "llm-1")
+            .unwrap()
+            .tracking
+            .status(),
+        EffectStatus::Failed,
+    );
+}
+
+#[test]
+fn interrupt_voids_pending_worker_decision() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let setup_events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: DraftMessage {
+                    id: None,
+                    role: Role::User,
+                    content: Some(Content::Text("hi".to_string())),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                    reasoning: None,
+                },
+                stream: false,
+            }),
+            turn: TurnTarget::Open("turn-1".to_string()),
+            queue: QueueMode::Refuse,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+    let decision_id = setup_events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionDispatched(p) => Some(p.id.clone()),
+            _ => None,
+        })
+        .expect("user message should request a worker decision");
+
+    dispatch(
+        &mut agg,
+        CommandPayload::Interrupt {
+            interrupt_id: "int-1".to_string(),
+            reason: "quota_exhausted".to_string(),
+            payload: serde_json::Value::Null,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+    assert!(!agg.state.has_pending_worker_decision());
+
+    let stale = dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id,
+            transcript: vec![],
+            actions: vec![Action::Done {
+                data: serde_json::Value::Null,
+            }],
+            state: None,
+            agent: None,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+    assert!(
+        stale.is_empty(),
+        "stale submission should no-op; got {stale:?}"
+    );
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::ResumeInterrupt {
+            interrupt_id: "int-1".to_string(),
+            payload: serde_json::Value::Null,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                EventPayload::InterruptResumed(_),
+                EventPayload::DecisionQueued(_),
+                EventPayload::DecisionDispatched(_),
+            ]
+        ),
+        "expected immediate DecisionDispatched; got {events:?}"
+    );
+}
+
+#[test]
+fn tool_result_during_interrupt_queues_until_resume() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let system = Caller::System {
+        tenant_id: "tenant-a".to_string(),
+    };
+    let setup_events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: DraftMessage {
+                    id: None,
+                    role: Role::User,
+                    content: Some(Content::Text("crawl the site".to_string())),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                    reasoning: None,
+                },
+                stream: false,
+            }),
+            turn: TurnTarget::Open("turn-1".to_string()),
+            queue: QueueMode::Refuse,
+        },
+        &system,
+    );
+    let decision_id = setup_events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionDispatched(p) => Some(p.id.clone()),
+            _ => None,
+        })
+        .expect("user message should request a worker decision");
+
+    dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id,
+            transcript: vec![],
+            actions: vec![Action::CallTool {
+                id: "tc-1".to_string(),
+                name: "crawl".to_string(),
+                arguments: "{}".to_string(),
+                retry: None,
+            }],
+            state: None,
+            agent: None,
+        },
+        &system,
+    );
+
+    dispatch(
+        &mut agg,
+        CommandPayload::Interrupt {
+            interrupt_id: "int-1".to_string(),
+            reason: "quota_exhausted".to_string(),
+            payload: serde_json::Value::Null,
+        },
+        &system,
+    );
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::ToolCall,
+            "tc-1".to_string(),
+            Some(0),
+            Outcome::Tool {
+                result: StoredResult::text("done".to_string()),
+            },
+        ),
+        &system,
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::ToolCallCompleted(_))),
+        "tool result should be recorded; got {events:?}"
+    );
+    assert_eq!(
+        agg.state.tool_call("tc-1").unwrap().result.as_deref(),
+        Some("done")
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::DecisionQueued(_))),
+        "decision should be queued while interrupted; got {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, EventPayload::DecisionDispatched(_))),
+        "no decision should be delivered while interrupted; got {events:?}"
+    );
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::ResumeInterrupt {
+            interrupt_id: "int-1".to_string(),
+            payload: serde_json::Value::Null,
+        },
+        &system,
+    );
+    let resumed_decision_id = events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionQueued(p)
+                if matches!(p.trigger, Trigger::InterruptResumed { .. }) =>
+            {
+                Some(p.id.clone())
+            }
+            _ => None,
+        })
+        .expect("resume should request an interrupt.resumed decision");
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: resumed_decision_id,
+            transcript: vec![],
+            actions: vec![],
+            state: None,
+            agent: None,
+        },
+        &system,
+    );
+    let trigger = events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionDispatched(p) => {
+                agg.state.worker_decision(&p.id).map(|d| d.trigger.clone())
+            }
+            _ => None,
+        })
+        .expect("queued decision should promote after the resumed decision completes");
+    assert!(
+        matches!(trigger, Trigger::ToolFinished { .. }),
+        "expected a tool.finished trigger; got {trigger:?}"
+    );
+}
+
+#[test]
+fn worker_interrupt_action_pauses_session_and_resume_carries_payload() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let setup_events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: DraftMessage {
+                    id: None,
+                    role: Role::User,
+                    content: Some(Content::Text("send the email".to_string())),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                    reasoning: None,
+                },
+                stream: false,
+            }),
+            turn: TurnTarget::Open("turn-1".to_string()),
+            queue: QueueMode::Refuse,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+    let decision_id = setup_events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionDispatched(p) => Some(p.id.clone()),
+            _ => None,
+        })
+        .expect("user message should request a worker decision");
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id,
+            transcript: vec![],
+            actions: vec![Action::Interrupt {
+                interrupt_id: "int-1".to_string(),
+                reason: "confirmation".to_string(),
+                payload: serde_json::json!({"message": "Send the email?"}),
+            }],
+            state: None,
+            agent: None,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::SessionInterrupted(_))),
+        "interrupt action should emit SessionInterrupted; got {events:?}"
+    );
+    assert!(matches!(
+        agg.state.projected_status(),
+        SessionStatus::Interrupted {
+            origin: InterruptOrigin::Frontend,
+            ..
+        }
+    ));
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::ResumeInterrupt {
+            interrupt_id: "int-1".to_string(),
+            payload: serde_json::json!({"approved": true}),
+        },
+        &frontend_caller("tenant-a", "user-1"),
+    );
+    let trigger = events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionQueued(p) => Some(p.trigger.clone()),
+            _ => None,
+        })
+        .expect("resume should request a worker decision");
+    match trigger {
+        Trigger::InterruptResumed {
+            interrupt_id,
+            payload,
+        } => {
+            assert_eq!(interrupt_id, "int-1");
+            assert_eq!(payload, serde_json::json!({"approved": true}));
+        }
+        other => panic!("expected InterruptResumed trigger; got {other:?}"),
+    }
+}
+
+#[test]
+fn fail_worker_decision_emits_errored() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let setup_events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: DraftMessage {
+                    id: None,
+                    role: Role::User,
+                    content: Some(Content::Text("hi".to_string())),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                    reasoning: None,
+                },
+                stream: false,
+            }),
+            turn: TurnTarget::Open("turn-1".to_string()),
+            queue: QueueMode::Refuse,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+    let decision_id = setup_events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionDispatched(p) => Some(p.id.clone()),
+            _ => None,
+        })
+        .expect("user message should request a worker decision");
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::Decision,
+            decision_id.clone(),
+            None,
+            SettleError::new(ErrorInfo::internal("worker offline".to_string()), false),
+        ),
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                EventPayload::DecisionErrored(_),
+                EventPayload::TurnCompleted(_),
+                EventPayload::SessionDone(_)
+            ]
+        ),
+        "expected [DecisionErrored, TurnCompleted, SessionDone]; got {events:?}"
+    );
+    let completed = turn_completed(&events).expect("the turn ends");
+    assert_eq!(completed.turn_id, "turn-1");
+    assert_eq!(
+        completed.error.as_ref().map(|e| e.message.as_str()),
+        Some("worker offline"),
+        "the turn carries the failure; got {completed:?}"
+    );
+    assert!(
+        !agg.state.has_effect(EffectKind::Decision, &decision_id),
+        "a settled decision leaves the map"
+    );
+}
+
+#[test]
+fn machine_caller_from_wrong_tenant_is_denied() {
+    let agg = create_session("sess-1", "tenant-a", "user-1");
+
+    let cross_tenant_machine = Caller::ApiKey {
+        tenant_id: "tenant-b".to_string(),
+        key_id: "key-from-tenant-b".to_string(),
+    };
+
+    let err = agg
+        .try_handle(
+            CommandPayload::settle(
+                EffectKind::ToolCall,
+                "tc-1".to_string(),
+                Some(0),
+                Outcome::Tool {
+                    result: StoredResult::text("ok".to_string()),
+                },
+            ),
+            &cross_tenant_machine,
+        )
+        .expect_err("machine from a different tenant should be rejected");
+
+    assert!(
+        matches!(err, SessionError::SessionAccessDenied),
+        "expected SessionAccessDenied; got {err:?}"
+    );
+}
+
+#[test]
+fn frontend_caller_with_mismatched_tenant_on_create_session_is_denied() {
+    let session_id = "sess-1".to_string();
+    let agg = Session::with_state(
+        session_id.clone(),
+        "tenant-a".to_string(),
+        SessionState::new(session_id),
+    );
+
+    let caller = Caller::Frontend {
+        tenant_id: "tenant-a".to_string(),
+        subject: Subject::new(Issuer::app(), "user-1".to_string()),
+        attrs: HashMap::new(),
+    };
+
+    let err = agg
+        .try_handle(
+            CommandPayload::CreateSession {
+                agent_id: "agent-1".to_string(),
+                owner: SessionOwner {
+                    tenant_id: "tenant-b".to_string(),
+                    requester: Requester::new(
+                        Subject::new(Issuer::app(), "user-1".to_string()),
+                        Default::default(),
+                    ),
+                    metadata: HashMap::new(),
+                },
+                ancestry: vec![],
+                worker_retry: RetryPolicy::no_retry(),
+                agent: None,
+                worker: None,
+                events: None,
+                state: None,
+            },
+            &caller,
+        )
+        .expect_err("creating a session in a different tenant should be rejected");
+
+    assert!(
+        matches!(err, SessionError::SessionAccessDenied),
+        "expected SessionAccessDenied; got {err:?}"
+    );
+}
+
+#[test]
+fn a_session_opens_with_the_config_its_creation_carries() {
+    let mut agg = Session::with_state(
+        "sess-1".to_string(),
+        "tenant-a".to_string(),
+        SessionState::new("sess-1".to_string()),
+    );
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::CreateSession {
+            agent_id: "invented".to_string(),
+            owner: SessionOwner {
+                tenant_id: "tenant-a".to_string(),
+                requester: Requester::new(
+                    Subject::new(Issuer::app(), "user-1".to_string()),
+                    Default::default(),
+                ),
+                metadata: HashMap::new(),
+            },
+            ancestry: vec![],
+            worker_retry: RetryPolicy::no_retry(),
+            agent: Some(Box::new(agent_config("inline-model"))),
+            worker: None,
+            events: None,
+            state: None,
+        },
+        &machine(),
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::AgentConfigUpdated(_))),
+        "creation seeds the config: {events:#?}"
+    );
+    assert_eq!(
+        agg.state.at_head().resolve_agent_for().map(|c| c.model),
+        Some("inline-model".to_string())
+    );
+}
+
+#[test]
+fn a_session_records_the_worker_its_creation_names() {
+    let mut agg = Session::with_state(
+        "sess-1".to_string(),
+        "tenant-a".to_string(),
+        SessionState::new("sess-1".to_string()),
+    );
+    let named = crate::protocol::WorkerRef {
+        id: "customers".to_string(),
+        url: Some("https://acme.internal/decide".to_string()),
+    };
+    dispatch(
+        &mut agg,
+        CommandPayload::CreateSession {
+            agent_id: "invented".to_string(),
+            owner: SessionOwner {
+                tenant_id: "tenant-a".to_string(),
+                requester: Requester::new(
+                    Subject::new(Issuer::app(), "user-1".to_string()),
+                    Default::default(),
+                ),
+                metadata: HashMap::new(),
+            },
+            ancestry: vec![],
+            worker_retry: RetryPolicy::no_retry(),
+            agent: None,
+            worker: Some(named.clone()),
+            events: None,
+            state: None,
+        },
+        &machine(),
+    );
+    assert_eq!(agg.state.worker, Some(named.clone()));
+
+    let err = Session::with_state(
+        "sess-2".to_string(),
+        "tenant-a".to_string(),
+        SessionState::new("sess-2".to_string()),
+    )
+    .try_handle(
+        CommandPayload::CreateSession {
+            agent_id: "invented".to_string(),
+            owner: SessionOwner {
+                tenant_id: "tenant-a".to_string(),
+                requester: Requester::new(
+                    Subject::new(Issuer::app(), "user-1".to_string()),
+                    Default::default(),
+                ),
+                metadata: HashMap::new(),
+            },
+            ancestry: vec![],
+            worker_retry: RetryPolicy::no_retry(),
+            agent: None,
+            worker: Some(named.clone()),
+            events: None,
+            state: None,
+        },
+        &frontend(),
+    )
+    .expect_err("a frontend brings no address");
+    assert!(matches!(err, SessionError::SessionAccessDenied));
+
+    let mut agg = Session::with_state(
+        "sess-3".to_string(),
+        "tenant-a".to_string(),
+        SessionState::new("sess-3".to_string()),
+    );
+    let bare = crate::protocol::WorkerRef {
+        id: "customers".to_string(),
+        url: None,
+    };
+    dispatch(
+        &mut agg,
+        CommandPayload::CreateSession {
+            agent_id: "invented".to_string(),
+            owner: SessionOwner {
+                tenant_id: "tenant-a".to_string(),
+                requester: Requester::new(
+                    Subject::new(Issuer::app(), "user-1".to_string()),
+                    Default::default(),
+                ),
+                metadata: HashMap::new(),
+            },
+            ancestry: vec![],
+            worker_retry: RetryPolicy::no_retry(),
+            agent: None,
+            worker: Some(bare.clone()),
+            events: None,
+            state: None,
+        },
+        &frontend(),
+    );
+    assert_eq!(
+        agg.state.worker,
+        Some(bare),
+        "a declared worker's bare id is as open as an agent id"
+    );
+}
+
+#[test]
+fn a_frontend_cannot_open_a_session_with_its_own_config() {
+    let agg = Session::with_state(
+        "sess-1".to_string(),
+        "tenant-a".to_string(),
+        SessionState::new("sess-1".to_string()),
+    );
+    let err = agg
+        .try_handle(
+            CommandPayload::CreateSession {
+                agent_id: "invented".to_string(),
+                owner: SessionOwner {
+                    tenant_id: "tenant-a".to_string(),
+                    requester: Requester::new(
+                        Subject::new(Issuer::app(), "user-1".to_string()),
+                        Default::default(),
+                    ),
+                    metadata: HashMap::new(),
+                },
+                ancestry: vec![],
+                worker_retry: RetryPolicy::no_retry(),
+                agent: Some(Box::new(agent_config("inline-model"))),
+                worker: None,
+                events: None,
+                state: None,
+            },
+            &frontend(),
+        )
+        .expect_err("a frontend chooses no config");
+    assert!(
+        matches!(err, SessionError::SessionAccessDenied),
+        "expected SessionAccessDenied; got {err:?}"
+    );
+}
+
+#[test]
+fn parallel_tool_results_record_in_completion_order() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let sys = Caller::System {
+        tenant_id: "tenant-a".to_string(),
+    };
+
+    let request = |agg: &mut Session, id: &str| {
+        dispatch(
+            agg,
+            CommandPayload::RequestToolCall {
+                tool_call_id: id.to_string(),
+                name: "t".to_string(),
+                arguments: "{}".to_string(),
+                retry: None,
+            },
+            &sys,
+        );
+    };
+    request(&mut agg, "tc-a");
+    request(&mut agg, "tc-b");
+
+    let complete = |agg: &mut Session, id: &str| {
+        dispatch(
+            agg,
+            CommandPayload::settle(
+                EffectKind::ToolCall,
+                id.to_string(),
+                Some(0),
+                Outcome::Tool {
+                    result: StoredResult::text(format!("result-{id}")),
+                },
+            ),
+            &sys,
+        )
+    };
+
+    let first = complete(&mut agg, "tc-b");
+    assert_eq!(fired_tool_result(&first), vec!["tc-b".to_string()]);
+    assert_eq!(
+        agg.state.tool_call("tc-b").unwrap().result.as_deref(),
+        Some("result-tc-b")
+    );
+
+    let second = complete(&mut agg, "tc-a");
+    assert_eq!(fired_tool_result(&second), vec!["tc-a".to_string()]);
+    assert_eq!(
+        agg.state.tool_call("tc-a").unwrap().result.as_deref(),
+        Some("result-tc-a")
+    );
+}
+
+#[test]
+fn worker_append_action_writes_a_tree_node() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let setup = dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: node_msg("", Role::User, "hi"),
+                stream: false,
+            }),
+            turn: TurnTarget::Open("turn-1".to_string()),
+            queue: QueueMode::Refuse,
+        },
+        &system(),
+    );
+    let decision_id = decision_with(&setup, |t| matches!(t, Trigger::ClientMessage { .. }))
+        .expect("user message decision");
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id,
+            transcript: vec![node_msg("u1", Role::User, "hi")],
+            actions: vec![],
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    );
+
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::NewMessage(m) if m.message.id == "u1")),
+        "append writes a NewMessage; got {events:?}"
+    );
+    assert_eq!(agg.state.head_id.as_deref(), Some("u1"));
+}
+
+#[test]
+fn complete_tool_call_fires_tool_result_without_appending() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    request_client_tool(&mut agg, "tc-1");
+
+    let events = complete_tool(&mut agg, "tc-1", "ok");
+
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::ToolCallCompleted(_))),
+        "expected a ToolCallCompleted event; got {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, EventPayload::NewMessage(_))),
+        "the engine appends no node on completion; got {events:?}"
+    );
+    assert_eq!(fired_tool_result(&events), vec!["tc-1".to_string()]);
+
+    let tc = agg
+        .state
+        .effect(EffectKind::ToolCall, "tc-1")
+        .expect("tool call present");
+    assert_eq!(tc.tracking.status(), EffectStatus::Completed);
+    assert_eq!(tc.tool().unwrap().result.as_deref(), Some("ok"));
+    assert!(!tc.tool().unwrap().is_error);
+}
+
+fn submit_decision(
+    agg: &mut Session,
+    decision_id: String,
+    transcript: Vec<DraftMessage>,
+    actions: Vec<Action>,
+) -> Vec<EventPayload> {
+    dispatch(
+        agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id,
+            transcript,
+            actions,
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    )
+}
+
+fn call_tool_action(id: &str) -> Action {
+    Action::CallTool {
+        id: id.to_string(),
+        name: "find".to_string(),
+        arguments: "{}".to_string(),
+        retry: None,
+    }
+}
+
+fn tool_result_action(id: &str) -> Action {
+    Action::ToolResult {
+        id: id.to_string(),
+        attempt: Some(0),
+        result: StoredResult::text(format!("result-{id}")),
+    }
+}
+
+fn delivered_transcript(agg: &Session) -> Vec<DraftMessage> {
+    agg.state
+        .head_id
+        .as_deref()
+        .map(|h| agg.state.message_tree().path_to(h))
+        .unwrap_or_default()
+        .into_iter()
+        .map(DraftMessage::from)
+        .collect()
+}
+
+fn pending_worker_decisions(agg: &Session) -> usize {
+    agg.state
+        .effects_of(EffectKind::Decision)
+        .filter(|d| d.tracking.status() == EffectStatus::Pending)
+        .count()
+}
+
+fn live_decision(agg: &Session) -> (String, Trigger) {
+    agg.state
+        .effects_of(EffectKind::Decision)
+        .filter(|d| d.tracking.status() == EffectStatus::Pending)
+        .min_by_key(|d| d.decision().map(|d| d.source_event_sequence))
+        .and_then(|e| Some((e.id.clone(), e.decision()?.trigger.clone())))
+        .expect("a live decision")
+}
+
+fn record_bases(
+    events: &[EventPayload],
+    agg: &Session,
+    bases: &mut HashMap<String, Vec<DraftMessage>>,
+) {
+    let frozen = delivered_transcript(agg);
+    for e in events {
+        if let EventPayload::DecisionDispatched(p) = e {
+            bases.insert(p.id.clone(), frozen.clone());
+        }
+    }
+}
+
+fn drive_worker(agg: &mut Session, bases: &mut HashMap<String, Vec<DraftMessage>>) {
+    for _ in 0..128 {
+        let mut live: Vec<(String, Trigger)> = agg
+            .state
+            .effects_of(EffectKind::Decision)
+            .filter(|d| d.tracking.status() == EffectStatus::Pending)
+            .filter_map(|e| Some((e.id.clone(), e.decision()?.trigger.clone())))
+            .collect();
+        live.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let Some((id, trigger)) = live.into_iter().next() else {
+            if !agg.state.has_queued_worker_decision() {
+                return;
+            }
+            let woken = wake(agg);
+            record_bases(&woken, agg, bases);
+            continue;
+        };
+
+        let base = bases.get(&id).cloned().unwrap_or_default();
+        let events = match trigger {
+            Trigger::ToolExecute { id: tid, .. } => {
+                submit_decision(agg, id, vec![], vec![tool_result_action(&tid)])
+            }
+            Trigger::ToolFinished { id: tid, name, .. } => {
+                let mut answer = base;
+                answer.push(tool_msg(&tid, &format!("done-{name}")));
+                submit_decision(agg, id, answer, vec![])
+            }
+            _ => submit_decision(agg, id, base, vec![]),
+        };
+        record_bases(&events, agg, bases);
+
+        let woken = wake(agg);
+        record_bases(&woken, agg, bases);
+    }
+    panic!("worker did not settle");
+}
+
+#[test]
+fn a_wake_does_not_promote_a_second_decision_while_one_is_pending() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+
+    let d0 = decision_with(
+        &submit_messages(&mut agg, vec![node_msg("u1", Role::User, "hi")]),
+        |_| true,
+    )
+    .expect("a client decision");
+    submit_decision(
+        &mut agg,
+        d0,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("asst", Role::Assistant, "calling"),
+        ],
+        vec![call_tool_action("tc-a"), call_tool_action("tc-b")],
+    );
+    assert_eq!(pending_worker_decisions(&agg), 1, "one execute live");
+    assert!(agg.state.has_queued_worker_decision(), "one execute queued");
+
+    wake(&mut agg);
+
+    assert_eq!(
+        pending_worker_decisions(&agg),
+        1,
+        "the wake promoted a second decision while one was pending — the \
+             serialization hole that forks parallel tool results"
+    );
+}
+
+#[test]
+fn parallel_tool_finishes_keep_results_on_one_path() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let mut bases: HashMap<String, Vec<DraftMessage>> = HashMap::new();
+
+    let d0 = decision_with(
+        &submit_messages(&mut agg, vec![node_msg("u1", Role::User, "hi")]),
+        |_| true,
+    )
+    .expect("a client decision");
+    let fanout = submit_decision(
+        &mut agg,
+        d0,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("asst", Role::Assistant, "calling"),
+        ],
+        vec![call_tool_action("tc-a"), call_tool_action("tc-b")],
+    );
+    record_bases(&fanout, &agg, &mut bases);
+    let woken = wake(&mut agg);
+    record_bases(&woken, &agg, &mut bases);
+
+    drive_worker(&mut agg, &mut bases);
+
+    let head = agg.state.head_id.clone().expect("a head");
+    let path = agg.state.message_tree().path_to(&head);
+    let seen: Vec<&str> = path
+        .iter()
+        .filter_map(|m| m.tool_call_id.as_deref())
+        .collect();
+    assert!(
+        seen.contains(&"tc-a") && seen.contains(&"tc-b"),
+        "parallel results forked: path holds {seen:?}, not both tc-a and tc-b"
+    );
+}
+
+#[test]
+fn only_the_last_parallel_tool_finish_reports_no_pending_work() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let d0 = decision_with(
+        &submit_messages(&mut agg, vec![node_msg("u1", Role::User, "hi")]),
+        |_| true,
+    )
+    .expect("a client decision");
+    submit_decision(
+        &mut agg,
+        d0,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("asst", Role::Assistant, "calling"),
+        ],
+        vec![call_tool_action("tc-a"), call_tool_action("tc-b")],
+    );
+
+    let (exec_a, _) = live_decision(&agg);
+    submit_decision(&mut agg, exec_a, vec![], vec![tool_result_action("tc-a")]);
+    let (exec_b, _) = live_decision(&agg);
+    submit_decision(&mut agg, exec_b, vec![], vec![tool_result_action("tc-b")]);
+
+    let (finish_first, trigger) = live_decision(&agg);
+    assert!(matches!(trigger, Trigger::ToolFinished { .. }));
+    assert_eq!(
+        agg.state.event_meta(Utc::now()).pending_work(&finish_first),
+        1,
+        "the first finish must wait: a sibling result is still unrecorded"
+    );
+
+    let mut answer = delivered_transcript(&agg);
+    answer.push(tool_msg("tc-a", "A"));
+    submit_decision(&mut agg, finish_first, answer, vec![]);
+
+    let (finish_last, trigger) = live_decision(&agg);
+    assert!(matches!(trigger, Trigger::ToolFinished { .. }));
+    assert_eq!(
+        agg.state.event_meta(Utc::now()).pending_work(&finish_last),
+        0,
+        "the last finish prompts: every result is recorded"
+    );
+}
+
+#[test]
+fn an_in_flight_async_sibling_keeps_a_fast_tool_from_prompting() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let d0 = decision_with(
+        &submit_messages(&mut agg, vec![node_msg("u1", Role::User, "hi")]),
+        |_| true,
+    )
+    .expect("a client decision");
+    submit_decision(
+        &mut agg,
+        d0,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("asst", Role::Assistant, "calling"),
+        ],
+        vec![call_tool_action("tc-fast"), call_tool_action("tc-async")],
+    );
+
+    let (exec_fast, t) = live_decision(&agg);
+    assert!(matches!(&t, Trigger::ToolExecute { id, .. } if id == "tc-fast"));
+    submit_decision(
+        &mut agg,
+        exec_fast,
+        vec![],
+        vec![tool_result_action("tc-fast")],
+    );
+
+    let (exec_async, t) = live_decision(&agg);
+    assert!(matches!(&t, Trigger::ToolExecute { id, .. } if id == "tc-async"));
+    submit_decision(&mut agg, exec_async, vec![], vec![]);
+
+    let (finish_fast, trigger) = live_decision(&agg);
+    assert!(matches!(trigger, Trigger::ToolFinished { .. }));
+    assert_eq!(
+        agg.state
+            .effect(EffectKind::ToolCall, "tc-async")
+            .unwrap()
+            .tracking
+            .status(),
+        EffectStatus::Pending,
+        "the async call stays in flight after its execute"
+    );
+    assert_eq!(
+        agg.state.event_meta(Utc::now()).pending_work(&finish_fast),
+        1,
+        "the fast tool must wait: an async sibling is still in flight"
+    );
+}
+
+fn call_llm_action(id: &str, handler: LlmHandler) -> Action {
+    Action::CallLlm {
+        llm: "claude".to_string(),
+        format: None,
+        id: id.to_string(),
+        request: request_with(vec![]),
+        stream: false,
+        retry: RetryPolicy::no_retry(),
+        handler,
+    }
+}
+
+fn llm_response(content: &str) -> LlmResponse {
+    LlmResponse {
+        model: "test-model".to_string(),
+        content: Some(content.to_string()),
+        tool_calls: vec![],
+        finish_reason: Some("stop".to_string()),
+        usage: None,
+        cost: None,
+        images: vec![],
+        reasoning: None,
+    }
+}
+
+fn request_llm(agg: &mut Session, id: &str, handler: LlmHandler) -> Vec<EventPayload> {
+    dispatch(
+        agg,
+        CommandPayload::RequestLlmCall {
+            llm: "claude".to_string(),
+            call_id: id.to_string(),
+            request: request_with(vec![]),
+            stream: false,
+            retry: RetryPolicy::no_retry(),
+            handler,
+            format: None,
+        },
+        &system(),
+    )
+}
+
+fn complete_llm(agg: &mut Session, id: &str, attempt: u32, caller: &Caller) -> Vec<EventPayload> {
+    dispatch(
+        agg,
+        CommandPayload::settle(
+            EffectKind::LlmCall,
+            id.to_string(),
+            Some(attempt),
+            Outcome::Llm(Box::new(llm_response("ok"))),
+        ),
+        caller,
+    )
+}
+
+fn submit_decision_with(agg: &mut Session, actions: Vec<Action>) -> Vec<EventPayload> {
+    let setup = dispatch(
+        agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: node_msg("seed", Role::User, "seed"),
+                stream: false,
+            }),
+            turn: TurnTarget::Detached,
+            queue: QueueMode::Refuse,
+        },
+        &system(),
+    );
+    let decision_id = setup
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionDispatched(p) => Some(p.id.clone()),
+            _ => None,
+        })
+        .expect("user message opens a decision");
+    dispatch(
+        agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id,
+            transcript: vec![],
+            actions,
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    )
+}
+
+fn fired_llm_execute(events: &[EventPayload]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    events
+        .iter()
+        .filter_map(|e| {
+            let (decision_id, trigger) = match e {
+                EventPayload::DecisionQueued(p) => (&p.id, &p.trigger),
+                _ => return None,
+            };
+            match trigger {
+                Trigger::LlmExecute { id, .. } if seen.insert(decision_id.clone()) => {
+                    Some(id.clone())
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+fn settled_llm_ids(events: &[EventPayload]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    events
+        .iter()
+        .filter_map(|e| {
+            let (decision_id, trigger) = match e {
+                EventPayload::DecisionQueued(p) => (&p.id, &p.trigger),
+                _ => return None,
+            };
+            match trigger {
+                Trigger::LlmFinished { id, .. } if seen.insert(decision_id.clone()) => {
+                    Some(id.clone())
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn two_server_llm_calls_in_one_decision_both_issue() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let events = submit_decision_with(
+        &mut agg,
+        vec![
+            call_llm_action("llm-1", LlmHandler::Server),
+            call_llm_action("llm-2", LlmHandler::Server),
+        ],
+    );
+    let requested: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            EventPayload::LlmCallRequested(r) => Some(r.id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        requested,
+        vec!["llm-1".to_string(), "llm-2".to_string()],
+        "both calls issue — the single-pending gate is gone; got {events:?}"
+    );
+    assert_eq!(agg.state.effects_of(EffectKind::LlmCall).count(), 2);
+    assert!(agg
+        .state
+        .effects_of(EffectKind::LlmCall)
+        .all(|c| c.tracking.status() == EffectStatus::Pending));
+    assert_eq!(agg.state.effects().len(), 2, "both in flight");
+}
+
+#[test]
+fn worker_handled_llm_fanout_delegates_both_executes() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let events = submit_decision_with(
+        &mut agg,
+        vec![
+            call_llm_action("llm-1", LlmHandler::Worker),
+            call_llm_action("llm-2", LlmHandler::Worker),
+        ],
+    );
+    let mut execs = fired_llm_execute(&events);
+    execs.sort();
+    assert_eq!(
+        execs,
+        vec!["llm-1".to_string(), "llm-2".to_string()],
+        "each worker-handled call delegates an llm.execute; got {events:?}"
+    );
+    assert_eq!(agg.state.effects().len(), 2);
+}
+
+#[test]
+fn reverse_order_llm_completion_settles_independently() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    request_llm(&mut agg, "llm-1", LlmHandler::Server);
+    request_llm(&mut agg, "llm-2", LlmHandler::Server);
+    assert_eq!(agg.state.effects().len(), 2);
+
+    let e2 = complete_llm(&mut agg, "llm-2", 0, &system());
+    assert!(settled_llm_ids(&e2).contains(&"llm-2".to_string()));
+    let remaining: Vec<String> = agg.state.effects().iter().map(|e| e.id.clone()).collect();
+    assert_eq!(
+        remaining,
+        vec!["llm-1".to_string()],
+        "only the unsettled call remains in flight"
+    );
+
+    let e1 = complete_llm(&mut agg, "llm-1", 0, &system());
+    assert!(settled_llm_ids(&e1).contains(&"llm-1".to_string()));
+    assert!(agg.state.effects().is_empty());
+}
+
+#[test]
+fn re_requesting_a_completed_llm_id_noops() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    request_llm(&mut agg, "llm-1", LlmHandler::Server);
+    complete_llm(&mut agg, "llm-1", 0, &system());
+    let again = request_llm(&mut agg, "llm-1", LlmHandler::Server);
+    assert!(
+        again.is_empty(),
+        "re-request of a Completed id is an idempotent no-op; got {again:?}"
+    );
+}
+
+#[test]
+fn llm_and_tool_with_the_same_id_coexist() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    request_client_tool(&mut agg, "shared");
+    request_llm(&mut agg, "shared", LlmHandler::Server);
+    assert!(agg.state.has_effect(EffectKind::ToolCall, "shared"));
+    assert!(agg.state.has_effect(EffectKind::LlmCall, "shared"));
+    assert_eq!(
+        agg.state.effects().len(),
+        2,
+        "distinct maps keep a tool and an llm call with the same id apart"
+    );
+}
+
+#[test]
+fn reissue_llm_after_interrupt_with_the_same_id() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    request_llm(&mut agg, "llm-1", LlmHandler::Server);
+    dispatch(
+        &mut agg,
+        CommandPayload::Interrupt {
+            interrupt_id: "int-1".to_string(),
+            reason: String::new(),
+            payload: serde_json::Value::Null,
+        },
+        &system(),
+    );
+    assert_eq!(
+        agg.state
+            .effect(EffectKind::LlmCall, "llm-1")
+            .unwrap()
+            .tracking
+            .status(),
+        EffectStatus::Failed,
+        "interrupt voids the pending call"
+    );
+    dispatch(
+        &mut agg,
+        CommandPayload::ResumeInterrupt {
+            interrupt_id: "int-1".to_string(),
+            payload: serde_json::Value::Null,
+        },
+        &system(),
+    );
+    let events = request_llm(&mut agg, "llm-1", LlmHandler::Server);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::LlmCallRequested(_))),
+        "a Failed id re-issues on the same key; got {events:?}"
+    );
+    assert_eq!(
+        agg.state
+            .effect(EffectKind::LlmCall, "llm-1")
+            .unwrap()
+            .tracking
+            .status(),
+        EffectStatus::Pending
+    );
+}
+
+#[test]
+fn machine_settles_worker_handled_llm_call() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    request_llm(&mut agg, "llm-1", LlmHandler::Worker);
+    let events = complete_llm(&mut agg, "llm-1", 0, &machine());
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, EventPayload::LlmCallCompleted(_))));
+    assert!(settled_llm_ids(&events).contains(&"llm-1".to_string()));
+    assert_eq!(
+        agg.state
+            .effect(EffectKind::LlmCall, "llm-1")
+            .unwrap()
+            .tracking
+            .status(),
+        EffectStatus::Completed
+    );
+}
+
+#[test]
+fn machine_fails_worker_handled_llm_call() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    request_llm(&mut agg, "llm-1", LlmHandler::Worker);
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::LlmCall,
+            "llm-1".to_string(),
+            Some(0),
+            SettleError::new(ErrorInfo::internal("boom".to_string()), false),
+        ),
+        &machine(),
+    );
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, EventPayload::LlmCallErrored(_))));
+    assert!(
+        settled_llm_ids(&events).contains(&"llm-1".to_string()),
+        "no-retry failure settles the call; got {events:?}"
+    );
+}
+
+#[test]
+fn machine_cannot_settle_engine_handled_llm_call() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    request_llm(&mut agg, "llm-1", LlmHandler::Server);
+    let err = agg
+        .try_handle(
+            CommandPayload::settle(
+                EffectKind::LlmCall,
+                "llm-1".to_string(),
+                Some(0),
+                Outcome::Llm(Box::new(llm_response("hi"))),
+            ),
+            &machine(),
+        )
+        .expect_err("an engine-handled call is not the machine's to settle");
+    assert!(
+        matches!(err, SessionError::EffectWrongHandler),
+        "expected EffectWrongHandler; got {err:?}"
+    );
+}
+
+#[test]
+fn machine_wrong_attempt_on_worker_llm_is_mismatch() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    request_llm(&mut agg, "llm-1", LlmHandler::Worker);
+    let err = agg
+        .try_handle(
+            CommandPayload::settle(
+                EffectKind::LlmCall,
+                "llm-1".to_string(),
+                Some(7),
+                Outcome::Llm(Box::new(llm_response("hi"))),
+            ),
+            &machine(),
+        )
+        .expect_err("a stale attempt is a mismatch");
+    assert!(
+        matches!(err, SessionError::EffectAttemptMismatch),
+        "expected EffectAttemptMismatch; got {err:?}"
+    );
+}
+
+#[test]
+fn machine_settle_of_unknown_llm_is_not_found() {
+    let agg = create_session("sess-1", "tenant-a", "user-1");
+    let err = agg
+        .try_handle(
+            CommandPayload::settle(
+                EffectKind::LlmCall,
+                "nope".to_string(),
+                Some(0),
+                Outcome::Llm(Box::new(llm_response("hi"))),
+            ),
+            &machine(),
+        )
+        .expect_err("unknown effect");
+    assert!(
+        matches!(err, SessionError::EffectNotFound),
+        "expected EffectNotFound; got {err:?}"
+    );
+}
+
+#[test]
+fn system_duplicate_llm_completion_is_silent_noop() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    request_llm(&mut agg, "llm-1", LlmHandler::Server);
+    complete_llm(&mut agg, "llm-1", 0, &system());
+    let again = complete_llm(&mut agg, "llm-1", 0, &system());
+    assert!(
+        again.is_empty(),
+        "a duplicate executor completion stays a silent no-op; got {again:?}"
+    );
+}
+
+#[test]
+fn done_then_late_llm_completion_still_settles() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    request_llm(&mut agg, "llm-1", LlmHandler::Server);
+    dispatch(
+        &mut agg,
+        CommandPayload::FinishTurn {
+            data: serde_json::Value::Null,
+        },
+        &system(),
+    );
+    let events = complete_llm(&mut agg, "llm-1", 0, &system());
+    assert!(
+        settled_llm_ids(&events).contains(&"llm-1".to_string()),
+        "a late settle after done still fires a decision; got {events:?}"
+    );
+}
+
+fn create_session_with_retry(retry: RetryPolicy) -> Session {
+    let mut agg = Session::with_state(
+        "sess-1".to_string(),
+        "tenant-a".to_string(),
+        SessionState::new("sess-1".to_string()),
+    );
+    dispatch(
+        &mut agg,
+        CommandPayload::CreateSession {
+            agent_id: "agent-1".to_string(),
+            owner: SessionOwner {
+                tenant_id: "tenant-a".to_string(),
+                requester: Requester::new(
+                    Subject::new(Issuer::app(), "user-1".to_string()),
+                    Default::default(),
+                ),
+                metadata: HashMap::new(),
+            },
+            ancestry: vec![],
+            worker_retry: retry,
+            agent: None,
+            worker: None,
+            events: None,
+            state: None,
+        },
+        &system(),
+    );
+    drain_session_start(&mut agg);
+    agg
+}
+
+fn drive_turn_done(agg: &mut Session, turn_id: &str, data: serde_json::Value) -> Vec<EventPayload> {
+    let setup = dispatch(
+        agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: node_msg("seed", Role::User, "seed"),
+                stream: false,
+            }),
+            turn: TurnTarget::Open(turn_id.to_string()),
+            queue: QueueMode::Refuse,
+        },
+        &system(),
+    );
+    let d = decision_with(&setup, |t| matches!(t, Trigger::ClientMessage { .. }))
+        .expect("client message opens a decision");
+    dispatch(
+        agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: d,
+            transcript: vec![],
+            actions: vec![Action::Done { data }],
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    )
+}
+
+fn turn_finished_decision(events: &[EventPayload]) -> Option<String> {
+    decision_with(events, |t| matches!(t, Trigger::TurnFinished { .. }))
+}
+
+fn has_session_done(events: &[EventPayload]) -> bool {
+    events
+        .iter()
+        .any(|e| matches!(e, EventPayload::SessionDone(_)))
+}
+
+fn turn_completed(events: &[EventPayload]) -> Option<&TurnCompleted> {
+    events.iter().find_map(|e| match e {
+        EventPayload::TurnCompleted(tc) => Some(tc),
+        _ => None,
+    })
+}
+
+#[test]
+fn turn_finished_notifies_worker_and_defers_completion() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let events = drive_turn_done(&mut agg, "t1", serde_json::json!("answer"));
+
+    assert!(
+        turn_completed(&events).is_none(),
+        "pass 1 does not complete the turn; got {events:?}"
+    );
+    assert!(
+        !has_session_done(&events),
+        "SessionDone is deferred; got {events:?}"
+    );
+    let queued = events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionQueued(p) => match &p.trigger {
+                Trigger::TurnFinished { turn_id, data, .. } => {
+                    Some((p.id.clone(), turn_id.clone(), data.clone()))
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("turn.finished is queued");
+    assert_eq!(queued.1, "t1");
+    assert_eq!(queued.2, serde_json::json!("answer"), "carries turn output");
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            EventPayload::DecisionDispatched(w) if w.id == queued.0
+        )),
+        "the deferred decision is promoted; got {events:?}"
+    );
+    let f = agg.state.phase.finalizing().expect("finalizing set");
+    assert_eq!(f.turn_id, "t1");
+    assert_eq!(f.data, serde_json::json!("answer"));
+}
+
+#[test]
+fn a_submit_during_an_active_turn_is_refused() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let setup = dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: node_msg("u1", Role::User, "hi"),
+                stream: false,
+            }),
+            turn: TurnTarget::Open("t1".to_string()),
+            queue: QueueMode::Refuse,
+        },
+        &system(),
+    );
+    let d = decision_with(&setup, |t| matches!(t, Trigger::ClientMessage { .. })).unwrap();
+    dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: d,
+            transcript: vec![node_msg("u1", Role::User, "hi")],
+            actions: vec![call_llm_action("call-1", LlmHandler::Server)],
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    );
+
+    let err = agg
+        .handle(
+            CommandPayload::SubmitClientPayload {
+                payload: ClientPayload::Message(ClientMessage {
+                    message: node_msg("u2", Role::User, "actually, stop"),
+                    stream: false,
+                }),
+                turn: TurnTarget::Open("t2".to_string()),
+                queue: QueueMode::Refuse,
+            },
+            &system(),
+            Utc::now(),
+        )
+        .expect_err("a second turn cannot open over a running one");
+    assert!(
+        matches!(err, SessionError::TurnAlreadyActive { ref turn_id } if turn_id == "t1"),
+        "the caller is told which turn holds the session; got {err:?}"
+    );
+    assert_eq!(
+        agg.state.phase.turn_id(),
+        Some("t1"),
+        "t1 keeps the session"
+    );
+    assert_eq!(
+        agg.state
+            .tracking(EffectKind::LlmCall, "call-1")
+            .map(|t| t.status()),
+        Some(EffectStatus::Pending),
+        "and its work is untouched"
+    );
+}
+
+#[test]
+fn a_new_turn_completes_the_finalizing_one_first() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    drive_turn_done(&mut agg, "t1", serde_json::json!("answer"));
+    assert_eq!(
+        agg.state.phase.finalizing().map(|f| f.turn_id.as_str()),
+        Some("t1"),
+        "t1 is waiting on its finalizer"
+    );
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: node_msg("next", Role::User, "next"),
+                stream: false,
+            }),
+            turn: TurnTarget::Open("t2".to_string()),
+            queue: QueueMode::Refuse,
+        },
+        &system(),
+    );
+
+    let completed = turn_completed(&events).expect("t1 gets its terminal");
+    assert_eq!(completed.turn_id, "t1");
+    assert_eq!(completed.data, serde_json::json!("answer"), "frozen output");
+    let ended = events
+        .iter()
+        .position(|e| matches!(e, EventPayload::TurnCompleted(_)))
+        .expect("t1 ends");
+    let started = events
+        .iter()
+        .position(|e| matches!(e, EventPayload::TurnStarted(t) if t.turn_id == "t2"))
+        .expect("t2 starts");
+    assert!(
+        ended < started,
+        "the old turn closes before the new one opens"
+    );
+    assert_eq!(agg.state.phase.turn_id(), Some("t2"));
+    assert_eq!(agg.state.completed_turn_ids, vec!["t1".to_string()]);
+}
+
+#[test]
+fn a_continuing_submit_joins_the_running_turn() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let setup = dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: node_msg("u1", Role::User, "hi"),
+                stream: false,
+            }),
+            turn: TurnTarget::Open("t1".to_string()),
+            queue: QueueMode::Refuse,
+        },
+        &system(),
+    );
+    let d = decision_with(&setup, |t| matches!(t, Trigger::ClientMessage { .. })).unwrap();
+    dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: d,
+            transcript: vec![node_msg("u1", Role::User, "hi")],
+            actions: vec![call_llm_action("call-1", LlmHandler::Server)],
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    );
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: node_msg("u2", Role::User, "and also this"),
+                stream: false,
+            }),
+            turn: TurnTarget::Continue("t2".to_string()),
+            queue: QueueMode::Refuse,
+        },
+        &system(),
+    );
+
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, EventPayload::TurnStarted(_))),
+        "no second turn opens; got {events:?}"
+    );
+    assert!(
+        decision_with(&events, |t| matches!(t, Trigger::ClientMessage { .. })).is_some(),
+        "the input is still recorded and delivered; got {events:?}"
+    );
+    assert_eq!(
+        agg.state.phase.turn_id(),
+        Some("t1"),
+        "t1 keeps the session"
+    );
+    assert_eq!(agg.state.completed_turn_ids, Vec::<String>::new());
+}
+
+#[test]
+fn a_continuing_submit_opens_its_fallback_turn_when_none_is_running() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: node_msg("u1", Role::User, "hi"),
+                stream: false,
+            }),
+            turn: TurnTarget::Continue("t2".to_string()),
+            queue: QueueMode::Refuse,
+        },
+        &system(),
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::TurnStarted(t) if t.turn_id == "t2")),
+        "got {events:?}"
+    );
+    assert_eq!(agg.state.phase.turn_id(), Some("t2"));
+}
+
+#[test]
+fn turn_finished_echo_completes_the_turn() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let p1 = drive_turn_done(&mut agg, "t1", serde_json::json!("answer"));
+    let tf = turn_finished_decision(&p1).expect("turn.finished queued");
+
+    let p2 = dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: tf,
+            transcript: vec![],
+            actions: vec![Action::Done {
+                data: serde_json::Value::Null,
+            }],
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    );
+
+    let tc = turn_completed(&p2).expect("pass 2 completes the turn");
+    assert_eq!(tc.turn_id, "t1");
+    assert_eq!(
+        tc.data,
+        serde_json::json!("answer"),
+        "frozen output survives"
+    );
+    assert!(tc.error.is_none(), "a clean finalize is not an error");
+    assert_eq!(
+        p2.iter()
+            .filter(|e| matches!(e, EventPayload::TurnCompleted(_)))
+            .count(),
+        1,
+        "exactly one TurnCompleted; got {p2:?}"
+    );
+    assert!(has_session_done(&p2), "SessionDone follows; got {p2:?}");
+    assert!(
+        turn_finished_decision(&p2).is_none(),
+        "no new turn.finished queued; got {p2:?}"
+    );
+    assert_eq!(agg.state.completed_turn_ids.len(), 1);
+    assert!(agg.state.phase.finalizing().is_none(), "finalizing cleared");
+}
+
+#[test]
+fn turn_finished_settled_without_done_still_completes_the_turn() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let p1 = drive_turn_done(&mut agg, "t1", serde_json::json!("answer"));
+    let tf = turn_finished_decision(&p1).expect("turn.finished queued");
+
+    let p2 = dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: tf,
+            transcript: vec![],
+            actions: vec![],
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    );
+
+    let tc = turn_completed(&p2).expect("the settled finalizer completes the turn");
+    assert_eq!(tc.turn_id, "t1");
+    assert_eq!(tc.data, serde_json::json!("answer"));
+    assert!(tc.error.is_none());
+    assert!(has_session_done(&p2), "SessionDone follows; got {p2:?}");
+    assert!(agg.state.phase.finalizing().is_none(), "finalizing cleared");
+    assert!(
+        agg.state.schedule_queue.is_empty(),
+        "the TurnEnd entry is consumed"
+    );
+}
+
+#[test]
+fn turn_finished_worker_runs_side_effect_before_completion() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let p1 = drive_turn_done(&mut agg, "t1", serde_json::json!("answer"));
+    let tf = turn_finished_decision(&p1).expect("turn.finished queued");
+
+    let p2 = dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: tf,
+            transcript: vec![],
+            actions: vec![
+                call_llm_action("side-1", LlmHandler::Server),
+                Action::Done {
+                    data: serde_json::Value::Null,
+                },
+            ],
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    );
+
+    assert!(
+        p2.iter().any(|e| matches!(
+            e,
+            EventPayload::LlmCallRequested(r) if r.id == "side-1"
+        )),
+        "the side effect dispatches; got {p2:?}"
+    );
+    assert!(
+        turn_completed(&p2).is_some_and(|tc| tc.error.is_none()),
+        "the turn completes after the worker's own done; got {p2:?}"
+    );
+    assert!(has_session_done(&p2));
+}
+
+#[test]
+fn no_turn_completes_immediately() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let events = submit_decision_with(
+        &mut agg,
+        vec![Action::Done {
+            data: serde_json::Value::Null,
+        }],
+    );
+    assert!(
+        has_session_done(&events),
+        "a turn-less session goes straight to SessionDone; got {events:?}"
+    );
+    assert!(
+        turn_finished_decision(&events).is_none(),
+        "no turn.finished without a turn; got {events:?}"
+    );
+    assert!(
+        turn_completed(&events).is_none(),
+        "no TurnCompleted without a turn; got {events:?}"
+    );
+}
+
+#[test]
+fn turn_finished_terminal_failure_completes_as_failed_run() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let p1 = drive_turn_done(&mut agg, "t1", serde_json::json!("answer"));
+    let tf = turn_finished_decision(&p1).expect("turn.finished queued");
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::Decision,
+            tf.clone(),
+            None,
+            SettleError::new(ErrorInfo::internal("worker crashed".to_string()), false),
+        ),
+        &machine(),
+    );
+
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::DecisionErrored(_))),
+        "the finalizer errors; got {events:?}"
+    );
+    let tc = turn_completed(&events).expect("a failed finalizer still completes the turn");
+    assert_eq!(tc.turn_id, "t1");
+    assert_eq!(tc.data, serde_json::json!("answer"), "output stays durable");
+    assert_eq!(
+        tc.error.as_ref().map(|e| e.message.as_str()),
+        Some("worker crashed")
+    );
+    assert!(has_session_done(&events));
+    assert!(!agg.state.has_effect(EffectKind::Decision, &tf));
+    assert_eq!(agg.state.completed_turn_ids.len(), 1);
+    assert!(agg.state.phase.finalizing().is_none(), "finalizing cleared");
+}
+
+#[test]
+fn turn_finished_retryable_failure_does_not_complete() {
+    let mut agg = create_session_with_retry(RetryPolicy {
+        queue_timeout_secs: None,
+        run_timeout_secs: None,
+        total_timeout_secs: None,
+        max_attempts: 2,
+        backoff_base_secs: 1,
+        backoff_max_secs: 1,
+    });
+    let p1 = drive_turn_done(&mut agg, "t1", serde_json::json!("answer"));
+    let tf = turn_finished_decision(&p1).expect("turn.finished queued");
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::Decision,
+            tf.clone(),
+            None,
+            SettleError::new(ErrorInfo::internal("transient".to_string()), true),
+        ),
+        &machine(),
+    );
+
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::DecisionErrored(_))),
+        "the failure is recorded; got {events:?}"
+    );
+    assert!(
+        turn_completed(&events).is_none() && !has_session_done(&events),
+        "a retryable failure neither completes nor settles; got {events:?}"
+    );
+    assert_eq!(
+        agg.state
+            .tracking(EffectKind::Decision, &tf)
+            .map(|t| t.status()),
+        Some(EffectStatus::RetryScheduled),
+        "the finalizer is rescheduled for redelivery"
+    );
+    assert!(
+        agg.state.phase.finalizing().is_some(),
+        "still finalizing pending redelivery"
+    );
+}
+
+#[test]
+fn turn_finished_deadline_completes_when_exhausted() {
+    let mut agg = create_session_with_retry(RetryPolicy {
+        queue_timeout_secs: None,
+        run_timeout_secs: Some(60),
+        total_timeout_secs: None,
+        max_attempts: 0,
+        backoff_base_secs: 0,
+        backoff_max_secs: 0,
+    });
+    let p1 = drive_turn_done(&mut agg, "t1", serde_json::json!("answer"));
+    let tf = turn_finished_decision(&p1).expect("turn.finished queued");
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::Wake {
+            now: Utc::now() + chrono::Duration::hours(1),
+        },
+        &system(),
+    );
+
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            EventPayload::DecisionErrored(p) if p.id == tf
+        )),
+        "the timed-out finalizer errors; got {events:?}"
+    );
+    let tc = turn_completed(&events).expect("a terminal timeout completes the turn");
+    assert_eq!(
+        tc.error.as_ref().map(|e| e.message.as_str()),
+        Some("deadline exceeded")
+    );
+    assert!(has_session_done(&events));
+}
+
+use crate::protocol::{Issuer, Requester, Subject};
+use serde_json::json;
+
+fn open_decision(agg: &mut Session, text: &str) -> String {
+    let setup = dispatch(
+        agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: node_msg("", Role::User, text),
+                stream: false,
+            }),
+            turn: TurnTarget::Detached,
+            queue: QueueMode::Refuse,
+        },
+        &system(),
+    );
+    decision_with(&setup, |t| matches!(t, Trigger::ClientMessage { .. }))
+        .expect("user message opens a decision")
+}
+
+fn submit_state(
+    agg: &mut Session,
+    decision_id: String,
+    transcript: Vec<DraftMessage>,
+    state: Option<serde_json::Value>,
+) -> Vec<EventPayload> {
+    dispatch(
+        agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id,
+            transcript,
+            actions: vec![],
+            state: state.map(WorkerState::from),
+            agent: None,
+        },
+        &machine(),
+    )
+}
+
+fn state_updates(events: &[EventPayload]) -> Vec<&WorkerStateUpdated> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            EventPayload::WorkerStateUpdated(p) => Some(p),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn echoed_state_writes_nothing() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let d1 = open_decision(&mut agg, "hi");
+    let events = submit_state(
+        &mut agg,
+        d1,
+        vec![node_msg("u1", Role::User, "hi")],
+        Some(json!({"a": 1, "b": 2})),
+    );
+    assert_eq!(
+        state_updates(&events).len(),
+        1,
+        "the first write records a version; got {events:?}"
+    );
+
+    let d2 = open_decision(&mut agg, "again");
+    let events = submit_state(
+        &mut agg,
+        d2,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("u2", Role::User, "again"),
+        ],
+        Some(json!({"b": 2, "a": 1})),
+    );
+    assert!(
+        state_updates(&events).is_empty(),
+        "an echoed state writes nothing; got {events:?}"
+    );
+}
+
+#[test]
+fn null_valued_key_differs_from_absent_key() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let d1 = open_decision(&mut agg, "hi");
+    submit_state(
+        &mut agg,
+        d1,
+        vec![node_msg("u1", Role::User, "hi")],
+        Some(json!({})),
+    );
+    let d2 = open_decision(&mut agg, "again");
+    let events = submit_state(
+        &mut agg,
+        d2,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("u2", Role::User, "again"),
+        ],
+        Some(json!({"a": null})),
+    );
+    assert_eq!(
+        state_updates(&events).len(),
+        1,
+        "null is not absence; got {events:?}"
+    );
+}
+
+#[test]
+fn changed_state_anchors_at_the_post_reconcile_head() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let d1 = open_decision(&mut agg, "hi");
+    let events = submit_state(
+        &mut agg,
+        d1,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("a1", Role::Assistant, "hello"),
+        ],
+        Some(json!({"v": 1})),
+    );
+    let updates = state_updates(&events);
+    assert_eq!(updates.len(), 1);
+    assert_eq!(
+        updates[0].anchor.as_deref(),
+        Some("a1"),
+        "the version anchors to the last appended node"
+    );
+    assert_eq!(agg.state.at_head().resolve_state_for().0, json!({"v": 1}));
+}
+
+#[test]
+fn omitted_state_keeps_the_current_version() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let d1 = open_decision(&mut agg, "hi");
+    submit_state(
+        &mut agg,
+        d1,
+        vec![node_msg("u1", Role::User, "hi")],
+        Some(json!({"v": 1})),
+    );
+    let d2 = open_decision(&mut agg, "more");
+    let events = submit_state(
+        &mut agg,
+        d2,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("u2", Role::User, "more"),
+        ],
+        None,
+    );
+    assert!(state_updates(&events).is_empty());
+    assert_eq!(agg.state.at_head().resolve_state_for().0, json!({"v": 1}));
+}
+
+fn agent_updates(events: &[EventPayload]) -> Vec<&AgentConfigUpdated> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            EventPayload::AgentConfigUpdated(p) => Some(p),
+            _ => None,
+        })
+        .collect()
+}
+
+fn agent_config(model: &str) -> AgentConfig {
+    AgentConfig {
+        llm: Some("claude".to_string()),
+        model: model.to_string(),
+        system: None,
+        retry: None,
+        tools: Vec::new(),
+        subagents: Vec::new(),
+        max_subagent_depth: None,
+        subagent_tools: None,
+        mcp: Vec::new(),
+        defer_tools: None,
+        mcp_announce: Default::default(),
+        plugins: Vec::new(),
+        effort: None,
+        attachments: None,
+    }
+}
+
+fn submit_agent(
+    agg: &mut Session,
+    decision_id: String,
+    transcript: Vec<DraftMessage>,
+    agent: Option<AgentConfig>,
+) -> Vec<EventPayload> {
+    dispatch(
+        agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id,
+            transcript,
+            actions: vec![],
+            state: None,
+            agent,
+        },
+        &machine(),
+    )
+}
+
+fn connector_config(ids: &[&str]) -> AgentConfig {
+    AgentConfig {
+        mcp: ids
+            .iter()
+            .map(|id| McpServer {
+                id: id.to_string(),
+                tools: None,
+                auth_failure: Default::default(),
+                tool_sync_failure: Default::default(),
+                approve: Default::default(),
+            })
+            .collect(),
+        ..agent_config("m1")
+    }
+}
+
+fn remote_tool(name: &str) -> RemoteTool {
+    RemoteTool {
+        name: name.to_string(),
+        title: None,
+        description: "a remote tool".to_string(),
+        input: None,
+        output: None,
+        annotations: Default::default(),
+    }
+}
+
+fn sync_requests(events: &[EventPayload]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            EventPayload::ConnectorSyncRequested(p) => Some(p.path.tool_prefix()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn promotions(events: &[EventPayload]) -> Vec<&str> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            EventPayload::DecisionDispatched(p) => Some(p.id.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn settle_sync(agg: &mut Session, id: &str, tools: &[&str]) -> Vec<EventPayload> {
+    settle_sync_at(agg, &format!("mcp.{id}"), tools)
+}
+
+fn settle_sync_at(agg: &mut Session, written: &str, tools: &[&str]) -> Vec<EventPayload> {
+    let id = ConnectionPath::parse(written)
+        .expect("a path")
+        .tool_prefix();
+    dispatch(
+        agg,
+        CommandPayload::settle(
+            EffectKind::ConnectorSync,
+            written.to_string(),
+            None,
+            Outcome::Connector {
+                server: None,
+                prefix: Some(id.to_string()),
+                tools: tools.iter().map(|t| remote_tool(t)).collect(),
+                instructions: None,
+            },
+        ),
+        &system(),
+    )
+}
+
+fn session_with_connectors(ids: &[&str], tools: &[&str]) -> Session {
+    let mut agg =
+        create_session_with_config("sess-1", "tenant-a", "user-1", Some(connector_config(ids)));
+    for id in ids {
+        settle_sync(&mut agg, id, tools);
+    }
+    agg
+}
+
+#[test]
+fn declaring_a_connector_fetches_it_and_parks_the_turn() {
+    let mut agg = create_session_with_config(
+        "sess-1",
+        "tenant-a",
+        "user-1",
+        Some(connector_config(&["sentry"])),
+    );
+    assert!(
+        agg.state
+            .has_effect(EffectKind::ConnectorSync, "mcp.sentry"),
+        "the config write fetches the connection it names"
+    );
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: node_msg("", Role::User, "hi"),
+                stream: false,
+            }),
+            turn: TurnTarget::Detached,
+            queue: QueueMode::Refuse,
+        },
+        &system(),
+    );
+    assert!(
+        promotions(&events).is_empty(),
+        "a decision parks behind an unsettled fetch; got {events:?}"
+    );
+    assert_eq!(
+        agg.state.queued_decisions().len(),
+        1,
+        "the decision is queued, not lost"
+    );
+
+    let events = settle_sync(&mut agg, "sentry", &["search_issues"]);
+    assert_eq!(
+        promotions(&events).len(),
+        1,
+        "settling the fetch releases the parked decision; got {events:?}"
+    );
+}
+
+#[test]
+fn syncing_a_connection_again_revives_its_settled_failure() {
+    let mut agg = create_session_with_config(
+        "sess-1",
+        "tenant-a",
+        "user-1",
+        Some(connector_config(&["sentry"])),
+    );
+    dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::ConnectorSync,
+            "mcp.sentry".to_string(),
+            None,
+            SettleError::new(ErrorInfo::internal("401".to_string()), false)
+                .auth(Some(AuthNeed::Reauthorize)),
+        ),
+        &system(),
+    );
+    assert_eq!(
+        agg.state
+            .tracking(EffectKind::ConnectorSync, "mcp.sentry")
+            .map(|t| t.status()),
+        Some(EffectStatus::Failed),
+    );
+
+    let d = open_decision(&mut agg, "hi");
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: d,
+            transcript: vec![],
+            actions: vec![Action::SyncConnector {
+                path: ConnectionPath::Mcp("sentry".into()),
+            }],
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    );
+
+    assert_eq!(sync_requests(&events), ["sentry"]);
+    let tracking = agg
+        .state
+        .tracking(EffectKind::ConnectorSync, "mcp.sentry")
+        .expect("the same entry, re-armed");
+    assert_eq!(tracking.status(), EffectStatus::Pending);
+    assert_eq!(
+        tracking.retry.attempts, 0,
+        "the spent attempts were against a credential that has been replaced"
+    );
+
+    settle_sync(&mut agg, "sentry", &["search_issues"]);
+    assert!(
+        agg.state
+            .connector_sync(&ConnectionPath::Mcp("sentry".into()))
+            .is_some_and(|c| c.auth.is_none() && !c.tools.is_empty()),
+        "the offer lands and the connection is authorized again"
+    );
+}
+
+#[test]
+fn syncing_a_connection_again_clears_an_auth_failure_a_call_found() {
+    let mut agg = session_with_connectors(&["sentry"], &["search_issues"]);
+    let d = open_decision(&mut agg, "hi");
+    dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: d,
+            transcript: vec![node_msg("u1", Role::User, "hi")],
+            actions: vec![Action::CallTool {
+                id: "tc-1".to_string(),
+                name: "sentry__search_issues".to_string(),
+                arguments: "{}".to_string(),
+                retry: None,
+            }],
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    );
+    let failed = dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::ToolCall,
+            "tc-1".to_string(),
+            None,
+            SettleError::new(ErrorInfo::internal("401".to_string()), false)
+                .auth(Some(AuthNeed::Reauthorize)),
+        ),
+        &system(),
+    );
+    assert_eq!(
+        agg.state
+            .connector_sync(&ConnectionPath::Mcp("sentry".into()))
+            .and_then(|c| c.auth),
+        Some(AuthNeed::Reauthorize),
+        "the fetch is still Completed; only the credential died"
+    );
+
+    let d = decision_with(&failed, |t| matches!(t, Trigger::ToolFinished { .. }))
+        .expect("a failed call opens tool.finished");
+    dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: d,
+            transcript: vec![],
+            actions: vec![Action::SyncConnector {
+                path: ConnectionPath::Mcp("sentry".into()),
+            }],
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    );
+    settle_sync(&mut agg, "sentry", &["search_issues", "create_issue"]);
+
+    let sync = agg
+        .state
+        .connector_sync(&ConnectionPath::Mcp("sentry".into()))
+        .expect("still one entry");
+    assert_eq!(sync.auth, None, "the fetch that succeeded proves the fix");
+    assert_eq!(sync.tools.len(), 2, "and its offer replaces the old one");
+}
+
+#[test]
+fn syncing_a_connection_the_config_does_not_name_is_refused() {
+    let mut agg = session_with_connectors(&["sentry"], &["search_issues"]);
+    let d = open_decision(&mut agg, "hi");
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: d,
+            transcript: vec![],
+            actions: vec![Action::SyncConnector {
+                path: ConnectionPath::Mcp("linear".into()),
+            }],
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    );
+
+    assert!(sync_requests(&events).is_empty(), "got {events:?}");
+    assert!(!agg
+        .state
+        .has_effect(EffectKind::ConnectorSync, "mcp.linear"));
+}
+
+#[test]
+fn a_call_refused_for_its_credential_marks_the_connection_not_just_the_call() {
+    let mut agg = session_with_connectors(&["sentry"], &["search_issues"]);
+    let d = open_decision(&mut agg, "hi");
+    dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: d,
+            transcript: vec![node_msg("u1", Role::User, "hi")],
+            actions: vec![Action::CallTool {
+                id: "tc-1".to_string(),
+                name: "sentry__search_issues".to_string(),
+                arguments: "{}".to_string(),
+                retry: None,
+            }],
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    );
+    assert!(
+        agg.state
+            .connector_sync(&ConnectionPath::Mcp("sentry".into()))
+            .is_some_and(|c| c.auth.is_none()),
+        "the connection starts clean: its fetch succeeded"
+    );
+
+    dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::ToolCall,
+            "tc-1".to_string(),
+            None,
+            SettleError::new(
+                ErrorInfo::internal("connection rejected the credential (401)".to_string()),
+                false,
+            )
+            .auth(Some(AuthNeed::Reauthorize)),
+        ),
+        &system(),
+    );
+
+    assert_eq!(
+        agg.state
+            .connector_sync(&ConnectionPath::Mcp("sentry".into()))
+            .and_then(|c| c.auth),
+        Some(AuthNeed::Reauthorize),
+        "the connection now needs authorizing, however the call settled"
+    );
+}
+
+#[test]
+fn a_plain_call_failure_leaves_the_connection_authorized() {
+    let mut agg = session_with_connectors(&["sentry"], &["search_issues"]);
+    let d = open_decision(&mut agg, "hi");
+    dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: d,
+            transcript: vec![node_msg("u1", Role::User, "hi")],
+            actions: vec![Action::CallTool {
+                id: "tc-1".to_string(),
+                name: "sentry__search_issues".to_string(),
+                arguments: "{}".to_string(),
+                retry: None,
+            }],
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    );
+    dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::ToolCall,
+            "tc-1".to_string(),
+            None,
+            SettleError::new(ErrorInfo::internal("no such issue".to_string()), false).auth(None),
+        ),
+        &system(),
+    );
+
+    assert!(
+        agg.state
+            .connector_sync(&ConnectionPath::Mcp("sentry".into()))
+            .is_some_and(|c| c.auth.is_none()),
+        "a tool saying no is not the credential being refused"
+    );
+}
+
+#[test]
+fn work_started_beside_a_new_connector_queues_its_decision_rather_than_running_it() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let d = open_decision(&mut agg, "hi");
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: d,
+            transcript: vec![node_msg("u1", Role::User, "hi")],
+            actions: vec![Action::CallTool {
+                id: "tc-1".to_string(),
+                name: "get_time".to_string(),
+                arguments: "{}".to_string(),
+                retry: None,
+            }],
+            state: None,
+            agent: Some(connector_config(&["sentry"])),
+        },
+        &machine(),
+    );
+
+    assert_eq!(sync_requests(&events), ["sentry"]);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::DecisionQueued(_))),
+        "the tool.execute decision is created; got {events:?}"
+    );
+    assert!(
+        promotions(&events).is_empty(),
+        "but not promoted while the fetch is in flight; got {events:?}"
+    );
+    assert_eq!(
+        agg.state.queued_decisions().len(),
+        1,
+        "it waits in the queue"
+    );
+
+    let events = settle_sync(&mut agg, "sentry", &["search_issues"]);
+    assert_eq!(
+        promotions(&events).len(),
+        1,
+        "and runs once the offer lands; got {events:?}"
+    );
+}
+
+#[test]
+fn resuming_an_interrupt_still_waits_on_an_unsettled_fetch() {
+    let mut agg = create_session_with_config(
+        "sess-1",
+        "tenant-a",
+        "user-1",
+        Some(connector_config(&["sentry"])),
+    );
+    dispatch(
+        &mut agg,
+        CommandPayload::Interrupt {
+            interrupt_id: "int-1".to_string(),
+            reason: "hold".to_string(),
+            payload: serde_json::json!({}),
+        },
+        &machine(),
+    );
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::ResumeInterrupt {
+            interrupt_id: "int-1".to_string(),
+            payload: serde_json::json!({}),
+        },
+        &machine(),
+    );
+    assert!(
+        promotions(&events).is_empty(),
+        "an interrupt clearing does not release a turn the fetch still holds; got {events:?}"
+    );
+
+    let events = settle_sync(&mut agg, "sentry", &["search_issues"]);
+    assert_eq!(
+        promotions(&events).len(),
+        1,
+        "the fetch releases it; got {events:?}"
+    );
+}
+
+#[test]
+fn a_fetch_is_keyed_on_the_connection_not_the_agent_version() {
+    let mut agg = session_with_connectors(&["sentry"], &["search_issues"]);
+
+    let mut rewritten = connector_config(&["sentry"]);
+    rewritten.tools.push(AgentTool {
+        name: "get_time".to_string(),
+        description: String::new(),
+        input: None,
+        output: None,
+        handler: None,
+        defer: None,
+    });
+    let d = open_decision(&mut agg, "hi");
+    let events = submit_agent(
+        &mut agg,
+        d,
+        vec![node_msg("u1", Role::User, "hi")],
+        Some(rewritten),
+    );
+    assert!(
+        sync_requests(&events).is_empty(),
+        "an unrelated config rewrite refetches nothing; got {events:?}"
+    );
+
+    let d = open_decision(&mut agg, "again");
+    let events = submit_agent(
+        &mut agg,
+        d,
+        vec![node_msg("u2", Role::User, "again")],
+        Some(connector_config(&["sentry", "github"])),
+    );
+    assert_eq!(
+        sync_requests(&events),
+        ["github"],
+        "only the connection that was never fetched; got {events:?}"
+    );
+}
+
+#[test]
+fn a_terminally_failed_fetch_releases_the_turn_rather_than_parking_it() {
+    let mut agg = create_session_with_config(
+        "sess-1",
+        "tenant-a",
+        "user-1",
+        Some(connector_config(&["sentry"])),
+    );
+    dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: node_msg("", Role::User, "hi"),
+                stream: false,
+            }),
+            turn: TurnTarget::Detached,
+            queue: QueueMode::Refuse,
+        },
+        &system(),
+    );
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::ConnectorSync,
+            "mcp.sentry".to_string(),
+            None,
+            SettleError::new(ErrorInfo::internal("connection refused".to_string()), false)
+                .auth(None),
+        ),
+        &system(),
+    );
+    assert_eq!(
+        promotions(&events).len(),
+        1,
+        "an unreachable connector unblocks the worker to decide; got {events:?}"
+    );
+    assert!(
+        !agg.state.at_head().has_pending_connector_sync(),
+        "a terminal failure is settled, so it parks nothing further"
+    );
+    assert!(
+        agg.state.at_head().connector_tools().tools.is_empty(),
+        "a failed fetch contributes no tools"
+    );
+}
+
+#[test]
+fn a_retryable_failure_keeps_parking_until_it_is_exhausted() {
+    let mut agg = create_session_with_config(
+        "sess-1",
+        "tenant-a",
+        "user-1",
+        Some(connector_config(&["sentry"])),
+    );
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::ConnectorSync,
+            "mcp.sentry".to_string(),
+            None,
+            SettleError::new(ErrorInfo::internal("503".to_string()), true).auth(None),
+        ),
+        &system(),
+    );
+    assert!(
+        promotions(&events).is_empty(),
+        "a retry is still unsettled, so it still parks; got {events:?}"
+    );
+    assert!(agg.state.at_head().has_pending_connector_sync());
+    assert!(
+        super::schedule::wake_at(&agg.state, Utc::now()).is_some(),
+        "the retry is scheduled, so the session wakes for it"
+    );
+}
+
+#[test]
+fn a_hung_fetch_times_out_rather_than_parking_the_session_forever() {
+    let agg = create_session_with_config(
+        "sess-1",
+        "tenant-a",
+        "user-1",
+        Some(connector_config(&["sentry"])),
+    );
+    let deadline = agg
+        .state
+        .tracking(EffectKind::ConnectorSync, "mcp.sentry")
+        .and_then(|t| t.deadline)
+        .expect("a fetch is bounded");
+    let events = agg
+        .try_handle(
+            CommandPayload::Wake {
+                now: deadline + chrono::Duration::seconds(1),
+            },
+            &system(),
+        )
+        .expect("wake");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::ConnectorSyncErrored(_))),
+        "a fetch past its deadline fails; got {events:?}"
+    );
+}
+
+#[test]
+fn connector_tools_reach_the_model_and_route_to_the_engine() {
+    let mut agg = session_with_connectors(&["sentry"], &["search_issues"]);
+
+    assert_eq!(
+        agg.state.tool_handler_for("sentry__search_issues"),
+        ToolHandler::Server,
+        "a connector-resolved name runs on the engine"
+    );
+    assert_eq!(
+        agg.state.tool_handler_for("something_else"),
+        ToolHandler::Worker,
+        "an undeclared name still gets its contract error on the worker"
+    );
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::RequestLlmCall {
+            llm: "claude".to_string(),
+            call_id: "call-1".to_string(),
+            request: LlmRequest {
+                model: "m1".to_string(),
+                messages: vec![],
+                tools: Some(vec![]),
+                temperature: None,
+                max_completion_tokens: None,
+                reasoning: None,
+            },
+            stream: false,
+            retry: RetryPolicy::no_retry(),
+            handler: LlmHandler::Server,
+            format: None,
+        },
+        &system(),
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::LlmCallDispatched(_))),
+        "the call dispatches; got {events:?}"
+    );
+    let offered: Vec<String> = agg
+        .state
+        .llm_call("call-1")
+        .unwrap()
+        .spec
+        .tools
+        .clone()
+        .expect("tools offered")
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert_eq!(
+        offered,
+        ["sentry__search_issues"],
+        "the engine adds the connector's tools, which no worker could name"
+    );
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::RequestToolCall {
+            tool_call_id: "tc-1".to_string(),
+            name: "sentry__search_issues".to_string(),
+            arguments: "{}".to_string(),
+            retry: None,
+        },
+        &system(),
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, EventPayload::DecisionQueued(_))),
+        "the engine executes it; the worker is not asked to; got {events:?}"
+    );
+    assert_eq!(
+        agg.state.tool_call("tc-1").unwrap().handler,
+        ToolHandler::Server,
+        "the handler is frozen onto the call"
+    );
+}
+
+fn searching_connector_config(ids: &[&str]) -> AgentConfig {
+    AgentConfig {
+        mcp: ids
+            .iter()
+            .map(|id| McpServer {
+                id: id.to_string(),
+                tools: Some(McpTools {
+                    defer: Some(true),
+                    ..Default::default()
+                }),
+                auth_failure: Default::default(),
+                tool_sync_failure: Default::default(),
+                approve: Default::default(),
+            })
+            .collect(),
+        ..agent_config("m1")
+    }
+}
+
+fn session_with_searched_connector(id: &str, tools: &[&str]) -> Session {
+    let mut agg = create_session_with_config(
+        "sess-1",
+        "tenant-a",
+        "user-1",
+        Some(searching_connector_config(&[id])),
+    );
+    settle_sync(&mut agg, id, tools);
+    agg
+}
+
+fn offered(agg: &Session) -> Vec<String> {
+    agg.state
+        .at(None)
+        .connector_tools()
+        .tools
+        .into_iter()
+        .filter(|t| !t.defer)
+        .map(|t| t.name)
+        .collect()
+}
+
+fn held(agg: &Session) -> Vec<String> {
+    agg.state
+        .at(None)
+        .connector_tools()
+        .tools
+        .into_iter()
+        .map(|t| t.name)
+        .collect()
+}
+
+fn call(agg: &mut Session, id: &str, name: &str, arguments: &str) -> Vec<EventPayload> {
+    dispatch(
+        agg,
+        CommandPayload::RequestToolCall {
+            tool_call_id: id.to_string(),
+            name: name.to_string(),
+            arguments: arguments.to_string(),
+            retry: None,
+        },
+        &system(),
+    )
+}
+
+#[test]
+fn a_search_answers_at_the_anchor_of_the_call() {
+    let mut agg = session_with_searched_connector("sentry", &["search_issues"]);
+    call(&mut agg, "tc-1", "tool_search", r#"{"query":"issues"}"#);
+
+    let ctx = CommitContext {
+        span: SpanContext::root(),
+        occurred_at: Utc::now(),
+    };
+    agg.commit(
+        vec![EventPayload::NewMessage(NewMessage {
+            message: node_msg("u9", Role::User, "later").record(&crate::ids::Ids::new(
+                "t",
+                0,
+                Utc::now(),
+            )),
+            parent_id: agg.state.head_id.clone(),
+            copied_from: None,
+        })],
+        &ctx,
+    );
+    agg.commit(
+        vec![EventPayload::AgentConfigUpdated(AgentConfigUpdated {
+            config: AgentConfig {
+                mcp: vec![],
+                ..searching_connector_config(&["sentry"])
+            },
+            anchor: agg.state.head_id.clone(),
+        })],
+        &ctx,
+    );
+    assert!(
+        agg.state.at_head().searchable_tools().is_empty(),
+        "the head has dropped the connection, so a new call would find nothing"
+    );
+
+    let settled = agg
+        .state
+        .local_connector_answer("tc-1")
+        .expect("the engine answers this one");
+    assert!(!settled.is_error, "a find is a result");
+    let result = settled.as_text();
+    let answer: serde_json::Value = serde_json::from_str(&result).expect("json");
+    assert_eq!(
+        answer["tools"][0]["name"], "sentry__search_issues",
+        "the call is anchored where the connection existed, and answers from there"
+    );
+}
+
+#[test]
+fn a_connection_is_announced_once_in_the_system_prefix() {
+    let mut agg = session_with_searched_connector("sentry", &["search_issues"]);
+    let call = |agg: &mut Session, id: &str| {
+        dispatch(
+            agg,
+            CommandPayload::RequestLlmCall {
+                llm: "claude".to_string(),
+                call_id: id.to_string(),
+                request: request_with(vec![]),
+                stream: false,
+                retry: RetryPolicy::no_retry(),
+                handler: LlmHandler::Server,
+                format: None,
+            },
+            &system(),
+        );
+        agg.state.llm_call(id).unwrap().prompt.clone()
+    };
+
+    let first = call(&mut agg, "call-1");
+    let notice = first.first().expect("the prompt carries the notice");
+    assert_eq!(
+        notice.role,
+        Role::System,
+        "no request has committed the prefix yet, so the free place is still open"
+    );
+    let text = match notice.content.as_ref().expect("content") {
+        Content::Text(t) => t.clone(),
+        _ => panic!("a notice is text"),
+    };
+    assert!(
+        text.starts_with("{\"mcp_server\":\"mcp.sentry\""),
+        "the name leads: a server's own words can be long, and a label after them \
+         is not a label: {text}"
+    );
+    assert!(text.contains("\"tools\":1"), "and how many it has: {text}");
+
+    let second = call(&mut agg, "call-2");
+    assert!(
+        second.is_empty(),
+        "a server is announced once, and the record is on the earlier call: {second:?}"
+    );
+}
+
+#[test]
+fn announce_never_says_nothing() {
+    let mut agg = create_session_with_config(
+        "sess-1",
+        "tenant-a",
+        "user-1",
+        Some(AgentConfig {
+            mcp_announce: McpAnnounce::Never,
+            ..searching_connector_config(&["sentry"])
+        }),
+    );
+    settle_sync(&mut agg, "sentry", &["search_issues"]);
+    dispatch(
+        &mut agg,
+        CommandPayload::RequestLlmCall {
+            llm: "claude".to_string(),
+            call_id: "call-1".to_string(),
+            request: request_with(vec![]),
+            stream: false,
+            retry: RetryPolicy::no_retry(),
+            handler: LlmHandler::Server,
+            format: None,
+        },
+        &system(),
+    );
+    assert!(
+        agg.state.llm_call("call-1").unwrap().prompt.is_empty(),
+        "the engine adds nothing"
+    );
+}
+
+#[test]
+fn a_searched_connector_offers_two_tools_however_many_it_has() {
+    let mut agg =
+        session_with_searched_connector("sentry", &["search_issues", "get_issue", "resolve_issue"]);
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::RequestLlmCall {
+            llm: "claude".to_string(),
+            call_id: "call-1".to_string(),
+            request: LlmRequest {
+                model: "m1".to_string(),
+                messages: vec![],
+                tools: Some(vec![]),
+                temperature: None,
+                max_completion_tokens: None,
+                reasoning: None,
+            },
+            stream: false,
+            retry: RetryPolicy::no_retry(),
+            handler: LlmHandler::Server,
+            format: None,
+        },
+        &system(),
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::LlmCallDispatched(_))),
+        "the call dispatches; got {events:?}"
+    );
+    let spec = agg.state.llm_call("call-1").unwrap().spec.clone();
+    let carried: Vec<String> = spec
+        .tools
+        .as_ref()
+        .expect("tools offered")
+        .iter()
+        .filter(|t| !t.defer)
+        .map(|t| t.name.clone())
+        .collect();
+    assert_eq!(
+        carried,
+        ["tool_search", "call_tool"],
+        "four tools cost the request two definitions, and thirty would cost the same two"
+    );
+    assert_eq!(
+        spec.tools.as_ref().unwrap().len(),
+        5,
+        "the engine still holds each one; only the request leaves them out"
+    );
+    assert_eq!(
+        agg.state.tool_handler_for("tool_search"),
+        ToolHandler::Server,
+        "both are the engine's to run"
+    );
+}
+
+#[test]
+fn find_tools_is_answered_from_the_recorded_offer_without_the_connection() {
+    let mut agg = session_with_searched_connector("sentry", &["search_issues", "list_projects"]);
+    let events = call(&mut agg, "tc-1", "tool_search", r#"{"query":"issues"}"#);
+
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::ToolCallCompleted(c) if c.id == "tc-1")),
+        "the engine answers it in the same step; got {events:?}"
+    );
+
+    let settled = agg
+        .state
+        .local_connector_answer("tc-1")
+        .expect("the engine answers this one");
+    assert!(!settled.is_error, "a find is a result, not an error");
+    let result = settled.as_text();
+    let answer: serde_json::Value = serde_json::from_str(&result).expect("json");
+    assert_eq!(answer["tools"][0]["name"], "sentry__search_issues");
+    assert_eq!(answer["matched"], 1);
+    assert_eq!(
+        agg.state.tool_call("tc-1").unwrap().target,
+        Some(ConnectorTarget::Find),
+        "the route is frozen, so a config change cannot turn this into a remote call, \
+         and it stands for no tool on the connection"
+    );
+}
+
+#[test]
+fn call_tool_becomes_the_call_it_names() {
+    let mut agg = session_with_searched_connector("sentry", &["search_issues"]);
+    call(
+        &mut agg,
+        "tc-1",
+        "call_tool",
+        r#"{"name":"sentry__search_issues","arguments":{"q":"boom"}}"#,
+    );
+    let target = agg
+        .state
+        .tool_call("tc-1")
+        .unwrap()
+        .target
+        .clone()
+        .expect("a connector target");
+    assert_eq!(
+        target,
+        ConnectorTarget::Remote {
+            path: ConnectionPath::Mcp("sentry".into()),
+            remote_name: "search_issues".into(),
+        },
+        "a `call_tool` becomes the call it names, so nothing downstream sees a wrapper \
+         and the executor calls the tool the model named"
+    );
+    assert_eq!(
+        agg.state.tool_call("tc-1").unwrap().name,
+        "sentry__search_issues",
+        "the recorded call names the tool that ran, not the wrapper"
+    );
+    assert_eq!(
+        agg.state.tool_call("tc-1").unwrap().arguments,
+        r#"{"q":"boom"}"#,
+        "and carries that tool's own arguments"
+    );
+}
+
+#[test]
+fn call_tool_refuses_a_name_the_filter_removed_and_never_dials() {
+    let mut agg = create_session_with_config(
+        "sess-1",
+        "tenant-a",
+        "user-1",
+        Some(AgentConfig {
+            mcp: vec![McpServer {
+                id: "sentry".into(),
+                tools: Some(McpTools {
+                    exclude: vec!["resolve_*".to_string()],
+                    defer: Some(true),
+                    ..Default::default()
+                }),
+                auth_failure: Default::default(),
+                tool_sync_failure: Default::default(),
+                approve: Default::default(),
+            }],
+            ..agent_config("m1")
+        }),
+    );
+    settle_sync(&mut agg, "sentry", &["search_issues", "resolve_issue"]);
+
+    call(
+        &mut agg,
+        "tc-1",
+        "call_tool",
+        r#"{"name":"sentry__resolve_issue","arguments":{}}"#,
+    );
+    let settled = agg
+        .state
+        .local_connector_answer("tc-1")
+        .expect("the engine answers this one");
+    assert!(settled.is_error, "a refused name is an error, not a result");
+    let message = settled.as_text();
+    assert!(
+        message.contains("resolve_issue"),
+        "the message names what the model asked for: {message}"
+    );
+    assert!(
+        message.contains("search_issues"),
+        "and what it could have asked for: {message}"
+    );
+    assert_eq!(
+        agg.state.tool_call("tc-1").unwrap().target,
+        Some(ConnectorTarget::Call),
+        "a target naming no connection is what keeps the connection out of it"
+    );
+}
+
+fn subagent_cfg(defer: Option<bool>, prefix: Option<bool>) -> AgentConfig {
+    AgentConfig {
+        subagents: vec![crate::protocol::Subagent {
+            id: "helper".to_string(),
+            description: "Does the work.".to_string(),
+            defer,
+            prefix,
+            mode: None,
+        }],
+        ..agent_config("m1")
+    }
+}
+
+fn subagent_session(defer: Option<bool>, prefix: Option<bool>) -> Session {
+    create_session_with_config(
+        "sess-1",
+        "tenant-a",
+        "user-1",
+        Some(subagent_cfg(defer, prefix)),
+    )
+}
+
+#[test]
+fn a_subagent_is_offered_as_a_connector_tool() {
+    let agg = subagent_session(None, None);
+    assert_eq!(offered(&agg), ["helper", "subagent_wait"]);
+    let tools = agg.state.at(None).connector_tools().tools;
+    assert_eq!(tools[0].kind, crate::protocol::ConnectorToolKind::Subagent);
+    assert_eq!(
+        tools[0].connector,
+        Some(ConnectionPath::Agent("helper".into()))
+    );
+}
+
+#[test]
+fn a_deferred_subagent_is_held_and_costs_the_same_search_pair() {
+    let agg = subagent_session(Some(true), None);
+    assert_eq!(
+        offered(&agg),
+        ["subagent_wait", "tool_search", "call_tool"],
+        "a deferred subagent alone brings the pair"
+    );
+    assert!(
+        held(&agg).contains(&"helper".to_string()),
+        "the engine still holds the subagent tool"
+    );
+}
+
+#[test]
+fn a_session_at_the_depth_limit_holds_no_subagent_tools() {
+    let mut agg = subagent_session(None, None);
+    agg.state.ancestry = (0..5).map(|i| format!("p{i}")).collect();
+    assert!(held(&agg).is_empty(), "the default limit is 5");
+
+    let mut deferred = subagent_session(Some(true), None);
+    deferred.state.ancestry = (0..5).map(|i| format!("p{i}")).collect();
+    assert!(
+        held(&deferred).is_empty(),
+        "at depth a deferred subagent brings no search pair either"
+    );
+}
+
+#[test]
+fn tool_search_finds_a_deferred_subagent() {
+    let mut agg = subagent_session(Some(true), None);
+    call(&mut agg, "tc-1", "tool_search", r#"{"query":"work"}"#);
+    let settled = agg
+        .state
+        .local_connector_answer("tc-1")
+        .expect("the engine answers this one");
+    let answer: serde_json::Value = serde_json::from_str(&settled.as_text()).expect("json");
+    assert_eq!(answer["tools"][0]["name"], "helper");
+    assert_eq!(
+        answer["tools"][0]["input"]["required"],
+        serde_json::json!(["message"]),
+        "the schema rides with the match, so the model can call it"
+    );
+}
+
+#[test]
+fn call_tool_faults_read_a_subagents_message_schema() {
+    let agg = subagent_session(Some(true), None);
+    let fault = agg
+        .state
+        .at_head()
+        .call_tool_fault(r#"{"name":"helper","arguments":{"question":"x"}}"#)
+        .expect("bad arguments fault");
+    assert!(
+        fault.contains("message"),
+        "the fault names the schema: {fault}"
+    );
+    assert!(
+        agg.state
+            .at_head()
+            .call_tool_fault(r#"{"name":"helper","arguments":{"message":"go"}}"#)
+            .is_none(),
+        "a valid subagent call is no fault"
+    );
+}
+
+#[test]
+fn a_direct_tool_call_on_a_subagent_name_stays_with_the_worker() {
+    let mut agg = subagent_session(None, None);
+    call(&mut agg, "tc-1", "helper", r#"{"message":"go"}"#);
+    let tc = agg.state.tool_call("tc-1").expect("recorded");
+    assert_eq!(
+        tc.handler,
+        ToolHandler::Worker,
+        "a subagent runs off a spawn, never a tool effect; the name stays the worker's"
+    );
+    assert!(tc.target.is_none());
+}
+
+#[test]
+fn a_subagent_and_an_unprefixed_connector_tool_both_lose_a_shared_name() {
+    let mut agg = create_session_with_config(
+        "sess-1",
+        "tenant-a",
+        "user-1",
+        Some(AgentConfig {
+            mcp: vec![McpServer {
+                id: "sentry".into(),
+                tools: None,
+                auth_failure: Default::default(),
+                tool_sync_failure: Default::default(),
+                approve: Default::default(),
+            }],
+            ..subagent_cfg(None, None)
+        }),
+    );
+    dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::ConnectorSync,
+            "mcp.sentry".to_string(),
+            None,
+            Outcome::Connector {
+                server: None,
+                prefix: None,
+                tools: vec![remote_tool("helper")],
+                instructions: None,
+            },
+        ),
+        &system(),
+    );
+    let merged = agg.state.at(None).connector_tools();
+    assert!(
+        merged.tools.iter().all(|t| t.name != "helper"),
+        "picking one of the two would route the model arbitrarily"
+    );
+    assert_eq!(merged.collisions, vec!["helper".to_string()]);
+}
+
+#[test]
+fn a_prefixed_subagent_dodges_the_collision() {
+    let agg = subagent_session(None, Some(true));
+    assert_eq!(offered(&agg), ["agent__helper", "subagent_wait"]);
+}
+
+#[test]
+fn two_searched_connections_share_one_pair_and_one_search() {
+    let mut agg = create_session_with_config(
+        "sess-1",
+        "tenant-a",
+        "user-1",
+        Some(searching_connector_config(&["sentry", "linear"])),
+    );
+    settle_sync(&mut agg, "sentry", &["list_projects"]);
+    settle_sync(&mut agg, "linear", &["search_issues"]);
+
+    assert_eq!(
+        offered(&agg),
+        ["tool_search", "call_tool"],
+        "two connections cost the same two definitions as one"
+    );
+
+    call(&mut agg, "tc-1", "tool_search", r#"{"query":"issues"}"#);
+    let settled = agg
+        .state
+        .local_connector_answer("tc-1")
+        .expect("the engine answers this one");
+    assert!(!settled.is_error, "a find is a result, not an error");
+    let result = settled.as_text();
+    let answer: serde_json::Value = serde_json::from_str(&result).expect("json");
+    assert_eq!(
+        answer["tools"][0]["name"], "linear__search_issues",
+        "one search reaches both connections, and the name says which holds the tool"
+    );
+    assert_eq!(
+        answer["searched"], 2,
+        "one search covers both connections, so neither needs its own"
+    );
+}
+
+#[test]
+fn a_connection_added_during_a_session_does_not_move_the_tool_list() {
+    let mut agg = session_with_searched_connector("sentry", &["list_projects"]);
+    let before = offered(&agg);
+    assert_eq!(before, ["tool_search", "call_tool"]);
+
+    let d = open_decision(&mut agg, "and now linear");
+    dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: d,
+            transcript: vec![node_msg("u2", Role::User, "and now linear")],
+            actions: vec![],
+            state: None,
+            agent: Some(searching_connector_config(&["sentry", "linear"])),
+        },
+        &machine(),
+    );
+    settle_sync(&mut agg, "linear", &["search_issues"]);
+
+    assert_eq!(
+        offered(&agg),
+        before,
+        "the definitions are identical, so the provider's cache holds"
+    );
+
+    call(&mut agg, "tc-9", "tool_search", r#"{"query":"issues"}"#);
+    let settled = agg
+        .state
+        .local_connector_answer("tc-9")
+        .expect("the engine answers this one");
+    assert!(!settled.is_error, "a find is a result");
+    let result = settled.as_text();
+    let answer: serde_json::Value = serde_json::from_str(&result).expect("json");
+    assert_eq!(
+        answer["tools"][0]["name"], "linear__search_issues",
+        "the new connection reaches the model through the answer, not the tool list"
+    );
+}
+
+#[test]
+fn a_search_covers_a_connection_that_lists_its_own_tools() {
+    let mut agg = create_session_with_config(
+        "sess-1",
+        "tenant-a",
+        "user-1",
+        Some(AgentConfig {
+            mcp: vec![
+                McpServer {
+                    id: "sentry".into(),
+                    tools: None,
+                    auth_failure: Default::default(),
+                    tool_sync_failure: Default::default(),
+                    approve: Default::default(),
+                },
+                McpServer {
+                    id: "aws".into(),
+                    tools: Some(McpTools {
+                        defer: Some(true),
+                        ..Default::default()
+                    }),
+                    auth_failure: Default::default(),
+                    tool_sync_failure: Default::default(),
+                    approve: Default::default(),
+                },
+            ],
+            ..agent_config("m1")
+        }),
+    );
+    settle_sync(&mut agg, "sentry", &["search_issues"]);
+    settle_sync(&mut agg, "aws", &["s3_list"]);
+
+    assert_eq!(
+        offered(&agg),
+        ["sentry__search_issues", "tool_search", "call_tool"],
+        "the listed connection keeps its own tools, beside the two"
+    );
+    assert!(
+        held(&agg).contains(&"aws__s3_list".to_string()),
+        "and the deferred one is still held, findable, and callable"
+    );
+
+    call(&mut agg, "tc-1", "tool_search", r#"{"query":"issues"}"#);
+    let settled = agg
+        .state
+        .local_connector_answer("tc-1")
+        .expect("the engine answers this one");
+    assert!(!settled.is_error, "a find is a result");
+    let result = settled.as_text();
+    let answer: serde_json::Value = serde_json::from_str(&result).expect("json");
+    assert_eq!(
+        answer["tools"][0]["name"], "sentry__search_issues",
+        "a search that skipped the listed connection would report an absence that is not real"
+    );
+    assert_eq!(
+        answer["searched"], 2,
+        "a search covers the agent, and not the deferred half of it"
+    );
+
+    call(
+        &mut agg,
+        "tc-2",
+        "call_tool",
+        r#"{"name":"sentry__search_issues","arguments":{}}"#,
+    );
+    let target = agg.state.tool_call("tc-2").unwrap().target.clone().unwrap();
+    assert_eq!(
+        target,
+        ConnectorTarget::Remote {
+            path: ConnectionPath::Mcp("sentry".into()),
+            remote_name: "search_issues".into(),
+        },
+        "a listed tool has two routes, and both work"
+    );
+}
+
+#[test]
+fn a_worker_tool_takes_a_search_name_and_the_other_half_survives() {
+    let mut agg = create_session_with_config(
+        "sess-1",
+        "tenant-a",
+        "user-1",
+        Some(AgentConfig {
+            tools: vec![AgentTool {
+                name: "tool_search".to_string(),
+                description: "the worker's own search".to_string(),
+                input: None,
+                output: None,
+                handler: None,
+                defer: None,
+            }],
+            mcp: vec![McpServer {
+                id: "sentry".into(),
+                tools: Some(McpTools {
+                    defer: Some(true),
+                    ..Default::default()
+                }),
+                auth_failure: Default::default(),
+                tool_sync_failure: Default::default(),
+                approve: Default::default(),
+            }],
+            ..agent_config("m1")
+        }),
+    );
+    settle_sync(&mut agg, "sentry", &["search_issues"]);
+
+    let merged = agg.state.at(None).connector_tools();
+    assert_eq!(
+        offered(&agg),
+        ["call_tool"],
+        "the worker keeps the name it declared, and the engine keeps the rest"
+    );
+    assert_eq!(
+        merged.collisions,
+        vec!["tool_search".to_string()],
+        "the drop is recorded, so a report can name it"
+    );
+    assert_eq!(
+        agg.state.tool_handler_for("tool_search"),
+        ToolHandler::Worker,
+        "the worker runs its own"
+    );
+    assert_eq!(
+        agg.state.tool_handler_for("call_tool"),
+        ToolHandler::Server,
+        "and the engine still runs the executor the worker did not replace"
+    );
+}
+
+#[test]
+fn an_agent_can_declare_search_before_it_names_a_connection() {
+    let mut agg = create_session_with_config(
+        "sess-1",
+        "tenant-a",
+        "user-1",
+        Some(AgentConfig {
+            defer_tools: Some(DeferTools::default()),
+            mcp_announce: Default::default(),
+            plugins: Vec::new(),
+            mcp: vec![],
+            ..agent_config("m1")
+        }),
+    );
+    let before = offered(&agg);
+    assert_eq!(
+        before,
+        ["tool_search", "call_tool"],
+        "an agent with no connection still gets them"
+    );
+
+    let d = open_decision(&mut agg, "connect sentry");
+    dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: d,
+            transcript: vec![node_msg("u2", Role::User, "connect sentry")],
+            actions: vec![],
+            state: None,
+            agent: Some(AgentConfig {
+                defer_tools: Some(DeferTools::default()),
+                mcp_announce: Default::default(),
+                plugins: Vec::new(),
+                mcp: vec![McpServer {
+                    id: "sentry".into(),
+                    tools: None,
+                    auth_failure: Default::default(),
+                    tool_sync_failure: Default::default(),
+                    approve: Default::default(),
+                }],
+                ..agent_config("m1")
+            }),
+        },
+        &machine(),
+    );
+    settle_sync(&mut agg, "sentry", &["search_issues"]);
+
+    assert_eq!(
+        offered(&agg),
+        before,
+        "the first connection of the session costs no cache at all"
+    );
+}
+
+#[test]
+fn a_connection_overrides_the_agents_default() {
+    let mut agg = create_session_with_config(
+        "sess-1",
+        "tenant-a",
+        "user-1",
+        Some(AgentConfig {
+            defer_tools: Some(DeferTools::default()),
+            mcp_announce: Default::default(),
+            plugins: Vec::new(),
+            mcp: vec![McpServer {
+                id: "sentry".into(),
+                tools: Some(McpTools {
+                    defer: Some(false),
+                    ..Default::default()
+                }),
+                auth_failure: Default::default(),
+                tool_sync_failure: Default::default(),
+                approve: Default::default(),
+            }],
+            ..agent_config("m1")
+        }),
+    );
+    settle_sync(&mut agg, "sentry", &["search_issues"]);
+    assert_eq!(
+        agg.state
+            .at(None)
+            .connector_tools()
+            .tools
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect::<Vec<_>>(),
+        ["sentry__search_issues", "tool_search", "call_tool"],
+        "the connection lists its own tools; the agent still gets the search"
+    );
+}
+
+#[test]
+fn call_tool_refuses_arguments_that_break_the_tools_own_schema() {
+    let mut agg = create_session_with_config(
+        "sess-1",
+        "tenant-a",
+        "user-1",
+        Some(searching_connector_config(&["sentry"])),
+    );
+    dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::ConnectorSync,
+            "mcp.sentry".to_string(),
+            None,
+            Outcome::Connector {
+                server: None,
+                prefix: Some("sentry".to_string()),
+                tools: vec![RemoteTool {
+                    name: "search_issues".to_string(),
+                    title: None,
+                    description: "search".to_string(),
+                    input: Some(serde_json::json!({
+                        "type": "object",
+                        "properties": { "query": { "type": "string" } },
+                        "required": ["query"]
+                    })),
+                    output: None,
+                    annotations: Default::default(),
+                }],
+                instructions: None,
+            },
+        ),
+        &system(),
+    );
+
+    call(
+        &mut agg,
+        "tc-1",
+        "call_tool",
+        r#"{"name":"sentry__search_issues","arguments":{"query":7}}"#,
+    );
+    let settled = agg
+        .state
+        .local_connector_answer("tc-1")
+        .expect("the engine answers this one");
+    assert!(settled.is_error, "bad arguments are an error");
+    let message = settled.as_text();
+    assert!(
+        message.contains("query"),
+        "the message names the field: {message}"
+    );
+    assert_eq!(
+        agg.state.tool_call("tc-1").unwrap().target,
+        Some(ConnectorTarget::Call),
+        "the provider held no schema for the inner tool, so the engine stops the call"
+    );
+}
+
+#[test]
+fn tool_search_picks_which_engine_tools_the_agent_gets() {
+    let agent = |strategy: DeferToolsStrategy| AgentConfig {
+        defer_tools: Some(DeferTools {
+            strategy,
+            ..DeferTools::default()
+        }),
+        tools: vec![AgentTool {
+            name: "run_payroll".to_string(),
+            description: "Run payroll.".to_string(),
+            input: None,
+            output: None,
+            handler: None,
+            defer: None,
+        }],
+        mcp: vec![],
+        ..agent_config("m1")
+    };
+    let offered = |search: DeferToolsStrategy| -> Vec<String> {
+        let agg = create_session_with_config("sess-1", "tenant-a", "user-1", Some(agent(search)));
+        agg.state
+            .at(None)
+            .connector_tools()
+            .tools
+            .into_iter()
+            .map(|t| t.name)
+            .collect()
+    };
+    assert_eq!(
+        offered(DeferToolsStrategy::Search),
+        ["tool_search", "call_tool"]
+    );
+    assert_eq!(
+        offered(DeferToolsStrategy::Search),
+        ["tool_search", "call_tool"],
+        "a catalog too long to read is one the agent can leave out"
+    );
+}
+
+#[test]
+fn defer_tools_defers_every_source_and_a_tool_can_opt_out() {
+    let agent = |defers: bool| AgentConfig {
+        defer_tools: defers.then(DeferTools::default),
+        tools: vec![
+            AgentTool {
+                name: "run_payroll".to_string(),
+                description: "Run payroll.".to_string(),
+                input: None,
+                output: None,
+                handler: None,
+                defer: None,
+            },
+            AgentTool {
+                name: "get_time".to_string(),
+                description: "The time.".to_string(),
+                input: None,
+                output: None,
+                handler: None,
+                defer: Some(false),
+            },
+        ],
+        ..agent_config("m1")
+    };
+    let deferred = |config: AgentConfig| -> Vec<String> {
+        config
+            .tools_as_llm()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|t| t.defer)
+            .map(|t| t.name)
+            .collect()
+    };
+    assert!(
+        deferred(agent(false)).is_empty(),
+        "nothing defers without the agent saying so"
+    );
+    assert_eq!(
+        deferred(agent(true)),
+        ["run_payroll"],
+        "the agent's default reaches a tool it declares, and `defer: false` opts out"
+    );
+}
+
+#[test]
+fn a_worker_tool_can_defer_and_the_search_finds_it() {
+    let mut agg = create_session_with_config(
+        "sess-1",
+        "tenant-a",
+        "user-1",
+        Some(AgentConfig {
+            tools: vec![
+                AgentTool {
+                    name: "send_email".to_string(),
+                    description: "Send an email to somebody.".to_string(),
+                    input: Some(serde_json::json!({
+                        "type": "object",
+                        "properties": { "to": { "type": "string" } },
+                        "required": ["to"]
+                    })),
+                    output: None,
+                    handler: None,
+                    defer: Some(true),
+                },
+                AgentTool {
+                    name: "get_time".to_string(),
+                    description: "The time.".to_string(),
+                    input: None,
+                    output: None,
+                    handler: None,
+                    defer: None,
+                },
+            ],
+            mcp: vec![],
+            ..agent_config("m1")
+        }),
+    );
+
+    assert_eq!(
+        offered(&agg),
+        ["tool_search", "call_tool"],
+        "no connection anywhere, and the agent still gets the search"
+    );
+
+    call(&mut agg, "tc-1", "tool_search", r#"{"query":"email"}"#);
+    let settled = agg
+        .state
+        .local_connector_answer("tc-1")
+        .expect("the engine answers this one");
+    assert!(!settled.is_error, "a search is a result");
+    let result = settled.as_text();
+    let answer: serde_json::Value = serde_json::from_str(&result).expect("json");
+    assert_eq!(answer["tools"][0]["name"], "send_email");
+    assert_eq!(
+        answer["searched"], 2,
+        "a search covers each source, so an empty answer means the agent has nothing"
+    );
+
+    call(
+        &mut agg,
+        "tc-2",
+        "call_tool",
+        r#"{"name":"send_email","arguments":{"to":"ops@example.com"}}"#,
+    );
+    let tc = agg.state.tool_call("tc-2").unwrap();
+    assert_eq!(tc.name, "send_email");
+    assert_eq!(tc.arguments, r#"{"to":"ops@example.com"}"#);
+    assert_eq!(tc.handler, ToolHandler::Worker);
+    assert!(tc.target.is_none(), "no connection is involved");
+}
+
+#[test]
+fn a_deferred_worker_tool_still_checks_its_arguments() {
+    let mut agg = create_session_with_config(
+        "sess-1",
+        "tenant-a",
+        "user-1",
+        Some(AgentConfig {
+            tools: vec![AgentTool {
+                name: "send_email".to_string(),
+                description: "Send an email.".to_string(),
+                input: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": { "to": { "type": "string" } },
+                    "required": ["to"]
+                })),
+                output: None,
+                handler: None,
+                defer: Some(true),
+            }],
+            mcp: vec![],
+            ..agent_config("m1")
+        }),
+    );
+    call(
+        &mut agg,
+        "tc-1",
+        "call_tool",
+        r#"{"name":"send_email","arguments":{"to":7}}"#,
+    );
+    let settled = agg
+        .state
+        .local_connector_answer("tc-1")
+        .expect("the engine answers this one");
+    assert!(settled.is_error, "bad arguments are an error");
+    let message = settled.as_text();
+    assert!(
+        message.contains("to"),
+        "the provider never saw this schema, so the engine checks it: {message}"
+    );
+    let schema: serde_json::Value = serde_json::from_str(
+        message
+            .split_once("input schema is: ")
+            .expect("the schema")
+            .1,
+    )
+    .expect("the schema is json the model can read");
+    assert_eq!(
+        schema["properties"]["to"]["type"], "string",
+        "the engine holds the schema, so a fault hands it back rather than \
+         leaving the model to guess: {message}"
+    );
+}
+
+#[test]
+fn call_tool_refuses_a_connection_this_agent_does_not_have() {
+    let mut agg = session_with_searched_connector("sentry", &["search_issues"]);
+    call(
+        &mut agg,
+        "tc-1",
+        "call_tool",
+        r#"{"name":"github__search_issues","arguments":{}}"#,
+    );
+    let settled = agg
+        .state
+        .local_connector_answer("tc-1")
+        .expect("the engine answers this one");
+    assert!(settled.is_error, "an unknown connection is an error");
+    let message = settled.as_text();
+    assert!(
+        message.contains("github__search_issues"),
+        "the message names what was asked for: {message}"
+    );
+    assert!(
+        message.contains("sentry__search_issues"),
+        "a wrong name is usually a near miss, so the same search ranks the \
+         neighbours: {message}"
+    );
+    assert!(
+        message.contains("tool_search"),
+        "and the message names the way to get a schema: {message}"
+    );
+}
+
+#[test]
+fn a_deferred_connector_tool_carries_its_output_contract() {
+    let mut agg = create_session_with_config(
+        "sess-1",
+        "tenant-a",
+        "user-1",
+        Some(searching_connector_config(&["sentry"])),
+    );
+    let schema = serde_json::json!({ "type": "object", "required": ["url"] });
+    dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::ConnectorSync,
+            "mcp.sentry".to_string(),
+            None,
+            Outcome::Connector {
+                server: None,
+                prefix: Some("sentry".to_string()),
+                tools: vec![RemoteTool {
+                    output: Some(schema.clone()),
+                    ..remote_tool("search_issues")
+                }],
+                instructions: None,
+            },
+        ),
+        &system(),
+    );
+    let tool = agg
+        .state
+        .at(None)
+        .connector_tools()
+        .tools
+        .into_iter()
+        .find(|t| t.name == "sentry__search_issues")
+        .expect("the engine holds it");
+    assert!(tool.defer, "and the request leaves it out");
+    assert_eq!(tool.to_llm_tool().output, Some(schema));
+}
+
+#[test]
+fn a_deferred_tool_is_still_the_engines_to_run() {
+    let agg = session_with_searched_connector("sentry", &["search_issues"]);
+    assert_eq!(
+        agg.state.tool_handler_for("sentry__search_issues"),
+        ToolHandler::Server
+    );
+    assert!(
+        !offered(&agg).contains(&"sentry__search_issues".to_string()),
+        "and the request does not carry it"
+    );
+}
+
+#[test]
+fn a_call_beside_a_new_connector_waits_for_the_fetch_and_gets_its_tools() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let d = open_decision(&mut agg, "hi");
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: d,
+            transcript: vec![node_msg("u1", Role::User, "hi")],
+            actions: vec![call_llm_action("call-1", LlmHandler::Server)],
+            state: None,
+            agent: Some(connector_config(&["sentry"])),
+        },
+        &machine(),
+    );
+    assert_eq!(sync_requests(&events), ["sentry"]);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, EventPayload::LlmCallDispatched(_))),
+        "the call queues behind the fetch; got {events:?}"
+    );
+    assert_eq!(
+        agg.state
+            .effect(EffectKind::LlmCall, "call-1")
+            .unwrap()
+            .tracking
+            .status(),
+        EffectStatus::Queued
+    );
+    assert_eq!(
+        super::schedule::waiting_on(&agg.state)[&(EffectKind::LlmCall, "call-1".to_string())],
+        vec!["connector_sync:mcp.sentry".to_string()]
+    );
+
+    let events = settle_sync(&mut agg, "sentry", &["search_issues"]);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::LlmCallDispatched(_))),
+        "the settled fetch dispatches the call; got {events:?}"
+    );
+    let offered: Vec<String> = agg
+        .state
+        .llm_call("call-1")
+        .unwrap()
+        .spec
+        .tools
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert_eq!(
+        offered,
+        ["sentry__search_issues"],
+        "dispatch merges the fetched tools"
+    );
+}
+
+#[test]
+fn a_dead_connection_dispatches_the_call_without_its_tools() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let d = open_decision(&mut agg, "hi");
+    dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: d,
+            transcript: vec![node_msg("u1", Role::User, "hi")],
+            actions: vec![call_llm_action("call-1", LlmHandler::Server)],
+            state: None,
+            agent: Some(connector_config(&["sentry"])),
+        },
+        &machine(),
+    );
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::ConnectorSync,
+            "mcp.sentry".to_string(),
+            None,
+            SettleError::new(ErrorInfo::internal("unreachable".to_string()), false).auth(None),
+        ),
+        &system(),
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::LlmCallDispatched(_))),
+        "a settled failure opens the gate rather than parking forever; got {events:?}"
+    );
+    assert!(
+        agg.state.llm_call("call-1").unwrap().spec.tools.is_none(),
+        "no tools to offer"
+    );
+}
+
+#[test]
+fn strict_order_holds_work_behind_a_gated_call() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let d = open_decision(&mut agg, "hi");
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: d,
+            transcript: vec![node_msg("u1", Role::User, "hi")],
+            actions: vec![
+                call_llm_action("call-1", LlmHandler::Server),
+                Action::CallTool {
+                    id: "tc-1".to_string(),
+                    name: "my_tool".to_string(),
+                    arguments: "{}".to_string(),
+                    retry: None,
+                },
+            ],
+            state: None,
+            agent: Some(connector_config(&["sentry"])),
+        },
+        &machine(),
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, EventPayload::ToolCallDispatched(_))),
+        "the tool call waits behind the gated llm call; got {events:?}"
+    );
+    assert_eq!(
+        super::schedule::waiting_on(&agg.state)[&(EffectKind::ToolCall, "tc-1".to_string())],
+        vec!["queued_behind:llm_call:call-1".to_string()]
+    );
+
+    let events = settle_sync(&mut agg, "sentry", &["search_issues"]);
+    let dispatch_order: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            EventPayload::LlmCallDispatched(_) => Some("llm"),
+            EventPayload::ToolCallDispatched(_) => Some("tool"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        dispatch_order,
+        ["llm", "tool"],
+        "the queue releases in arrival order; got {events:?}"
+    );
+}
+
+#[test]
+fn a_worker_run_call_gets_its_execute_decision_at_dispatch_with_the_tools() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let d = open_decision(&mut agg, "hi");
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: d,
+            transcript: vec![node_msg("u1", Role::User, "hi")],
+            actions: vec![call_llm_action("call-1", LlmHandler::Worker)],
+            state: None,
+            agent: Some(connector_config(&["sentry"])),
+        },
+        &machine(),
+    );
+    assert!(
+        decision_with(&events, |t| matches!(t, Trigger::LlmExecute { .. })).is_none(),
+        "no execute decision until the call dispatches; got {events:?}"
+    );
+
+    let events = settle_sync(&mut agg, "sentry", &["search_issues"]);
+    let request = events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionQueued(p) => match &p.trigger {
+                Trigger::LlmExecute { request, .. } => Some(request.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("dispatch queues the execute decision");
+    let offered: Vec<String> = request
+        .tools
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert_eq!(
+        offered,
+        ["sentry__search_issues"],
+        "the execute trigger carries the merged tools"
+    );
+}
+
+#[test]
+fn a_re_prompt_does_not_offer_a_connector_tool_twice() {
+    let mut agg = session_with_connectors(&["sentry"], &["search_issues"]);
+
+    let already = LlmRequest {
+        model: "m1".to_string(),
+        messages: vec![],
+        tools: Some(vec![LlmTool {
+            name: "sentry__search_issues".to_string(),
+            description: "a remote tool".to_string(),
+            input: None,
+            output: None,
+            defer: false,
+        }]),
+        temperature: None,
+        max_completion_tokens: None,
+        reasoning: None,
+    };
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::RequestLlmCall {
+            llm: "claude".to_string(),
+            call_id: "call-1".to_string(),
+            request: already,
+            stream: false,
+            retry: RetryPolicy::no_retry(),
+            handler: LlmHandler::Server,
+            format: None,
+        },
+        &system(),
+    );
+    let names: Vec<String> = events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::LlmCallRequested(p) => p.request.tools.clone(),
+            _ => None,
+        })
+        .expect("an llm call")
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert_eq!(names, ["sentry__search_issues"], "offered once, not twice");
+}
+
+#[test]
+fn a_declared_tool_keeps_its_name_and_its_handler_against_a_connector() {
+    let mut config = connector_config(&["sentry"]);
+    config.tools.push(AgentTool {
+        name: "sentry__search_issues".to_string(),
+        description: String::new(),
+        input: None,
+        output: None,
+        handler: None,
+        defer: None,
+    });
+    let mut agg = create_session_with_config("sess-1", "tenant-a", "user-1", Some(config));
+    settle_sync(&mut agg, "sentry", &["search_issues"]);
+
+    assert_eq!(
+        agg.state.tool_handler_for("sentry__search_issues"),
+        ToolHandler::Worker,
+        "the config claims the name, so the connector never takes it"
+    );
+    let merged = agg.state.at_head().connector_tools();
+    assert!(merged.tools.is_empty());
+    assert_eq!(
+        merged.collisions,
+        ["sentry__search_issues"],
+        "and the drop is reported rather than silent"
+    );
+}
+
+#[test]
+fn a_filter_change_re_derives_without_another_fetch() {
+    let mut agg = session_with_connectors(&["sentry"], &["search_issues", "create_issue"]);
+    assert_eq!(agg.state.at_head().connector_tools().tools.len(), 2);
+
+    let narrowed = AgentConfig {
+        mcp: vec![McpServer {
+            id: "sentry".into(),
+            tools: Some(McpTools {
+                include: vec!["search_*".to_string()],
+                ..Default::default()
+            }),
+            auth_failure: Default::default(),
+            tool_sync_failure: Default::default(),
+            approve: Default::default(),
+        }],
+        ..agent_config("m1")
+    };
+    let d = open_decision(&mut agg, "hi");
+    let events = submit_agent(
+        &mut agg,
+        d,
+        vec![node_msg("u1", Role::User, "hi")],
+        Some(narrowed),
+    );
+    assert!(
+        sync_requests(&events).is_empty(),
+        "filtering is pure, so narrowing costs no round trip; got {events:?}"
+    );
+    let names: Vec<String> = agg
+        .state
+        .at_head()
+        .connector_tools()
+        .tools
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert_eq!(names, ["sentry__search_issues"], "the offer re-filters");
+}
+
+#[test]
+fn a_fork_keeps_the_offer_it_already_fetched() {
+    let agg = session_with_connectors(&["sentry"], &["search_issues"]);
+
+    let rewound = agg.state.clone().rewind(0, None);
+    assert!(
+        rewound
+            .tracking(EffectKind::ConnectorSync, "mcp.sentry")
+            .unwrap()
+            .is_ready(),
+        "a fork refetches nothing"
+    );
+}
+
+#[test]
+fn changed_agent_config_anchors_at_head_and_dedups() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+
+    let d1 = open_decision(&mut agg, "hi");
+    let events = submit_agent(
+        &mut agg,
+        d1,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("a1", Role::Assistant, "hello"),
+        ],
+        Some(agent_config("m1")),
+    );
+    let updates = agent_updates(&events);
+    assert_eq!(updates.len(), 1, "the first write records a config version");
+    assert_eq!(
+        updates[0].anchor.as_deref(),
+        Some("a1"),
+        "the config anchors to the last appended node"
+    );
+    assert_eq!(
+        agg.state.at_head().resolve_agent_for(),
+        Some(agent_config("m1"))
+    );
+
+    let d2 = open_decision(&mut agg, "again");
+    let events = submit_agent(
+        &mut agg,
+        d2,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("a1", Role::Assistant, "hello"),
+            node_msg("u2", Role::User, "again"),
+        ],
+        Some(agent_config("m1")),
+    );
+    assert!(
+        agent_updates(&events).is_empty(),
+        "an echoed config writes nothing; got {events:?}"
+    );
+}
+
+#[test]
+fn omitted_agent_keeps_the_current_config() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let d1 = open_decision(&mut agg, "hi");
+    submit_agent(
+        &mut agg,
+        d1,
+        vec![node_msg("u1", Role::User, "hi")],
+        Some(agent_config("m1")),
+    );
+    let d2 = open_decision(&mut agg, "more");
+    let events = submit_agent(
+        &mut agg,
+        d2,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("u2", Role::User, "more"),
+        ],
+        None,
+    );
+    assert!(agent_updates(&events).is_empty());
+    assert_eq!(
+        agg.state.at_head().resolve_agent_for(),
+        Some(agent_config("m1"))
+    );
+}
+
+#[test]
+fn create_session_emits_session_start_before_client_input() {
+    let mut agg = Session::with_state(
+        "sess-1".to_string(),
+        "tenant-a".to_string(),
+        SessionState::new("sess-1".to_string()),
+    );
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::CreateSession {
+            agent_id: "agent-1".to_string(),
+            owner: SessionOwner {
+                tenant_id: "tenant-a".to_string(),
+                requester: Requester::new(
+                    Subject::new(Issuer::app(), "user-1".to_string()),
+                    Default::default(),
+                ),
+                metadata: HashMap::new(),
+            },
+            ancestry: vec![],
+            worker_retry: RetryPolicy::no_retry(),
+            agent: None,
+            worker: None,
+            events: None,
+            state: None,
+        },
+        &system(),
+    );
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                EventPayload::SessionCreated(_),
+                EventPayload::DecisionQueued(q),
+                EventPayload::DecisionDispatched(_),
+            ] if matches!(q.trigger, Trigger::SessionStart)
+        ),
+        "CreateSession opens session.start as the first decision; got {events:?}"
+    );
+}
+
+#[test]
+fn create_session_writes_seeded_state_before_session_start() {
+    let mut agg = Session::with_state(
+        "sess-1".to_string(),
+        "tenant-a".to_string(),
+        SessionState::new("sess-1".to_string()),
+    );
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::CreateSession {
+            agent_id: "agent-1".to_string(),
+            owner: SessionOwner {
+                tenant_id: "tenant-a".to_string(),
+                requester: Requester::new(
+                    Subject::new(Issuer::app(), "user-1".to_string()),
+                    Default::default(),
+                ),
+                metadata: HashMap::new(),
+            },
+            ancestry: vec![],
+            worker_retry: RetryPolicy::no_retry(),
+            agent: None,
+            state: Some(WorkerState(json!({ "plan": "pro" }))),
+            worker: None,
+            events: None,
+        },
+        &system(),
+    );
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                EventPayload::SessionCreated(_),
+                EventPayload::WorkerStateUpdated(_),
+                EventPayload::DecisionQueued(q),
+                EventPayload::DecisionDispatched(_),
+            ] if matches!(q.trigger, Trigger::SessionStart)
+        ),
+        "the seed is written before session.start; got {events:?}"
+    );
+    assert_eq!(
+        agg.state.at_head().resolve_state_for().0,
+        json!({ "plan": "pro" }),
+        "session.start reads the seeded state"
+    );
+}
+
+#[test]
+fn create_session_without_a_seed_writes_no_state() {
+    let mut agg = Session::with_state(
+        "sess-1".to_string(),
+        "tenant-a".to_string(),
+        SessionState::new("sess-1".to_string()),
+    );
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::CreateSession {
+            agent_id: "agent-1".to_string(),
+            owner: SessionOwner {
+                tenant_id: "tenant-a".to_string(),
+                requester: Requester::new(
+                    Subject::new(Issuer::app(), "user-1".to_string()),
+                    Default::default(),
+                ),
+                metadata: HashMap::new(),
+            },
+            ancestry: vec![],
+            worker_retry: RetryPolicy::no_retry(),
+            agent: None,
+            state: None,
+            worker: None,
+            events: None,
+        },
+        &system(),
+    );
+    assert!(state_updates(&events).is_empty());
+    assert_eq!(
+        agg.state.at_head().resolve_state_for(),
+        WorkerState::default()
+    );
+}
+
+#[test]
+fn a_frontend_cannot_seed_state() {
+    let agg = Session::with_state(
+        "sess-1".to_string(),
+        "tenant-a".to_string(),
+        SessionState::new("sess-1".to_string()),
+    );
+    let owner = SessionOwner {
+        tenant_id: "tenant-a".to_string(),
+        requester: Requester::new(
+            Subject::new(Issuer::app(), "user-1".to_string()),
+            Default::default(),
+        ),
+        metadata: HashMap::new(),
+    };
+    let err = agg
+        .try_handle(
+            CommandPayload::CreateSession {
+                agent_id: "agent-1".to_string(),
+                owner,
+                ancestry: vec![],
+                worker_retry: RetryPolicy::no_retry(),
+                agent: None,
+                state: Some(WorkerState(json!({ "plan": "pro" }))),
+                worker: None,
+                events: None,
+            },
+            &Caller::Frontend {
+                tenant_id: "tenant-a".to_string(),
+                subject: Subject::new(Issuer::app(), "user-1".to_string()),
+                attrs: HashMap::new(),
+            },
+        )
+        .expect_err("a browser may not write agent state");
+    assert!(matches!(err, SessionError::SessionAccessDenied));
+}
+
+#[test]
+fn session_start_config_is_visible_to_a_queued_client_decision() {
+    let mut agg = Session::with_state(
+        "sess-1".to_string(),
+        "tenant-a".to_string(),
+        SessionState::new("sess-1".to_string()),
+    );
+    dispatch(
+        &mut agg,
+        CommandPayload::CreateSession {
+            agent_id: "agent-1".to_string(),
+            owner: SessionOwner {
+                tenant_id: "tenant-a".to_string(),
+                requester: Requester::new(
+                    Subject::new(Issuer::app(), "user-1".to_string()),
+                    Default::default(),
+                ),
+                metadata: HashMap::new(),
+            },
+            ancestry: vec![],
+            worker_retry: RetryPolicy::no_retry(),
+            agent: None,
+            worker: None,
+            events: None,
+            state: None,
+        },
+        &system(),
+    );
+
+    let setup = dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: node_msg("", Role::User, "hi"),
+                stream: false,
+            }),
+            turn: TurnTarget::Detached,
+            queue: QueueMode::Refuse,
+        },
+        &system(),
+    );
+    assert!(
+        setup
+            .iter()
+            .any(|e| matches!(e, EventPayload::DecisionQueued(_))),
+        "the client decision queues behind session.start; got {setup:?}"
+    );
+
+    let start = agg
+        .state
+        .effects_of(EffectKind::Decision)
+        .find(|d| {
+            d.decision()
+                .is_some_and(|d| matches!(d.trigger, Trigger::SessionStart))
+        })
+        .map(|d| d.id.clone())
+        .expect("a pending session.start decision");
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: start,
+            transcript: vec![],
+            actions: vec![],
+            state: None,
+            agent: Some(agent_config("m1")),
+        },
+        &machine(),
+    );
+
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            EventPayload::DecisionDispatched(w)
+                if matches!(
+                    agg.state.worker_decision(&w.id).map(|d| &d.trigger),
+                    Some(Trigger::ClientMessage { .. })
+                )
+        )),
+        "the queued client decision is promoted; got {events:?}"
+    );
+    assert_eq!(
+        agg.state.at_head().resolve_agent_for(),
+        Some(agent_config("m1"))
+    );
+}
+
+#[test]
+fn client_message_parks_while_session_start_retry_is_scheduled() {
+    let mut agg = Session::with_state(
+        "sess-1".to_string(),
+        "tenant-a".to_string(),
+        SessionState::new("sess-1".to_string()),
+    );
+    let created = dispatch(
+        &mut agg,
+        CommandPayload::CreateSession {
+            agent_id: "agent-1".to_string(),
+            owner: SessionOwner {
+                tenant_id: "tenant-a".to_string(),
+                requester: Requester::new(
+                    Subject::new(Issuer::app(), "user-1".to_string()),
+                    Default::default(),
+                ),
+                metadata: HashMap::new(),
+            },
+            ancestry: vec![],
+            worker_retry: RetryPolicy {
+                queue_timeout_secs: None,
+                run_timeout_secs: None,
+                total_timeout_secs: None,
+                max_attempts: 2,
+                backoff_base_secs: 1,
+                backoff_max_secs: 1,
+            },
+            agent: None,
+            worker: None,
+            events: None,
+            state: None,
+        },
+        &system(),
+    );
+    let start = created
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionDispatched(w) => Some(w.id.clone()),
+            _ => None,
+        })
+        .expect("CreateSession opens a session.start decision");
+
+    dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::Decision,
+            start.clone(),
+            None,
+            SettleError::new(ErrorInfo::internal("transient".to_string()), true),
+        ),
+        &machine(),
+    );
+    assert_eq!(
+        agg.state
+            .tracking(EffectKind::Decision, &start)
+            .map(|t| t.status()),
+        Some(EffectStatus::RetryScheduled),
+        "session.start is rescheduled, not settled"
+    );
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: node_msg("", Role::User, "hi"),
+                stream: false,
+            }),
+            turn: TurnTarget::Detached,
+            queue: QueueMode::Refuse,
+        },
+        &system(),
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::DecisionQueued(_))),
+        "the client decision queues; got {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, EventPayload::DecisionDispatched(_))),
+        "the client decision parks behind the scheduled session.start retry, \
+             exactly as it does while session.start is Pending; got {events:?}"
+    );
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::Wake {
+            now: Utc::now() + chrono::Duration::hours(1),
+        },
+        &system(),
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            EventPayload::DecisionDispatched(w) if w.id == start
+        )),
+        "the wake re-delivers session.start first; got {events:?}"
+    );
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: start,
+            transcript: vec![],
+            actions: vec![],
+            state: None,
+            agent: Some(agent_config("m1")),
+        },
+        &machine(),
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            EventPayload::DecisionDispatched(w)
+                if matches!(
+                    agg.state.worker_decision(&w.id).map(|d| &d.trigger),
+                    Some(Trigger::ClientMessage { .. })
+                )
+        )),
+        "the queued client decision is promoted; got {events:?}"
+    );
+    assert_eq!(
+        agg.state.at_head().resolve_agent_for(),
+        Some(agent_config("m1"))
+    );
+}
+
+#[test]
+fn terminal_session_start_failure_restarts_on_the_next_message() {
+    let mut agg = Session::with_state(
+        "sess-1".to_string(),
+        "tenant-a".to_string(),
+        SessionState::new("sess-1".to_string()),
+    );
+    let created = dispatch(
+        &mut agg,
+        CommandPayload::CreateSession {
+            agent_id: "agent-1".to_string(),
+            owner: SessionOwner {
+                tenant_id: "tenant-a".to_string(),
+                requester: Requester::new(
+                    Subject::new(Issuer::app(), "user-1".to_string()),
+                    Default::default(),
+                ),
+                metadata: HashMap::new(),
+            },
+            ancestry: vec![],
+            worker_retry: RetryPolicy::no_retry(),
+            agent: None,
+            worker: None,
+            events: None,
+            state: None,
+        },
+        &system(),
+    );
+    let start = created
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionDispatched(w) => Some(w.id.clone()),
+            _ => None,
+        })
+        .expect("CreateSession opens a session.start decision");
+
+    let queued = dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: node_msg("", Role::User, "hi"),
+                stream: false,
+            }),
+            turn: TurnTarget::Detached,
+            queue: QueueMode::Refuse,
+        },
+        &system(),
+    );
+    let queued_id = decision_with(&queued, |t| matches!(t, Trigger::ClientMessage { .. }))
+        .expect("the client decision queues behind session.start");
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::Decision,
+            start,
+            None,
+            SettleError::new(ErrorInfo::internal("worker crashed".to_string()), false),
+        ),
+        &machine(),
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::DecisionErrored(_))),
+        "the failure is recorded; got {events:?}"
+    );
+    assert!(
+        turn_completed(&events).is_none(),
+        "no turn to complete without one started; got {events:?}"
+    );
+
+    let events = wake(&mut agg);
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            EventPayload::DecisionDispatched(w) if w.id == queued_id
+        )),
+        "a queued client decision must not be promoted after session.start \
+             failed terminally; got {events:?}"
+    );
+
+    let retried = dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: node_msg("", Role::User, "hello again"),
+                stream: false,
+            }),
+            turn: TurnTarget::Detached,
+            queue: QueueMode::Refuse,
+        },
+        &system(),
+    );
+    let restart = decision_with(&retried, |t| matches!(t, Trigger::SessionStart))
+        .expect("a new user message re-queues session.start");
+    let follow_up = decision_with(&retried, |t| matches!(t, Trigger::ClientMessage { .. }))
+        .expect("the message queues too");
+    assert!(
+        retried.iter().any(|e| matches!(
+            e,
+            EventPayload::DecisionDispatched(w) if w.id == restart
+        )),
+        "the restart is promoted; got {retried:?}"
+    );
+    assert!(
+        !retried.iter().any(|e| matches!(
+            e,
+            EventPayload::DecisionDispatched(w) if w.id == follow_up
+        )),
+        "the message parks behind the restart; got {retried:?}"
+    );
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: restart,
+            transcript: vec![],
+            actions: vec![],
+            state: None,
+            agent: Some(agent_config("m1")),
+        },
+        &machine(),
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            EventPayload::DecisionDispatched(w) if w.id == follow_up
+        )),
+        "the recovered session promotes the waiting message; got {events:?}"
+    );
+    assert!(
+        !agg.state.session_start_failed,
+        "the session is no longer poisoned"
+    );
+}
+
+#[test]
+fn fork_anchors_new_state_and_resolves_as_of_the_prefix_without_one() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let d1 = open_decision(&mut agg, "hi");
+    submit_state(
+        &mut agg,
+        d1,
+        vec![node_msg("u1", Role::User, "hi")],
+        Some(json!({"v": 1})),
+    );
+    let d2 = open_decision(&mut agg, "more");
+    submit_state(
+        &mut agg,
+        d2,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("a1", Role::Assistant, "hello"),
+            node_msg("u2", Role::User, "more"),
+        ],
+        Some(json!({"v": 2})),
+    );
+    assert_eq!(agg.state.at_head().resolve_state_for().0, json!({"v": 2}));
+
+    let d3 = open_decision(&mut agg, "redo");
+    let events = submit_state(
+        &mut agg,
+        d3,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("x1", Role::User, "redo"),
+        ],
+        Some(json!({"v": 3})),
+    );
+    let updates = state_updates(&events);
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].anchor.as_deref(), Some("x1"));
+    assert_eq!(agg.state.at_head().resolve_state_for().0, json!({"v": 3}));
+
+    let d4 = open_decision(&mut agg, "retry");
+    let events = submit_state(
+        &mut agg,
+        d4,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("y1", Role::User, "retry"),
+        ],
+        None,
+    );
+    assert!(state_updates(&events).is_empty());
+    assert_eq!(agg.state.head_id.as_deref(), Some("y1"));
+    assert_eq!(
+        agg.state.at_head().resolve_state_for().0,
+        json!({"v": 1}),
+        "the fork is uncontaminated by the abandoned branches"
+    );
+}
+
+fn submit_config(
+    agg: &mut Session,
+    decision_id: String,
+    transcript: Vec<DraftMessage>,
+    agent: AgentConfig,
+) {
+    dispatch(
+        agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id,
+            transcript,
+            actions: vec![],
+            state: None,
+            agent: Some(agent),
+        },
+        &machine(),
+    );
+}
+
+fn root_of(agg: &Session) -> Option<String> {
+    let mut at = agg.state.head_id.clone()?;
+    loop {
+        let node = agg.state.nodes.iter().find(|n| n.message.id == at)?;
+        match &node.parent_id {
+            Some(parent) => at = parent.clone(),
+            None => return Some(at),
+        }
+    }
+}
+
+fn long_chat(agg: &mut Session) {
+    let d1 = open_decision(agg, "hi");
+    submit_state(
+        agg,
+        d1,
+        vec![node_msg("u1", Role::User, "hi")],
+        Some(json!({"v": 1})),
+    );
+    let d2 = open_decision(agg, "more");
+    submit_config(
+        agg,
+        d2,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("a1", Role::Assistant, "hello"),
+            node_msg("u2", Role::User, "more"),
+        ],
+        agent_config("m2"),
+    );
+}
+
+#[test]
+fn a_reset_starts_a_new_root_and_keeps_the_state_sent_with_it() {
+    let mut agg =
+        create_session_with_config("sess-1", "tenant-a", "user-1", Some(agent_config("m1")));
+    long_chat(&mut agg);
+
+    let d3 = open_decision(&mut agg, "latest");
+    let events = submit_state(
+        &mut agg,
+        d3,
+        vec![node_msg("", Role::User, "latest")],
+        Some(json!({"v": 3})),
+    );
+
+    let head = agg.state.head_id.clone().expect("a head");
+    assert_eq!(root_of(&agg), Some(head.clone()), "the head is a new root");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::NewMessage(m) if m.parent_id.is_none())),
+        "the view records a root; got {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::BranchUnloaded(_))),
+        "the old branch leaves memory; it stays in the log"
+    );
+    assert!(!agg.state.has_node("u2"));
+    assert_eq!(agg.state.at_head().resolve_state_for().0, json!({"v": 3}));
+}
+
+#[test]
+fn a_compaction_records_the_summary_then_copies_of_the_kept_messages() {
+    let mut agg =
+        create_session_with_config("sess-1", "tenant-a", "user-1", Some(agent_config("m1")));
+    long_chat(&mut agg);
+
+    let d3 = open_decision(&mut agg, "next");
+    let events = submit_state(
+        &mut agg,
+        d3,
+        vec![
+            node_msg("", Role::User, "Summary: said hi."),
+            node_msg("u2", Role::User, "more"),
+        ],
+        None,
+    );
+
+    let path: Vec<String> = agg
+        .state
+        .at_head()
+        .transcript()
+        .iter()
+        .map(|m| {
+            m.content
+                .as_ref()
+                .map(Content::text_owned)
+                .unwrap_or_default()
+        })
+        .collect();
+    assert_eq!(path, vec!["Summary: said hi.", "more"]);
+    let kept = agg.state.head_id.clone().expect("a head");
+    assert_ne!(
+        kept, "u2",
+        "the kept message is a fresh copy on the new branch"
+    );
+    let copies: Vec<Option<&str>> = events
+        .iter()
+        .filter_map(|e| match e {
+            EventPayload::NewMessage(m) => Some(m.copied_from.as_deref()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        copies,
+        vec![None, Some("u2")],
+        "the copy names its original"
+    );
+}
+
+#[test]
+fn a_new_root_without_state_or_config_reads_the_start() {
+    let mut agg =
+        create_session_with_config("sess-1", "tenant-a", "user-1", Some(agent_config("m1")));
+    long_chat(&mut agg);
+    assert_eq!(agg.state.at_head().resolve_state_for().0, json!({"v": 1}));
+    assert_eq!(
+        agg.state.at_head().resolve_agent_for().map(|c| c.model),
+        Some("m2".to_string())
+    );
+
+    let d3 = open_decision(&mut agg, "edit");
+    submit_state(
+        &mut agg,
+        d3,
+        vec![node_msg("e1", Role::User, "hi, edited")],
+        None,
+    );
+
+    assert_eq!(root_of(&agg).as_deref(), Some("e1"));
+    assert!(
+        agg.state.at_head().resolve_state_for().0.is_null(),
+        "state written on the old branch stays there"
+    );
+    assert_eq!(
+        agg.state.at_head().resolve_agent_for().map(|c| c.model),
+        Some("m1".to_string()),
+        "the session.start config holds on every branch"
+    );
+}
+
+#[test]
+fn a_reset_that_sends_config_keeps_it() {
+    let mut agg =
+        create_session_with_config("sess-1", "tenant-a", "user-1", Some(agent_config("m1")));
+    long_chat(&mut agg);
+
+    let d3 = open_decision(&mut agg, "latest");
+    submit_config(
+        &mut agg,
+        d3,
+        vec![node_msg("", Role::User, "latest")],
+        agent_config("m2"),
+    );
+
+    assert_eq!(
+        agg.state.at_head().resolve_agent_for().map(|c| c.model),
+        Some("m2".to_string())
+    );
+}
+
+#[test]
+fn effect_anchor_is_the_post_reconcile_head() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let d1 = open_decision(&mut agg, "hi");
+    dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: d1,
+            transcript: vec![node_msg("u1", Role::User, "hi")],
+            actions: vec![Action::CallTool {
+                id: "t1".to_string(),
+                name: "slow".to_string(),
+                arguments: "{}".to_string(),
+                retry: None,
+            }],
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    );
+    assert_eq!(
+        agg.state
+            .effect(EffectKind::ToolCall, "t1")
+            .unwrap()
+            .anchor
+            .as_deref(),
+        Some("u1"),
+        "the anchor is the head after this submit's appends"
+    );
+}
+
+fn head_moves(events: &[EventPayload]) -> Vec<&str> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            EventPayload::HeadMoved(h) => Some(h.head_id.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn truncating_view_moves_head_and_forks_the_regenerated_reply() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let d1 = open_decision(&mut agg, "hi");
+    submit_state(
+        &mut agg,
+        d1,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("a1", Role::Assistant, "hello"),
+        ],
+        None,
+    );
+    assert_eq!(agg.state.head_id.as_deref(), Some("a1"));
+
+    let d2 = open_decision(&mut agg, "regen");
+    let events = submit_state(&mut agg, d2, vec![node_msg("u1", Role::User, "hi")], None);
+    assert_eq!(head_moves(&events), ["u1"], "got {events:?}");
+    assert_eq!(agg.state.head_id.as_deref(), Some("u1"));
+
+    let d3 = open_decision(&mut agg, "next");
+    submit_state(
+        &mut agg,
+        d3,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("a2", Role::Assistant, "hello again"),
+        ],
+        None,
+    );
+    assert_eq!(agg.state.head_id.as_deref(), Some("a2"));
+    let tree = agg.state.message_tree();
+    let a2 = tree.nodes.iter().find(|n| n.message.id == "a2").unwrap();
+    assert_eq!(
+        a2.parent_id.as_deref(),
+        Some("u1"),
+        "forks at the truncation point"
+    );
+}
+
+#[test]
+fn full_resend_does_not_move_the_head() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let d1 = open_decision(&mut agg, "hi");
+    submit_state(
+        &mut agg,
+        d1,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("a1", Role::Assistant, "hello"),
+        ],
+        None,
+    );
+    let d2 = open_decision(&mut agg, "again");
+    let events = submit_state(
+        &mut agg,
+        d2,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("a1", Role::Assistant, "hello"),
+        ],
+        None,
+    );
+    assert!(head_moves(&events).is_empty(), "got {events:?}");
+    assert_eq!(agg.state.head_id.as_deref(), Some("a1"));
+}
+
+#[test]
+fn viewless_decision_keeps_the_head() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let d1 = open_decision(&mut agg, "hi");
+    submit_state(&mut agg, d1, vec![node_msg("u1", Role::User, "hi")], None);
+    let d2 = open_decision(&mut agg, "more");
+    let events = submit_state(&mut agg, d2, vec![], None);
+    assert!(head_moves(&events).is_empty(), "got {events:?}");
+    assert_eq!(agg.state.head_id.as_deref(), Some("u1"));
+}
+
+#[test]
+fn truncation_voids_work_anchored_on_the_abandoned_branch() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let d1 = open_decision(&mut agg, "hi");
+    submit_state(
+        &mut agg,
+        d1,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("a1", Role::Assistant, "hello"),
+        ],
+        None,
+    );
+    request_client_tool(&mut agg, "tc-1");
+
+    let d2 = open_decision(&mut agg, "regen");
+    let events = submit_state(&mut agg, d2, vec![node_msg("u1", Role::User, "hi")], None);
+    assert_eq!(head_moves(&events), ["u1"]);
+    assert_eq!(voided_ids(&events), ["tc-1"], "got {events:?}");
+}
+
+fn settle_decisions(events: &[EventPayload]) -> Vec<&Trigger> {
+    events
+        .iter()
+        .filter_map(|e| {
+            let trigger = match e {
+                EventPayload::DecisionQueued(p) => &p.trigger,
+                _ => return None,
+            };
+            matches!(
+                trigger,
+                Trigger::ToolFinished { .. }
+                    | Trigger::SubagentFinished { .. }
+                    | Trigger::LlmFinished { .. }
+            )
+            .then_some(trigger)
+        })
+        .collect()
+}
+
+#[test]
+fn settle_without_attempt_settles_the_current_attempt() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    request_client_tool(&mut agg, "tc-1");
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::ToolCall,
+            "tc-1".to_string(),
+            None,
+            Outcome::Tool {
+                result: StoredResult::text("ok".to_string()),
+            },
+        ),
+        &machine(),
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::ToolCallCompleted(_))),
+        "an attempt-less settle lands on the current attempt; got {events:?}"
+    );
+
+    request_client_tool(&mut agg, "tc-2");
+    let err = agg
+        .try_handle(
+            CommandPayload::settle(
+                EffectKind::ToolCall,
+                "tc-2".to_string(),
+                Some(7),
+                Outcome::Tool {
+                    result: StoredResult::text("ok".to_string()),
+                },
+            ),
+            &machine(),
+        )
+        .expect_err("mismatched attempt is fenced");
+    assert!(matches!(err, SessionError::EffectAttemptMismatch));
+}
+
+fn voided_ids(events: &[EventPayload]) -> Vec<&str> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            EventPayload::CallVoided(v) => Some(v.id.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn fork_voids_a_pending_tool_call() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let d1 = open_decision(&mut agg, "hi");
+    submit_state(&mut agg, d1, vec![node_msg("u1", Role::User, "hi")], None);
+    request_client_tool(&mut agg, "tc-1");
+
+    let d2 = open_decision(&mut agg, "redo");
+    let events = submit_state(&mut agg, d2, vec![node_msg("x1", Role::User, "redo")], None);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            EventPayload::CallVoided(v)
+                if v.kind == EffectKind::ToolCall && v.id == "tc-1"
+        )),
+        "the fork voids the stranded call; got {events:?}"
+    );
+
+    let err = agg
+        .try_handle(
+            CommandPayload::settle(
+                EffectKind::ToolCall,
+                "tc-1".to_string(),
+                Some(0),
+                Outcome::Tool {
+                    result: StoredResult::text("ok".to_string()),
+                },
+            ),
+            &machine(),
+        )
+        .expect_err("settling voided work is an error");
+    assert!(matches!(err, SessionError::EffectNotPending));
+}
+
+#[test]
+fn fork_spares_work_anchored_on_the_shared_prefix() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let d1 = open_decision(&mut agg, "hi");
+    submit_state(&mut agg, d1, vec![node_msg("u1", Role::User, "hi")], None);
+    request_client_tool(&mut agg, "tc-1");
+
+    let d2 = open_decision(&mut agg, "more");
+    submit_state(
+        &mut agg,
+        d2,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("a1", Role::Assistant, "?"),
+        ],
+        None,
+    );
+    let d3 = open_decision(&mut agg, "redo");
+    let events = submit_state(
+        &mut agg,
+        d3,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("b1", Role::Assistant, "!"),
+        ],
+        None,
+    );
+    assert!(
+        voided_ids(&events).is_empty(),
+        "work above the fork point is untouched; got {events:?}"
+    );
+
+    let events = complete_tool(&mut agg, "tc-1", "ok");
+    assert_eq!(fired_tool_result(&events), vec!["tc-1".to_string()]);
+}
+
+#[test]
+fn fork_voids_a_retrying_effect() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    declare_client_tool(&mut agg, "flaky");
+    let d1 = open_decision(&mut agg, "hi");
+    submit_state(&mut agg, d1, vec![node_msg("u1", Role::User, "hi")], None);
+    dispatch(
+        &mut agg,
+        CommandPayload::RequestToolCall {
+            tool_call_id: "tc-1".to_string(),
+            name: "flaky".to_string(),
+            arguments: "{}".to_string(),
+            retry: Some(RetryOverride {
+                queue_timeout_secs: None,
+                run_timeout_secs: None,
+                total_timeout_secs: None,
+                max_attempts: Some(2),
+                backoff_base_secs: Some(1),
+                backoff_max_secs: Some(1),
+            }),
+        },
+        &system(),
+    );
+    dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::ToolCall,
+            "tc-1".to_string(),
+            Some(0),
+            SettleError::new(ErrorInfo::internal("flake".to_string()), true),
+        ),
+        &machine(),
+    );
+
+    let d2 = open_decision(&mut agg, "redo");
+    let events = submit_state(&mut agg, d2, vec![node_msg("x1", Role::User, "redo")], None);
+    assert_eq!(voided_ids(&events), vec!["tc-1"], "got {events:?}");
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::Wake {
+            now: Utc::now() + chrono::Duration::hours(1),
+        },
+        &system(),
+    );
+    assert!(events.is_empty(), "got {events:?}");
+}
+
+#[test]
+fn promoting_submit_drops_a_queued_settle_for_the_branch_it_forked_away() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let d1 = open_decision(&mut agg, "hi");
+    submit_state(&mut agg, d1, vec![node_msg("u1", Role::User, "hi")], None);
+    request_client_tool(&mut agg, "tc-1");
+
+    let d2 = open_decision(&mut agg, "redo");
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::ToolCall,
+            "tc-1".to_string(),
+            Some(0),
+            Outcome::Tool {
+                result: StoredResult::text("ok".to_string()),
+            },
+        ),
+        &machine(),
+    );
+    let settle_id = decision_with(&events, |t| matches!(t, Trigger::ToolFinished { .. }))
+        .expect("on-path settle queues behind the pending decision");
+    open_decision(&mut agg, "also this");
+
+    let events = submit_state(&mut agg, d2, vec![node_msg("x1", Role::User, "redo")], None);
+    let dropped: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            EventPayload::DecisionDropped(p) => Some(p.id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(dropped, vec![settle_id.as_str()], "got {events:?}");
+    assert!(
+        settle_decisions(&events).is_empty(),
+        "the stale settle is not delivered; got {events:?}"
+    );
+    let promoted = events.iter().find_map(|e| match e {
+        EventPayload::DecisionDispatched(p) => agg.state.worker_decision(&p.id).map(|d| &d.trigger),
+        _ => None,
+    });
+    assert!(
+        matches!(promoted, Some(Trigger::ClientMessage { .. })),
+        "the next live decision is promoted past the dropped settle; got {events:?}"
+    );
+    assert!(
+        agg.state.queued_decisions().is_empty(),
+        "nothing is left queued"
+    );
+}
+
+#[test]
+fn fork_voids_a_pending_llm_call() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let d1 = open_decision(&mut agg, "hi");
+    submit_state(&mut agg, d1, vec![node_msg("u1", Role::User, "hi")], None);
+    request_llm(&mut agg, "llm-1", LlmHandler::Server);
+
+    let d2 = open_decision(&mut agg, "redo");
+    let events = submit_state(&mut agg, d2, vec![node_msg("x1", Role::User, "redo")], None);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            EventPayload::CallVoided(v)
+                if v.kind == EffectKind::LlmCall && v.id == "llm-1"
+        )),
+        "the fork voids the in-flight call; got {events:?}"
+    );
+
+    let events = complete_llm(&mut agg, "llm-1", 0, &system());
+    assert!(events.is_empty(), "got {events:?}");
+}
+
+#[test]
+fn fork_drops_a_queued_execute_decision() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let d1 = open_decision(&mut agg, "hi");
+    let call_tool = |id: &str| Action::CallTool {
+        id: id.to_string(),
+        name: "slow".to_string(),
+        arguments: "{}".to_string(),
+        retry: None,
+    };
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: d1,
+            transcript: vec![node_msg("u1", Role::User, "hi")],
+            actions: vec![call_tool("t1"), call_tool("t2")],
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    );
+    let exec_t1 = decision_with(
+        &events,
+        |t| matches!(t, Trigger::ToolExecute { id, .. } if id == "t1"),
+    )
+    .expect("first execute is delivered");
+    let exec_t2 = decision_with(
+        &events,
+        |t| matches!(t, Trigger::ToolExecute { id, .. } if id == "t2"),
+    )
+    .expect("second execute queues");
+
+    let events = submit_state(
+        &mut agg,
+        exec_t1,
+        vec![node_msg("x1", Role::User, "redo")],
+        None,
+    );
+    let mut voided = voided_ids(&events);
+    voided.sort_unstable();
+    assert_eq!(voided, vec!["t1", "t2"], "got {events:?}");
+    let dropped: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            EventPayload::DecisionDropped(p) => Some(p.id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(dropped, vec![exec_t2.as_str()], "got {events:?}");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, EventPayload::DecisionDispatched(_))),
+        "nothing is left to promote; got {events:?}"
+    );
+}
+
+#[test]
+fn submit_settling_work_it_forked_away_voids_it_instead() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let d1 = open_decision(&mut agg, "hi");
+    submit_state(&mut agg, d1, vec![node_msg("u1", Role::User, "hi")], None);
+    request_client_tool(&mut agg, "tc-1");
+
+    let d2 = open_decision(&mut agg, "redo");
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: d2,
+            transcript: vec![node_msg("x1", Role::User, "redo")],
+            actions: vec![Action::ToolResult {
+                id: "tc-1".to_string(),
+                attempt: None,
+                result: StoredResult::text("late".to_string()),
+            }],
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    );
+    assert_eq!(voided_ids(&events), vec!["tc-1"], "got {events:?}");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, EventPayload::ToolCallCompleted(_))),
+        "the settle dies with the branch; got {events:?}"
+    );
+    assert!(settle_decisions(&events).is_empty(), "got {events:?}");
+}
+
+#[test]
+fn submit_settling_a_call_its_own_interrupt_voided_swallows_it() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let d1 = open_decision(&mut agg, "hi");
+    request_llm(&mut agg, "llm-1", LlmHandler::Server);
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: d1,
+            transcript: vec![node_msg("u1", Role::User, "hi")],
+            actions: vec![
+                Action::Interrupt {
+                    interrupt_id: "int-1".to_string(),
+                    reason: "hold".to_string(),
+                    payload: serde_json::Value::Null,
+                },
+                Action::LlmResult {
+                    id: "llm-1".to_string(),
+                    attempt: None,
+                    response: llm_response("late"),
+                },
+            ],
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    );
+    assert_eq!(voided_ids(&events), vec!["llm-1"], "got {events:?}");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, EventPayload::LlmCallCompleted(_))),
+        "the settle dies with the voided call; got {events:?}"
+    );
+    assert_eq!(
+        agg.state
+            .effect(EffectKind::LlmCall, "llm-1")
+            .unwrap()
+            .tracking
+            .status(),
+        EffectStatus::Failed,
+    );
+}
+
+#[test]
+fn void_guard_matches_kind_not_just_id() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let d1 = open_decision(&mut agg, "hi");
+    submit_state(&mut agg, d1, vec![node_msg("u1", Role::User, "hi")], None);
+    request_client_tool(&mut agg, "shared");
+
+    let d2 = open_decision(&mut agg, "more");
+    submit_state(
+        &mut agg,
+        d2,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("a1", Role::Assistant, "?"),
+        ],
+        None,
+    );
+    dispatch(&mut agg, spawn_as("helper", "shared"), &system());
+
+    let d3 = open_decision(&mut agg, "redo");
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: d3,
+            transcript: vec![
+                node_msg("u1", Role::User, "hi"),
+                node_msg("b1", Role::Assistant, "!"),
+            ],
+            actions: vec![Action::ToolResult {
+                id: "shared".to_string(),
+                attempt: None,
+                result: StoredResult::text("ok".to_string()),
+            }],
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    );
+    assert_eq!(voided_ids(&events), vec!["shared"], "got {events:?}");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::ToolCallCompleted(_))),
+        "the tool settle lands despite the voided subagent sharing its id; got {events:?}"
+    );
+}
+
+#[test]
+fn fork_drops_a_retrying_settle_decision() {
+    let mut agg = Session::with_state(
+        "sess-1".to_string(),
+        "tenant-a".to_string(),
+        SessionState::new("sess-1".to_string()),
+    );
+    dispatch(
+        &mut agg,
+        CommandPayload::CreateSession {
+            agent_id: "agent-1".to_string(),
+            owner: SessionOwner {
+                tenant_id: "tenant-a".to_string(),
+                requester: Requester::new(
+                    Subject::new(Issuer::app(), "user-1".to_string()),
+                    Default::default(),
+                ),
+                metadata: HashMap::new(),
+            },
+            ancestry: vec![],
+            worker_retry: RetryPolicy {
+                queue_timeout_secs: None,
+                run_timeout_secs: None,
+                total_timeout_secs: None,
+                max_attempts: 2,
+                backoff_base_secs: 1,
+                backoff_max_secs: 1,
+            },
+            agent: None,
+            worker: None,
+            events: None,
+            state: None,
+        },
+        &system(),
+    );
+    drain_session_start(&mut agg);
+
+    let d1 = open_decision(&mut agg, "hi");
+    submit_state(&mut agg, d1, vec![node_msg("u1", Role::User, "hi")], None);
+    request_client_tool(&mut agg, "tc-1");
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::ToolCall,
+            "tc-1".to_string(),
+            Some(0),
+            Outcome::Tool {
+                result: StoredResult::text("ok".to_string()),
+            },
+        ),
+        &machine(),
+    );
+    let settle_id = decision_with(&events, |t| matches!(t, Trigger::ToolFinished { .. }))
+        .expect("on-path settle is delivered");
+    dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::Decision,
+            settle_id.clone(),
+            None,
+            SettleError::new(ErrorInfo::internal("worker crashed".to_string()), true),
+        ),
+        &machine(),
+    );
+
+    let d2 = open_decision(&mut agg, "redo");
+    let events = submit_state(&mut agg, d2, vec![node_msg("x1", Role::User, "redo")], None);
+    let dropped: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            EventPayload::DecisionDropped(p) => Some(p.id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(dropped, vec![settle_id.as_str()], "got {events:?}");
+    assert!(
+        settle_decisions(&events).is_empty(),
+        "the stale settle is not re-delivered; got {events:?}"
+    );
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::Wake {
+            now: Utc::now() + chrono::Duration::hours(1),
+        },
+        &system(),
+    );
+    assert!(events.is_empty(), "got {events:?}");
+}
+
+fn interrupt(agg: &mut Session, id: &str) -> Vec<EventPayload> {
+    dispatch(
+        agg,
+        CommandPayload::Interrupt {
+            interrupt_id: id.to_string(),
+            reason: "paused".to_string(),
+            payload: serde_json::Value::Null,
+        },
+        &system(),
+    )
+}
+
+fn resume(agg: &mut Session, id: &str) -> Vec<EventPayload> {
+    dispatch(
+        agg,
+        CommandPayload::ResumeInterrupt {
+            interrupt_id: id.to_string(),
+            payload: serde_json::Value::Null,
+        },
+        &system(),
+    )
+}
+
+fn parked_session() -> Session {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let d1 = open_decision(&mut agg, "hi");
+    submit_state(
+        &mut agg,
+        d1,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("a1", Role::Assistant, "hello"),
+        ],
+        None,
+    );
+    interrupt(&mut agg, "int-1");
+    agg
+}
+
+#[test]
+fn client_interrupt_anchors_at_the_head() {
+    let agg = parked_session();
+    let open = agg.state.open_interrupt("int-1").expect("open interrupt");
+    assert_eq!(open.anchor.as_deref(), Some("a1"));
+    assert!(agg.state.head_parked());
+}
+
+#[test]
+fn edited_view_escapes_a_parked_head_and_the_interrupt_survives() {
+    let mut agg = parked_session();
+    let events = submit_messages(
+        &mut agg,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("", Role::User, "actually, do this instead"),
+        ],
+    );
+    assert!(
+        decision_with(&events, |t| matches!(t, Trigger::ClientTranscript { .. })).is_some(),
+        "the escaping view is delivered; got {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::DecisionDispatched(_))),
+        "dispatched live, not queued; got {events:?}"
+    );
+    assert!(
+        agg.state.open_interrupt("int-1").is_some(),
+        "the interrupt stays open on its branch"
+    );
+}
+
+#[test]
+fn appending_to_a_parked_branch_is_rejected() {
+    let agg = parked_session();
+    let err = agg
+        .try_handle(
+            CommandPayload::SubmitClientPayload {
+                payload: ClientPayload::Messages(ClientMessages {
+                    messages: vec![
+                        node_msg("u1", Role::User, "hi"),
+                        node_msg("a1", Role::Assistant, "hello"),
+                        node_msg("", Role::User, "and then?"),
+                    ],
+                    stream: false,
+                    client: Default::default(),
+                }),
+                turn: TurnTarget::Detached,
+                queue: QueueMode::Refuse,
+            },
+            &system(),
+        )
+        .expect_err("an append lands on the parked branch");
+    assert!(matches!(err, SessionError::SessionInterrupted));
+}
+
+#[test]
+fn global_interrupt_gates_all_new_views() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    interrupt(&mut agg, "int-1");
+    assert_eq!(agg.state.open_interrupt("int-1").unwrap().anchor, None);
+    let err = agg
+        .try_handle(
+            CommandPayload::SubmitClientPayload {
+                payload: ClientPayload::Messages(ClientMessages {
+                    messages: vec![node_msg("", Role::User, "hello")],
+                    stream: false,
+                    client: Default::default(),
+                }),
+                turn: TurnTarget::Detached,
+                queue: QueueMode::Refuse,
+            },
+            &system(),
+        )
+        .expect_err("a global interrupt parks every path");
+    assert!(matches!(err, SessionError::SessionInterrupted));
+}
+
+#[test]
+fn answer_carrying_view_is_accepted_and_queued_while_parked() {
+    let mut agg = parked_session();
+    request_client_tool(&mut agg, "tc-1");
+    let events = submit_messages(
+        &mut agg,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("a1", Role::Assistant, "hello"),
+            tool_msg("tc-1", "the answer"),
+        ],
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::ToolCallCompleted(_))),
+        "the answer settles; got {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::DecisionQueued(_))),
+        "the follow-up queues until resume; got {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, EventPayload::DecisionDispatched(_))),
+        "nothing dispatches while parked; got {events:?}"
+    );
+}
+
+fn escape_to_e1(agg: &mut Session) {
+    let events = submit_messages(
+        agg,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("e1", Role::User, "actually, do this instead"),
+        ],
+    );
+    let d = events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionDispatched(p) => Some(p.id.clone()),
+            _ => None,
+        })
+        .expect("the escape dispatches");
+    submit_state(
+        agg,
+        d,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("e1", Role::User, "actually, do this instead"),
+        ],
+        None,
+    );
+}
+
+#[test]
+fn two_parked_branches_coexist_and_resume_independently() {
+    let mut agg = parked_session();
+    escape_to_e1(&mut agg);
+    assert_eq!(agg.state.head_id.as_deref(), Some("e1"));
+    assert!(!agg.state.head_parked(), "the new branch starts unparked");
+
+    interrupt(&mut agg, "int-2");
+    assert_eq!(agg.state.open_interrupts.len(), 2);
+    assert!(agg.state.head_parked());
+
+    let events = resume(&mut agg, "int-1");
+    assert!(
+        matches!(events.as_slice(), [EventPayload::InterruptResumed(_)]),
+        "off-head resume clears silently; got {events:?}"
+    );
+    assert!(agg.state.head_parked(), "int-2 still parks the head");
+
+    let events = resume(&mut agg, "int-2");
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                EventPayload::InterruptResumed(_),
+                EventPayload::DecisionQueued(_),
+                EventPayload::DecisionDispatched(_),
+            ]
+        ),
+        "on-head resume fires the trigger; got {events:?}"
+    );
+    assert!(agg.state.open_interrupts.is_empty());
+    assert!(!agg.state.head_parked());
+}
+
+#[test]
+fn resume_with_a_live_escape_decision_queues_the_trigger() {
+    let mut agg = parked_session();
+    submit_messages(
+        &mut agg,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("", Role::User, "meanwhile, on another branch"),
+        ],
+    );
+    assert!(agg.state.has_pending_worker_decision());
+
+    let events = resume(&mut agg, "int-1");
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                EventPayload::InterruptResumed(_),
+                EventPayload::DecisionQueued(_),
+            ]
+        ),
+        "the resume trigger queues behind the live decision; got {events:?}"
+    );
+}
+
+#[test]
+fn interrupt_voiding_is_scoped_to_the_parked_path() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let ctx = CommitContext {
+        span: SpanContext::root(),
+        occurred_at: Utc::now(),
+    };
+    let msg = |id: &str, parent: Option<&str>| {
+        EventPayload::NewMessage(NewMessage {
+            message: node_msg(id, Role::User, "m").record(&crate::ids::Ids::new(
+                "t",
+                0,
+                Utc::now(),
+            )),
+            parent_id: parent.map(str::to_string),
+            copied_from: None,
+        })
+    };
+    let llm = |id: &str| {
+        EventPayload::LlmCallRequested(LlmCallRequested {
+            defer_tools_strategy: Default::default(),
+            llm: "claude".to_string(),
+            format: None,
+            id: id.to_string(),
+            attempt: 0,
+            request: request_with(vec![]),
+            stream: false,
+            retry: RetryPolicy::no_retry(),
+            handler: LlmHandler::Server,
+        })
+    };
+    agg.commit(vec![msg("u1", None), msg("a1", Some("u1"))], &ctx);
+    agg.commit(vec![llm("L1")], &ctx);
+    agg.commit(vec![msg("e1", Some("u1"))], &ctx);
+    agg.commit(vec![llm("L2")], &ctx);
+
+    let events = interrupt(&mut agg, "int-1");
+    assert_eq!(
+        voided_ids(&events),
+        vec!["L2"],
+        "voiding spares the other branch; got {events:?}"
+    );
+}
+
+#[test]
+fn worker_interrupt_anchors_at_the_post_reconcile_head() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let d1 = open_decision(&mut agg, "hi");
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: d1,
+            transcript: vec![
+                node_msg("u1", Role::User, "hi"),
+                node_msg("x1", Role::Assistant, "confirm?"),
+            ],
+            actions: vec![Action::Interrupt {
+                interrupt_id: "int-1".to_string(),
+                reason: "confirmation".to_string(),
+                payload: serde_json::Value::Null,
+            }],
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    );
+    let anchor = events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::SessionInterrupted(p) => Some(p.anchor.clone()),
+            _ => None,
+        })
+        .expect("the action raises the interrupt");
+    assert_eq!(anchor.as_deref(), Some("x1"), "anchored at head_after");
+    assert_eq!(agg.state.head_id.as_deref(), Some("x1"));
+    assert!(agg.state.head_parked());
+}
+
+#[test]
+fn worker_interrupt_on_an_escaped_branch_is_not_deduped_by_the_old_one() {
+    let mut agg = parked_session();
+    let events = submit_messages(
+        &mut agg,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("e1", Role::User, "other branch"),
+        ],
+    );
+    let d = events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionDispatched(p) => Some(p.id.clone()),
+            _ => None,
+        })
+        .expect("the escape dispatches");
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: d,
+            transcript: vec![
+                node_msg("u1", Role::User, "hi"),
+                node_msg("e1", Role::User, "other branch"),
+            ],
+            actions: vec![Action::Interrupt {
+                interrupt_id: "int-2".to_string(),
+                reason: "confirmation".to_string(),
+                payload: serde_json::Value::Null,
+            }],
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::SessionInterrupted(_))),
+        "idempotence is per-path, not per-session; got {events:?}"
+    );
+    assert_eq!(agg.state.open_interrupts.len(), 2);
+}
+
+#[test]
+fn promotion_and_wake_skip_parked_branches() {
+    let mut agg = parked_session();
+    request_client_tool(&mut agg, "tc-1");
+    let events = complete_tool(&mut agg, "tc-1", "ok");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::DecisionQueued(_))),
+        "the answer queues while parked; got {events:?}"
+    );
+
+    assert_eq!(
+        super::schedule::wake_at(&agg.state, Utc::now()),
+        None,
+        "a parked head schedules no wake"
+    );
+    let events = wake(&mut agg);
+    assert!(
+        events.is_empty(),
+        "wake does not promote a parked decision; got {events:?}"
+    );
+
+    let events = resume(&mut agg, "int-1");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::DecisionDispatched(_))),
+        "resume fires the interrupt.resumed decision; got {events:?}"
+    );
+}
+
+#[test]
+fn wake_promotes_a_queued_decision_on_an_unparked_branch() {
+    let mut agg = parked_session();
+    escape_to_e1(&mut agg);
+    agg.commit(
+        vec![EventPayload::DecisionQueued(DecisionQueued {
+            id: "d-queued".to_string(),
+            trigger: Trigger::ClientMessage {
+                messages: vec![node_msg("", Role::User, "queued")],
+                client: ClientContext::default(),
+                turn_id: None,
+                merge: false,
+            },
+        })],
+        &CommitContext {
+            span: SpanContext::root(),
+            occurred_at: Utc::now(),
+        },
+    );
+    assert!(
+        super::schedule::wake_at(&agg.state, Utc::now()).is_some(),
+        "a promotable queued decision wakes immediately"
+    );
+    let events = wake(&mut agg);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::DecisionDispatched(_))),
+        "the off-head interrupt does not block promotion; got {events:?}"
+    );
+}
+
+#[test]
+fn anchorless_interrupt_event_replays_as_global() {
+    let payload = serde_json::json!({
+        "type": "session.interrupted",
+        "interrupt_id": "int-old",
+        "origin": "frontend",
+        "reason": "paused",
+        "payload": null,
+    });
+    let event: EventPayload = serde_json::from_value(payload).expect("old event deserializes");
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let d1 = open_decision(&mut agg, "hi");
+    submit_state(&mut agg, d1, vec![node_msg("u1", Role::User, "hi")], None);
+    agg.commit(
+        vec![event],
+        &CommitContext {
+            span: SpanContext::root(),
+            occurred_at: Utc::now(),
+        },
+    );
+    let open = agg.state.open_interrupt("int-old").expect("open");
+    assert_eq!(open.anchor, None);
+    assert!(
+        agg.state.head_parked(),
+        "an anchorless interrupt parks every path"
+    );
+}
+
+#[test]
+fn escape_decision_retry_fires_while_the_head_is_parked() {
+    let mut agg = Session::with_state(
+        "sess-1".to_string(),
+        "tenant-a".to_string(),
+        SessionState::new("sess-1".to_string()),
+    );
+    dispatch(
+        &mut agg,
+        CommandPayload::CreateSession {
+            agent_id: "agent-1".to_string(),
+            owner: SessionOwner {
+                tenant_id: "tenant-a".to_string(),
+                requester: Requester::new(
+                    Subject::new(Issuer::app(), "user-1".to_string()),
+                    Default::default(),
+                ),
+                metadata: HashMap::new(),
+            },
+            ancestry: vec![],
+            worker_retry: RetryPolicy {
+                queue_timeout_secs: None,
+                run_timeout_secs: None,
+                total_timeout_secs: None,
+                max_attempts: 2,
+                backoff_base_secs: 1,
+                backoff_max_secs: 1,
+            },
+            agent: None,
+            worker: None,
+            events: None,
+            state: None,
+        },
+        &system(),
+    );
+    drain_session_start(&mut agg);
+    let d1 = open_decision(&mut agg, "hi");
+    submit_state(
+        &mut agg,
+        d1,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("a1", Role::Assistant, "hello"),
+        ],
+        None,
+    );
+    interrupt(&mut agg, "int-1");
+
+    let events = submit_messages(
+        &mut agg,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("", Role::User, "escape"),
+        ],
+    );
+    let escape = events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionDispatched(p) => Some(p.id.clone()),
+            _ => None,
+        })
+        .expect("the escape dispatches while parked");
+    dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::Decision,
+            escape.clone(),
+            None,
+            SettleError::new(ErrorInfo::internal("worker flaked".to_string()), true),
+        ),
+        &machine(),
+    );
+
+    assert!(
+        super::schedule::wake_at(&agg.state, Utc::now()).is_some(),
+        "the escape's retry schedules a wake despite the parked head"
+    );
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::Wake {
+            now: Utc::now() + chrono::Duration::hours(1),
+        },
+        &system(),
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            EventPayload::DecisionDispatched(p) if p.id == escape
+        )),
+        "the wake re-fires the escape decision; got {events:?}"
+    );
+}
+
+#[test]
+fn parked_branch_deadlines_are_suppressed_but_live_branch_timers_run() {
+    let deadline_policy = RetryOverride {
+        queue_timeout_secs: None,
+        run_timeout_secs: Some(60),
+        total_timeout_secs: None,
+        max_attempts: Some(1),
+        backoff_base_secs: Some(1),
+        backoff_max_secs: Some(1),
+    };
+    let mut agg = parked_session();
+    dispatch(
+        &mut agg,
+        CommandPayload::RequestToolCall {
+            tool_call_id: "tc-parked".to_string(),
+            name: "slow".to_string(),
+            arguments: "{}".to_string(),
+            retry: Some(deadline_policy.clone()),
+        },
+        &system(),
+    );
+    assert_eq!(
+        super::schedule::wake_at(&agg.state, Utc::now()),
+        None,
+        "a parked branch's deadline schedules nothing"
+    );
+
+    escape_to_e1(&mut agg);
+    dispatch(
+        &mut agg,
+        CommandPayload::RequestToolCall {
+            tool_call_id: "tc-live".to_string(),
+            name: "slow".to_string(),
+            arguments: "{}".to_string(),
+            retry: Some(deadline_policy),
+        },
+        &system(),
+    );
+    assert!(
+        super::schedule::wake_at(&agg.state, Utc::now()).is_some(),
+        "a live branch's deadline keeps running"
+    );
+}
+
+fn submit_queued(
+    agg: &mut Session,
+    text: &str,
+    turn_id: &str,
+) -> Result<Vec<EventPayload>, SessionError> {
+    let cmd = CommandPayload::SubmitClientPayload {
+        payload: ClientPayload::Message(ClientMessage {
+            message: node_msg("", Role::User, text),
+            stream: false,
+        }),
+        turn: TurnTarget::Open(turn_id.to_string()),
+        queue: QueueMode::Turn,
+    };
+    let now = Utc::now();
+    let events = agg.handle(cmd, &frontend(), now)?;
+    agg.commit(
+        events.clone(),
+        &CommitContext {
+            span: SpanContext::root(),
+            occurred_at: now,
+        },
+    );
+    Ok(events)
+}
+
+fn session_mid_turn() -> Session {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: node_msg("", Role::User, "hi"),
+                stream: false,
+            }),
+            turn: TurnTarget::Open("turn-1".to_string()),
+            queue: QueueMode::Refuse,
+        },
+        &frontend(),
+    );
+    agg
+}
+
+fn decide(agg: &mut Session, actions: Vec<Action>) -> Vec<EventPayload> {
+    let id = agg
+        .state
+        .effects_of(EffectKind::Decision)
+        .find(|d| d.tracking.status() == EffectStatus::Pending)
+        .map(|d| d.id.clone())
+        .expect("a live decision");
+    dispatch(
+        agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: id,
+            transcript: vec![],
+            actions,
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    )
+}
+
+fn end_turn(agg: &mut Session) -> Vec<EventPayload> {
+    decide(
+        agg,
+        vec![Action::Done {
+            data: serde_json::Value::Null,
+        }],
+    );
+    decide(
+        agg,
+        vec![Action::Done {
+            data: serde_json::Value::Null,
+        }],
+    )
+}
+
+fn started_turns(events: &[EventPayload]) -> Vec<&str> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            EventPayload::TurnStarted(p) => Some(p.turn_id.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_queued_submit_is_taken_without_starting_a_turn() {
+    let mut agg = session_mid_turn();
+    let events = submit_queued(&mut agg, "and another thing", "turn-2").expect("queued submit");
+
+    assert!(
+        started_turns(&events).is_empty(),
+        "the running turn keeps the phase; got {events:?}"
+    );
+    let queued = decision_with(&events, |t| t.deferred_turn_id() == Some("turn-2"))
+        .expect("the message queues as a decision holding turn-2");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, EventPayload::DecisionDispatched(p) if p.id == queued)),
+        "and it parks rather than dispatching; got {events:?}"
+    );
+    assert_eq!(agg.state.phase.turn_id(), Some("turn-1"));
+}
+
+#[test]
+fn a_queued_turn_starts_in_the_batch_that_ends_the_one_before_it() {
+    let mut agg = session_mid_turn();
+    let queued = submit_queued(&mut agg, "and another thing", "turn-2")
+        .ok()
+        .and_then(|events| decision_with(&events, |t| t.deferred_turn_id() == Some("turn-2")))
+        .expect("the queued decision holding turn-2");
+
+    let events = end_turn(&mut agg);
+    let handoff: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            EventPayload::TurnCompleted(p) => Some(format!("completed:{}", p.turn_id)),
+            EventPayload::TurnStarted(p) => Some(format!("started:{}", p.turn_id)),
+            EventPayload::DecisionDispatched(p) if p.id == queued => {
+                Some("dispatched:queued".to_string())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        handoff,
+        vec!["completed:turn-1", "started:turn-2", "dispatched:queued"],
+        "got {events:?}"
+    );
+    assert_eq!(agg.state.phase.turn_id(), Some("turn-2"));
+    assert!(
+        agg.state.has_pending_worker_decision(),
+        "and the queued decision is now live"
+    );
+}
+
+#[test]
+fn a_fail_completes_the_turn_with_the_error_and_takes_the_next_message() {
+    let mut agg = session_mid_turn();
+    let error = ErrorInfo::new(crate::protocol::ErrorCode::RateLimited, "rate limited");
+    let events = decide(
+        &mut agg,
+        vec![Action::Fail {
+            error: error.clone(),
+        }],
+    );
+    let completed = events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::TurnCompleted(p) => Some(p),
+            _ => None,
+        })
+        .expect("the turn completes");
+    assert_eq!(completed.turn_id, "turn-1");
+    assert_eq!(completed.error, Some(error));
+    assert_eq!(agg.state.status, SessionStatus::Idle);
+    assert_eq!(agg.state.phase.turn_id(), None);
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: node_msg("", Role::User, "again"),
+                stream: false,
+            }),
+            turn: TurnTarget::Open("turn-2".to_string()),
+            queue: QueueMode::Refuse,
+        },
+        &frontend(),
+    );
+    assert_eq!(started_turns(&events), vec!["turn-2"]);
+}
+
+#[test]
+fn a_queued_submit_defers_while_the_turn_before_it_finalizes() {
+    let mut agg = session_mid_turn();
+    decide(
+        &mut agg,
+        vec![Action::Done {
+            data: serde_json::Value::Null,
+        }],
+    );
+    assert!(agg.state.phase.finalizing().is_some(), "turn-1 finalizing");
+
+    let events = submit_queued(&mut agg, "and another thing", "turn-2").expect("queued submit");
+    assert!(
+        started_turns(&events).is_empty(),
+        "no turn opens beside the finalizing one; got {events:?}"
+    );
+    let queued = decision_with(&events, |t| t.deferred_turn_id() == Some("turn-2"))
+        .expect("the message queues as a decision holding turn-2");
+    assert_eq!(
+        super::schedule::waiting_on(&agg.state)[&(EffectKind::Decision, queued)],
+        vec!["turn:turn-1".to_string()],
+        "and it waits on the turn, which is still turn-1's"
+    );
+
+    let events = decide(
+        &mut agg,
+        vec![Action::Done {
+            data: serde_json::Value::Null,
+        }],
+    );
+    assert_eq!(started_turns(&events), vec!["turn-2"], "got {events:?}");
+}
+
+#[test]
+fn queued_turns_start_one_at_a_time_in_arrival_order() {
+    let mut agg = session_mid_turn();
+    submit_queued(&mut agg, "second", "turn-2").expect("queued submit");
+    submit_queued(&mut agg, "third", "turn-3").expect("queued submit");
+
+    let events = end_turn(&mut agg);
+    assert_eq!(
+        started_turns(&events),
+        vec!["turn-2"],
+        "the phase admits one; got {events:?}"
+    );
+
+    let events = end_turn(&mut agg);
+    assert_eq!(started_turns(&events), vec!["turn-3"]);
+    assert_eq!(agg.state.phase.turn_id(), Some("turn-3"));
+}
+
+#[test]
+fn a_queued_turn_id_is_refused_until_it_has_run() {
+    let mut agg = session_mid_turn();
+    submit_queued(&mut agg, "and another thing", "turn-2").expect("queued submit");
+
+    match submit_queued(&mut agg, "and another thing", "turn-2") {
+        Err(SessionError::TurnAlreadyActive { turn_id }) => assert_eq!(turn_id, "turn-2"),
+        other => panic!("expected TurnAlreadyActive; got {other:?}"),
+    }
+    match submit_queued(&mut agg, "hi", "turn-1") {
+        Err(SessionError::TurnAlreadyActive { turn_id }) => assert_eq!(turn_id, "turn-1"),
+        other => panic!("expected TurnAlreadyActive; got {other:?}"),
+    }
+    end_turn(&mut agg);
+    match submit_queued(&mut agg, "hi", "turn-1") {
+        Err(SessionError::TurnAlreadyCompleted { turn_id }) => assert_eq!(turn_id, "turn-1"),
+        other => panic!("expected TurnAlreadyCompleted; got {other:?}"),
+    }
+}
+
+#[test]
+fn a_queued_submit_on_an_idle_session_starts_its_turn_now() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let events = submit_queued(&mut agg, "hi", "turn-1").expect("queued submit");
+
+    assert_eq!(
+        started_turns(&events),
+        vec!["turn-1"],
+        "nothing holds the phase, so the flag changes nothing; got {events:?}"
+    );
+    assert!(agg.state.has_pending_worker_decision());
+}
+
+#[test]
+fn a_view_or_action_is_still_refused_mid_turn() {
+    let agg = session_mid_turn();
+    let refused = [
+        ClientPayload::Messages(ClientMessages {
+            messages: vec![node_msg("", Role::User, "again")],
+            stream: false,
+            client: ClientContext::default(),
+        }),
+        ClientPayload::Action(crate::protocol::ClientAction {
+            name: "regenerate".to_string(),
+            args: None,
+        }),
+    ];
+    for payload in refused {
+        let err = agg
+            .try_handle(
+                CommandPayload::SubmitClientPayload {
+                    payload: payload.clone(),
+                    turn: TurnTarget::Open("turn-2".to_string()),
+                    queue: QueueMode::Turn,
+                },
+                &frontend(),
+            )
+            .expect_err("only the message shapes defer");
+        assert!(
+            matches!(err, SessionError::TurnAlreadyActive { .. }),
+            "got {err:?} for {payload:?}"
+        );
+    }
+}
+
+#[test]
+fn a_failed_turn_does_not_un_ask_the_turn_queued_behind_it() {
+    let mut agg = session_mid_turn();
+    submit_queued(&mut agg, "and another thing", "turn-2").expect("queued submit");
+    let live = agg
+        .state
+        .effects_of(EffectKind::Decision)
+        .find(|d| d.tracking.status() == EffectStatus::Pending)
+        .map(|d| d.id.clone())
+        .expect("turn-1's decision is live");
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::Decision,
+            live,
+            None,
+            SettleError::new(ErrorInfo::internal("worker crashed".to_string()), false),
+        ),
+        &machine(),
+    );
+    assert!(
+        turn_completed(&events).is_some_and(|tc| tc.error.is_some()),
+        "turn-1 ends with its error; got {events:?}"
+    );
+    assert_eq!(
+        started_turns(&events),
+        vec!["turn-2"],
+        "and the queued question still gets asked; got {events:?}"
+    );
+}
+
+#[test]
+fn cancelling_never_starts_a_queued_turn() {
+    let mut agg = session_mid_turn();
+    submit_queued(&mut agg, "and another thing", "turn-2").expect("queued submit");
+
+    let events = dispatch(&mut agg, CommandPayload::CancelSession, &system());
+    assert!(
+        started_turns(&events).is_empty(),
+        "cancellation is terminal; got {events:?}"
+    );
+    let events = wake(&mut agg);
+    assert!(
+        started_turns(&events).is_empty(),
+        "and stays terminal; got {events:?}"
+    );
+}
+
+#[test]
+fn an_interrupt_holds_a_queued_turn_until_the_one_before_it_finishes() {
+    let mut agg = session_mid_turn();
+    submit_queued(&mut agg, "and another thing", "turn-2").expect("queued submit");
+    decide(&mut agg, vec![]);
+    dispatch(
+        &mut agg,
+        CommandPayload::Interrupt {
+            interrupt_id: "int-1".to_string(),
+            reason: "approval".to_string(),
+            payload: serde_json::Value::Null,
+        },
+        &frontend(),
+    );
+    let queued = agg
+        .state
+        .queued_decisions()
+        .first()
+        .map(|e| e.id.clone())
+        .expect("turn-2's decision is still queued");
+    assert_eq!(
+        super::schedule::waiting_on(&agg.state)[&(EffectKind::Decision, queued)],
+        vec!["interrupt:int-1".to_string()],
+        "the branch is what holds it now, not the turn"
+    );
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::ResumeInterrupt {
+            interrupt_id: "int-1".to_string(),
+            payload: serde_json::Value::Null,
+        },
+        &frontend(),
+    );
+    assert!(
+        started_turns(&events).is_empty(),
+        "turn-1 still holds the phase; got {events:?}"
+    );
+    let live = agg
+        .state
+        .effects_of(EffectKind::Decision)
+        .find(|d| d.tracking.status() == EffectStatus::Pending)
+        .and_then(|d| d.decision())
+        .map(|d| d.trigger.clone())
+        .expect("the resume is live");
+    assert!(
+        matches!(live, Trigger::InterruptResumed { .. }),
+        "the resume jumps the queue; got {live:?}"
+    );
+
+    let events = end_turn(&mut agg);
+    assert_eq!(started_turns(&events), vec!["turn-2"]);
+}
+
+#[test]
+fn a_queued_turn_id_cannot_be_opened_by_another_path() {
+    let mut agg = session_mid_turn();
+    submit_queued(&mut agg, "and another thing", "turn-2").expect("queued submit");
+    decide(
+        &mut agg,
+        vec![Action::Done {
+            data: serde_json::Value::Null,
+        }],
+    );
+    assert!(
+        agg.state.phase.finalizing().is_some(),
+        "turn-1 is finalizing, so it no longer holds the phase against a new turn"
+    );
+
+    let err = agg
+        .try_handle(
+            CommandPayload::SendMessage {
+                message: node_msg("", Role::Assistant, "aside"),
+                stream: false,
+                turn_id: Some("turn-2".to_string()),
+                parent_id: None,
+            },
+            &system(),
+        )
+        .expect_err("turn-2 is already taken");
+    match err {
+        SessionError::TurnAlreadyActive { turn_id } => assert_eq!(turn_id, "turn-2"),
+        other => panic!("expected TurnAlreadyActive; got {other:?}"),
+    }
+}
+
+#[test]
+fn admin_cannot_submit_a_worker_decision() {
+    assert!(matches!(
+        SessionState::ensure_worker_or_system(&admin()),
+        Err(SessionError::SessionAccessDenied)
+    ));
+    assert!(SessionState::ensure_worker_or_system(&machine()).is_ok());
+    assert!(SessionState::ensure_worker_or_system(&system()).is_ok());
+    assert!(matches!(
+        SessionState::ensure_worker_or_system(&frontend()),
+        Err(SessionError::SessionAccessDenied)
+    ));
+}
+
+#[test]
+fn an_admin_can_cancel_a_session_and_an_end_user_cannot() {
+    assert!(SessionState::ensure_operator_or_system(&admin()).is_ok());
+    assert!(SessionState::ensure_operator_or_system(&machine()).is_ok());
+    assert!(SessionState::ensure_operator_or_system(&system()).is_ok());
+    assert!(matches!(
+        SessionState::ensure_operator_or_system(&frontend()),
+        Err(SessionError::SessionAccessDenied)
+    ));
+}
+
+#[test]
+fn only_a_worker_answers_an_llm_call() {
+    let state = SessionState::new("sess-1".to_string());
+    assert!(matches!(
+        state.check_llm_call_caller(None, &machine()),
+        Err(SessionError::EffectNotFound)
+    ));
+    assert!(matches!(
+        state.check_llm_call_caller(None, &admin()),
+        Err(SessionError::EffectWrongHandler)
+    ));
+    assert!(matches!(
+        state.check_llm_call_caller(None, &frontend()),
+        Err(SessionError::EffectWrongHandler)
+    ));
+    assert!(state.check_llm_call_caller(None, &system()).is_ok());
+}
+
+#[test]
+fn an_admin_is_bound_to_its_tenant() {
+    assert!(SessionState::ensure_tenant_matches(&admin(), "tenant-a").is_ok());
+    assert!(matches!(
+        SessionState::ensure_tenant_matches(&admin(), "tenant-b"),
+        Err(SessionError::SessionAccessDenied)
+    ));
+}
+
+#[test]
+fn an_admin_does_not_answer_to_a_session_owner() {
+    let state = SessionState::new("sess-1".to_string());
+    assert!(state.ensure_owns_session(&admin()).is_ok());
+}
+
+#[test]
+fn an_admin_outranks_a_machine_and_answers_to_the_engine() {
+    use crate::protocol::InterruptOrigin;
+    assert!(InterruptOrigin::Operator.privilege() > InterruptOrigin::Machine.privilege());
+    assert!(InterruptOrigin::Operator.privilege() > InterruptOrigin::Frontend.privilege());
+    assert!(InterruptOrigin::Operator.privilege() < InterruptOrigin::System.privilege());
+}
+
+#[test]
+fn an_admin_caller_raises_an_admin_interrupt() {
+    use crate::protocol::InterruptOrigin;
+    assert!(matches!(
+        SessionState::caller_interrupt_origin(&admin()),
+        InterruptOrigin::Operator
+    ));
+    assert!(matches!(
+        SessionState::caller_interrupt_origin(&machine()),
+        InterruptOrigin::Machine
+    ));
+}
+
+fn plugin_config() -> AgentConfig {
+    AgentConfig {
+        plugins: vec![crate::protocol::AgentPlugin {
+            id: "pdf".to_string(),
+            description: "PDF work.".to_string(),
+            skills: vec![crate::protocol::SkillMeta {
+                name: "form-filling".to_string(),
+                description: "Fill out PDF forms.".to_string(),
+            }],
+            servers: vec!["renderer".to_string()],
+            tools: None,
+            auth_failure: Default::default(),
+            tool_sync_failure: Default::default(),
+            approve: Default::default(),
+        }],
+        ..agent_config("m1")
+    }
+}
+
+#[test]
+fn a_plugins_server_re_fetches_when_a_person_authorizes_it() {
+    let path = ConnectionPath::PluginServer {
+        plugin: "pdf".into(),
+        server: "renderer".into(),
+    };
+    let mut agg = create_session_with_config("sess-1", "tenant-a", "user-1", Some(plugin_config()));
+    dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::ConnectorSync,
+            path.to_string(),
+            None,
+            SettleError::new(ErrorInfo::internal("401".to_string()), false)
+                .auth(Some(AuthNeed::Reauthorize)),
+        ),
+        &system(),
+    );
+    assert_eq!(
+        agg.state
+            .tracking(EffectKind::ConnectorSync, &path.to_string())
+            .map(|t| t.status()),
+        Some(EffectStatus::Failed),
+    );
+
+    let d = open_decision(&mut agg, "hi");
+    dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: d,
+            transcript: vec![],
+            actions: vec![Action::SyncConnector { path: path.clone() }],
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    );
+
+    assert_eq!(
+        agg.state
+            .tracking(EffectKind::ConnectorSync, &path.to_string())
+            .map(|t| t.status()),
+        Some(EffectStatus::Pending),
+        "a plugin's server is one the agent reaches, so `connector.sync` must take it"
+    );
+}
+
+fn plugin_session() -> Session {
+    create_session_with_config("sess-1", "tenant-a", "user-1", Some(plugin_config()))
+}
+
+#[test]
+fn a_declared_plugin_offers_the_skill_tool_and_fetches_its_servers() {
+    let mut agg = plugin_session();
+    assert!(
+        offered(&agg).contains(&"skill".to_string()),
+        "the skill tool is offered from turn 1: {:?}",
+        offered(&agg)
+    );
+    assert!(
+        agg.state
+            .has_effect(EffectKind::ConnectorSync, "plugin.pdf.mcp.renderer"),
+        "naming a plugin is what turns it on"
+    );
+    settle_sync_at(&mut agg, "plugin.pdf.mcp.renderer", &["fill_form"]);
+    assert!(
+        held(&agg).contains(&"pdf_renderer__fill_form".to_string()),
+        "the server's tools join under the derived id: {:?}",
+        held(&agg)
+    );
+}
+
+#[test]
+fn using_a_skill_only_freezes_the_call() {
+    let mut agg = plugin_session();
+    call(&mut agg, "tc-1", "skill", r#"{"name":"pdf:form-filling"}"#);
+    assert!(
+        agg.state.skill_call("tc-1").is_some(),
+        "the call is frozen as a skill call for the executor"
+    );
+}
+
+#[test]
+fn the_catalog_rides_the_first_prompt_once() {
+    let mut agg = plugin_session();
+    settle_sync_at(&mut agg, "plugin.pdf.mcp.renderer", &["fill_form"]);
+    let prompt = |agg: &mut Session, id: &str| {
+        dispatch(
+            agg,
+            CommandPayload::RequestLlmCall {
+                llm: "claude".to_string(),
+                call_id: id.to_string(),
+                request: request_with(vec![]),
+                stream: false,
+                retry: RetryPolicy::no_retry(),
+                handler: LlmHandler::Server,
+                format: None,
+            },
+            &system(),
+        );
+        agg.state.llm_call(id).unwrap().prompt.clone()
+    };
+
+    let first = prompt(&mut agg, "call-1");
+    let notice = first.first().expect("the catalog rides the prompt");
+    assert_eq!(notice.role, Role::System);
+    let text = match notice.content.as_ref().expect("content") {
+        Content::Text(t) => t.clone(),
+        _ => panic!("a catalog entry is text"),
+    };
+    assert!(
+        text.starts_with("{\"plugin\":\"pdf\""),
+        "the name leads: {text}"
+    );
+    assert!(text.contains("pdf:form-filling"), "{text}");
+    assert!(text.contains("Fill out PDF forms."), "{text}");
+
+    let second = prompt(&mut agg, "call-2");
+    assert!(
+        second.is_empty(),
+        "a plugin is cataloged once per path: {second:?}"
+    );
+}
+
+#[test]
+fn a_worker_adding_a_plugin_mid_session_wakes_its_servers() {
+    let mut agg =
+        create_session_with_config("sess-1", "tenant-a", "user-1", Some(agent_config("m1")));
+    assert!(!agg
+        .state
+        .has_effect(EffectKind::ConnectorSync, "plugin.pdf.mcp.renderer"));
+
+    let d = open_decision(&mut agg, "hi");
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: d,
+            transcript: vec![node_msg("u1", Role::User, "hi")],
+            actions: vec![],
+            state: None,
+            agent: Some(plugin_config()),
+        },
+        &machine(),
+    );
+    assert_eq!(
+        sync_requests(&events),
+        ["pdf_renderer"],
+        "the config write reads its own plugins"
+    );
+}
+
+#[test]
+fn a_declared_tool_named_skill_shadows_the_engines_and_is_a_collision() {
+    let mut cfg = plugin_config();
+    cfg.tools.push(AgentTool {
+        name: "skill".to_string(),
+        description: String::new(),
+        input: None,
+        output: None,
+        handler: Some(Handler::Client),
+        defer: None,
+    });
+    let agg = create_session_with_config("sess-1", "tenant-a", "user-1", Some(cfg));
+    let merged = agg.state.at(None).connector_tools();
+    assert!(
+        merged.collisions.contains(&"skill".to_string()),
+        "reported, so the warning has something to say: {:?}",
+        merged.collisions
+    );
+    assert!(
+        !merged.tools.iter().any(|t| t.name == "skill"),
+        "the declared tool wins; the engine's is not offered"
+    );
+}
+
+fn attachment_config() -> AgentConfig {
+    AgentConfig {
+        attachments: Some(crate::attachments::Attachments {
+            tools: vec![
+                crate::attachments::Tool::View,
+                crate::attachments::Tool::Read,
+            ],
+            ..Default::default()
+        }),
+        ..agent_config("m1")
+    }
+}
+
+#[test]
+fn an_agent_that_declares_attachment_tools_offers_them_in_name_order() {
+    let agg = create_session_with_config("sess-1", "tenant-a", "user-1", Some(attachment_config()));
+    assert_eq!(offered(&agg), ["attachment_read", "attachment_view"]);
+}
+
+#[test]
+fn an_attachment_call_is_answered_by_the_engine() {
+    let mut agg =
+        create_session_with_config("sess-1", "tenant-a", "user-1", Some(attachment_config()));
+    call(
+        &mut agg,
+        "tc-1",
+        "attachment_read",
+        r#"{"attachment":"sales.csv"}"#,
+    );
+    let tc = agg.state.tool_call("tc-1").expect("requested");
+    assert_eq!(tc.handler, ToolHandler::Server);
+    assert_eq!(tc.target, Some(ConnectorTarget::Attachment));
+    let call = agg
+        .state
+        .attachment_call("tc-1")
+        .expect("the engine reads this one");
+    assert_eq!(call.tool, crate::attachments::Tool::Read);
+    assert!(call.attachments.is_empty(), "nothing arrived on this path");
+}
+
+#[test]
+fn a_subagent_retry_is_a_new_attempt_and_a_stale_answer_is_ignored() {
+    let system = Caller::System {
+        tenant_id: "tenant-a".to_string(),
+    };
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let retrying = RetryPolicy {
+        max_attempts: 3,
+        backoff_base_secs: 0,
+        backoff_max_secs: 0,
+        ..RetryPolicy::no_retry()
+    };
+    let request = match spawn("call-sa") {
+        CommandPayload::RequestSubagent {
+            session_id,
+            agent_id,
+            tool_call_id,
+            message,
+            decision_id,
+            mode,
+            ..
+        } => CommandPayload::RequestSubagent {
+            session_id,
+            agent_id,
+            tool_call_id,
+            message,
+            retry: retrying,
+            decision_id,
+            mode,
+        },
+        other => other,
+    };
+    dispatch(&mut agg, request, &system);
+    let attempt = |agg: &Session| {
+        agg.open_work().iter().find_map(|w| match w {
+            crate::work::Work::StartSubagent { work, .. } => work.attempt,
+            _ => None,
+        })
+    };
+    assert_eq!(attempt(&agg), Some(0));
+
+    dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::Subagent,
+            "call-sa".to_string(),
+            Some(0),
+            SettleError::new(ErrorInfo::internal("child store down"), true),
+        ),
+        &system,
+    );
+    dispatch(
+        &mut agg,
+        CommandPayload::Wake {
+            now: Utc::now() + chrono::Duration::hours(1),
+        },
+        &system,
+    );
+    assert_eq!(attempt(&agg), Some(1));
+
+    let stale = agg
+        .try_handle(
+            CommandPayload::settle(
+                EffectKind::Subagent,
+                "call-sa".to_string(),
+                Some(0),
+                Outcome::SubagentStarted,
+            ),
+            &system,
+        )
+        .unwrap();
+    assert!(
+        stale.is_empty(),
+        "the old attempt's answer is ignored: {stale:?}"
+    );
+}

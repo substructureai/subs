@@ -53,7 +53,6 @@ The model called your `get_weather` tool.
     { "id": "m1", "role": "user", "content": "weather in Tokyo?" },
     { "id": "m2", "role": "assistant", "tool_calls": [ { "id": "call_abc", "type": "function", "function": { "name": "get_weather", "arguments": "{\"city\":\"Tokyo\"}" } } ] }
   ],
-  "message_tree": { "nodes": [], "head_id": "m2" },
   "ancestry": [],
   "attempts": 1,
   "deadline": "2026-08-05T18:04:00Z",
@@ -93,7 +92,6 @@ type DecisionRequest = {
     calls: Call[]
     pending_calls: number
     messages: Message[]
-    message_tree: MessageTree
     ancestry: string[]
     attempts: number
     deadline: string | null
@@ -114,7 +112,6 @@ type DecisionRequest = {
 | `calls` | Tool, model, subagent, and connector calls in flight. |
 | `pending_calls` | How many tool and subagent calls are in flight. |
 | `messages` | The active conversation, root to head. This is what the model sees. |
-| `message_tree` | Every branch. See [Conversations](./120-conversations.md). |
 | `ancestry` | Parent session IDs, for a subagent. Empty for a root session. |
 | `attempts` | How many times the engine has delivered this decision. |
 | `deadline` | When this attempt expires. |
@@ -158,7 +155,6 @@ type DecisionResponse = {
     actions?: Action[]
     state?: unknown
     agent?: AgentConfig
-    channels?: Record<string, unknown>
 }
 ```
 
@@ -168,7 +164,6 @@ type DecisionResponse = {
 | `actions` | What the engine does next. See [Actions](#actions). |
 | `state` | Replaces your state. Omit or send `null` to keep it. Send `{}` to clear it. |
 | `agent` | Replaces the config. Omit to keep it. |
-| `channels` | How a frontend shows this decision, keyed by kind. The engine passes it through. See [Slack](./130-slack.md#customize-what-the-bot-shows). |
 
 An empty response `{}` writes nothing. Use it to leave a tool call open. See
 [Async tools](./110-async-tools.md).
@@ -181,7 +176,7 @@ What fires, what the engine proposes, and what you return.
 | --- | --- | --- | --- |
 | `session.start` | The session was created. | The config from the file. Empty when the section sets none. | An `agent` config. |
 | `client.messages` | A client sent or edited messages. | Record the view, then call the model. | `proposed` |
-| `client.action` | A client called a named action. | Empty. A Slack prompt button proposes `interrupt.resolve`. | Your own actions. |
+| `client.action` | A client called a named action. | Empty. | Your own actions. |
 | `tool.execute` | The model called your tool. | Empty. A `tool.error` when the arguments failed validation or the tool is undeclared. | `tool.result` or `tool.error`. |
 | `tool.finished` | A tool call ended, after retries. | Record the result, then call the model. Waits when other calls are in flight. | `proposed` |
 | `llm.execute` | The agent's LLM block is `type = "worker"`. | Empty. | `llm.result` or `llm.error`, or a stream. |
@@ -628,7 +623,7 @@ type ClientInput =
           turn_id?: string        // idempotency key
           message: DraftMessage
           stream?: boolean
-          queue?: boolean         // wait for the next turn
+          queue?: boolean | "merge"  // wait for the next turn
       }
     | {
           type: "client.messages"
@@ -645,7 +640,7 @@ type ClientInput =
           messages: DraftMessage[]  // added at the head, never branching
           stream?: boolean
           client?: ClientContext
-          queue?: boolean
+          queue?: boolean | "merge"
       }
     | {
           type: "client.action"
@@ -691,6 +686,10 @@ waits.
 Only `client.message` and `client.append` take this flag. Queued turns run in
 the order they arrived.
 
+Set `queue: "merge"` to add the message to the turn that is waiting, when that
+turn was also merged. Messages sent during one turn then run as one next turn.
+Each merged submit gets back the same `turn_id`.
+
 ## Delivery
 
 The engine POSTs to your worker's URL.
@@ -704,6 +703,12 @@ The engine POSTs to your worker's URL.
 
 Answer with `application/json` holding a `DecisionResponse`. To stream, answer
 with `text/event-stream`.
+
+The engine can send the same request more than once, for example after a crash
+before it saved your answer. A repeat has the same `decision_id` and
+`attempts`. Use the pair as an idempotency key: answer a repeat the same way,
+and do not run its side effects twice. The engine keeps the first answer for a
+decision and ignores the rest.
 
 ## Streaming
 

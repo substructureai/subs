@@ -1,13 +1,19 @@
-// Skills as Slack buttons: every turn message ends with a row of skills, and a
-// click turns one on for the thread and answers again with it.
+// Skills as Slack buttons: after every turn the thread gets a row of skills, and
+// a click turns one on for the thread and answers again with it.
+//
+// One server, two paths. `/` is the worker: it decides what happens next.
+// `/events` is the events URL: it hears what happened and draws the row.
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
+import { createHmac, timingSafeEqual } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import matter from "gray-matter";
 
 const dir = join(dirname(fileURLToPath(import.meta.url)), "skills");
+const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN_ONCALL;
+const EVENTS_SECRET = process.env.EVENTS_SECRET;
 
 // Each skill is a folder: SKILL.md holds its instructions, tools.mjs its functions.
 const SKILLS = {};
@@ -36,38 +42,35 @@ const button = (name, on) => ({
     style: on ? "primary" : undefined
 });
 
-// The row replaces the one a message already has, so it never grows two.
-const withRow = (blocks, active) => [
-    ...blocks.filter((b) => b.type !== "actions"),
+const row = (active) => [
     { type: "actions", elements: Object.keys(SKILLS).map((name) => button(name, active.includes(name))) }
 ];
 
-// The clicked message, redrawn where it sits.
-const redraw = (click, active) => ({
-    channel: click.channel,
-    ts: click.message_ts,
-    text: click.message_text,
-    blocks: withRow(click.message_blocks ?? [], active)
-});
+async function slack(method, body) {
+    const res = await fetch(`https://slack.com/api/${method}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${SLACK_BOT_TOKEN}`, "content-type": "application/json" },
+        body: JSON.stringify(body)
+    });
+    const out = await res.json();
+    if (!out.ok) console.warn(`slack ${method}: ${out.error}`);
+}
 
-function decide({ trigger, proposed, state, messages }) {
+// --- worker ---------------------------------------------------------------
+
+async function decide({ trigger, proposed, state, messages }) {
     const active = state?.active ?? [];
 
     if (trigger.type === "session.start") {
         return { agent: agent(active), state: { active } };
     }
 
-    // Slack proposes the finished message; append the row to it instead of
-    // building a message of our own.
-    if (trigger.type === "turn.finished") {
-        const view = proposed.channels?.slack?.view;
-        if (view) view.blocks = withRow(view.blocks ?? [], active);
-        return proposed;
-    }
-
     if (trigger.type === "client.action" && trigger.name.startsWith("skill:")) {
         const name = trigger.name.slice("skill:".length);
         const next = active.includes(name) ? active : [...active, name];
+        // Move the check mark on the row that was clicked.
+        const click = trigger.args;
+        await slack("chat.update", { channel: click.channel, ts: click.message_ts, text: "Skills", blocks: row(next) });
         // `messages` is the whole branch, so the skill goes on the end of the
         // thread. Sending it alone starts the turn on a branch of its own.
         const note = {
@@ -78,8 +81,7 @@ function decide({ trigger, proposed, state, messages }) {
             state: { active: next },
             agent: agent(next),
             messages: [...messages, note],
-            actions: [{ type: "llm.call" }],
-            channels: { slack: { update: redraw(trigger.args, next) } }
+            actions: [{ type: "llm.call" }]
         };
     }
 
@@ -91,8 +93,43 @@ function decide({ trigger, proposed, state, messages }) {
     return proposed;
 }
 
+// --- events URL -----------------------------------------------------------
+
+// The skills each thread has on, from the `worker.state.updated` events.
+const activeBySession = new Map();
+
+function signed(body, header) {
+    if (!EVENTS_SECRET) return true;
+    const want = `sha256=${createHmac("sha256", EVENTS_SECRET).update(body).digest("hex")}`;
+    return header?.length === want.length && timingSafeEqual(Buffer.from(header), Buffer.from(want));
+}
+
+async function heard({ session_id, metadata, events = [] }) {
+    for (const { payload } of events) {
+        if (payload.type === "worker.state.updated") {
+            activeBySession.set(session_id, payload.state?.active ?? []);
+        }
+        // The row goes into the thread once the turn ends.
+        if (payload.type === "turn.completed" && !payload.error) {
+            await slack("chat.postMessage", {
+                channel: metadata.slack_channel,
+                thread_ts: metadata.slack_thread_ts,
+                text: "Skills",
+                blocks: row(activeBySession.get(session_id) ?? [])
+            });
+        }
+    }
+}
+
 const app = new Hono();
-app.post("/", async (c) => c.json(decide(await c.req.json())));
+app.post("/", async (c) => c.json(await decide(await c.req.json())));
+app.post("/events", async (c) => {
+    const body = await c.req.text();
+    if (!signed(body, c.req.header("x-substructure-signature"))) return c.body(null, 401);
+    const batch = JSON.parse(body);
+    if (batch.type === "events") await heard(batch);
+    return c.body(null, 204);
+});
 
 serve({ fetch: app.fetch, port: 4444 }, () =>
-    console.log("worker listening on http://localhost:4444"));
+    console.log("worker and events URL listening on http://localhost:4444"));

@@ -342,8 +342,7 @@
               "$ref": "#/$defs/DraftMessage"
             },
             "queue": {
-              "description": "Hold this message for the next turn instead of refusing it while a\nturn is running. Off by default.",
-              "type": "boolean"
+              "$ref": "#/$defs/QueueMode"
             },
             "stream": {
               "type": "boolean"
@@ -418,8 +417,7 @@
               "type": "array"
             },
             "queue": {
-              "description": "Hold this batch for the next turn instead of refusing it while a\nturn is running. Off by default.",
-              "type": "boolean"
+              "$ref": "#/$defs/QueueMode"
             },
             "stream": {
               "type": "boolean"
@@ -1307,9 +1305,6 @@
         "identity": {
           "$ref": "#/$defs/WorkerIdentity"
         },
-        "message_tree": {
-          "$ref": "#/$defs/MessageTree"
-        },
         "messages": {
           "items": {
             "$ref": "#/$defs/Message"
@@ -1364,7 +1359,6 @@
         "calls",
         "pending_calls",
         "messages",
-        "message_tree",
         "ancestry",
         "attempts"
       ],
@@ -1391,11 +1385,6 @@
             }
           ],
           "description": "A new agent config write; omitted keeps the current config."
-        },
-        "channels": {
-          "additionalProperties": {},
-          "description": "How each channel shows this decision, keyed by channel kind. The engine\ndoes not read it.",
-          "type": "object"
         },
         "messages": {
           "items": {
@@ -2127,7 +2116,7 @@
     },
     "InterruptOption": {
       "additionalProperties": false,
-      "description": "One answer under `metadata.options`. Slack shows it as a button. A click\nresumes with the option's `value`.",
+      "description": "One answer under `metadata.options`. A channel can show it as a button. A\nclick resumes with the option's `value`.",
       "properties": {
         "label": {
           "type": "string"
@@ -2163,7 +2152,7 @@
     },
     "InterruptPayload": {
       "additionalProperties": false,
-      "description": "An interrupt payload in the AG-UI shape. `id` and `reason` live on the\ninterrupt itself.",
+      "description": "An interrupt payload. `id` and `reason` live on the interrupt itself.",
       "properties": {
         "expiresAt": {
           "description": "RFC 3339. Display only.",
@@ -2180,7 +2169,7 @@
           ]
         },
         "metadata": {
-          "description": "Free-form, delivered to clients unchanged. `metadata.options` is a\nlist of [`InterruptOption`], which Slack shows as buttons."
+          "description": "Free-form, delivered to clients unchanged. `metadata.options` is a\nlist of [`InterruptOption`], which a channel can show as buttons."
         },
         "responseSchema": {
           "description": "JSON Schema for the expected resolution payload."
@@ -2198,7 +2187,7 @@
     },
     "InterruptResolution": {
       "additionalProperties": false,
-      "description": "A resume payload a channel wrote: the AG-UI shape plus who resolved it.",
+      "description": "A resume payload a channel wrote, with who resolved it.",
       "properties": {
         "payload": {},
         "responder": {
@@ -2226,7 +2215,7 @@
       "description": "Who resolved it. The channel sets this, never the requester.",
       "properties": {
         "channel": {
-          "description": "The channel kind, e.g. `slack`, `ag-ui`.",
+          "description": "The channel that resolved it.",
           "type": "string"
         },
         "label": {
@@ -2258,7 +2247,7 @@
       "type": "object"
     },
     "Issuer": {
-      "description": "Where a person's name comes from: `slack`, `app`, `cli`, or another source\na deployment registers. Set by whatever authenticated the request, never\nread from the request.",
+      "description": "Where a person's name comes from: `app`, `cli`, or another source a\ndeployment registers. Set by whatever authenticated the request, never\nread from the request.",
       "title": "Issuer",
       "type": "string"
     },
@@ -2622,6 +2611,12 @@
           "items": {
             "additionalProperties": false,
             "properties": {
+              "copied_from": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
               "message": {
                 "$ref": "#/$defs/Message"
               },
@@ -2645,6 +2640,24 @@
       ],
       "title": "MessageTree",
       "type": "object"
+    },
+    "QueueMode": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "enum": [
+            "merge"
+          ],
+          "title": "QueueWord",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "What a message does while a turn runs. `false` or `null` refuses it. `true` holds it for a turn of its own. `\"merge\"` adds it to the turn waiting last when that turn also merges, so messages sent during a turn become one turn."
     },
     "Reasoning": {
       "additionalProperties": false,

@@ -84,7 +84,7 @@ jobs:
 
       # ── CLI binary build ────────────────────────────────────────────────
       - name: Build CLI binary
-        run: cargo build --release --bin subs -p substructure-core --target ${{ matrix.target }}
+        run: cargo build --release --bin subs -p subs --target ${{ matrix.target }}
 
       - name: Build CLI platform package
         shell: bash

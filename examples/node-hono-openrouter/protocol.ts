@@ -30,14 +30,7 @@ export interface Protocol {
 export interface ClientInput {
     agent_id?: string;
     message?: DraftMessage;
-    /**
-     * Hold this message for the next turn instead of refusing it while a
-     * turn is running. Off by default.
-     *
-     * Hold this batch for the next turn instead of refusing it while a
-     * turn is running. Off by default.
-     */
-    queue?: boolean;
+    queue?: boolean | QueueWord | null;
     stream?: boolean;
     turn_id?: null | string;
     type: ClientInputType;
@@ -197,6 +190,8 @@ export interface ToolCallFunction {
     name: string;
 }
 
+export type QueueWord = "merge";
+
 export type ClientInputType =
     | "client.message"
     | "client.messages"
@@ -247,7 +242,6 @@ export interface DecisionRequest {
     deadline?: Date | null;
     decision_id: string;
     identity: WorkerIdentity;
-    message_tree: MessageTree;
     messages: Message[];
     /**
      * Count of in-flight `tool_call`/`subagent` calls.
@@ -631,16 +625,6 @@ export interface Subject {
  */
 export type Visibility = "shared" | "private";
 
-export interface MessageTree {
-    head_id?: null | string;
-    nodes: Node[];
-}
-
-export interface Node {
-    message: Message;
-    parent_id?: null | string;
-}
-
 export interface Message {
     content?: ContentPartWire[] | null | string;
     id: string;
@@ -665,11 +649,6 @@ export interface DecisionResponse {
      * A new agent config write; omitted keeps the current config.
      */
     agent?: AgentConfig | null;
-    /**
-     * How each channel shows this decision, keyed by channel kind. The engine
-     * does not read it.
-     */
-    channels?: { [key: string]: unknown };
     messages?: DraftMessage[];
     /**
      * Absent or `null` keeps the current state. Send an empty value to
@@ -1052,8 +1031,7 @@ export interface WorkerRef {
 }
 
 /**
- * An interrupt payload in the AG-UI shape. `id` and `reason` live on the
- * interrupt itself.
+ * An interrupt payload. `id` and `reason` live on the interrupt itself.
  */
 export interface InterruptPayload {
     /**
@@ -1067,7 +1045,7 @@ export interface InterruptPayload {
     message?: null | string;
     /**
      * Free-form, delivered to clients unchanged. `metadata.options` is a
-     * list of [`InterruptOption`], which Slack shows as buttons.
+     * list of [`InterruptOption`], which a channel can show as buttons.
      */
     metadata?: unknown;
     /**
@@ -1081,7 +1059,7 @@ export interface InterruptPayload {
 }
 
 /**
- * A resume payload a channel wrote: the AG-UI shape plus who resolved it.
+ * A resume payload a channel wrote, with who resolved it.
  */
 export interface InterruptResolution {
     payload?: unknown;
@@ -1094,7 +1072,7 @@ export interface InterruptResolution {
  */
 export interface InterruptResponder {
     /**
-     * The channel kind, e.g. `slack`, `ag-ui`.
+     * The channel that resolved it.
      */
     channel: string;
     /**

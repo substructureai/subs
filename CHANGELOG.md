@@ -4,14 +4,55 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-The `@substructure.ai/cli` package and the `substructure-core` crate release
-together at the same version.
+The `@substructure.ai/cli` package and the `subs`, `substructure-host` and
+`substructure-session` crates release together at the same version.
 
 ## [Unreleased]
 
 ### Added
 
 - A machine submit can set the agent state when it creates the session.
+- Add the `substructure-session` crate. It runs one session on its own log, in memory or in a store you supply.
+- Add `[events.<id>]` blocks. The `events` URL of an agent gets the events and the live text of its sessions.
+- A subagent session sends its events to the events URL of its parent when its agent names none.
+- Add `subs secret events.<id>`.
+- A submit with `queue: "merge"` adds its messages to the turn that waits, so the messages sent during a turn become one turn.
+- A message that is copied onto a new branch names its original in `copied_from`.
+- Add an admin route that resumes a parked reader of a session.
+
+### Changed
+
+- The `substructure-core` crate is now two crates: `substructure-host` and `subs`, which holds the CLI.
+- Log filters now name `substructure_host`, `substructure_session` and `subs` in place of `substructure_core`.
+- Each session now keeps its own log of entries in the database.
+- The database migration moves existing sessions into their logs and removes the old event tables.
+- Work, the session list, wake times and Slack messages now catch up after a crash.
+- The engine skips a task when its work was cancelled or settled.
+- After a restart, the engine sends the open work of each session again.
+- Each event now names the command that caused it in `command_id`.
+- A command now returns before the engine sends its work, updates the session list or posts to Slack.
+- The engine now writes a wake time only when it changes.
+- A failed delivery to the session list, to Slack or to another session now retries with backoff and is written to the session log.
+- Work that the engine cannot put on its queue is sent again later as the same attempt.
+- Model calls, tool calls, subagents and decisions now go through one queue interface that a host can replace.
+- A queued decision is now leased while a worker takes it, so a crash does not lose it.
+- Each failed push of a decision or start of a subagent is now recorded, not only the first.
+- A decision push that runs longer than its lease keeps the lease and is not pushed twice.
+- The engine no longer pushes a decision that was settled or dropped while it waited.
+- A task result that fails to save is saved again before the task runs again.
+- Work that the engine can never send now fails at once with the error.
+- The engine now answers its own tools, such as tool search, in the same step as the call.
+- The engine and the CLI now return or log errors that stopped them before.
+- A session now keeps only its active branch in memory. Other branches stay in the log and load again when a view names them.
+- A resent message whose ID the session already recorded on another branch now starts no turn.
+- Work or a delivery that does not send within `send_timeout_secs` now retries later. The default is 30 seconds.
+- The Slack bot now builds its task card from the session events.
+- A click on a Slack prompt button now resumes the interrupt directly.
+
+### Removed
+
+- Decision requests no longer carry `message_tree`. Read `messages` for the active branch, or the client session for every branch.
+- Decision responses no longer carry `channels`, and the engine no longer writes `channels.updated`. To change what a channel shows, use an events URL.
 
 ## [0.9.5] - 2026-09-09
 

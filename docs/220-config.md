@@ -71,6 +71,7 @@ deploys a separate project.
 | `max_subagent_depth` | integer | `5` | How deep subagents may nest, for every agent. An agent's own value wins. See [Subagents](./80-subagents.md#how-deep-subagents-nest). |
 | `db` | path | `~/.config/subs/subs.db` | The SQLite file holding events, sessions, and connector credentials. A relative path resolves against the file. |
 | `log` | string | `error` for `run`, `info` for `serve` | A `RUST_LOG` filter. `$RUST_LOG` wins over it. |
+| `send_timeout_secs` | integer | `30` | How long the engine waits to hand off work or a batch of events. After that it tries again later. |
 
 Unset, `db` is `~/.config/subs/subs.db`, beside `credentials.toml`. Every
 command on the machine reads that one, whichever directory it runs in and
@@ -146,6 +147,7 @@ tool = { max_attempts = 3 }
 | `tools` | list | none | Browser tools. Each needs `handler = "client"`. |
 | `attachments` | table | none | How files reach the model. See [`[agent.<id>.attachments]`](#agentidattachments). |
 | `worker` | url | none | Where decisions go. Leave it off and the engine decides. |
+| `events` | string | none | The `[events.<id>]` block that gets this agent's events. See [Events URL](./55-events-url.md). |
 | `signing_secret_env` | string | none | The variable holding the signing secret. For an engine you run. |
 | `retry` | table | engine defaults | Timeouts and attempts, per kind. See [Retries](./210-retries.md). |
 
@@ -229,6 +231,21 @@ The same table is `attachments` on the agent config, so a worker can set it
 at `session.start` like any other field. The rules are applied when a message
 is delivered to the worker, after `session.start` has settled the config, so
 they cover the first message of a session too.
+
+## `[events.<id>]`
+
+A URL that gets the events and the live text of the sessions of each agent that
+names it. See [Events URL](./55-events-url.md).
+
+```toml
+[events.app]
+url = "https://app.example.com/events"
+```
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `url` | url | required | Where the engine POSTs events and live text. |
+| `timeout_secs` | integer | `10` | How long one POST may take before the engine sends it again later. |
 
 ## `[mcp.<id>]`
 
@@ -378,6 +395,7 @@ The file names secrets. It never holds them.
 | --- | --- |
 | Provider key | `api_key_env` on the LLM block, for an engine you run. `subs auth` for a deployment. |
 | Signing secret | `signing_secret_env` on the agent, for an engine you run. The deployment creates its own. |
+| Events signing secret | `subs secret events.<id>`, for an engine you run. |
 | Connector token | `subs auth <path>`. |
 | Slack tokens | `$SLACK_APP_TOKEN_<AGENT>` and `$SLACK_BOT_TOKEN_<AGENT>`, or `subs auth agent.<id>.slack`. |
 

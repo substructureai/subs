@@ -973,9 +973,6 @@
           "identity": {
             "$ref": "#/components/schemas/WorkerIdentity"
           },
-          "message_tree": {
-            "$ref": "#/components/schemas/MessageTree"
-          },
           "messages": {
             "items": {
               "$ref": "#/components/schemas/Message"
@@ -1030,7 +1027,6 @@
           "calls",
           "pending_calls",
           "messages",
-          "message_tree",
           "ancestry",
           "attempts"
         ],
@@ -1057,11 +1053,6 @@
               }
             ],
             "description": "A new agent config write; omitted keeps the current config."
-          },
-          "channels": {
-            "additionalProperties": {},
-            "description": "How each channel shows this decision, keyed by channel kind. The engine\ndoes not read it.",
-            "type": "object"
           },
           "messages": {
             "items": {
@@ -1792,7 +1783,7 @@
         "type": "object"
       },
       "Issuer": {
-        "description": "Where a person's name comes from: `slack`, `app`, `cli`, or another source\na deployment registers. Set by whatever authenticated the request, never\nread from the request.",
+        "description": "Where a person's name comes from: `app`, `cli`, or another source a\ndeployment registers. Set by whatever authenticated the request, never\nread from the request.",
         "title": "Issuer",
         "type": "string"
       },
@@ -2020,43 +2011,6 @@
           "role"
         ],
         "title": "Message",
-        "type": "object"
-      },
-      "MessageTree": {
-        "additionalProperties": false,
-        "properties": {
-          "head_id": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "nodes": {
-            "items": {
-              "additionalProperties": false,
-              "properties": {
-                "message": {
-                  "$ref": "#/components/schemas/Message"
-                },
-                "parent_id": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                }
-              },
-              "required": [
-                "message"
-              ],
-              "type": "object"
-            },
-            "type": "array"
-          }
-        },
-        "required": [
-          "nodes"
-        ],
-        "title": "MessageTree",
         "type": "object"
       },
       "Reasoning": {

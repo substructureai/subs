@@ -47,14 +47,9 @@ type Protocol struct {
 // to the worker. Shared by the [`ClientInput::InterruptResume`] input and the
 // [`DecisionTrigger::InterruptResumed`] trigger.
 type ClientInput struct {
-	AgentID *string       `json:"agent_id,omitempty"`
-	Message *DraftMessage `json:"message,omitempty"`
-	// Hold this message for the next turn instead of refusing it while a
-	// turn is running. Off by default.
-	//
-	// Hold this batch for the next turn instead of refusing it while a
-	// turn is running. Off by default.
-	Queue             *bool           `json:"queue,omitempty"`
+	AgentID           *string         `json:"agent_id,omitempty"`
+	Message           *DraftMessage   `json:"message,omitempty"`
+	Queue             *Queue          `json:"queue"`
 	Stream            *bool           `json:"stream,omitempty"`
 	TurnID            *string         `json:"turn_id"`
 	Type              ClientInputType `json:"type"`
@@ -209,16 +204,15 @@ type ClientPayload struct {
 
 type DecisionRequest struct {
 	// The agent config for the active path. `null` when none is set.
-	Agent       *AgentConfig   `json:"agent"`
-	AgentID     string         `json:"agent_id"`
-	Ancestry    []string       `json:"ancestry"`
-	Attempts    int64          `json:"attempts"`
-	Calls       []Effect       `json:"calls"`
-	Deadline    *time.Time     `json:"deadline"`
-	DecisionID  string         `json:"decision_id"`
-	Identity    WorkerIdentity `json:"identity"`
-	MessageTree MessageTree    `json:"message_tree"`
-	Messages    []Message      `json:"messages"`
+	Agent      *AgentConfig   `json:"agent"`
+	AgentID    string         `json:"agent_id"`
+	Ancestry   []string       `json:"ancestry"`
+	Attempts   int64          `json:"attempts"`
+	Calls      []Effect       `json:"calls"`
+	Deadline   *time.Time     `json:"deadline"`
+	DecisionID string         `json:"decision_id"`
+	Identity   WorkerIdentity `json:"identity"`
+	Messages   []Message      `json:"messages"`
 	// Count of in-flight `tool_call`/`subagent` calls.
 	PendingCalls int64 `json:"pending_calls"`
 	// The engine's default continuation for `trigger`. Empty when only the
@@ -418,16 +412,6 @@ type Subject struct {
 	Issuer string `json:"issuer"`
 }
 
-type MessageTree struct {
-	HeadID *string `json:"head_id"`
-	Nodes  []Node  `json:"nodes"`
-}
-
-type Node struct {
-	Message  Message `json:"message"`
-	ParentID *string `json:"parent_id"`
-}
-
 type Message struct {
 	Content    *Content          `json:"content"`
 	ID         string            `json:"id"`
@@ -447,11 +431,8 @@ type Message struct {
 type DecisionResponse struct {
 	Actions []DecisionAction `json:"actions,omitempty"`
 	// A new agent config write; omitted keeps the current config.
-	Agent *AgentConfig `json:"agent"`
-	// How each channel shows this decision, keyed by channel kind. The engine
-	// does not read it.
-	Channels map[string]interface{} `json:"channels,omitempty"`
-	Messages []DraftMessage         `json:"messages,omitempty"`
+	Agent    *AgentConfig   `json:"agent"`
+	Messages []DraftMessage `json:"messages,omitempty"`
 	// Absent or `null` keeps the current state. Send an empty value to
 	// clear it.
 	State interface{} `json:"state"`
@@ -706,8 +687,7 @@ type WorkerRef struct {
 	URL *string `json:"url"`
 }
 
-// An interrupt payload in the AG-UI shape. `id` and `reason` live on the
-// interrupt itself.
+// An interrupt payload. `id` and `reason` live on the interrupt itself.
 type InterruptPayload struct {
 	// RFC 3339. Display only.
 	ExpiresAt *string `json:"expiresAt"`
@@ -715,7 +695,7 @@ type InterruptPayload struct {
 	// shows the interrupt's `reason`.
 	Message *string `json:"message"`
 	// Free-form, delivered to clients unchanged. `metadata.options` is a
-	// list of [`InterruptOption`], which Slack shows as buttons.
+	// list of [`InterruptOption`], which a channel can show as buttons.
 	Metadata interface{} `json:"metadata"`
 	// JSON Schema for the expected resolution payload.
 	ResponseSchema interface{} `json:"responseSchema"`
@@ -723,7 +703,7 @@ type InterruptPayload struct {
 	ToolCallID *string `json:"toolCallId"`
 }
 
-// A resume payload a channel wrote: the AG-UI shape plus who resolved it.
+// A resume payload a channel wrote, with who resolved it.
 type InterruptResolution struct {
 	Payload   interface{}         `json:"payload"`
 	Responder *InterruptResponder `json:"responder"`
@@ -732,7 +712,7 @@ type InterruptResolution struct {
 
 // Who resolved it. The channel sets this, never the requester.
 type InterruptResponder struct {
-	// The channel kind, e.g. `slack`, `ag-ui`.
+	// The channel that resolved it.
 	Channel string `json:"channel"`
 	// The chosen option's label, when the resolution was a pick.
 	Label *string `json:"label"`
@@ -827,6 +807,12 @@ const (
 	System    Role = "system"
 	Tool      Role = "tool"
 	User      Role = "user"
+)
+
+type QueueWord string
+
+const (
+	Merge QueueWord = "merge"
 )
 
 type ClientInputType string
@@ -1131,6 +1117,29 @@ func (x *Content) UnmarshalJSON(data []byte) error {
 
 func (x *Content) MarshalJSON() ([]byte, error) {
 	return marshalUnion(nil, nil, nil, x.String, x.ContentPartWireArray != nil, x.ContentPartWireArray, false, nil, false, nil, false, nil, true)
+}
+
+// What a message does while a turn runs. `false` or `null` refuses it. `true` holds it for
+// a turn of its own. `"merge"` adds it to the turn waiting last when that turn also merges,
+// so messages sent during a turn become one turn.
+type Queue struct {
+	Bool *bool
+	Enum *QueueWord
+}
+
+func (x *Queue) UnmarshalJSON(data []byte) error {
+	x.Enum = nil
+	object, err := unmarshalUnion(data, nil, nil, &x.Bool, nil, false, nil, false, nil, false, nil, true, &x.Enum, true)
+	if err != nil {
+		return err
+	}
+	if object {
+	}
+	return nil
+}
+
+func (x *Queue) MarshalJSON() ([]byte, error) {
+	return marshalUnion(nil, nil, x.Bool, nil, false, nil, false, nil, false, nil, x.Enum != nil, x.Enum, true)
 }
 
 type Size struct {

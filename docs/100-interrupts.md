@@ -99,11 +99,10 @@ channel stamps the `responder`, and the requester never does. It names who
 answered, and carries the option's `label` and `style`, which the engine drops
 once the interrupt resolves.
 
-Answering is a decision like any other. The engine proposes the resolution shown
-here, so a worker that returns `proposed` needs no code for it. A worker that
-wants its own rules, such as who may answer or a refusal, answers the decision
-itself. A channel can deliver the same click twice, so record the ones you have
-handled in worker state.
+The worker then gets an `interrupt.resumed` trigger with this payload. A worker
+that wants its own rules, such as who may answer, reads the `responder` there
+and can raise the interrupt again. A second click on a prompt that is already
+answered does nothing.
 
 ## Reference
 

@@ -191,48 +191,20 @@ If the credential is still not good, the same question comes back. The engine
 raises one prompt per connection however many times a decision runs, so nobody
 is asked twice.
 
-## Customize what the bot shows
+## Add your own buttons
 
-Every Slack message goes through the decision loop. A decision response can
-carry a `channels.slack` value. Without it, the bot shows its default. With it,
-your value wins.
+The bot draws its messages from the session's events. To show more, give the
+agent an [events URL](./55-events-url.md) and post to the thread from your app
+with the bot token. The events carry the thread in `metadata.slack_channel` and
+`metadata.slack_thread_ts`.
 
-```json
-{
-  "messages": [ ... ],
-  "actions": [ ... ],
-  "channels": {
-    "slack": {
-      "status": "is researching…",
-      "view": { "text": "fallback text", "blocks": [ ... ] },
-      "update": { "channel": "C…", "ts": "123.456", "text": "…", "blocks": [ ... ] }
-    }
-  }
-}
-```
+A button you post comes back to the worker as a `client.action` decision, named
+after its `action_id`. Its `args` carry the `value`, the user, and the message
+it came from. Nothing about a click expires: answer it with an `llm.call` days
+later, and the work opens a new turn.
 
-| Key | Sets |
-| --- | --- |
-| `status` | The thread's working indicator. |
-| `view` | The whole state of the turn's message. It streams during the turn and becomes the final message. |
-| `prompt` | The message an interrupt posts, when the same decision raises one. |
-| `update` | Rewrites one message, by channel and ts. |
-
-On every decision the engine proposes the default `view`. A worker that
-customizes the view changes the proposed view instead of building a new one.
-
-A view streams while the turn runs. The `turn.finished` view becomes the final
-message, posted by the reply that ends the turn.
-
-Blocks with buttons pass through unchanged. Give each button an `action_id` and
-a `value`, and the click comes back as a `client.action` decision with both.
-
-A worker that replaces a prompt's blocks must keep the `interrupt_id` and
-`option` on its buttons, or the click cannot find its interrupt.
-
-This is how you build a custom bot on the default behavior. Add buttons to a
-`turn.finished` view. When someone clicks one, days later, answer the
-`client.action` with a note and an `llm.call`. The work opens a new turn.
+See [node-hono-slack-skills](../examples/node-hono-slack-skills) for a worker and
+events URL in one program.
 
 ## Thread context
 

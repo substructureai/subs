@@ -74,7 +74,7 @@ fi
 
 echo "Bumping $CURRENT -> $VERSION"
 
-BUMPED="packages/cli/package.json crates/core/Cargo.toml Cargo.lock CHANGELOG.md schemas"
+BUMPED="packages/cli/package.json crates/host/Cargo.toml crates/session/Cargo.toml crates/subs/Cargo.toml Cargo.lock CHANGELOG.md schemas"
 # shellcheck disable=SC2064
 trap "echo >&2; echo 'Release aborted with a partial bump in the tree. Undo with:' >&2; echo '  git checkout -- $BUMPED' >&2" ERR
 
@@ -83,7 +83,7 @@ npm --prefix packages/cli version "$VERSION" --no-git-tag-version --allow-same-v
 # Keep the Rust crate version in lockstep — `env!("CARGO_PKG_VERSION")`
 # bakes it into the CLI's User-Agent header. `cargo set-version` (from
 # cargo-edit) also refreshes Cargo.lock.
-cargo set-version --package substructure-core "$VERSION"
+cargo set-version --workspace "$VERSION"
 
 # Promote the CHANGELOG's [Unreleased] section into a dated release section.
 # Fails (and aborts the release) if there are no unreleased entries.

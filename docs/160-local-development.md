@@ -185,7 +185,7 @@ log = "info"
 ```
 
 `log` takes `RUST_LOG` syntax: a level on its own, or per-target directives such
-as `substructure_core=debug,warn`. `$RUST_LOG` wins over it. Without it, `subs
+as `substructure_host=debug,warn`. `$RUST_LOG` wins over it. Without it, `subs
 run` shows errors and `subs serve` shows info.
 
 ## Next steps

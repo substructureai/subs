@@ -28,7 +28,7 @@ export function resolve() {
   } catch {
     throw new Error(
       `Could not find package ${pkg}. Make sure it's installed.\n` +
-      `If you're developing locally, build the Rust binary with: cargo build -p substructure-core --bin subs`
+      `If you're developing locally, build the Rust binary with: cargo build -p subs --bin subs`
     );
   }
 }

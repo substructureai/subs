@@ -206,6 +206,7 @@ const decide = (req) => (req.agent_id === "poet" ? poet(req) : assistant(req));
 
 - [Tool calls](./60-tools.md): schemas, errors, and where a tool runs.
 - [Agent state](./90-state.md): memory that travels with the session.
+- [Events URL](./55-events-url.md): get what happened in each session.
 - [Interrupts](./100-interrupts.md): pause for a person.
 - [Protocol](./230-protocol.md): every field of the request and the response.
 - [Typed bindings](./270-typed-bindings.md): generate the types for your language.

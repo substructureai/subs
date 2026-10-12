@@ -1,6 +1,8 @@
 ### Rust crates
 ```
-crates/core              → Rust agent-loop engine, server, CLI
+crates/session           → One session: rules, state, log, stores
+crates/host              → Runs sessions: server, providers, connectors, transports
+crates/subs              → The `subs` CLI
 ```
 
 ### TypeScript packages

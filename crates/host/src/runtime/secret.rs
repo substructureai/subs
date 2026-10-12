@@ -1,0 +1,189 @@
+use aes_gcm::aead::Aead;
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+use async_trait::async_trait;
+use base64::Engine as _;
+
+use crate::event_store::StoreError;
+
+pub const KEYS_ENV: &str = "SUBS_SECRET_KEY";
+
+const NONCE_LEN: usize = 12;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct SecretRef(String);
+
+impl SecretRef {
+    pub fn mint() -> Self {
+        Self(uuid::Uuid::now_v7().to_string())
+    }
+
+    pub fn from_stored(id: String) -> Self {
+        Self(id)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for SecretRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[async_trait]
+pub trait SecretStore: Send + Sync {
+    async fn put(&self, tenant_id: &str, r: &SecretRef, value: &[u8]) -> Result<(), StoreError>;
+    async fn get(&self, tenant_id: &str, r: &SecretRef) -> Result<Option<Vec<u8>>, StoreError>;
+    async fn delete(&self, tenant_id: &str, r: &SecretRef) -> Result<bool, StoreError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecretPath {
+    Worker(String),
+    Events(String),
+}
+
+impl SecretPath {
+    pub fn secret_ref(&self) -> SecretRef {
+        SecretRef::from_stored(self.to_string())
+    }
+}
+
+impl std::fmt::Display for SecretPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Worker(id) => write!(f, "worker.{id}"),
+            Self::Events(id) => write!(f, "events.{id}"),
+        }
+    }
+}
+
+pub fn random_token(bytes: usize) -> String {
+    let mut buf = vec![0u8; bytes];
+    rand::Rng::fill(&mut rand::rng(), &mut buf[..]);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
+}
+
+pub fn mint_secret() -> String {
+    random_token(32)
+}
+
+pub async fn get_or_mint(
+    store: &dyn SecretStore,
+    tenant_id: &str,
+    r: &SecretRef,
+) -> Result<String, StoreError> {
+    if let Some(bytes) = store.get(tenant_id, r).await? {
+        return Ok(String::from_utf8_lossy(&bytes).into_owned());
+    }
+    let minted = mint_secret();
+    store.put(tenant_id, r, minted.as_bytes()).await?;
+    Ok(minted)
+}
+
+pub struct SecretCipher {
+    cipher: Aes256Gcm,
+}
+
+impl SecretCipher {
+    pub fn from_env() -> Result<Option<Self>, String> {
+        match std::env::var(KEYS_ENV) {
+            Ok(v) => Self::parse(&v).map(Some),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(e) => Err(format!("${KEYS_ENV}: {e}")),
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let bytes = hex::decode(value.trim()).map_err(|e| {
+            format!("${KEYS_ENV} is not hex: {e} (generate a key with `openssl rand -hex 32`)")
+        })?;
+        if bytes.len() != 32 {
+            return Err(format!(
+                "${KEYS_ENV} is {} bytes, not 32 (generate a key with `openssl rand -hex 32`)",
+                bytes.len()
+            ));
+        }
+        let cipher = Aes256Gcm::new_from_slice(&bytes).map_err(|e| format!("${KEYS_ENV}: {e}"))?;
+        Ok(Self { cipher })
+    }
+
+    pub fn current_version(&self) -> u32 {
+        1
+    }
+
+    pub fn encrypt(&self, plaintext: &[u8]) -> Result<(u32, String), String> {
+        let mut nonce = [0u8; NONCE_LEN];
+        rand::Rng::fill(&mut rand::rng(), &mut nonce);
+        let sealed = self
+            .cipher
+            .encrypt(Nonce::from_slice(&nonce), plaintext)
+            .map_err(|e| format!("encrypting a secret: {e}"))?;
+        let mut framed = nonce.to_vec();
+        framed.extend(sealed);
+        Ok((
+            self.current_version(),
+            base64::engine::general_purpose::STANDARD.encode(framed),
+        ))
+    }
+
+    pub fn decrypt(&self, encoded: &str) -> Result<Vec<u8>, String> {
+        let framed = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|e| format!("stored ciphertext is not base64: {e}"))?;
+        if framed.len() < NONCE_LEN {
+            return Err("stored ciphertext is shorter than its nonce".to_string());
+        }
+        let (nonce, sealed) = framed.split_at(NONCE_LEN);
+        self.cipher
+            .decrypt(Nonce::from_slice(nonce), sealed)
+            .map_err(|_| {
+                format!("decryption failed: ${KEYS_ENV} is not the key this was sealed under")
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key() -> String {
+        "ab".repeat(32)
+    }
+
+    #[test]
+    fn a_secret_round_trips_and_never_repeats_a_nonce() {
+        let cipher = SecretCipher::parse(&key()).unwrap();
+        let (version, a) = cipher.encrypt(b"xoxb-secret").unwrap();
+        let (_, b) = cipher.encrypt(b"xoxb-secret").unwrap();
+        assert_eq!(version, 1);
+        assert_ne!(a, b, "a fresh nonce per encryption");
+        assert_eq!(cipher.decrypt(&a).unwrap(), b"xoxb-secret");
+        assert_eq!(cipher.decrypt(&b).unwrap(), b"xoxb-secret");
+    }
+
+    #[test]
+    fn the_wrong_key_and_tampering_fail_closed() {
+        let cipher = SecretCipher::parse(&key()).unwrap();
+        let (_, sealed) = cipher.encrypt(b"secret").unwrap();
+
+        let other = SecretCipher::parse(&"cd".repeat(32)).unwrap();
+        let err = other.decrypt(&sealed).unwrap_err();
+        assert!(err.contains(KEYS_ENV), "{err}");
+
+        let mut tampered = sealed.clone();
+        tampered.replace_range(0..1, if sealed.starts_with('A') { "B" } else { "A" });
+        assert!(cipher.decrypt(&tampered).is_err());
+        assert!(cipher.decrypt("AAAA").is_err());
+    }
+
+    #[test]
+    fn a_set_and_wrong_variable_is_an_error_not_no_cipher() {
+        for wrong in ["", "abc", "zz", &"ab".repeat(16)] {
+            assert!(SecretCipher::parse(wrong).is_err(), "{wrong}");
+        }
+    }
+}
