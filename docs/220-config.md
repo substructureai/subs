@@ -245,7 +245,7 @@ url = "https://app.example.com/events"
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `url` | url | required | Where the engine POSTs events and live text. |
-| `timeout_secs` | integer | `10` | How long one POST may take before the engine sends it again later. |
+| `timeout_secs` | integer | `10` | How long one POST may take before the engine sends it again later. At most `15`. |
 
 ## `[mcp.<id>]`
 

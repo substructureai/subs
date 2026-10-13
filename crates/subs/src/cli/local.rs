@@ -397,6 +397,7 @@ pub(crate) async fn start_engine(
             alarms,
             blobs,
             token_delta_transport,
+            outbound: None,
         },
         config,
     )

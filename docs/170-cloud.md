@@ -97,9 +97,9 @@ the project can run its worker.
 Printing a secret is its own command, so no other output carries one.
 
 ```sh
-subs agents list
-subs agents secret triage        # the secret, on stdout
-subs agents rotate-secret triage # the old secret stops working at once
+subs secret                      # the paths that hold one
+subs secret worker.main          # the secret, on stdout
+subs secret events.app --rotate  # the old secret stops working at once
 ```
 
 ## Send a message from your backend

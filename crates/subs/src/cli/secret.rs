@@ -24,13 +24,13 @@ pub struct SecretCommand {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct WorkerSecretView {
+struct SecretView {
     signing_secret: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct WorkerRow {
-    id: String,
+struct SecretRow {
+    path: String,
 }
 
 pub async fn run(cmd: SecretCommand) -> Result<()> {
@@ -47,38 +47,33 @@ async fn run_deployment(cmd: SecretCommand) -> Result<()> {
         if cmd.rotate {
             bail!("--rotate needs a path: `subs secret worker.<id> --rotate`");
         }
-        let workers: Vec<WorkerRow> = ctx
+        let rows: Vec<SecretRow> = ctx
             .client
-            .get(&format!("/api/v1/projects/{project}/workers"))
+            .get(&format!("/api/v1/projects/{project}/secrets"))
             .await?;
-        return list_deployment(workers, cmd.scope.globals.json);
+        return list_deployment(rows, cmd.scope.globals.json);
     };
 
-    let id = match Address::parse(&path) {
-        Some(Address::Worker(id)) => id,
-        Some(Address::Events(_)) => {
-            bail!("a deployment does not serve events secrets yet; `subs secret {path}` works against a local engine")
-        }
+    match Address::parse(&path) {
+        Some(Address::Worker(_) | Address::Events(_)) => {}
         Some(_) => {
             bail!("`{path}` holds no minted secret; for a credential, use `subs auth {path}`")
         }
         None => bail!(
             "`{path}` holds no minted secret. Only a `[worker.*]` or `[events.*]` block does."
         ),
-    };
+    }
 
-    let view: WorkerSecretView = match cmd.rotate {
+    let view: SecretView = match cmd.rotate {
         false => {
             ctx.client
-                .get(&format!("/api/v1/projects/{project}/workers/{id}/secret"))
+                .get(&format!("/api/v1/projects/{project}/secrets/{path}"))
                 .await?
         }
         true => {
             let view = ctx
                 .client
-                .post_empty(&format!(
-                    "/api/v1/projects/{project}/workers/{id}/rotate-secret"
-                ))
+                .post_empty(&format!("/api/v1/projects/{project}/secrets/{path}/rotate"))
                 .await?;
             eprintln!("Rotated. The engine signs with it from its next push.");
             view
@@ -87,7 +82,7 @@ async fn run_deployment(cmd: SecretCommand) -> Result<()> {
 
     if cmd.scope.globals.json {
         return print::json(&serde_json::json!({
-            "path": SecretPath::Worker(id).to_string(),
+            "path": path,
             "secret": view.signing_secret,
         }));
     }
@@ -95,26 +90,24 @@ async fn run_deployment(cmd: SecretCommand) -> Result<()> {
     Ok(())
 }
 
-fn list_deployment(workers: Vec<WorkerRow>, json: bool) -> Result<()> {
-    let rows: Vec<(String, bool)> = workers
-        .into_iter()
-        .map(|w| (SecretPath::Worker(w.id).to_string(), true))
-        .collect();
+fn list_deployment(rows: Vec<SecretRow>, json: bool) -> Result<()> {
     if json {
         let rows: Vec<serde_json::Value> = rows
             .iter()
-            .map(|(path, set)| serde_json::json!({ "path": path, "set": set }))
+            .map(|row| serde_json::json!({ "path": row.path, "set": true }))
             .collect();
         return print::json(&rows);
     }
     if rows.is_empty() {
-        println!("This deployment declares no [worker.*], so nothing holds a minted secret.");
+        println!(
+            "This deployment declares no [worker.*] or [events.*], so nothing holds a minted secret."
+        );
         return Ok(());
     }
     let columns = [print::Column::left("PATH"), print::Column::left("SECRET")];
     let rows: Vec<Vec<String>> = rows
         .into_iter()
-        .map(|(path, _)| vec![path, "minted".to_string()])
+        .map(|row| vec![row.path, "minted".to_string()])
         .collect();
     print::table(&columns, &rows);
     Ok(())

@@ -1230,6 +1230,23 @@ impl SlackBot {
 
 pub const READER: &str = "slack";
 
+#[async_trait::async_trait]
+impl crate::runtime::sessions::Reader for SlackBot {
+    fn subscription(&self) -> substructure_session::delivery::Subscription {
+        use substructure_session::delivery::{AtLimit, Start, Subscription};
+        Subscription::new(READER, Start::Beginning, AtLimit::Skip)
+    }
+
+    async fn deliver(
+        &self,
+        _sessions: &crate::runtime::sessions::Sessions,
+        _session: &substructure_session::Session,
+        events: &[SessionEvent],
+    ) -> Result<(), DeliveryError> {
+        SlackBot::deliver(self, events).await
+    }
+}
+
 impl SlackBot {
     pub async fn deliver(&self, events: &[SessionEvent]) -> Result<(), DeliveryError> {
         if self.ctx.get().is_none() {

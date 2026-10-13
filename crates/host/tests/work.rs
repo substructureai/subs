@@ -249,6 +249,7 @@ async fn engine_with(
     let runtime = substructure_host::start(
         RuntimeDeps {
             blobs: Arc::new(substructure_host::runtime::blob::Nowhere),
+            outbound: None,
             sessions: Arc::new(SqliteSessionStores::new(db.clone())),
             readers: Vec::new(),
             secrets: Arc::new(SqliteSecretStore::new(db.clone(), None)),

@@ -19,6 +19,8 @@ The `@substructure.ai/cli` package and the `subs`, `substructure-host` and
 - A submit with `queue: "merge"` adds its messages to the turn that waits, so the messages sent during a turn become one turn.
 - A message that is copied onto a new branch names its original in `copied_from`.
 - Add an admin route that resumes a parked reader of a session.
+- A host can now give a `SlackBot` to the runtime as a session reader.
+- A host can now give the runtime the HTTP client it uses for events URLs.
 
 ### Changed
 
@@ -48,6 +50,7 @@ The `@substructure.ai/cli` package and the `subs`, `substructure-host` and
 - Work or a delivery that does not send within `send_timeout_secs` now retries later. The default is 30 seconds.
 - The Slack bot now builds its task card from the session events.
 - A click on a Slack prompt button now resumes the interrupt directly.
+- A failed read of an events block now retries the delivery instead of dropping the events.
 
 ### Removed
 

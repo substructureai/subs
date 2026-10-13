@@ -846,6 +846,7 @@ pub struct RuntimeDeps {
     pub alarms: Arc<dyn Alarms>,
     pub token_delta_transport: Arc<dyn TokenDeltaTransport>,
     pub blobs: Arc<dyn BlobStore>,
+    pub outbound: Option<reqwest::Client>,
 }
 
 pub async fn start(deps: RuntimeDeps, config: RuntimeConfig) -> Arc<Runtime> {
@@ -865,6 +866,7 @@ pub async fn start(deps: RuntimeDeps, config: RuntimeConfig) -> Arc<Runtime> {
         alarms,
         token_delta_transport,
         blobs,
+        outbound,
     } = deps;
     let cancel = CancellationToken::new();
     let tap = Arc::new(live::LocalTap::new(token_delta_transport));
@@ -884,7 +886,11 @@ pub async fn start(deps: RuntimeDeps, config: RuntimeConfig) -> Arc<Runtime> {
         Arc::new(consumers::IndexReader(session_index_store.clone())),
         Arc::new(consumers::MailReader),
     ];
-    let events = Arc::new(events_url::EventsReader::new(agents.clone(), secrets));
+    let events = Arc::new(events_url::EventsReader::new(
+        agents.clone(),
+        secrets,
+        outbound,
+    ));
     let mut outside: Vec<Arc<dyn sessions::Reader>> = outside;
     outside.push(events.clone());
     let sessions = sessions::Sessions::new(

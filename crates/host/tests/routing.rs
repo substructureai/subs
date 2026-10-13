@@ -290,6 +290,7 @@ async fn start_with(
     let runtime = substructure_host::start(
         RuntimeDeps {
             blobs: std::sync::Arc::new(substructure_host::runtime::blob::Nowhere),
+            outbound: None,
             sessions: Arc::new(
                 substructure_host::providers::sqlite::SqliteSessionStores::new(db.clone()),
             ),

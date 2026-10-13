@@ -20,6 +20,7 @@ use crate::runtime::worker::AgentDirectory;
 
 pub const READER: &str = "events";
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+pub const MAX_TIMEOUT: Duration = Duration::from_secs(15);
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -136,11 +137,15 @@ pub struct EventsReader {
 }
 
 impl EventsReader {
-    pub fn new(agents: Arc<dyn AgentDirectory>, secrets: Arc<dyn SecretStore>) -> Self {
+    pub fn new(
+        agents: Arc<dyn AgentDirectory>,
+        secrets: Arc<dyn SecretStore>,
+        http: Option<Client>,
+    ) -> Self {
         Self {
             agents,
             secrets,
-            http: Client::new(),
+            http: http.unwrap_or_default(),
         }
     }
 
@@ -153,10 +158,12 @@ impl EventsReader {
             .agents
             .events(&tenant_id, &id)
             .await
+            .map_err(|e| DeliveryError::retry(None, format!("reading [events.{id}] failed: {e}")))?
             .unwrap_or_default();
         let timeout = block
             .timeout_secs
-            .map_or(DEFAULT_TIMEOUT, |secs| Duration::from_secs(secs.get()));
+            .map_or(DEFAULT_TIMEOUT, |secs| Duration::from_secs(secs.get()))
+            .min(MAX_TIMEOUT);
         let Some(url) = block.url else {
             tracing::debug!(events = %id, session_id = %session.id(), "the session's [events] block is gone");
             return Ok(None);
@@ -333,7 +340,7 @@ mod tests {
         let agents =
             StaticAgentDirectory::new("t".into(), Default::default(), LlmBlocks::default())
                 .with_events(BTreeMap::from([("app".to_string(), block)]));
-        EventsReader::new(Arc::new(agents), secrets)
+        EventsReader::new(Arc::new(agents), secrets, None)
     }
 
     fn signed(secret: &[u8], body: &str) -> String {
@@ -513,5 +520,40 @@ mod tests {
 
         assert!(!failed.permanent);
         assert_eq!(failed.retry_after, TimeDelta::try_seconds(7));
+    }
+
+    struct Unreadable;
+
+    #[async_trait]
+    impl AgentDirectory for Unreadable {
+        async fn tenant(&self, _tenant_id: &str) -> crate::worker::TenantDirectory {
+            Default::default()
+        }
+
+        async fn tenants(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        async fn events(&self, _tenant_id: &str, _id: &str) -> Result<Option<EventsBlock>, String> {
+            Err("the store is busy".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_events_block_that_cannot_be_read_is_tried_again_not_dropped() {
+        let events = EventsReader::new(Arc::new(Unreadable), Arc::<Secrets>::default(), None);
+        let disk = crate::runtime::sessions::testing::disk();
+        let sessions = disk.sessions();
+        let s1 = session(&sessions, "s1", Some("app")).await;
+        let logged = logged(&sessions, s1.id()).await;
+
+        let failed = events.deliver(&sessions, &s1, &logged).await.unwrap_err();
+
+        assert!(!failed.permanent);
+        assert!(
+            failed.error.contains("the store is busy"),
+            "{}",
+            failed.error
+        );
     }
 }

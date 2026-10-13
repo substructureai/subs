@@ -57,6 +57,10 @@ impl Manifest {
                 bail!("[events.{id}]: needs a `url` to send events to");
             };
             check_url(url).map_err(|e| anyhow::anyhow!("[events.{id}]: {e}"))?;
+            let most = crate::runtime::events_url::MAX_TIMEOUT.as_secs();
+            if let Some(secs) = spec.timeout_secs.filter(|s| s.get() > most) {
+                bail!("[events.{id}]: `timeout_secs` must be 1 to {most}, not {secs}");
+            }
         }
         if let Some(id) = &self.default_worker {
             let Some(spec) = self.worker.get(id) else {
@@ -1245,6 +1249,18 @@ mod tests {
         );
         assert!(undeclared.contains("names no block"), "{undeclared}");
         assert!(invalid("[events.app]\n").contains("needs a `url`"));
+        let slow = |secs: u64| {
+            invalid(&format!(
+                "[events.app]\nurl = \"https://a.example.com/e\"\ntimeout_secs = {secs}\n"
+            ))
+        };
+        assert_eq!(slow(15), "");
+        assert!(
+            slow(16).contains("`timeout_secs` must be 1 to 15, not 16"),
+            "{}",
+            slow(16)
+        );
+        assert!(slow(i64::MAX as u64).contains("must be 1 to 15"));
     }
 
     #[test]

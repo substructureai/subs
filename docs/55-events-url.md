@@ -63,7 +63,7 @@ you do not need.
 | Answer | What the engine does |
 | --- | --- |
 | `2xx` | The batch is delivered. The next one follows. |
-| Anything else, or no answer within `timeout_secs` (10 by default) | It sends the same batch again later, with backoff. It writes `delivery.failed` to the session log. |
+| Anything else, or no answer within `timeout_secs` (10 by default, 15 at most) | It sends the same batch again later, with backoff. It writes `delivery.failed` to the session log. |
 
 A `Retry-After` header in seconds sets the wait. The engine tries for up to
 three days. Then it skips the event and writes `delivery.skipped`. While the

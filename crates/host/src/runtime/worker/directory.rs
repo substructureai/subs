@@ -109,8 +109,8 @@ pub trait AgentDirectory: Send + Sync {
 
     async fn tenants(&self) -> Vec<String>;
 
-    async fn events(&self, tenant_id: &str, id: &str) -> Option<EventsBlock> {
-        self.tenant(tenant_id).await.events.get(id).cloned()
+    async fn events(&self, tenant_id: &str, id: &str) -> Result<Option<EventsBlock>, String> {
+        Ok(self.tenant(tenant_id).await.events.get(id).cloned())
     }
 }
 
@@ -192,11 +192,11 @@ impl AgentDirectory for StaticAgentDirectory {
         vec![self.tenant_id.clone()]
     }
 
-    async fn events(&self, tenant_id: &str, id: &str) -> Option<EventsBlock> {
-        match tenant_id == self.tenant_id {
+    async fn events(&self, tenant_id: &str, id: &str) -> Result<Option<EventsBlock>, String> {
+        Ok(match tenant_id == self.tenant_id {
             true => self.directory.events.get(id).cloned(),
             false => None,
-        }
+        })
     }
 }
 
