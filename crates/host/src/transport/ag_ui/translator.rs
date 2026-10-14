@@ -39,6 +39,8 @@ pub struct AgUiTranslator {
     subagent_calls: HashSet<String>,
     detached_calls: HashMap<String, String>,
     called: HashMap<String, (String, String)>,
+    making_room: Option<String>,
+    summary_calls: HashSet<String>,
     terminated: bool,
 }
 
@@ -59,6 +61,8 @@ impl AgUiTranslator {
             subagent_calls: HashSet::new(),
             detached_calls: HashMap::new(),
             called: HashMap::new(),
+            making_room: None,
+            summary_calls: HashSet::new(),
             terminated: false,
         }
     }
@@ -161,6 +165,21 @@ impl AgUiTranslator {
                 self.turn_id = Some(t.turn_id);
                 vec![]
             }
+            EventPayload::ContextLimited(l) => {
+                self.making_room = Some(l.call.id);
+                vec![]
+            }
+            EventPayload::ContextReplaced(_) | EventPayload::ContextKept => {
+                self.making_room = None;
+                vec![]
+            }
+            EventPayload::LlmCallRequested(r)
+                if self.making_room.as_ref().is_some_and(|held| *held != r.id) =>
+            {
+                self.summary_calls.insert(r.id);
+                vec![]
+            }
+            EventPayload::LlmCallCompleted(c) if self.summary_calls.contains(&c.id) => vec![],
             EventPayload::LlmCallRequested(r) => {
                 self.current_call_id = Some(r.id);
                 vec![]

@@ -192,6 +192,7 @@ fn retrying() -> RetryPolicy {
 struct Trace {
     agg: Session,
     names: Vec<String>,
+    started: Vec<(String, Option<serde_json::Value>)>,
     arms: BTreeSet<&'static str>,
     now: DateTime<Utc>,
 }
@@ -209,6 +210,7 @@ impl Trace {
                 SessionState::new("sess-1".to_string()),
             ),
             names: Vec::new(),
+            started: Vec::new(),
             arms: BTreeSet::new(),
             now: DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
                 .unwrap()
@@ -253,6 +255,10 @@ impl Trace {
             },
         );
         self.names.extend(events.iter().map(name));
+        self.started.extend(events.iter().filter_map(|e| match e {
+            EventPayload::TurnStarted(t) => Some((t.turn_id.clone(), t.client_state.clone())),
+            _ => None,
+        }));
         events
     }
 
@@ -871,6 +877,14 @@ fn trace_merged_turn() {
         Some(serde_json::json!({"ref": "m2"})),
         "the last state wins"
     );
+    assert_eq!(
+        t.started,
+        vec![
+            ("turn-1".to_string(), None),
+            ("turn-2".to_string(), Some(serde_json::json!({"ref": "m2"}))),
+        ],
+        "a turn says what its client sent when it starts"
+    );
     t.assert_trace(&[
         "session.created",
         "decision.queued",
@@ -897,8 +911,16 @@ fn trace_merged_turn() {
 fn a_merge_with_no_turn_running_starts_at_once() {
     let mut t = Trace::create();
     t.decide(vec![], vec![]);
-    t.merge(vec![user_message("hi")], "turn-1", serde_json::json!({}));
+    t.merge(
+        vec![user_message("hi")],
+        "turn-1",
+        serde_json::json!({"ref": "m0"}),
+    );
     assert_eq!(t.agg.state.phase.turn_id(), Some("turn-1"));
+    assert_eq!(
+        t.started,
+        vec![("turn-1".to_string(), Some(serde_json::json!({"ref": "m0"})))]
+    );
     assert!(t.waiting_turns().is_empty());
 }
 
@@ -1494,3 +1516,5 @@ fn traces_cover_every_command_arm() {
         "commands missing from ALL: {unlisted:?}"
     );
 }
+
+mod context;

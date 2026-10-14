@@ -4,8 +4,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::connectors::ConnectionPath;
 use crate::protocol::{
-    ClientContext, DeferToolsStrategy, DraftMessage, ErrorInfo, Handler, LlmFormat, LlmRequest,
-    LlmResponse, RetryOverride, RetryPolicy, SpawnMode, StoredResult, ToolResult, Usage,
+    ClientContext, ContextReason, ContextStrategyKind, DeferToolsStrategy, DraftMessage, ErrorInfo,
+    Handler, HeldCall, LlmFormat, LlmRequest, LlmResponse, RetryOverride, RetryPolicy, SpawnMode,
+    StoredResult, ToolResult, Usage,
 };
 use crate::retry::RetryTarget;
 
@@ -199,6 +200,16 @@ pub enum Trigger {
         #[serde(default)]
         payload: serde_json::Value,
     },
+    #[serde(rename = "context.limit")]
+    ContextLimit {
+        reason: ContextReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        strategy: Option<ContextStrategyKind>,
+        tokens: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window: Option<u64>,
+        call: HeldCall,
+    },
     #[serde(rename = "turn.finished")]
     TurnFinished {
         turn_id: String,
@@ -212,6 +223,13 @@ pub enum Trigger {
 }
 
 impl Trigger {
+    pub fn client_state(&self) -> Option<&serde_json::Value> {
+        match self {
+            Trigger::ClientMessage { client, .. } => client.state.as_ref(),
+            _ => None,
+        }
+    }
+
     pub fn deferred_turn_id(&self) -> Option<&str> {
         match self {
             Trigger::ClientMessage { turn_id, .. } => turn_id.as_deref(),
@@ -376,4 +394,11 @@ pub enum Action {
     },
     #[serde(rename = "fail")]
     Fail { error: ErrorInfo },
+    #[serde(rename = "context.replace")]
+    ReplaceContext {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+        #[serde(default)]
+        messages: Vec<DraftMessage>,
+    },
 }

@@ -252,6 +252,7 @@ async fn lower_actions(
 ) -> Result<Vec<Action>, ResolveError> {
     let config_retry = config.and_then(|c| c.retry.as_deref());
     let mut lowered = Vec::with_capacity(actions.len());
+    let mut view = view.to_vec();
     for action in actions {
         lowered.push({
             Ok::<Action, ResolveError>(match action {
@@ -271,8 +272,8 @@ async fn lower_actions(
                         .or_else(|| config.map(|c| c.model.clone()))
                         .ok_or(ResolveError::MissingModel)?;
                     let messages = messages.unwrap_or_else(|| match config {
-                        Some(c) => c.prompt_for(view),
-                        None => view.to_vec(),
+                        Some(c) => c.prompt_for(&view),
+                        None => view.clone(),
                     });
                     let tools = tools.or_else(|| config.and_then(|c| c.tools_as_llm()));
                     let stream = stream.unwrap_or(true);
@@ -434,6 +435,15 @@ async fn lower_actions(
                 DecisionAction::SyncConnector { path } => Action::SyncConnector { path },
                 DecisionAction::Done { data } => Action::Done { data },
                 DecisionAction::Fail { error } => Action::Fail { error },
+                DecisionAction::ReplaceContext { summary, messages } => {
+                    view = summary
+                        .as_deref()
+                        .map(substructure_session::context::summary_message)
+                        .into_iter()
+                        .chain(messages.iter().cloned())
+                        .collect();
+                    Action::ReplaceContext { summary, messages }
+                }
             })
         }?);
     }
@@ -966,6 +976,53 @@ mod tests {
         )
         .await?;
         Ok(r.actions.into_iter().next().expect("one action"))
+    }
+
+    #[tokio::test]
+    async fn a_bare_llm_call_after_a_replace_reads_the_replaced_history() {
+        let config = cfg("m1", Some("be nice"));
+        let r = resolve_response(
+            DecisionResponse {
+                messages: vec![user_wire("old"), user_wire("new")],
+                actions: vec![
+                    DecisionAction::ReplaceContext {
+                        summary: Some("notes".to_string()),
+                        messages: vec![user_wire("new")],
+                    },
+                    bare_llm_call(),
+                ],
+                state: None,
+                agent: None,
+            },
+            Some(&config),
+            None,
+            &blocks(),
+            &crate::runtime::blob::NOWHERE,
+            "t1",
+        )
+        .await
+        .unwrap();
+        let Some(Action::CallLlm { request, .. }) = r.actions.get(1) else {
+            panic!("expected llm.call; got {:?}", r.actions);
+        };
+        let texts: Vec<String> = request
+            .messages
+            .iter()
+            .map(|m| {
+                m.content
+                    .as_ref()
+                    .map(|c| c.text_owned())
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "be nice",
+                "The earlier conversation was summarized:\n\nnotes",
+                "new"
+            ]
+        );
     }
 
     #[tokio::test]

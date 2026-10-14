@@ -500,18 +500,7 @@ impl OpenRouterClient {
 }
 
 fn classify_error(status: reqwest::StatusCode, body: &str) -> LlmCallError {
-    let status_code = status.as_u16();
-    let retryable = status.is_server_error() || status_code == 408 || status_code == 429;
-    let code = if status_code == 429 {
-        ErrorCode::RateLimited
-    } else {
-        ErrorCode::ProviderError
-    };
-    let message = match crate::json::error_message(body.as_bytes()) {
-        Some(reported) => format!("OpenRouter API error {status}: {reported}"),
-        None => format!("OpenRouter API error {status}"),
-    };
-    LlmCallError::new(code, message, retryable)
+    super::classify_error("OpenRouter", status, body)
 }
 
 #[async_trait]

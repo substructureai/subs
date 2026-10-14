@@ -177,6 +177,7 @@ What fires, what the engine proposes, and what you return.
 | `session.start` | The session was created. | The config from the file. Empty when the section sets none. | An `agent` config. |
 | `client.messages` | A client sent or edited messages. | Record the view, then call the model. | `proposed` |
 | `client.action` | A client called a named action. | Empty. | Your own actions. |
+| `context.limit` | A model call waits for room. See [Make room](./120-conversations.md#make-room). | The plan of the strategy that applied. | `proposed`, `context.replace` and `call`, a summary `llm.call`, or `call` alone. |
 | `tool.execute` | The model called your tool. | Empty. A `tool.error` when the arguments failed validation or the tool is undeclared. | `tool.result` or `tool.error`. |
 | `tool.finished` | A tool call ended, after retries. | Record the result, then call the model. Waits when other calls are in flight. | `proposed` |
 | `llm.execute` | The agent's LLM block is `type = "worker"`. | Empty. | `llm.result` or `llm.error`, or a stream. |
@@ -195,6 +196,19 @@ type Trigger =
           client: ClientContext
       }
     | { type: "client.action"; name: string; args?: unknown }
+    | {
+          type: "context.limit"
+          reason: "idle" | "full" | "overflow"
+          strategy?: "reset" | "summarize" | "worker"
+          tokens: number            // what the model would read
+          window?: number
+          call: {                   // the held call. an llm.call with its id runs it again
+              id: string
+              llm: string
+              request: LlmRequest
+              stream: boolean
+          }
+      }
     | {
           type: "tool.execute"
           id: string
@@ -277,6 +291,7 @@ type ClientContext = {
 | `interrupt` | Pause the active branch. | Any trigger. |
 | `interrupt.resolve` | Clear an open interrupt and resume. | Any trigger. |
 | `fail` | End the turn as a failed run. | Any trigger. |
+| `context.replace` | Set what the model reads, on a new branch. | Any trigger. |
 | `connector.sync` | Fetch a connection's tools again. | Any trigger. |
 | `done` | End the turn. | Any trigger. |
 
@@ -354,6 +369,11 @@ type Action =
     | { type: "connector.sync"; path: string }   // "mcp.<id>" or "plugin.<id>.mcp.<server>"
     | { type: "done"; data?: unknown }
     | { type: "fail"; error: ErrorInfo }
+    | {
+          type: "context.replace"
+          summary?: string        // comes first, as a message saying it is a summary
+          messages?: DraftMessage[]  // a recorded id is kept as a copy
+      }
 ```
 
 `{ "type": "llm.call" }` on its own prompts the model with the agent's config
@@ -384,6 +404,7 @@ type ErrorCode =
     | "refused"
     | "budget_exceeded"
     | "deadline_exceeded"
+    | "context_overflow"        // the request was longer than the model reads
 ```
 
 `code` describes a failure. `retryable` decides whether the engine tries again.
@@ -411,6 +432,10 @@ type AgentConfig = {
     }
     mcp_announce?: "auto" | "never"  // tell the model a connection exists. omitted: "auto"
     attachments?: Attachments   // how a file reaches the model. omitted: as media
+    context?: {                 // how the agent makes room. see [agent.<id>.context]
+        window?: number
+        strategy?: ContextStrategy[]
+    }
 }
 
 type Attachments = {
@@ -419,6 +444,17 @@ type Attachments = {
     rules?: {                    // mime pattern to disposition. most specific wins
         [pattern: string]: "inline" | "attachment"
     }
+}
+
+type ContextStrategy = {
+    use: "reset" | "summarize" | "worker"
+    idle_secs?: number          // at a turn's first call, after this long with no turn
+    over_tokens?: number        // when the model would read more than this.
+                                // without idle_secs: the window less 16000
+    keep_tokens?: number        // summarize: recent tokens kept as they are
+    llm?: string                // summarize: where the summary runs
+    model?: string
+    prompt?: string             // summarize: the instructions for the summary
 }
 
 type AgentTool = {

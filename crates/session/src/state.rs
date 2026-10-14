@@ -63,9 +63,10 @@ use rust_decimal::Decimal;
 
 pub use crate::protocol::EffectKind;
 use crate::protocol::{
-    AgentConfig, ClientContext, DraftMessage, Effect, EffectStatus, InterruptOrigin, LlmFormat,
-    LlmRequest, LlmTool, Message, MessageTree, NewMessage, ReasoningConfig, RetryConfig,
-    RetryPolicy, Role, SessionOwner, SpawnMode, SubagentTools, Usage, WorkerRef, WorkerState,
+    AgentConfig, ClientContext, ContextReason, DraftMessage, Effect, EffectStatus, HeldCall,
+    InterruptOrigin, LlmFormat, LlmRequest, LlmTool, Message, MessageTree, NewMessage,
+    ReasoningConfig, RetryConfig, RetryPolicy, Role, SessionOwner, SpawnMode, SubagentTools, Usage,
+    WorkerRef, WorkerState,
 };
 use crate::retry::RetryState;
 
@@ -360,6 +361,28 @@ payload_views! {
     subagent, subagent_mut => Subagent(SubagentCallState),
     connector, connector_mut => ConnectorSync(ConnectorSyncState),
     decision, decision_mut => Decision(WorkerDecisionState),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LastRead {
+    pub call_id: String,
+    pub tokens: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Limited {
+    pub reason: ContextReason,
+    pub call: HeldCall,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub released: bool,
+}
+
+impl Limited {
+    pub fn open(&self) -> bool {
+        !self.released
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -733,6 +756,24 @@ pub struct SessionState {
     #[serde(default)]
     pub turn_token_usage: Usage,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_turn_at: Option<DateTime<Utc>>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_read: Option<LastRead>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limited: Option<Limited>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_head: Option<String>,
+
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub turn_called: bool,
+
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub context_kept: bool,
+
     #[serde(default)]
     pub subagent_token_usage: Usage,
 
@@ -803,6 +844,12 @@ impl SessionState {
             subagent_cost: Decimal::ZERO,
             turn_cost: Decimal::ZERO,
             turn_token_usage: Usage::default(),
+            last_turn_at: None,
+            last_read: None,
+            limited: None,
+            turn_head: None,
+            turn_called: false,
+            context_kept: false,
             subagent_token_usage: Usage::default(),
             state_versions: Vec::new(),
             agent_versions: Vec::new(),
@@ -988,6 +1035,10 @@ impl SessionState {
                 }),
             );
         }
+        match &mut self.limited {
+            Some(l) if l.open() && l.call.id != payload.id => l.summary = Some(payload.id.clone()),
+            _ => self.turn_called = true,
+        }
         self.enqueue(ctx.sequence, EffectKind::LlmCall, &payload.id);
     }
 
@@ -1125,6 +1176,7 @@ impl SessionState {
             usage,
         } = &p.trigger
         {
+            self.last_turn_at = Some(ctx.occurred_at);
             self.phase = TurnPhase::Finalizing(TurnEnd {
                 turn_id: turn_id.clone(),
                 data: data.clone(),
@@ -1176,6 +1228,15 @@ impl SessionState {
             EventPayload::LlmCallRequested(payload) => self.apply_llm_requested(payload, ctx),
             EventPayload::LlmCallDispatched(payload) => self.apply_llm_dispatched(payload, now),
             EventPayload::LlmCallCompleted(payload) => {
+                match &payload.response.usage {
+                    Some(usage) if !self.is_summary_call(&payload.id) => {
+                        self.last_read = Some(LastRead {
+                            call_id: payload.id.clone(),
+                            tokens: usage.input,
+                        });
+                    }
+                    _ => {}
+                }
                 self.track_usage(&payload.response.usage);
                 self.track_turn_usage(&payload.response.usage);
                 if let Some(c) = payload.response.cost {
@@ -1354,6 +1415,7 @@ impl SessionState {
             }
             EventPayload::SessionCancelled => {
                 self.status = SessionStatus::Done;
+                self.limited = None;
                 self.effects.retain(|(kind, _), e| {
                     *kind != EffectKind::Decision || e.tracking.status() != EffectStatus::Pending
                 });
@@ -1400,16 +1462,23 @@ impl SessionState {
                     turn_id: p.turn_id.clone(),
                 };
                 self.turn_started_seq = Some(ctx.sequence);
+                self.turn_head = self.head_id.clone();
+                self.turn_called = false;
+                self.context_kept = false;
                 self.turn_cost = Decimal::ZERO;
                 self.turn_token_usage = Usage::default();
             }
             EventPayload::TurnCompleted(payload) => {
                 self.completed_turn_ids.push(payload.turn_id.clone());
+                if !matches!(self.phase, TurnPhase::Finalizing(_)) {
+                    self.last_turn_at = Some(now);
+                }
                 self.data = payload.data.clone();
                 self.turn_cost = Decimal::ZERO;
                 self.turn_token_usage = Usage::default();
                 self.phase = TurnPhase::Idle;
                 self.turn_started_seq = None;
+                self.limited = None;
                 self.dequeue(EffectKind::TurnEnd, &payload.turn_id);
             }
             EventPayload::WorkUnsent(p) => {
@@ -1448,6 +1517,26 @@ impl SessionState {
                 d.attempts = 0;
                 d.failing_since = None;
                 d.retry_at = None;
+            }
+            EventPayload::ContextLimited(p) => {
+                self.limited = Some(Limited {
+                    reason: p.reason,
+                    call: p.call.clone(),
+                    summary: None,
+                    released: false,
+                });
+            }
+            EventPayload::ContextReplaced(_) => {
+                self.last_read = None;
+                if let Some(l) = &mut self.limited {
+                    l.released = true;
+                }
+            }
+            EventPayload::ContextKept => {
+                self.context_kept = true;
+                if let Some(l) = &mut self.limited {
+                    l.released = true;
+                }
             }
             EventPayload::DeliveryResumed(p) => {
                 let d = self.deliveries.entry(p.subscription.clone()).or_default();
@@ -1530,6 +1619,16 @@ impl SessionState {
             _ => None,
         }
         .and_then(|e| e.anchor.as_deref())
+    }
+
+    pub fn is_summary_call(&self, id: &str) -> bool {
+        self.limited.as_ref().and_then(|l| l.summary.as_deref()) == Some(id)
+    }
+
+    pub fn holds(&self, id: &str) -> bool {
+        self.limited
+            .as_ref()
+            .is_some_and(|l| l.open() && l.call.id == id)
     }
 
     pub fn worker_decision(&self, id: &str) -> Option<&WorkerDecisionState> {

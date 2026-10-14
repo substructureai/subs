@@ -15,6 +15,16 @@
               }
             ]
           },
+          "context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ContextConfig"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "defer_tools": {
             "anyOf": [
               {
@@ -448,6 +458,136 @@
           }
         ],
         "title": "ContentPartWire"
+      },
+      "ContextConfig": {
+        "additionalProperties": {
+          "not": {}
+        },
+        "description": "How the agent makes room in what the model reads. Before each model call\nthe engine tries the strategies in order. The first that applies proposes\na plan on a `context.limit` decision, and the worker has the final say.",
+        "properties": {
+          "strategy": {
+            "items": {
+              "$ref": "#/components/schemas/ContextStrategy"
+            },
+            "type": "array"
+          },
+          "window": {
+            "description": "The model's context window in tokens. Without it, only `idle_secs`,\n`over_tokens` and a provider's refusal start making room.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "title": "ContextConfig",
+        "type": "object"
+      },
+      "ContextReason": {
+        "description": "Why the engine stopped before a model call to make room.",
+        "oneOf": [
+          {
+            "const": "idle",
+            "description": "The session was quiet for longer than `idle_secs`.",
+            "type": "string"
+          },
+          {
+            "const": "full",
+            "description": "The model would read more than the strategy allows.",
+            "type": "string"
+          },
+          {
+            "const": "overflow",
+            "description": "The provider refused the call as too long.",
+            "type": "string"
+          }
+        ],
+        "title": "ContextReason"
+      },
+      "ContextStrategy": {
+        "additionalProperties": {
+          "not": {}
+        },
+        "description": "One way to make room, and when it applies.",
+        "properties": {
+          "idle_secs": {
+            "description": "At a turn's first model call, after this many seconds with no turn.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "keep_tokens": {
+            "description": "`summarize`: about how many recent tokens are kept as they are, from a\nuser message.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "llm": {
+            "description": "`summarize`: the `[llm.*]` block the summary runs on.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "description": "`summarize`: the model that writes the summary.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "over_tokens": {
+            "description": "When the model would read more than this. Without `idle_secs`, it\ndefaults to the window less 16000.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "prompt": {
+            "description": "`summarize`: the instructions for the summary, in place of the engine's.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "use": {
+            "$ref": "#/components/schemas/ContextStrategyKind"
+          }
+        },
+        "required": [
+          "use"
+        ],
+        "title": "ContextStrategy",
+        "type": "object"
+      },
+      "ContextStrategyKind": {
+        "oneOf": [
+          {
+            "const": "reset",
+            "description": "Start over with only the turn's own messages.",
+            "type": "string"
+          },
+          {
+            "const": "summarize",
+            "description": "Summarize the older messages and keep the recent ones.",
+            "type": "string"
+          },
+          {
+            "const": "worker",
+            "description": "Leave the plan to the worker.",
+            "type": "string"
+          }
+        ],
+        "title": "ContextStrategyKind"
       },
       "DecisionAction": {
         "description": "The action a worker writes on the wire. A settle can leave out the effect\nid, because the `*.execute` trigger it answers already names it.",
@@ -922,6 +1062,32 @@
               "error"
             ],
             "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Set what the model reads, on a new branch. `summary` comes first, as a\nmessage saying the conversation before it was summarized. A message\nwhose `id` is recorded is kept as a copy; any other is written new.\nThe worker's state and the config carry over.",
+            "properties": {
+              "messages": {
+                "items": {
+                  "$ref": "#/components/schemas/DraftMessage"
+                },
+                "type": "array"
+              },
+              "summary": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "type": {
+                "const": "context.replace",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
           }
         ],
         "title": "DecisionAction"
@@ -1138,6 +1304,53 @@
             "required": [
               "type",
               "name"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "A model call waits for room. `proposed` holds the plan of the strategy\nthat applied. A model call made before `call` runs again writes the\nsummary. `call` with its own id runs on whatever history is set by then.",
+            "properties": {
+              "call": {
+                "$ref": "#/components/schemas/HeldCall"
+              },
+              "reason": {
+                "$ref": "#/components/schemas/ContextReason"
+              },
+              "strategy": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ContextStrategyKind"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "tokens": {
+                "description": "What the model would read, in tokens.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": {
+                "const": "context.limit",
+                "type": "string"
+              },
+              "window": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "type",
+              "reason",
+              "tokens",
+              "call"
             ],
             "type": "object"
           },
@@ -1686,7 +1899,7 @@
         "title": "EffectStatus"
       },
       "ErrorCode": {
-        "description": "What kind of failure, so a consumer can branch on it instead of reading the\nsentence. A closed set, required on every [`ErrorInfo`].\n\n`provider_error`, `rate_limited`, `refused`, `budget_exceeded`, and\n`deadline_exceeded` mean a call ran and went wrong.\n`invalid_response` means a document did not parse, or parsed into something\nunusable. `handler_error` means the worker or client reported its own\nfailure. `worker_unreachable` means it was never reached. `unroutable`\nmeans nothing could decide. `internal` means the engine's own fault.",
+        "description": "What kind of failure, so a consumer can branch on it instead of reading the\nsentence. A closed set, required on every [`ErrorInfo`].\n\n`provider_error`, `rate_limited`, `refused`, `budget_exceeded`, and\n`deadline_exceeded` mean a call ran and went wrong.\n`invalid_response` means a document did not parse, or parsed into something\nunusable. `handler_error` means the worker or client reported its own\nfailure. `worker_unreachable` means it was never reached. `unroutable`\nmeans nothing could decide. `internal` means the engine's own fault.\n`context_overflow` means the request was longer than the model can read.",
         "enum": [
           "provider_error",
           "rate_limited",
@@ -1697,7 +1910,8 @@
           "handler_error",
           "worker_unreachable",
           "unroutable",
-          "internal"
+          "internal",
+          "context_overflow"
         ],
         "title": "ErrorCode",
         "type": "string"
@@ -1769,6 +1983,32 @@
         ],
         "title": "Handler"
       },
+      "HeldCall": {
+        "additionalProperties": false,
+        "description": "A model call that waits for room.",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "llm": {
+            "type": "string"
+          },
+          "request": {
+            "$ref": "#/components/schemas/LlmRequest"
+          },
+          "stream": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "llm",
+          "request",
+          "stream"
+        ],
+        "title": "HeldCall",
+        "type": "object"
+      },
       "ImageUrl": {
         "additionalProperties": false,
         "properties": {
@@ -1802,6 +2042,60 @@
           }
         ],
         "title": "LlmFormat"
+      },
+      "LlmRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "max_completion_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "messages": {
+            "items": {
+              "$ref": "#/components/schemas/DraftMessage"
+            },
+            "type": "array"
+          },
+          "model": {
+            "type": "string"
+          },
+          "reasoning": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ReasoningConfig"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "temperature": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "tools": {
+            "items": {
+              "$ref": "#/components/schemas/LlmTool"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "model",
+          "messages"
+        ],
+        "title": "LlmRequest",
+        "type": "object"
       },
       "LlmTool": {
         "additionalProperties": false,

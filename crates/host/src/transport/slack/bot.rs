@@ -2620,6 +2620,7 @@ mod tests {
         let (bot, ws) = bot_for(api_base);
         let started = EventPayload::TurnStarted(crate::runtime::session::events::TurnStarted {
             turn_id: "turn-1".into(),
+            client_state: None,
         });
         bot.track(&ws, &thread(), &turn_event(started, Some("turn-1"), None))
             .await
@@ -2651,6 +2652,7 @@ mod tests {
             &turn_event(
                 EventPayload::TurnStarted(crate::runtime::session::events::TurnStarted {
                     turn_id: "turn-1".into(),
+                    client_state: None,
                 }),
                 Some("turn-1"),
                 None,
@@ -2955,6 +2957,7 @@ mod tests {
 
         let started = EventPayload::TurnStarted(crate::session::events::TurnStarted {
             turn_id: "turn-1".into(),
+            client_state: None,
         });
         bot.apply(turn_event(started, Some("turn-1"), None))
             .await

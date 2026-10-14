@@ -72,44 +72,127 @@ An active path of `u1 → a1 → u2`. The client edits back to the first questio
 `u1` matches. The message with no ID starts a branch under it. The worker sees
 `messages: [u1, e1]` with `new_from: 1`. The `a1 → u2` branch stays.
 
-## Reset or compact
+## Make room
 
-A worker can shorten what the model reads. Its decision returns a short
-`messages` view whose first message is new. The engine starts a new branch at
-the root and moves the head there. The old messages stay in the tree, and the
-model no longer reads them.
+A model reads a limited number of tokens. Before a model call, the engine
+checks whether there is room. When there is not, it holds the call and asks the
+worker with a `context.limit` decision.
 
-To reset, send only the new message:
+The engine counts what the model would read. It takes the input tokens that the
+provider reported for the last call, and adds about one token for every four
+characters written since.
+
+### Strategies
+
+The agent lists strategies in `[agent.<id>.context]`. The engine tries them in
+order. The first that applies sets the plan in `proposed`.
+
+```toml
+[agent.bot.context]
+window = 200000
+
+[[agent.bot.context.strategy]]
+use = "reset"
+idle_secs = 3600
+
+[[agent.bot.context.strategy]]
+use = "summarize"
+```
+
+Here an hour with no turn starts the model over. Otherwise, when the model would
+read more than 184,000 tokens, the engine summarizes.
+
+| Strategy | `proposed` holds |
+| --- | --- |
+| `reset` | `context.replace` with only the turn's own messages, then the held call on them. |
+| `summarize` | An `llm.call` that summarizes the older messages. About `keep_tokens` of recent messages, from a user message, stay as they are. |
+| `worker` | The held call, as it was. Change it or replace it. |
+
+`window` is the model's context window. Set it to what the model reads. A
+strategy without `idle_secs` applies when the model would read more than the
+window less 16,000 tokens, or more than its `over_tokens`. Without a window,
+only `idle_secs`, `over_tokens` and a provider's refusal apply.
+
+`idle_secs` applies only at a turn's first model call. See
+[`[agent.<id>.context]`](./220-config.md#agentidcontext) for every key.
+
+### Answer `context.limit`
 
 ```jsonc
 {
-    "messages": [{ "role": "user", "content": "Sam: had 120ml" }],
-    "actions": [{ "type": "llm.call" }],
-    "state": { "last_reset": "2026-10-11T14:02:00Z" }
+    "type": "context.limit",
+    "reason": "full",           // "idle", "full", or "overflow"
+    "strategy": "summarize",
+    "tokens": 186400,
+    "window": 200000,
+    "call": { "id": "llm-7", "llm": "claude", "request": { ... }, "stream": true }
 }
 ```
 
-To compact, send a summary first, then the messages to keep. The engine records
-copies of the kept messages on the new branch. Each copy names its original in
-`copied_from` on its `message.new` event.
+`call` is the held call. An `llm.call` with its `id` runs it again. The engine
+does not hold it a second time.
+
+| Answer | Then |
+| --- | --- |
+| `context.replace`, then `call` | The engine sets the history, and the call runs on it. |
+| An `llm.call` with another id | That call writes the summary. Its `llm.finished` proposes `context.replace` with the summary and the kept messages, then `call` on them. |
+| `call` alone | The history stays. The engine does not ask again in that turn. |
+
+The summary is not added to the conversation. When the summary call fails, the
+engine proposes `call` as it was. When the provider finds the summary call too
+long, the engine proposes a shorter one.
+
+A `summarize` strategy takes `prompt` for its own instructions, and `llm` and
+`model` to write the summary elsewhere. An earlier summary is part of what the
+next one reads.
+
+### When the provider refuses the call
+
+A provider can refuse a call as too long. The engine then asks with
+`reason: "overflow"` and a summary in `proposed`. The call runs once more. If
+the provider refuses it again, the turn fails.
+
+### Replace the history at any time
+
+Any decision can return `context.replace`. Use it to reset on a deploy, or for
+your own compaction.
 
 ```jsonc
 {
-    "messages": [
-        { "role": "user", "content": "Summary: Sam logs feeds and naps." },
-        { "id": "u40", "role": "user", "content": "nap at 2" },
-        { "id": "a40", "role": "assistant", "content": "Logged." }
+    "actions": [
+        {
+            "type": "context.replace",
+            "summary": "Sam logs feeds and naps.",
+            "messages": [
+                { "id": "u40", "role": "user", "content": "nap at 2" },
+                { "id": "a40", "role": "assistant", "content": "Logged." }
+            ]
+        },
+        { "type": "llm.call" }
     ]
 }
 ```
 
-State and config written during the conversation stay on the old branch. Send
-`state` again in the same decision, and `agent` if you changed it. The engine
-writes them after the messages, so they land on the new branch. The config from
-`session.start` holds on every branch.
+The engine starts a new branch at the root. `summary` comes first, as a user
+message that says the earlier conversation was summarized. A message with a
+recorded `id` becomes a copy. Its `message.new` event names the original in
+`copied_from`. Any other message is new.
 
-Reset at the start of a turn, on `client.messages`. A new branch cancels work in
-flight on the old one.
+The worker's state and the config carry over to the new branch. The old
+messages stay in the tree, and the model no longer reads them. An `llm.call`
+without `messages` after the replace reads the new history.
+
+### Show it in a UI
+
+| Event | Show |
+| --- | --- |
+| `context.limited` | The engine is making room. |
+| `context.replaced` | Room was made. |
+| `context.kept` | The history stays. |
+
+A model call between `context.limited` and the next of the other two writes the
+summary. Do not show its text as an answer. The summary that the engine
+proposes is not streamed.
 
 ## One turn at a time
 

@@ -234,7 +234,8 @@ type DecisionRequest struct {
 // the call runs and what shape it takes. A config that names no block fails
 // when the engine resolves a call.
 type AgentConfig struct {
-	Attachments *Attachments `json:"attachments"`
+	Attachments *Attachments   `json:"attachments"`
+	Context     *ContextConfig `json:"context"`
 	// Defer every tool this agent offers, whatever its source. A tool or a
 	// connection overrides this with its own `defer`. Absent, the agent defers
 	// nothing; a connection can still defer on its own.
@@ -270,6 +271,35 @@ type Attachments struct {
 	MaxInline *Size                  `json:"max_inline"`
 	Rules     map[string]Disposition `json:"rules,omitempty"`
 	Tools     []AttachmentTool       `json:"tools,omitempty"`
+}
+
+// How the agent makes room in what the model reads. Before each model call
+// the engine tries the strategies in order. The first that applies proposes
+// a plan on a `context.limit` decision, and the worker has the final say.
+type ContextConfig struct {
+	Strategy []ContextStrategy `json:"strategy,omitempty"`
+	// The model's context window in tokens. Without it, only `idle_secs`,
+	// `over_tokens` and a provider's refusal start making room.
+	Window *int64 `json:"window"`
+}
+
+// One way to make room, and when it applies.
+type ContextStrategy struct {
+	// At a turn's first model call, after this many seconds with no turn.
+	IdleSecs *int64 `json:"idle_secs"`
+	// `summarize`: about how many recent tokens are kept as they are, from a
+	// user message.
+	KeepTokens *int64 `json:"keep_tokens"`
+	// `summarize`: the `[llm.*]` block the summary runs on.
+	Llm *string `json:"llm"`
+	// `summarize`: the model that writes the summary.
+	Model *string `json:"model"`
+	// When the model would read more than this. Without `idle_secs`, it
+	// defaults to the window less 16000.
+	OverTokens *int64 `json:"over_tokens"`
+	// `summarize`: the instructions for the summary, in place of the engine's.
+	Prompt *string             `json:"prompt"`
+	Use    ContextStrategyKind `json:"use"`
 }
 
 // How an agent's deferred tools reach the model.
@@ -471,6 +501,11 @@ type DecisionResponse struct {
 // credential.
 //
 // End the turn as a failed run.
+//
+// Set what the model reads, on a new branch. `summary` comes first, as a
+// message saying the conversation before it was summarized. A message
+// whose `id` is recorded is kept as a copy; any other is written new.
+// The worker's state and the config carry over.
 type DecisionAction struct {
 	ID *string `json:"id"`
 	// The `[llm.*]` block this call runs on. Absent uses the config's
@@ -521,6 +556,7 @@ type DecisionAction struct {
 	Reason      *string     `json:"reason,omitempty"`
 	Path        *string     `json:"path,omitempty"`
 	Data        interface{} `json:"data"`
+	Summary     *string     `json:"summary"`
 }
 
 // Why something failed. One shape on every event and on the wire.
@@ -576,6 +612,10 @@ type LlmTool struct {
 //
 // The first decision of every session; carries no proposal.
 //
+// A model call waits for room. `proposed` holds the plan of the strategy
+// that applied. A model call made before `call` runs again writes the
+// summary. `call` with its own id runs on whatever history is set by then.
+//
 // Answer with `tool.result`/`tool.error`.
 //
 // Answer with `llm.result`/`llm.error`.
@@ -590,15 +630,21 @@ type DecisionTrigger struct {
 	Type DecisionTriggerType `json:"type"`
 	// Inputs the client declared on its run. The engine adds
 	// `client.tools` to the proposed config.
-	Client    *ClientContext `json:"client,omitempty"`
-	Messages  []DraftMessage `json:"messages,omitempty"`
-	NewFrom   *int64         `json:"new_from,omitempty"`
-	Args      interface{}    `json:"args"`
-	Name      *string        `json:"name,omitempty"`
-	Arguments *string        `json:"arguments,omitempty"`
-	Attempt   *int64         `json:"attempt,omitempty"`
-	Deadline  *time.Time     `json:"deadline"`
-	ID        *string        `json:"id,omitempty"`
+	Client   *ClientContext       `json:"client,omitempty"`
+	Messages []DraftMessage       `json:"messages,omitempty"`
+	NewFrom  *int64               `json:"new_from,omitempty"`
+	Args     interface{}          `json:"args"`
+	Name     *string              `json:"name,omitempty"`
+	Call     *HeldCall            `json:"call,omitempty"`
+	Reason   *ContextReason       `json:"reason,omitempty"`
+	Strategy *ContextStrategyKind `json:"strategy"`
+	// What the model would read, in tokens.
+	Tokens    *int64     `json:"tokens,omitempty"`
+	Window    *int64     `json:"window"`
+	Arguments *string    `json:"arguments,omitempty"`
+	Attempt   *int64     `json:"attempt,omitempty"`
+	Deadline  *time.Time `json:"deadline"`
+	ID        *string    `json:"id,omitempty"`
 	// What the engine made of `arguments` against the tool's `input`
 	// schema: `valid`, `invalid`, or `malformed`. Always on the wire.
 	Input  *ToolInput `json:"input,omitempty"`
@@ -623,6 +669,23 @@ type DecisionTrigger struct {
 	Payload     interface{} `json:"payload"`
 	Data        interface{} `json:"data"`
 	TurnID      *string     `json:"turn_id,omitempty"`
+}
+
+// A model call that waits for room.
+type HeldCall struct {
+	ID      string     `json:"id"`
+	Llm     string     `json:"llm"`
+	Request LlmRequest `json:"request"`
+	Stream  bool       `json:"stream"`
+}
+
+type LlmRequest struct {
+	MaxCompletionTokens *int64           `json:"max_completion_tokens"`
+	Messages            []DraftMessage   `json:"messages"`
+	Model               string           `json:"model"`
+	Reasoning           *ReasoningConfig `json:"reasoning"`
+	Temperature         *float64         `json:"temperature"`
+	Tools               []LlmTool        `json:"tools"`
 }
 
 // What the engine made of `arguments` against the tool's `input`
@@ -763,9 +826,9 @@ type TokenDelta struct {
 type Handler string
 
 const (
-	Client Handler = "client"
-	Server Handler = "server"
-	Worker Handler = "worker"
+	Client        Handler = "client"
+	HandlerWorker Handler = "worker"
+	Server        Handler = "server"
 )
 
 type ToolContentType string
@@ -848,6 +911,19 @@ type AttachmentTool string
 const (
 	Read AttachmentTool = "read"
 	View AttachmentTool = "view"
+)
+
+// Start over with only the turn's own messages.
+//
+// Summarize the older messages and keep the recent ones.
+//
+// Leave the plan to the worker.
+type ContextStrategyKind string
+
+const (
+	ContextStrategyKindWorker ContextStrategyKind = "worker"
+	Reset                     ContextStrategyKind = "reset"
+	Summarize                 ContextStrategyKind = "summarize"
 )
 
 // Which tools the agent gets to reach the ones it defers.
@@ -1009,10 +1085,12 @@ const (
 // unusable. `handler_error` means the worker or client reported its own
 // failure. `worker_unreachable` means it was never reached. `unroutable`
 // means nothing could decide. `internal` means the engine's own fault.
+// `context_overflow` means the request was longer than the model can read.
 type ErrorCode string
 
 const (
 	BudgetExceeded    ErrorCode = "budget_exceeded"
+	ContextOverflow   ErrorCode = "context_overflow"
 	DeadlineExceeded  ErrorCode = "deadline_exceeded"
 	HandlerError      ErrorCode = "handler_error"
 	Internal          ErrorCode = "internal"
@@ -1036,6 +1114,7 @@ const (
 type DecisionActionType string
 
 const (
+	ContextReplace    DecisionActionType = "context.replace"
 	Done              DecisionActionType = "done"
 	Fail              DecisionActionType = "fail"
 	FluffyToolError   DecisionActionType = "tool.error"
@@ -1069,6 +1148,21 @@ const (
 	Valid     Status = "valid"
 )
 
+// Why the engine stopped before a model call to make room.
+//
+// The session was quiet for longer than `idle_secs`.
+//
+// The model would read more than the strategy allows.
+//
+// The provider refused the call as too long.
+type ContextReason string
+
+const (
+	Full     ContextReason = "full"
+	Idle     ContextReason = "idle"
+	Overflow ContextReason = "overflow"
+)
+
 type StoredContentType string
 
 const (
@@ -1080,6 +1174,7 @@ const (
 type DecisionTriggerType string
 
 const (
+	ContextLimit            DecisionTriggerType = "context.limit"
 	InterruptResumed        DecisionTriggerType = "interrupt.resumed"
 	LlmExecute              DecisionTriggerType = "llm.execute"
 	LlmFinished             DecisionTriggerType = "llm.finished"

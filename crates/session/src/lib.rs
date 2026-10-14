@@ -5,6 +5,7 @@ pub mod branch;
 pub mod caller;
 pub mod command;
 pub mod connectors;
+pub mod context;
 pub mod copy;
 pub mod cx;
 pub mod decision;

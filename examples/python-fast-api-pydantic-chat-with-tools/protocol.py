@@ -93,6 +93,18 @@ class ContentPart4(BaseModel):
     type: Literal['input_audio']
 
 
+class ContextReason(Enum):
+    idle = 'idle'
+    full = 'full'
+    overflow = 'overflow'
+
+
+class ContextStrategyKind(Enum):
+    reset = 'reset'
+    summarize = 'summarize'
+    worker = 'worker'
+
+
 class DecisionAction4(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
@@ -164,7 +176,7 @@ class DecisionTrigger3(BaseModel):
     type: Literal['client.action']
 
 
-class DecisionTrigger9(BaseModel):
+class DecisionTrigger10(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
     )
@@ -207,6 +219,7 @@ class ErrorCode(Enum):
     worker_unreachable = 'worker_unreachable'
     unroutable = 'unroutable'
     internal = 'internal'
+    context_overflow = 'context_overflow'
 
 
 class ErrorInfo(BaseModel):
@@ -809,6 +822,50 @@ class ContentPart5(BaseModel):
     video_url: VideoUrl
 
 
+class ContextStrategy(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
+    idle_secs: Annotated[
+        int | None,
+        Field(
+            description="At a turn's first model call, after this many seconds with no turn.",
+            ge=0,
+        ),
+    ] = None
+    keep_tokens: Annotated[
+        int | None,
+        Field(
+            description='`summarize`: about how many recent tokens are kept as they are, from a\nuser message.',
+            ge=0,
+        ),
+    ] = None
+    llm: Annotated[
+        str | None,
+        Field(description='`summarize`: the `[llm.*]` block the summary runs on.'),
+    ] = None
+    model: Annotated[
+        str | None, Field(description='`summarize`: the model that writes the summary.')
+    ] = None
+    over_tokens: Annotated[
+        int | None,
+        Field(
+            description='When the model would read more than this. Without `idle_secs`, it\ndefaults to the window less 16000.',
+            ge=0,
+        ),
+    ] = None
+    prompt: Annotated[
+        str | None,
+        Field(
+            description="`summarize`: the instructions for the summary, in place of the engine's."
+        ),
+    ] = None
+    use: ContextStrategyKind
+
+
 class DecisionAction2(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
@@ -875,7 +932,7 @@ class DecisionAction13(BaseModel):
     type: Literal['fail']
 
 
-class DecisionTrigger4(BaseModel):
+class DecisionTrigger5(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
     )
@@ -894,7 +951,7 @@ class DecisionTrigger4(BaseModel):
     type: Literal['tool.execute']
 
 
-class DecisionTrigger5(BaseModel):
+class DecisionTrigger6(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
     )
@@ -906,7 +963,7 @@ class DecisionTrigger5(BaseModel):
     type: Literal['tool.finished']
 
 
-class DecisionTrigger6(BaseModel):
+class DecisionTrigger7(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
     )
@@ -924,7 +981,7 @@ class DecisionTrigger6(BaseModel):
     type: Literal['llm.execute']
 
 
-class DecisionTrigger8(BaseModel):
+class DecisionTrigger9(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
     )
@@ -937,7 +994,7 @@ class DecisionTrigger8(BaseModel):
     type: Literal['subagent.finished']
 
 
-class DecisionTrigger10(BaseModel):
+class DecisionTrigger11(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
     )
@@ -1137,69 +1194,20 @@ class ToolCall(BaseModel):
     type: str
 
 
-class AgentConfig(BaseModel):
+class ContextConfig(BaseModel):
     model_config = ConfigDict(
-        extra='forbid',
+        extra='allow',
     )
-    attachments: Attachments | None = None
-    defer_tools: Annotated[
-        bool | DeferTools | None,
-        Field(
-            description='Defer every tool this agent offers, whatever its source. A tool or a\nconnection overrides this with its own `defer`. Absent, the agent defers\nnothing; a connection can still defer on its own.'
-        ),
-    ] = None
-    effort: Annotated[
-        ReasoningEffort | None,
-        Field(
-            description="How hard the model thinks. Unset leaves the provider's own default."
-        ),
-    ] = None
-    llm: Annotated[
-        str | None, Field(description="The `[llm.*]` block this agent's calls run on.")
-    ] = None
-    max_subagent_depth: Annotated[
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
+    strategy: list[ContextStrategy] | None = None
+    window: Annotated[
         int | None,
         Field(
-            description="How deep this agent's subagents may nest. A session whose depth\nreaches it may not delegate. `0` never delegates.",
+            description="The model's context window in tokens. Without it, only `idle_secs`,\n`over_tokens` and a provider's refusal start making room.",
             ge=0,
         ),
-    ] = None
-    mcp: Annotated[
-        list[McpServer] | None,
-        Field(description='MCP servers this agent draws tools from.'),
-    ] = None
-    mcp_announce: Annotated[
-        McpAnnounce | None,
-        Field(
-            description='Whether the engine tells the model that an MCP server is available, and\nwhat that server says it is for.'
-        ),
-    ] = None
-    model: str
-    plugins: Annotated[
-        list[AgentPlugin] | None, Field(description='Plugins this agent uses.')
-    ] = None
-    retry: Annotated[
-        RetryConfig | None,
-        Field(
-            description='Boxed. Five per-kind overrides are too many bytes to carry inline.'
-        ),
-    ] = None
-    subagent_tools: Annotated[
-        SubagentTools | None,
-        Field(
-            description='What shape the subagents take as tools. Absent ⇒ one tool per agent.'
-        ),
-    ] = None
-    subagents: Annotated[
-        list[Subagent] | None,
-        Field(
-            description='Subagents the model can delegate to. The model sees them as tools.\nEach call starts a child session.'
-        ),
-    ] = None
-    system: str | None = None
-    tools: Annotated[
-        list[AgentTool] | None,
-        Field(description='Worker- or client-executed tools the model can call.'),
     ] = None
 
 
@@ -1306,6 +1314,73 @@ class MessageTree(BaseModel):
     )
     head_id: str | None = None
     nodes: list[Node]
+
+
+class AgentConfig(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    attachments: Attachments | None = None
+    context: ContextConfig | None = None
+    defer_tools: Annotated[
+        bool | DeferTools | None,
+        Field(
+            description='Defer every tool this agent offers, whatever its source. A tool or a\nconnection overrides this with its own `defer`. Absent, the agent defers\nnothing; a connection can still defer on its own.'
+        ),
+    ] = None
+    effort: Annotated[
+        ReasoningEffort | None,
+        Field(
+            description="How hard the model thinks. Unset leaves the provider's own default."
+        ),
+    ] = None
+    llm: Annotated[
+        str | None, Field(description="The `[llm.*]` block this agent's calls run on.")
+    ] = None
+    max_subagent_depth: Annotated[
+        int | None,
+        Field(
+            description="How deep this agent's subagents may nest. A session whose depth\nreaches it may not delegate. `0` never delegates.",
+            ge=0,
+        ),
+    ] = None
+    mcp: Annotated[
+        list[McpServer] | None,
+        Field(description='MCP servers this agent draws tools from.'),
+    ] = None
+    mcp_announce: Annotated[
+        McpAnnounce | None,
+        Field(
+            description='Whether the engine tells the model that an MCP server is available, and\nwhat that server says it is for.'
+        ),
+    ] = None
+    model: str
+    plugins: Annotated[
+        list[AgentPlugin] | None, Field(description='Plugins this agent uses.')
+    ] = None
+    retry: Annotated[
+        RetryConfig | None,
+        Field(
+            description='Boxed. Five per-kind overrides are too many bytes to carry inline.'
+        ),
+    ] = None
+    subagent_tools: Annotated[
+        SubagentTools | None,
+        Field(
+            description='What shape the subagents take as tools. Absent ⇒ one tool per agent.'
+        ),
+    ] = None
+    subagents: Annotated[
+        list[Subagent] | None,
+        Field(
+            description='Subagents the model can delegate to. The model sees them as tools.\nEach call starts a child session.'
+        ),
+    ] = None
+    system: str | None = None
+    tools: Annotated[
+        list[AgentTool] | None,
+        Field(description='Worker- or client-executed tools the model can call.'),
+    ] = None
 
 
 class ClientInput1(BaseModel):
@@ -1445,6 +1520,15 @@ class DecisionAction8(BaseModel):
     type: Literal['message.send']
 
 
+class DecisionAction14(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    messages: list[DraftMessage] | None = None
+    summary: str | None = None
+    type: Literal['context.replace']
+
+
 class DecisionResponse(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
@@ -1464,6 +1548,7 @@ class DecisionResponse(BaseModel):
             | DecisionAction11
             | DecisionAction12
             | DecisionAction13
+            | DecisionAction14
         ]
         | None
     ) = None
@@ -1497,7 +1582,7 @@ class DecisionTrigger2(BaseModel):
     type: Literal['client.messages']
 
 
-class DecisionTrigger7(BaseModel):
+class DecisionTrigger8(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
     )
@@ -1515,6 +1600,30 @@ class DecisionTrigger7(BaseModel):
     truncated: bool
     type: Literal['llm.finished']
     usage: Usage | None = None
+
+
+class HeldCall(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str
+    llm: str
+    request: LlmRequest
+    stream: bool
+
+
+class DecisionTrigger4(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    call: HeldCall
+    reason: ContextReason
+    strategy: ContextStrategyKind | None = None
+    tokens: Annotated[
+        int, Field(description='What the model would read, in tokens.', ge=0)
+    ]
+    type: Literal['context.limit']
+    window: Annotated[int | None, Field(ge=0)] = None
 
 
 class DecisionRequest(BaseModel):
@@ -1562,7 +1671,8 @@ class DecisionRequest(BaseModel):
         | DecisionTrigger7
         | DecisionTrigger8
         | DecisionTrigger9
-        | DecisionTrigger10,
+        | DecisionTrigger10
+        | DecisionTrigger11,
         Field(
             description='The trigger a worker sees on the wire. There is no `ClientMessage`: the\nengine turns a bare client message into `ClientTranscript` before it sends\nit.',
             title='DecisionTrigger',

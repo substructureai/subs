@@ -230,6 +230,19 @@ pub fn wire_trigger(
             }
         }
         Trigger::ClientAction { name, args } => DecisionTrigger::ClientAction { name, args },
+        Trigger::ContextLimit {
+            reason,
+            strategy,
+            tokens,
+            window,
+            call,
+        } => DecisionTrigger::ContextLimit {
+            reason,
+            strategy,
+            tokens,
+            window,
+            call,
+        },
         Trigger::ToolExecute {
             id,
             name,

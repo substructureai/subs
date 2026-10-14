@@ -583,7 +583,7 @@ pub struct PromptRequest {
 
 impl PromptRequest {
     pub fn offered_tools(&self, search: DeferToolsStrategy) -> Option<Vec<&LlmTool>> {
-        Some(search.offered(self.tools.as_ref()?))
+        Some(search.offered(self.tools.as_ref()?)).filter(|tools| !tools.is_empty())
     }
 }
 
@@ -970,6 +970,87 @@ pub struct AgentConfig {
     pub mcp_announce: McpAnnounce,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachments: Option<Attachments>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ContextConfig>,
+}
+
+/// How the agent makes room in what the model reads. Before each model call
+/// the engine tries the strategies in order. The first that applies proposes
+/// a plan on a `context.limit` decision, and the worker has the final say.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "ContextConfig")]
+pub struct ContextConfig {
+    /// The model's context window in tokens. Without it, only `idle_secs`,
+    /// `over_tokens` and a provider's refusal start making room.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub strategy: Vec<ContextStrategy>,
+}
+
+/// One way to make room, and when it applies.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "ContextStrategy")]
+pub struct ContextStrategy {
+    #[serde(rename = "use")]
+    pub kind: ContextStrategyKind,
+    /// At a turn's first model call, after this many seconds with no turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_secs: Option<u64>,
+    /// When the model would read more than this. Without `idle_secs`, it
+    /// defaults to the window less 16000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub over_tokens: Option<u64>,
+    /// `summarize`: about how many recent tokens are kept as they are, from a
+    /// user message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_tokens: Option<u64>,
+    /// `summarize`: the `[llm.*]` block the summary runs on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm: Option<String>,
+    /// `summarize`: the model that writes the summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// `summarize`: the instructions for the summary, in place of the engine's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(title = "ContextStrategyKind")]
+pub enum ContextStrategyKind {
+    /// Start over with only the turn's own messages.
+    Reset,
+    /// Summarize the older messages and keep the recent ones.
+    Summarize,
+    /// Leave the plan to the worker.
+    Worker,
+}
+
+/// A model call that waits for room.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(title = "HeldCall")]
+pub struct HeldCall {
+    pub id: String,
+    pub llm: String,
+    pub request: LlmRequest,
+    pub stream: bool,
+}
+
+/// Why the engine stopped before a model call to make room.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(title = "ContextReason")]
+pub enum ContextReason {
+    /// The session was quiet for longer than `idle_secs`.
+    Idle,
+    /// The model would read more than the strategy allows.
+    Full,
+    /// The provider refused the call as too long.
+    Overflow,
 }
 
 /// Where an MCP announcement lands.
@@ -1544,7 +1625,7 @@ pub struct LlmRequest {
 
 impl LlmRequest {
     pub fn offered_tools(&self, search: DeferToolsStrategy) -> Option<Vec<&LlmTool>> {
-        Some(search.offered(self.tools.as_ref()?))
+        Some(search.offered(self.tools.as_ref()?)).filter(|tools| !tools.is_empty())
     }
 }
 
@@ -1698,6 +1779,7 @@ pub struct LlmResponse {
 /// unusable. `handler_error` means the worker or client reported its own
 /// failure. `worker_unreachable` means it was never reached. `unroutable`
 /// means nothing could decide. `internal` means the engine's own fault.
+/// `context_overflow` means the request was longer than the model can read.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 #[schemars(title = "ErrorCode")]
@@ -1712,6 +1794,7 @@ pub enum ErrorCode {
     WorkerUnreachable,
     Unroutable,
     Internal,
+    ContextOverflow,
 }
 
 /// Why something failed. One shape on every event and on the wire.
@@ -1968,6 +2051,16 @@ pub struct ClientAction {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub args: Option<Value>,
+}
+
+impl ClientPayload {
+    pub fn client_state(&self) -> Option<&Value> {
+        match self {
+            ClientPayload::Messages(m) => m.client.state.as_ref(),
+            ClientPayload::Append(a) => a.client.state.as_ref(),
+            ClientPayload::Message(_) | ClientPayload::Action(_) => None,
+        }
+    }
 }
 
 /// What a client submits: a message, its full conversation view, an append
@@ -2276,6 +2369,20 @@ pub enum DecisionTrigger {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         args: Option<Value>,
     },
+    /// A model call waits for room. `proposed` holds the plan of the strategy
+    /// that applied. A model call made before `call` runs again writes the
+    /// summary. `call` with its own id runs on whatever history is set by then.
+    #[serde(rename = "context.limit")]
+    ContextLimit {
+        reason: ContextReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        strategy: Option<ContextStrategyKind>,
+        /// What the model would read, in tokens.
+        tokens: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window: Option<u64>,
+        call: HeldCall,
+    },
     /// Answer with `tool.result`/`tool.error`.
     #[serde(rename = "tool.execute")]
     ToolExecute {
@@ -2369,6 +2476,7 @@ impl DecisionTrigger {
             Self::SessionStart => "session.start",
             Self::ClientTranscript { .. } => "client.messages",
             Self::ClientAction { .. } => "client.action",
+            Self::ContextLimit { .. } => "context.limit",
             Self::ToolExecute { .. } => "tool.execute",
             Self::ToolFinished { .. } => "tool.finished",
             Self::LlmExecute { .. } => "llm.execute",
@@ -2548,6 +2656,17 @@ pub enum DecisionAction {
     /// End the turn as a failed run.
     #[serde(rename = "fail")]
     Fail { error: ErrorInfo },
+    /// Set what the model reads, on a new branch. `summary` comes first, as a
+    /// message saying the conversation before it was summarized. A message
+    /// whose `id` is recorded is kept as a copy; any other is written new.
+    /// The worker's state and the config carry over.
+    #[serde(rename = "context.replace")]
+    ReplaceContext {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+        #[serde(default)]
+        messages: Vec<DraftMessage>,
+    },
 }
 
 /// The messages and actions to author, plus optional state and agent writes.

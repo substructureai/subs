@@ -45,6 +45,22 @@ impl KindSpec for LlmSpec {
     }
 
     fn terminal(&self, state: &Cx<'_>, id: &str, e: &SettleError) -> Vec<EventPayload> {
+        let overflow = (e.error.code == ErrorCode::ContextOverflow)
+            .then(|| crate::context::overflow(state, id))
+            .flatten();
+        if let Some(limited) = overflow {
+            let trigger = Trigger::ContextLimit {
+                reason: limited.reason,
+                strategy: limited.strategy,
+                tokens: limited.tokens,
+                window: limited.window,
+                call: limited.call.clone(),
+            };
+            return vec![
+                EventPayload::ContextLimited(Box::new(limited)),
+                decision_queued(state.ids(), trigger),
+            ];
+        }
         vec![decision_queued(
             state.ids(),
             Trigger::llm_err(id.to_string(), e.error.clone()),

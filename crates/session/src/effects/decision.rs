@@ -122,6 +122,7 @@ impl KindSpec for DecisionSpec {
             }
             events.push(EventPayload::TurnStarted(TurnStarted {
                 turn_id: turn_id.to_string(),
+                client_state: decision.trigger.client_state().cloned(),
             }));
         }
         events.push(EventPayload::DecisionDispatched(DecisionDispatched {

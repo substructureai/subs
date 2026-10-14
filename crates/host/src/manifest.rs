@@ -11,9 +11,9 @@ use crate::copy::declared;
 use crate::plugins::{BundleServer, PluginBundle};
 use crate::protocol::ReasoningEffort;
 use crate::protocol::{
-    AgentConfig, AgentPlugin, AgentTool, Approve, ConnectorProtocol, DeferTools, Handler,
-    LlmFormat, McpAnnounce, McpAuthFailure, McpServer, McpToolSyncFailure, McpTools, RetryConfig,
-    SpawnMode, Subagent, SubagentMode, SubagentTools, SubagentToolsStrategy, SUBAGENT,
+    AgentConfig, AgentPlugin, AgentTool, Approve, ConnectorProtocol, ContextConfig, DeferTools,
+    Handler, LlmFormat, McpAnnounce, McpAuthFailure, McpServer, McpToolSyncFailure, McpTools,
+    RetryConfig, SpawnMode, Subagent, SubagentMode, SubagentTools, SubagentToolsStrategy, SUBAGENT,
     SUBAGENT_WAIT,
 };
 use crate::runtime::events_url::EventsBlock;
@@ -349,6 +349,8 @@ pub struct AgentSection {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp_announce: Option<McpAnnounce>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<ContextConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp_auth_failure: Option<McpAuthFailure>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp_tool_sync_failure: Option<McpToolSyncFailure>,
@@ -397,6 +399,7 @@ impl AgentSection {
                 .iter()
                 .map(|p| p.to_wire(manifest, self.mcp_defaults()))
                 .collect(),
+            context: self.context.clone(),
         })
     }
 

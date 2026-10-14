@@ -288,6 +288,7 @@ pub(in crate::transport::slack) mod tests {
             seq,
             EventPayload::TurnStarted(TurnStarted {
                 turn_id: turn.into(),
+                client_state: None,
             }),
         )
     }

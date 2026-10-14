@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 
+use super::context;
 use super::interrupts::{self, approval, auth};
 use super::state::{inner_arguments, EffectState, SessionStateAtNode};
 use super::tool_contract::{declared_tool, violates, DeclaredTool};
 use crate::protocol::StoredContent;
 use crate::protocol::{
-    AgentConfig, ClientContext, ConnectorTool, ConnectorToolKind, Content, DecisionAction,
-    DecisionResponse, DecisionTrigger, DraftMessage, ErrorCode, ErrorInfo, Message, Role,
-    SpawnMode, StoredResult, ToolCall,
+    AgentConfig, ClientContext, ConnectorTool, ConnectorToolKind, Content, ContextStrategyKind,
+    DecisionAction, DecisionResponse, DecisionTrigger, DraftMessage, ErrorCode, ErrorInfo, Message,
+    Role, SpawnMode, StoredResult, ToolCall,
 };
 
 pub struct Proposing<'a> {
@@ -16,6 +17,9 @@ pub struct Proposing<'a> {
 }
 
 pub fn propose(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionResponse> {
+    if let Some(plan) = for_room(trigger, p) {
+        return Some(plan);
+    }
     let proposed = derive(trigger, p)?;
     if proposed.actions.iter().any(|a| {
         matches!(
@@ -31,6 +35,81 @@ pub fn propose(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionR
             ..proposed
         },
         None => proposed,
+    })
+}
+
+fn for_room(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionResponse> {
+    let state = p.state.state();
+    let path = p.state.transcript();
+    let config = p.state.resolve_agent_for();
+    let config = config.as_ref();
+    let summarize = || context::strategy(config, ContextStrategyKind::Summarize);
+    let actions = match trigger {
+        DecisionTrigger::ContextLimit { strategy, call, .. } => match strategy {
+            Some(ContextStrategyKind::Reset) => {
+                let messages = context::turn_messages(state, &path);
+                vec![
+                    DecisionAction::ReplaceContext {
+                        summary: None,
+                        messages: messages.clone(),
+                    },
+                    context::reissue(call, Some(messages)),
+                ]
+            }
+            Some(ContextStrategyKind::Summarize) => {
+                vec![context::summary_call(config, &summarize(), &path, None)
+                    .unwrap_or_else(|| context::reissue(call, None))]
+            }
+            _ => vec![context::reissue(call, None)],
+        },
+        DecisionTrigger::LlmFinished {
+            id,
+            ok,
+            message,
+            truncated,
+            refused,
+            error,
+            ..
+        } if state.is_summary_call(id) => {
+            let held = &state.limited.as_ref()?.call;
+            let summary = message
+                .as_ref()
+                .and_then(|m| m.content.as_ref())
+                .map(Content::text_owned)
+                .filter(|text| *ok && !truncated && !refused && !text.trim().is_empty());
+            let overflowed = error
+                .as_ref()
+                .is_some_and(|e| e.code == ErrorCode::ContextOverflow);
+            match summary {
+                Some(summary) => {
+                    let kept = context::kept(&path, &summarize());
+                    let mut view = vec![context::summary_message(&summary)];
+                    view.extend(kept.iter().cloned());
+                    vec![
+                        DecisionAction::ReplaceContext {
+                            summary: Some(summary),
+                            messages: kept,
+                        },
+                        context::reissue(held, Some(view)),
+                    ]
+                }
+                None => {
+                    let smaller = overflowed
+                        .then(|| {
+                            let half = context::summary_size(state, id) / 2;
+                            context::summary_call(config, &summarize(), &path, Some(half))
+                        })
+                        .flatten();
+                    vec![smaller.unwrap_or_else(|| context::reissue(held, None))]
+                }
+            }
+        }
+        _ => return None,
+    };
+    Some(DecisionResponse {
+        messages: recorded(&path),
+        actions,
+        ..Default::default()
     })
 }
 

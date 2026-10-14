@@ -146,6 +146,7 @@ tool = { max_attempts = 3 }
 | `max_subagent_depth` | integer | `5` | How deep this agent's subagents may nest. A session that deep may not delegate; `0` never delegates. See [Subagents](./80-subagents.md#how-deep-subagents-nest). |
 | `tools` | list | none | Browser tools. Each needs `handler = "client"`. |
 | `attachments` | table | none | How files reach the model. See [`[agent.<id>.attachments]`](#agentidattachments). |
+| `context` | table | none | How the agent makes room when the model reads too much. See [`[agent.<id>.context]`](#agentidcontext). |
 | `worker` | url | none | Where decisions go. Leave it off and the engine decides. |
 | `events` | string | none | The `[events.<id>]` block that gets this agent's events. See [Events URL](./55-events-url.md). |
 | `signing_secret_env` | string | none | The variable holding the signing secret. For an engine you run. |
@@ -231,6 +232,44 @@ The same table is `attachments` on the agent config, so a worker can set it
 at `session.start` like any other field. The rules are applied when a message
 is delivered to the worker, after `session.start` has settled the config, so
 they cover the first message of a session too.
+
+## `[agent.<id>.context]`
+
+How the agent makes room in what the model reads. Before a model call, the
+engine tries the strategies in order. See
+[Make room](./120-conversations.md#make-room).
+
+```toml
+[agent.support.context]
+window = 200000
+
+[[agent.support.context.strategy]]
+use = "reset"
+idle_secs = 3600
+
+[[agent.support.context.strategy]]
+use = "summarize"
+keep_tokens = 20000
+```
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `window` | integer | none | The model's context window in tokens. |
+| `strategy` | list | none | The strategies, in order. |
+
+Each strategy:
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `use` | `reset`, `summarize`, `worker` | required | What the engine proposes. `reset` keeps the turn's own messages. `summarize` summarizes the older messages. `worker` proposes the held call as it was. |
+| `idle_secs` | integer | none | Applies at a turn's first model call, after this many seconds with no turn. |
+| `over_tokens` | integer | the window less `16000`, without `idle_secs` | Applies when the model would read more than this. |
+| `keep_tokens` | integer | `20000` | `summarize`: about how many recent tokens stay as they are, from a user message. |
+| `llm` | string | the agent's | `summarize`: the `[llm.<id>]` block that writes the summary. |
+| `model` | string | the agent's | `summarize`: the model that writes the summary. |
+| `prompt` | string | the engine's | `summarize`: the instructions for the summary. The engine puts the conversation before them. |
+
+The same table is `context` on the agent config.
 
 ## `[events.<id>]`
 

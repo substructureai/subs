@@ -7003,6 +7003,7 @@ fn agent_config(model: &str) -> AgentConfig {
         plugins: Vec::new(),
         effort: None,
         attachments: None,
+        context: None,
     }
 }
 

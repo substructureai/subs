@@ -9,9 +9,10 @@ use crate::connectors::ConnectionPath;
 use crate::connectors::{AuthNeed, RemoteTool};
 pub use crate::protocol::EffectKind;
 use crate::protocol::{
-    AgentConfig, ClientContext, ConnectorToolKind, DeferToolsStrategy, DraftMessage, ErrorInfo,
-    InterruptOrigin, LlmFormat, LlmRequest, LlmResponse, Message, MessageTree, NewMessage,
-    RetryPolicy, SessionOwner, SpawnMode, StoredResult, Usage, WorkerRef, WorkerState,
+    AgentConfig, ClientContext, ConnectorToolKind, ContextReason, ContextStrategyKind,
+    DeferToolsStrategy, DraftMessage, ErrorInfo, HeldCall, InterruptOrigin, LlmFormat, LlmRequest,
+    LlmResponse, Message, MessageTree, NewMessage, RetryPolicy, SessionOwner, SpawnMode,
+    StoredResult, Usage, WorkerRef, WorkerState,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,6 +108,39 @@ pub enum EventPayload {
     BranchLoaded(BranchLoaded),
     #[serde(rename = "branch.unloaded")]
     BranchUnloaded(BranchUnloaded),
+    #[serde(rename = "context.limited")]
+    ContextLimited(Box<ContextLimited>),
+    #[serde(rename = "context.replaced")]
+    ContextReplaced(ContextReplaced),
+    #[serde(rename = "context.kept")]
+    ContextKept,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextLimited {
+    pub reason: ContextReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<ContextStrategyKind>,
+    pub tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<u64>,
+    pub call: HeldCall,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextReplaced {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<ContextReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<ContextSummary>,
+    pub kept: usize,
+    pub dropped: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextSummary {
+    pub id: String,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -452,6 +486,8 @@ pub struct AgentConfigUpdated {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnStarted {
     pub turn_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_state: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -21,6 +21,12 @@ The `@substructure.ai/cli` package and the `subs`, `substructure-host` and
 - Add an admin route that resumes a parked reader of a session.
 - A host can now give a `SlackBot` to the runtime as a session reader.
 - A host can now give the runtime the HTTP client it uses for events URLs.
+- `turn.started` now carries the `client.state` its turn was submitted with.
+- Add `[agent.<id>.context]` strategies. Before a model call that has no room, the engine sends a `context.limit` decision with a plan to reset or summarize.
+- Add the `context.replace` action. It sets the history on a new branch and keeps the state and the config.
+- When a provider refuses a call as too long, the engine summarizes and tries the call one more time.
+- An `llm.call` with no messages after a `context.replace` reads the new history.
+- An LLM call with an empty tool list now sends no tools to the provider.
 
 ### Changed
 

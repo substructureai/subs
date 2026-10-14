@@ -9,12 +9,12 @@ use super::state::{EffectKind, EffectTracking, EventMeta, SessionState, SessionS
 use crate::branch::Outside;
 use crate::cx::Cx;
 use crate::ids::Ids;
-use crate::protocol::ErrorInfo;
 use crate::protocol::{
     AgentConfig, ClientContext, ClientPayload, DraftMessage, EffectStatus, InterruptOrigin,
     LlmFormat, LlmRequest, QueueMode, RetryOverride, RetryPolicy, Role, SessionOwner, SpawnMode,
     Usage, WorkerRef, WorkerState,
 };
+use crate::protocol::{ErrorInfo, HeldCall};
 use crate::retry::RetryTarget;
 use crate::Caller;
 
@@ -287,7 +287,8 @@ impl Action {
             | Action::ResolveInterrupt { .. }
             | Action::SyncConnector { .. }
             | Action::Done { .. }
-            | Action::Fail { .. } => None,
+            | Action::Fail { .. }
+            | Action::ReplaceContext { .. } => None,
         }
     }
 }
@@ -677,7 +678,11 @@ impl Working {
             .filter_map(|e| e.decision()?.trigger.deferred_turn_id())
     }
 
-    fn begin_turn(&mut self, target: TurnTarget) -> Result<(), SessionError> {
+    fn begin_turn(
+        &mut self,
+        target: TurnTarget,
+        client_state: Option<serde_json::Value>,
+    ) -> Result<(), SessionError> {
         let turn_id = match target {
             TurnTarget::Detached => return Ok(()),
             TurnTarget::Continue(_) if matches!(self.phase, TurnPhase::Active { .. }) => {
@@ -697,7 +702,10 @@ impl Working {
             }
             TurnPhase::Idle => {}
         }
-        self.emit(EventPayload::TurnStarted(TurnStarted { turn_id }));
+        self.emit(EventPayload::TurnStarted(TurnStarted {
+            turn_id,
+            client_state,
+        }));
         Ok(())
     }
 
@@ -722,16 +730,24 @@ impl Working {
         }
     }
 
-    fn apply_actions(&mut self, actions: Vec<Action>, decision_id: &str) {
-        let system = Caller::System {
+    fn system(&self) -> Caller {
+        Caller::System {
             tenant_id: self
                 .owner
                 .as_ref()
                 .map(|o| o.tenant_id.clone())
                 .unwrap_or_default(),
-        };
+        }
+    }
+
+    fn apply_actions(&mut self, actions: Vec<Action>, decision_id: &str) {
+        let system = self.system();
         for action in actions {
             let _ = match action {
+                Action::ReplaceContext { summary, messages } => {
+                    self.replace_context(summary, messages);
+                    Ok(())
+                }
                 Action::SendMessage {
                     session_id,
                     message,
@@ -895,7 +911,7 @@ impl Working {
                 };
                 let deferred = self.deferred_turn(&turn, queue, &payload)?;
                 if deferred.is_none() {
-                    self.begin_turn(turn)?;
+                    self.begin_turn(turn, payload.client_state().cloned())?;
                 }
                 let merge = deferred.is_some() && queue == QueueMode::Merge;
                 let (events, waiting) = {
@@ -917,7 +933,7 @@ impl Working {
                 if self.head_parked() && message.role == Role::User {
                     return Err(SessionError::SessionInterrupted);
                 }
-                self.begin_turn(turn_id.map_or(TurnTarget::Detached, TurnTarget::Open))?;
+                self.begin_turn(turn_id.map_or(TurnTarget::Detached, TurnTarget::Open), None)?;
                 if message.role == Role::User {
                     self.queue_decision(Trigger::ClientMessage {
                         messages: vec![message],
@@ -937,13 +953,32 @@ impl Working {
                 retry,
                 handler,
                 format,
-            } => self
-                .try_then(|s| {
+            } => {
+                SessionState::ensure_internal(caller)?;
+                let held = HeldCall {
+                    id: call_id,
+                    llm,
+                    request,
+                    stream,
+                };
+                if self.held_for_room(&held) {
+                    return Ok(());
+                }
+                self.try_then(|s| {
                     effects::llm::request(
-                        s, call_id, llm, request, stream, retry, handler, format, caller,
+                        s,
+                        held.id,
+                        held.llm,
+                        held.request,
+                        held.stream,
+                        retry,
+                        handler,
+                        format,
+                        caller,
                     )
                 })
-                .map(|_| ()),
+                .map(|_| ())
+            }
 
             CommandPayload::SettleEffect {
                 kind,
@@ -1158,6 +1193,7 @@ impl Working {
                     }
                     self.emit(EventPayload::TurnStarted(TurnStarted {
                         turn_id: format!("action:{decision_id}"),
+                        client_state: None,
                     }));
                 }
 
@@ -1228,6 +1264,7 @@ impl Working {
 }
 
 mod authorize;
+mod context;
 mod delivery;
 mod transcript;
 

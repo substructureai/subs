@@ -105,6 +105,8 @@ second.
 - `reasoning` carries the model's thinking the same way as `text`.
 - A gap in `seq` means some text was lost. `turn.completed` holds the final
   reply.
+- The summary that the engine proposes is not streamed, so it sends no live
+  text.
 
 Live text is best effort. It is not written to the log and is not sent again
 after a restart. It can arrive before the logged events around it.
@@ -140,8 +142,8 @@ Two more inputs help a chat app:
 - [`queue: "merge"`](./120-conversations.md#one-turn-at-a-time) puts the
   messages that arrive during a turn into one next turn.
 - `client.state` on `client.append` carries data for the turn, such as the
-  message it answers. It arrives on the first decision of the turn and on its
-  `decision.queued` event.
+  message it answers. It arrives on the first decision of the turn, and on its
+  `turn.started` event as `client_state`.
 
 ## Chat apps
 

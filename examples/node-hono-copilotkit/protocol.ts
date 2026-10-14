@@ -273,6 +273,7 @@ export interface DecisionRequest {
  */
 export interface AgentConfig {
     attachments?: null | Attachments;
+    context?: null | ContextConfig;
     /**
      * Defer every tool this agent offers, whatever its source. A tool or a
      * connection overrides this with its own `defer`. Absent, the agent defers
@@ -336,6 +337,64 @@ export interface Attachments {
 export type Disposition = "inline" | "attachment";
 
 export type AttachmentTool = "read" | "view";
+
+/**
+ * How the agent makes room in what the model reads. Before each model call
+ * the engine tries the strategies in order. The first that applies proposes
+ * a plan on a `context.limit` decision, and the worker has the final say.
+ */
+export interface ContextConfig {
+    strategy?: ContextStrategy[];
+    /**
+     * The model's context window in tokens. Without it, only `idle_secs`,
+     * `over_tokens` and a provider's refusal start making room.
+     */
+    window?: number | null;
+    [property: string]: unknown;
+}
+
+/**
+ * One way to make room, and when it applies.
+ */
+export interface ContextStrategy {
+    /**
+     * At a turn's first model call, after this many seconds with no turn.
+     */
+    idle_secs?: number | null;
+    /**
+     * `summarize`: about how many recent tokens are kept as they are, from a
+     * user message.
+     */
+    keep_tokens?: number | null;
+    /**
+     * `summarize`: the `[llm.*]` block the summary runs on.
+     */
+    llm?: null | string;
+    /**
+     * `summarize`: the model that writes the summary.
+     */
+    model?: null | string;
+    /**
+     * When the model would read more than this. Without `idle_secs`, it
+     * defaults to the window less 16000.
+     */
+    over_tokens?: number | null;
+    /**
+     * `summarize`: the instructions for the summary, in place of the engine's.
+     */
+    prompt?: null | string;
+    use: ContextStrategyKind;
+    [property: string]: unknown;
+}
+
+/**
+ * Start over with only the turn's own messages.
+ *
+ * Summarize the older messages and keep the recent ones.
+ *
+ * Leave the plan to the worker.
+ */
+export type ContextStrategyKind = "reset" | "summarize" | "worker";
 
 /**
  * How an agent's deferred tools reach the model.
@@ -691,6 +750,11 @@ export interface DecisionResponse {
  * credential.
  *
  * End the turn as a failed run.
+ *
+ * Set what the model reads, on a new branch. `summary` comes first, as a
+ * message saying the conversation before it was summarized. A message
+ * whose `id` is recorded is kept as a copy; any other is written new.
+ * The worker's state and the config carry over.
  */
 export interface DecisionAction {
     id?: null | string;
@@ -754,6 +818,7 @@ export interface DecisionAction {
     reason?: string;
     path?: string;
     data?: unknown;
+    summary?: null | string;
 }
 
 /**
@@ -766,6 +831,7 @@ export interface DecisionAction {
  * unusable. `handler_error` means the worker or client reported its own
  * failure. `worker_unreachable` means it was never reached. `unroutable`
  * means nothing could decide. `internal` means the engine's own fault.
+ * `context_overflow` means the request was longer than the model can read.
  */
 export type ErrorCode =
     | "provider_error"
@@ -777,7 +843,8 @@ export type ErrorCode =
     | "handler_error"
     | "worker_unreachable"
     | "unroutable"
-    | "internal";
+    | "internal"
+    | "context_overflow";
 
 /**
  * Why something failed. One shape on every event and on the wire.
@@ -860,7 +927,8 @@ export type DecisionActionType =
     | "interrupt.resolve"
     | "connector.sync"
     | "done"
-    | "fail";
+    | "fail"
+    | "context.replace";
 
 /**
  * The trigger a worker sees on the wire. There is no `ClientMessage`: the
@@ -868,6 +936,10 @@ export type DecisionActionType =
  * it.
  *
  * The first decision of every session; carries no proposal.
+ *
+ * A model call waits for room. `proposed` holds the plan of the strategy
+ * that applied. A model call made before `call` runs again writes the
+ * summary. `call` with its own id runs on whatever history is set by then.
  *
  * Answer with `tool.result`/`tool.error`.
  *
@@ -891,6 +963,14 @@ export interface DecisionTrigger {
     new_from?: number;
     args?: unknown;
     name?: string;
+    call?: HeldCall;
+    reason?: ContextReason;
+    strategy?: ContextStrategyKind | null;
+    /**
+     * What the model would read, in tokens.
+     */
+    tokens?: number;
+    window?: number | null;
     arguments?: string;
     attempt?: number;
     deadline?: Date | null;
@@ -928,6 +1008,25 @@ export interface DecisionTrigger {
 }
 
 /**
+ * A model call that waits for room.
+ */
+export interface HeldCall {
+    id: string;
+    llm: string;
+    request: LlmRequest;
+    stream: boolean;
+}
+
+export interface LlmRequest {
+    max_completion_tokens?: number | null;
+    messages: DraftMessage[];
+    model: string;
+    reasoning?: ReasoningConfig | null;
+    temperature?: number | null;
+    tools?: LlmTool[] | null;
+}
+
+/**
  * OpenAI Chat Completions.
  *
  * Anthropic Messages API.
@@ -956,6 +1055,17 @@ export interface ToolInput {
 
 export type Status = "valid" | "invalid" | "malformed";
 
+/**
+ * Why the engine stopped before a model call to make room.
+ *
+ * The session was quiet for longer than `idle_secs`.
+ *
+ * The model would read more than the strategy allows.
+ *
+ * The provider refused the call as too long.
+ */
+export type ContextReason = "idle" | "full" | "overflow";
+
 export interface StoredResult {
     content?: StoredContent[];
     isError?: boolean;
@@ -976,6 +1086,7 @@ export type DecisionTriggerType =
     | "session.start"
     | "client.messages"
     | "client.action"
+    | "context.limit"
     | "tool.execute"
     | "tool.finished"
     | "llm.execute"

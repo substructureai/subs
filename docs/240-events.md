@@ -58,7 +58,7 @@ Render a chat from these.
 | `session.created` | The session exists. |
 | `message.new` | A message joined the tree: `{ message, parent_id?, copied_from? }`. `copied_from` names the original of a copy. |
 | `head.moved` | The active leaf changed. A client branched or edited. |
-| `turn.started` | A turn began: `{ turn_id }`. |
+| `turn.started` | A turn began: `{ turn_id, client_state? }`. `client_state` is the `client.state` the turn was submitted with. For a merged turn it is the last one. |
 | `turn.completed` | A turn ended, with its cost and output. |
 | `session.done` | The session finished its work. |
 | `session.cancelled` | The session was canceled. |
@@ -126,6 +126,19 @@ stream with that to watch the child.
 | --- | --- |
 | `worker.state.updated` | A decision wrote new state. |
 | `agent.updated` | A decision wrote a new config. |
+
+## Context
+
+See [Make room](./120-conversations.md#make-room).
+
+| Event | Payload |
+| --- | --- |
+| `context.limited` | A model call waits for room: `{ reason, strategy?, tokens, window?, call }`. A `context.limit` decision follows. |
+| `context.replaced` | The history was set on a new branch: `{ reason?, summary?, kept, dropped }`. `summary` holds `{ id, text }`. |
+| `context.kept` | The held call runs on the history as it is. |
+
+A model call between `context.limited` and the next `context.replaced` or
+`context.kept` writes the summary. Its text is not an answer.
 
 ## Decisions
 
