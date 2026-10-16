@@ -9,7 +9,7 @@ use substructure_session::protocol::{
     AgentConfig, ClientMessage, ClientPayload, Content, DraftMessage, EffectKind, ErrorInfo,
     Issuer, QueueMode, Requester, RetryPolicy, Role, SessionOwner, Subject,
 };
-use substructure_session::protocol::{ClientAppend, WorkerState};
+use substructure_session::protocol::{ClientAction, ClientAppend, WorkerState};
 use substructure_session::{settle, Command, MemoryStore, Session, Settings, Store, Work};
 
 const TENANT: &str = "tenant-a";
@@ -346,8 +346,191 @@ fn say(id: &str, turn: &str, queue: QueueMode) -> Command {
             }),
             turn: TurnTarget::Open(turn.to_string()),
             queue,
+            metadata: Default::default(),
         },
     )
+}
+
+fn say_with(id: &str, turn: &str, queue: QueueMode, metadata: &[(&str, &str)]) -> Command {
+    let mut command = say(id, turn, queue);
+    if let CommandPayload::SubmitClientPayload { metadata: m, .. } = &mut command.payload {
+        *m = metadata
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+    }
+    command
+}
+
+fn finish_open_decision(store: &MemoryStore, session: &mut Session, id: &str) {
+    let decision_id = session
+        .open_work()
+        .into_iter()
+        .find_map(|w| match w {
+            Work::AskWorker { work, .. } => Some(work.id),
+            _ => None,
+        })
+        .expect("a decision is open");
+    let ran = session
+        .run(
+            store,
+            Utc::now(),
+            Command::system(
+                id,
+                TENANT,
+                CommandPayload::SubmitWorkerDecision {
+                    decision_id,
+                    transcript: vec![],
+                    actions: vec![Action::Done {
+                        data: serde_json::Value::Null,
+                    }],
+                    state: None,
+                    agent: None,
+                },
+            ),
+        )
+        .unwrap();
+    assert!(ran.result.is_ok(), "{:?}", ran.result);
+}
+
+#[test]
+fn a_voided_subagent_call_mails_its_child_a_cancel() {
+    let store = MemoryStore::new();
+    let mut session = load(&store, Settings::default());
+    session.run(&store, Utc::now(), create("c1")).unwrap();
+    finish_open_decision(&store, &mut session, "d0");
+    session
+        .run(
+            &store,
+            Utc::now(),
+            Command::system(
+                "spawn",
+                TENANT,
+                CommandPayload::RequestSubagent {
+                    session_id: None,
+                    agent_id: "agent-2".into(),
+                    tool_call_id: "call-sa".into(),
+                    message: None,
+                    retry: RetryPolicy::no_retry(),
+                    decision_id: "d-spawn".into(),
+                    mode: None,
+                },
+            ),
+        )
+        .unwrap();
+    let child = session
+        .state()
+        .subagent("call-sa")
+        .unwrap()
+        .session_id
+        .clone();
+
+    let cancelled = session
+        .run(
+            &store,
+            Utc::now(),
+            Command::system("cancel", TENANT, CommandPayload::CancelSession),
+        )
+        .unwrap()
+        .written
+        .unwrap()
+        .events;
+    let mail = session.mail(&cancelled);
+    assert!(
+        mail.iter()
+            .any(|m| m.to == child && matches!(m.command.payload, CommandPayload::CancelSession)),
+        "got {mail:?}"
+    );
+}
+
+fn click(id: &str, turn: &str) -> Command {
+    Command::system(
+        id,
+        TENANT,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Action(ClientAction {
+                name: "approve".into(),
+                args: None,
+            }),
+            turn: TurnTarget::Open(turn.to_string()),
+            queue: QueueMode::Refuse,
+            metadata: Default::default(),
+        },
+    )
+}
+
+#[test]
+fn an_action_answers_with_the_turn_it_runs_in() {
+    let store = MemoryStore::new();
+    let mut session = load(&store, Settings::default());
+    session.run(&store, Utc::now(), create("c1")).unwrap();
+    finish_open_decision(&store, &mut session, "d0");
+
+    let idle = session.run(&store, Utc::now(), click("a1", "ta")).unwrap();
+    assert_eq!(idle.result.unwrap().turn_id.as_deref(), Some("ta"));
+    finish_open_decision(&store, &mut session, "d1");
+    finish_open_decision(&store, &mut session, "d2");
+
+    session
+        .run(&store, Utc::now(), say("m1", "t1", QueueMode::Refuse))
+        .unwrap();
+    let joined = session.run(&store, Utc::now(), click("a2", "tb")).unwrap();
+    assert_eq!(
+        joined.result.unwrap().turn_id.as_deref(),
+        Some("t1"),
+        "a click mid-turn joins the running turn"
+    );
+}
+
+#[test]
+fn a_decision_carries_the_metadata_of_its_turn() {
+    let store = MemoryStore::new();
+    let mut session = load(&store, Settings::default());
+    session.run(&store, Utc::now(), create("c1")).unwrap();
+    finish_open_decision(&store, &mut session, "d0");
+
+    session
+        .run(&store, Utc::now(), say("m1", "t1", QueueMode::Refuse))
+        .unwrap();
+    session
+        .run(
+            &store,
+            Utc::now(),
+            say_with(
+                "m2",
+                "t2",
+                QueueMode::Merge,
+                &[("ref", "m2"), ("room", "r1")],
+            ),
+        )
+        .unwrap();
+    session
+        .run(
+            &store,
+            Utc::now(),
+            say_with("m3", "t3", QueueMode::Merge, &[("ref", "m3")]),
+        )
+        .unwrap();
+    finish_open_decision(&store, &mut session, "d1");
+    finish_open_decision(&store, &mut session, "d2");
+
+    let turn = session
+        .open_work()
+        .into_iter()
+        .find_map(|w| match w {
+            Work::AskWorker { request, .. } => request.turn,
+            _ => None,
+        })
+        .expect("the merged turn asks the worker");
+    assert_eq!(turn.id, "t2");
+    assert_eq!(
+        turn.metadata,
+        [("ref", "m3"), ("room", "r1")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect::<std::collections::BTreeMap<_, _>>(),
+        "a later key wins"
+    );
 }
 
 #[test]
@@ -1148,6 +1331,7 @@ mod branches {
                         }),
                         turn: TurnTarget::Open("t9".into()),
                         queue: QueueMode::Refuse,
+                        metadata: Default::default(),
                     },
                 ),
             )

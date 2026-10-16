@@ -116,6 +116,8 @@ pub struct SubmitClientPayloadRequest {
     pub state: Option<crate::protocol::WorkerState>,
     #[serde(default)]
     pub queue: crate::protocol::QueueMode,
+    #[serde(default)]
+    pub metadata: std::collections::BTreeMap<String, String>,
     pub identity: SubmitClientPayloadIdentity,
 }
 
@@ -173,6 +175,15 @@ mod tests {
         let req: SubmitClientPayloadRequest =
             serde_json::from_str(body).expect("the submit deserializes");
         assert_eq!(req.queue, crate::protocol::QueueMode::Merge);
+    }
+
+    #[test]
+    fn a_submit_carries_turn_metadata() {
+        let body = r#"{"agent_id":"a","identity":{"id":"u"},"metadata":{"ref":"m1"},
+            "payload":{"type":"client.message","message":{"role":"user","content":"hi"}}}"#;
+        let req: SubmitClientPayloadRequest =
+            serde_json::from_str(body).expect("the submit deserializes");
+        assert_eq!(req.metadata.get("ref").map(String::as_str), Some("m1"));
     }
 
     #[test]

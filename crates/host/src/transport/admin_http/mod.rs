@@ -44,6 +44,10 @@ pub fn router(state: AdminHttpState) -> Router {
             "/api/admin/sessions/{session_id}/deliveries/{reader}/resume",
             post(routes::resume_delivery),
         )
+        .route(
+            "/api/admin/sessions/{session_id}/cancel",
+            post(routes::cancel_session),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             machine_auth_middleware,

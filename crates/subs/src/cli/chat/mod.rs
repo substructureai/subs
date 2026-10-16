@@ -74,7 +74,7 @@ pub async fn chat(args: ChatArgs) -> Result<()> {
     };
 
     let session_id = args.session.unwrap_or_else(|| Uuid::now_v7().to_string());
-    let mut turns = turns::open(
+    let turns = turns::open(
         &cfg,
         Open {
             globals,
@@ -86,10 +86,10 @@ pub async fn chat(args: ChatArgs) -> Result<()> {
     .await?;
 
     banner(&cfg, &agent_id, &session_id);
-    repl(turns.as_mut(), &agent_id, &session_id).await
+    repl(turns.as_ref(), &agent_id, &session_id).await
 }
 
-async fn repl(turns: &mut dyn Turns, agent_id: &str, session_id: &str) -> Result<()> {
+async fn repl(turns: &dyn Turns, agent_id: &str, session_id: &str) -> Result<()> {
     let mut editor = editor::build().context("terminal input")?;
     let history = history_path();
     if let Some(path) = &history {
@@ -125,16 +125,13 @@ async fn repl(turns: &mut dyn Turns, agent_id: &str, session_id: &str) -> Result
         }
 
         let input = message_input(line, agent_id.to_string());
-        let end = tokio::select! {
-            driven = turns.drive(input, &mut renderer) => driven,
-            _ = tokio::signal::ctrl_c() => {
-                status.stop();
-                output::note("\nstopped watching. The turn keeps running — resume the session to read it.");
-                break;
-            }
+        let Some(end) = turns::drive_or_cancel(turns, input, &mut renderer).await? else {
+            status.stop();
+            output::note("stopped watching.");
+            break;
         };
         status.idle();
-        open = settle(turns, end?.interrupts, &mut renderer).await?;
+        open = settle(turns, end.interrupts, &mut renderer).await?;
         status.idle();
         println!();
     }
@@ -146,7 +143,7 @@ async fn repl(turns: &mut dyn Turns, agent_id: &str, session_id: &str) -> Result
 }
 
 async fn settle(
-    turns: &mut dyn Turns,
+    turns: &dyn Turns,
     mut interrupts: Vec<AgUiInterrupt>,
     renderer: &mut Renderer,
 ) -> Result<bool> {
@@ -154,7 +151,10 @@ async fn settle(
         let Some(input) = answer(interrupt).await? else {
             return Ok(false);
         };
-        interrupts = turns.drive(input, renderer).await?.interrupts;
+        let Some(end) = turns::drive_or_cancel(turns, input, renderer).await? else {
+            return Ok(false);
+        };
+        interrupts = end.interrupts;
     }
     Ok(true)
 }

@@ -39,6 +39,10 @@ pub fn router(state: WorkerHttpState) -> Router {
             post(routes::settle_effect),
         )
         .route(
+            "/api/machine/sessions/{session_id}/cancel",
+            post(routes::cancel_session),
+        )
+        .route(
             "/api/machine/sessions/{session_id}/events/stream",
             get(routes::stream_session_events),
         )

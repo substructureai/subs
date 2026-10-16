@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -486,8 +486,8 @@ pub struct AgentConfigUpdated {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnStarted {
     pub turn_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub client_state: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -520,6 +520,8 @@ pub struct DecisionAmended {
     pub messages: Vec<DraftMessage>,
     #[serde(default)]
     pub client: ClientContext,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

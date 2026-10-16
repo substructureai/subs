@@ -156,14 +156,16 @@ What chat resolves is stamped `channel: "cli"`, so the session records which
 channel answered and which option was picked, the same way Slack's does. See
 [Interrupts](./100-interrupts.md).
 
+## Cancel a turn
+
+`Ctrl-C` during a turn cancels it and its subagents. The chat goes back to the
+prompt, and the session stays usable. A second `Ctrl-C` stops watching and ends
+the chat. See [Cancel a run](./100-interrupts.md#cancel-a-run).
+
 ## Limitations
 
 Chat has no slash commands, and it cannot send a message while a turn is
 running.
-
-`Ctrl-C` during a turn stops watching it and prints how to pick the session back
-up. It does not stop the turn. The turn runs to its end, and the next chat on
-that session reads what it wrote.
 
 Chat cannot settle a client-side tool call, so it says so and stops.
 

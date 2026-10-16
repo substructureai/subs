@@ -69,7 +69,7 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     };
 
     let session_id = args.session.unwrap_or_else(|| Uuid::now_v7().to_string());
-    let mut turns = turns::open(
+    let turns = turns::open(
         &cfg,
         Open {
             globals,
@@ -82,9 +82,11 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
 
     let status = super::output::Status::start();
     let mut renderer = Renderer::new(output_mode, output::color()).with_status(status.clone());
-    let driven = turns.drive(input, &mut renderer).await;
+    let driven = turns::drive_or_cancel(turns.as_ref(), input, &mut renderer).await;
     status.stop();
-    driven?;
+    if driven?.is_none() {
+        output::note("stopped watching.");
+    }
 
     turns.settled().await;
     print_resume_hint(&session_id, payload.as_deref());

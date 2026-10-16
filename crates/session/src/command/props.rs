@@ -383,6 +383,7 @@ impl World {
                         }),
                         turn: TurnTarget::Open(turn_id),
                         queue: queue.into(),
+                        metadata: Default::default(),
                     },
                     &frontend(),
                 );

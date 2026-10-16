@@ -1242,6 +1242,7 @@ mod tests {
                 }),
                 turn: TurnTarget::Open(turn.to_string()),
                 queue: QueueMode::Refuse,
+                metadata: Default::default(),
             })
         };
         decide(vec![]).await;

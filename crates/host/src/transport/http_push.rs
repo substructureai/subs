@@ -355,7 +355,7 @@ async fn publish_worker_delta(
                 .unwrap_or_else(|| decision.session_id.clone()),
             session_id: decision.session_id.clone(),
             agent_id: decision.agent_id.clone(),
-            turn_id: decision.turn_id.clone(),
+            turn_id: decision.turn.as_ref().map(|t| t.id.clone()),
             call_id: call_id.clone(),
             attempt: *attempt,
             seq: *seq,
@@ -435,7 +435,7 @@ mod tests {
             span: SpanContext::root(),
             attempts: 0,
             deadline: None,
-            turn_id: None,
+            turn: None,
         }
     }
 

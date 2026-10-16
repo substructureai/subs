@@ -432,6 +432,7 @@ mod tests {
                         }),
                         turn: TurnTarget::Open("t1".into()),
                         queue: QueueMode::Refuse,
+                        metadata: Default::default(),
                     },
                 ),
             )

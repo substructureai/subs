@@ -240,6 +240,12 @@ While a detached child is working, another message to its session comes back
 as a tool error naming `wait`. Cancelling the parent no longer reaches a
 detached child whose call has settled: the child finishes on its own.
 
+When a blocking call ends before the child answers, the engine cancels the
+child's run. This happens on a [cancel](./100-interrupts.md#cancel-a-run), on
+`fail` and `done`, and when an edit moves the conversation to a new branch. The
+child's own subagents are cancelled the same way. The child session stays
+usable.
+
 ## Reference
 
 ```typescript

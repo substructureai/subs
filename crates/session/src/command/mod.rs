@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 
@@ -5,7 +7,7 @@ use super::decision::{Action, LlmHandler, Trigger};
 use super::effects::{self, decision_queued, void_events, Settle};
 use super::events::*;
 use super::schedule::{self, ScheduleStep};
-use super::state::{EffectKind, EffectTracking, EventMeta, SessionState, SessionStatus, TurnPhase};
+use super::state::{EffectKind, EffectTracking, EventMeta, SessionState, TurnPhase};
 use crate::branch::Outside;
 use crate::cx::Cx;
 use crate::ids::Ids;
@@ -40,6 +42,8 @@ pub enum CommandPayload {
         turn: TurnTarget,
         #[serde(default)]
         queue: QueueMode,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        metadata: BTreeMap<String, String>,
     },
     SendMessage {
         message: DraftMessage,
@@ -329,11 +333,8 @@ impl SessionState {
 
     fn void_stranded_work(&self, node: Option<&str>) -> Vec<EventPayload> {
         let at = self.at(node);
-        let mut events = self.void_effects(|_, tracking, anchor| {
-            matches!(
-                tracking.status(),
-                EffectStatus::Queued | EffectStatus::Pending | EffectStatus::RetryScheduled
-            ) && !at.anchor_on_path(anchor)
+        let mut events = self.void_effects(|kind, tracking, anchor| {
+            crate::effects::stops(kind, tracking, anchor) && !at.anchor_on_path(anchor)
         });
         for e in self.effects_of(EffectKind::Decision) {
             let Some(wd) = e.decision() else { continue };
@@ -544,10 +545,13 @@ impl Working {
             ScheduleStep::Resend { kind, id } => {
                 self.then(|s| kind.spec().resend(s, &id));
             }
+            ScheduleStep::EndQuietTurn => {
+                let system = self.system();
+                let _ = self
+                    .try_then(|s| s.finish_turn_events(s.ids(), serde_json::Value::Null, &system));
+            }
             ScheduleStep::RedispatchDecision { decision_id } => {
-                self.emit(EventPayload::DecisionDispatched(DecisionDispatched {
-                    id: decision_id,
-                }));
+                self.then(|s| EffectKind::Decision.spec().resend(s, &decision_id));
             }
         }
     }
@@ -675,13 +679,16 @@ impl Working {
     fn queued_turn_ids(&self) -> impl Iterator<Item = &str> {
         self.queued_decisions()
             .into_iter()
-            .filter_map(|e| e.decision()?.trigger.deferred_turn_id())
+            .filter_map(|e| match &e.decision()?.trigger {
+                Trigger::ClientAction { turn_id, .. } => turn_id.as_deref(),
+                trigger => trigger.deferred_turn_id(),
+            })
     }
 
     fn begin_turn(
         &mut self,
         target: TurnTarget,
-        client_state: Option<serde_json::Value>,
+        metadata: BTreeMap<String, String>,
     ) -> Result<(), SessionError> {
         let turn_id = match target {
             TurnTarget::Detached => return Ok(()),
@@ -702,10 +709,7 @@ impl Working {
             }
             TurnPhase::Idle => {}
         }
-        self.emit(EventPayload::TurnStarted(TurnStarted {
-            turn_id,
-            client_state,
-        }));
+        self.emit(EventPayload::TurnStarted(TurnStarted { turn_id, metadata }));
         Ok(())
     }
 
@@ -740,7 +744,12 @@ impl Working {
         }
     }
 
-    fn apply_actions(&mut self, actions: Vec<Action>, decision_id: &str) {
+    fn apply_actions(
+        &mut self,
+        actions: Vec<Action>,
+        decision_id: &str,
+        answered: Option<Trigger>,
+    ) {
         let system = self.system();
         for action in actions {
             let _ = match action {
@@ -822,6 +831,7 @@ impl Working {
                     Ok(())
                 }
                 Action::Done { data } => {
+                    self.then(|s| s.close_open_calls(s.ids(), answered.as_ref()));
                     let cmd = if self.phase.finalizing().is_some() {
                         CommandPayload::CompleteTurn
                     } else {
@@ -842,8 +852,6 @@ impl Working {
     }
 
     pub fn run(&mut self, cmd: CommandPayload, caller: &Caller) -> Result<(), SessionError> {
-        let cancelling = matches!(cmd, CommandPayload::CancelSession);
-
         match (self.agent_id.is_some(), cmd) {
             (
                 false,
@@ -886,9 +894,7 @@ impl Working {
             (false, _) => return Err(SessionError::SessionNotCreated),
             (true, cmd) => self.run_active(cmd, caller)?,
         }
-        if !cancelling {
-            self.schedule();
-        }
+        self.schedule();
         self.unload_off_path();
         Ok(())
     }
@@ -904,22 +910,49 @@ impl Working {
                 payload,
                 turn,
                 queue,
+                metadata,
             } => {
                 self.ensure_owns_session(caller)?;
                 let Some(payload) = self.outside.drop_known(payload) else {
                     return Ok(());
                 };
+                let action = matches!(payload, ClientPayload::Action(_));
+                let own_turn = match &turn {
+                    TurnTarget::Open(id) if action => Some(id.clone()),
+                    _ => None,
+                }
+                .filter(|id| self.phase.active_turn_id() != Some(id.as_str()));
+                let turn = match turn {
+                    TurnTarget::Open(id) if action && matches!(self.phase, TurnPhase::Idle) => {
+                        TurnTarget::Open(id)
+                    }
+                    TurnTarget::Open(_) if action => {
+                        if let Some(id) = &own_turn {
+                            self.turn_taken(id)?;
+                        }
+                        TurnTarget::Detached
+                    }
+                    turn => turn,
+                };
+                let action_waits = own_turn.is_some() && self.phase.finalizing().is_some();
                 let deferred = self.deferred_turn(&turn, queue, &payload)?;
                 if deferred.is_none() {
-                    self.begin_turn(turn, payload.client_state().cloned())?;
+                    self.begin_turn(turn, metadata.clone())?;
                 }
                 let merge = deferred.is_some() && queue == QueueMode::Merge;
                 let (events, waiting) = {
                     let cx = self.cx();
-                    cx.client_payload_events(cx.ids(), payload, caller, deferred, merge)?
+                    cx.client_payload_events(
+                        cx.ids(),
+                        payload,
+                        caller,
+                        deferred.or(own_turn.clone()),
+                        merge,
+                        metadata,
+                    )?
                 };
                 self.emit_all(events);
-                self.waiting = waiting;
+                self.waiting = waiting.or(own_turn.filter(|_| action_waits));
                 Ok(())
             }
 
@@ -933,13 +966,17 @@ impl Working {
                 if self.head_parked() && message.role == Role::User {
                     return Err(SessionError::SessionInterrupted);
                 }
-                self.begin_turn(turn_id.map_or(TurnTarget::Detached, TurnTarget::Open), None)?;
+                self.begin_turn(
+                    turn_id.map_or(TurnTarget::Detached, TurnTarget::Open),
+                    BTreeMap::new(),
+                )?;
                 if message.role == Role::User {
                     self.queue_decision(Trigger::ClientMessage {
                         messages: vec![message],
                         client: ClientContext::default(),
                         turn_id: None,
                         merge: false,
+                        metadata: BTreeMap::new(),
                     });
                 }
                 Ok(())
@@ -1159,9 +1196,9 @@ impl Working {
                     Some(EffectStatus::Pending) => {}
                     _ => return Ok(()),
                 }
-                let decision = self.worker_decision(&decision_id);
-                let is_action =
-                    decision.is_some_and(|d| matches!(d.trigger, Trigger::ClientAction { .. }));
+                let answered = self
+                    .worker_decision(&decision_id)
+                    .map(|d| d.trigger.clone());
                 let ids: Vec<&str> = transcript.iter().filter_map(|m| m.id.as_deref()).collect();
                 if let Some(loaded) = self.outside.branch_to(&ids, &self.state) {
                     self.emit(EventPayload::BranchLoaded(BranchLoaded {
@@ -1179,41 +1216,18 @@ impl Working {
                 .then(|s| s.worker_state_events(state))
                 .then(|s| s.agent_config_events(agent));
 
-                let starts_work = actions.iter().any(|a| {
-                    matches!(
-                        a,
-                        Action::CallLlm { .. }
-                            | Action::CallTool { .. }
-                            | Action::SpawnSubagent { .. }
-                    )
-                });
-                if is_action && starts_work && !matches!(self.phase, TurnPhase::Active { .. }) {
-                    if self.phase.finalizing().is_some() {
-                        self.then(|s| s.finalize_run(None));
-                    }
-                    self.emit(EventPayload::TurnStarted(TurnStarted {
-                        turn_id: format!("action:{decision_id}"),
-                        client_state: None,
-                    }));
-                }
-
-                self.apply_actions(actions, &decision_id);
+                self.apply_actions(actions, &decision_id, answered);
                 Ok(())
             }
 
             CommandPayload::CancelSession => {
-                SessionState::ensure_operator_or_system(caller)?;
-                if matches!(self.status, SessionStatus::Done) {
+                self.ensure_owns_session(caller)?;
+                if !self.cancellable() {
                     return Ok(());
                 }
-                self.then(|_| vec![EventPayload::SessionCancelled])
-                    .then(|s| {
-                        s.void_effects(|kind, tracking, _| {
-                            tracking.is_open()
-                                || (tracking.status() == EffectStatus::Running
-                                    && kind.spec().voids_when_running())
-                        })
-                    });
+                self.emit(EventPayload::SessionCancelled);
+                self.then(|s| s.close_open_calls(s.ids(), None))
+                    .then(|s| s.cancel_run());
                 Ok(())
             }
 

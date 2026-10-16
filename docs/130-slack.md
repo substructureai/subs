@@ -200,8 +200,10 @@ with the bot token. The events carry the thread in `metadata.slack_channel` and
 
 A button you post comes back to the worker as a `client.action` decision, named
 after its `action_id`. Its `args` carry the `value`, the user, and the message
-it came from. Nothing about a click expires: answer it with an `llm.call` days
-later, and the work opens a new turn.
+it came from. A click runs in its own turn, unless a turn is running. If your
+answer leaves no work in the click's turn, the turn ends and the bot posts
+nothing. Nothing about a click expires: answer it with an `llm.call` days
+later, and the work runs in the click's turn.
 
 See [node-hono-slack-skills](../examples/node-hono-slack-skills) for a worker and
 events URL in one program.

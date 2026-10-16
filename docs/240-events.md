@@ -58,10 +58,10 @@ Render a chat from these.
 | `session.created` | The session exists. |
 | `message.new` | A message joined the tree: `{ message, parent_id?, copied_from? }`. `copied_from` names the original of a copy. |
 | `head.moved` | The active leaf changed. A client branched or edited. |
-| `turn.started` | A turn began: `{ turn_id, client_state? }`. `client_state` is the `client.state` the turn was submitted with. For a merged turn it is the last one. |
+| `turn.started` | A turn began: `{ turn_id, metadata? }`. `metadata` is the `metadata` the turn was submitted with. For a merged turn, a later submit's key wins. |
 | `turn.completed` | A turn ended, with its cost and output. |
 | `session.done` | The session finished its work. |
-| `session.cancelled` | The session was canceled. |
+| `session.cancelled` | The current run was cancelled. A `turn.completed` with the error code `cancelled` follows. The session stays usable. |
 
 ## Model calls
 

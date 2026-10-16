@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::connectors::ConnectionPath;
 use crate::protocol::{
@@ -9,6 +10,7 @@ use crate::protocol::{
     StoredResult, ToolResult, Usage,
 };
 use crate::retry::RetryTarget;
+use crate::state::TurnPhase;
 
 impl Handler {
     pub fn as_str(self) -> &'static str {
@@ -111,6 +113,8 @@ pub enum Trigger {
         turn_id: Option<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         merge: bool,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        metadata: BTreeMap<String, String>,
     },
     #[serde(rename = "client.messages")]
     ClientTranscript {
@@ -125,6 +129,10 @@ pub enum Trigger {
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         args: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        metadata: BTreeMap<String, String>,
     },
     #[serde(rename = "subagent.notice")]
     SubagentNotice {
@@ -223,10 +231,32 @@ pub enum Trigger {
 }
 
 impl Trigger {
-    pub fn client_state(&self) -> Option<&serde_json::Value> {
-        match self {
-            Trigger::ClientMessage { client, .. } => client.state.as_ref(),
+    pub fn own_turn(&self, decision_id: &str, phase: &TurnPhase) -> Option<String> {
+        match (self, phase) {
+            (Trigger::ClientAction { turn_id, .. }, TurnPhase::Idle) => Some(
+                turn_id
+                    .clone()
+                    .unwrap_or_else(|| format!("action:{decision_id}")),
+            ),
             _ => None,
+        }
+    }
+
+    pub fn owns_turn(&self, decision_id: &str, turn_id: &str) -> bool {
+        match self {
+            Trigger::ClientAction {
+                turn_id: opened, ..
+            } => opened.as_deref() == Some(turn_id) || turn_id == format!("action:{decision_id}"),
+            _ => false,
+        }
+    }
+
+    pub fn turn_metadata(&self) -> BTreeMap<String, String> {
+        match self {
+            Trigger::ClientMessage { metadata, .. } | Trigger::ClientAction { metadata, .. } => {
+                metadata.clone()
+            }
+            _ => BTreeMap::new(),
         }
     }
 

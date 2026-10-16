@@ -33,6 +33,20 @@ pub enum SessionsCommand {
     /// Print a session's events. Prints all events and exits; pass --stream to
     /// follow live (Ctrl-C to stop).
     Events(EventsCommand),
+    /// Cancel a session's current run and its subagents. The session stays
+    /// usable.
+    Cancel(CancelCommand),
+}
+
+#[derive(Args)]
+pub struct CancelCommand {
+    pub session_id: String,
+    /// Use this SQLite database instead of a deployment. [default: the
+    /// engine's, when the file names no `[remote]`]
+    #[arg(long)]
+    pub db: Option<String>,
+    #[command(flatten)]
+    pub scope: ProjectScope,
 }
 
 #[derive(Args)]
@@ -86,7 +100,65 @@ pub async fn run(command: SessionsCommand) -> Result<()> {
             Source::Local(db) => local_events(&cmd, &db).await,
             Source::Remote => remote_events(&cmd).await,
         },
+        SessionsCommand::Cancel(cmd) => {
+            match source(&cmd.scope.globals, cmd.db.clone())? {
+                Source::Local(db) => local_cancel(&cmd.session_id, &db)?,
+                Source::Remote => remote_cancel(&cmd).await?,
+            }
+            eprintln!("cancelled {}", cmd.session_id);
+            Ok(())
+        }
     }
+}
+
+async fn remote_cancel(cmd: &CancelCommand) -> Result<()> {
+    let (ctx, project) = Context::from_project(&cmd.scope).await?;
+    let _: serde_json::Value = ctx
+        .client
+        .post_empty(&format!(
+            "/api/v1/projects/{project}/sessions/{}/cancel",
+            cmd.session_id
+        ))
+        .await?;
+    Ok(())
+}
+
+fn local_cancel(session_id: &str, db: &str) -> Result<()> {
+    use crate::runtime::sessions::SessionStores as _;
+    use crate::session::command::CommandPayload;
+    use crate::session::{Command, Session, Settings};
+
+    let stores = crate::providers::sqlite::SqliteSessionStores::new(open_db(db)?);
+    let mut mail = vec![(
+        session_id.to_string(),
+        Command::system(
+            format!("cli-cancel:{}", uuid::Uuid::now_v7()),
+            DEFAULT_TENANT,
+            CommandPayload::CancelSession,
+        ),
+    )];
+    while let Some((to, command)) = mail.pop() {
+        let store = stores.open(DEFAULT_TENANT, &to);
+        let mut session = Session::load(store.as_ref(), &to, DEFAULT_TENANT, Settings::default())?;
+        if !session.exists() {
+            if to == session_id {
+                bail!("no session {session_id} in {db}");
+            }
+            continue;
+        }
+        let ran = session.run(store.as_ref(), chrono::Utc::now(), command)?;
+        if let Err(rejected) = ran.result {
+            bail!("{to}: {:?}", rejected.error);
+        }
+        for sent in ran
+            .written
+            .map(|entry| session.mail(&entry.events))
+            .unwrap_or_default()
+        {
+            mail.push((sent.to, sent.command));
+        }
+    }
+    Ok(())
 }
 
 enum Source {
@@ -660,5 +732,121 @@ mod tests {
         let decoded = SessionCursor::decode(&cursor.encode().unwrap()).unwrap();
         assert_eq!(decoded.session_id, "sess-1");
         assert_eq!(decoded.at, cursor.at);
+    }
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::protocol::{
+        DraftMessage, Issuer, Requester, RetryPolicy, Role, SessionOwner, Subject,
+    };
+    use crate::runtime::sessions::SessionStores as _;
+    use crate::session::command::CommandPayload;
+    use crate::session::{Command, Session, Settings};
+
+    fn message(text: &str) -> DraftMessage {
+        DraftMessage {
+            id: None,
+            role: Role::User,
+            content: Some(crate::protocol::Content::Text(text.to_string())),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            reasoning: None,
+        }
+    }
+
+    fn create(ancestry: Vec<String>) -> CommandPayload {
+        CommandPayload::CreateSession {
+            agent_id: "agent".into(),
+            owner: SessionOwner {
+                tenant_id: DEFAULT_TENANT.into(),
+                requester: Requester::new(Subject::new(Issuer::app(), "u"), Default::default()),
+                metadata: HashMap::new(),
+            },
+            ancestry,
+            worker_retry: RetryPolicy::no_retry(),
+            agent: None,
+            worker: None,
+            events: None,
+            state: None,
+        }
+    }
+
+    #[test]
+    fn a_local_cancel_ends_the_run_and_its_child() {
+        let dir = std::env::temp_dir().join(format!("subs-cancel-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("t.db").display().to_string();
+        let stores = crate::providers::sqlite::SqliteSessionStores::new(
+            SqliteDb::open(&db, BUSY_TIMEOUT).unwrap(),
+        );
+        let run = |id: &str, payload: CommandPayload| -> Session {
+            let store = stores.open(DEFAULT_TENANT, id);
+            let mut session =
+                Session::load(store.as_ref(), id, DEFAULT_TENANT, Settings::default()).unwrap();
+            let ran = session
+                .run(
+                    store.as_ref(),
+                    chrono::Utc::now(),
+                    Command::system(uuid::Uuid::now_v7().to_string(), DEFAULT_TENANT, payload),
+                )
+                .unwrap();
+            assert!(ran.result.is_ok(), "{:?}", ran.result);
+            session
+        };
+
+        run("parent", create(vec![]));
+        run(
+            "parent",
+            CommandPayload::SendMessage {
+                message: message("hi"),
+                stream: false,
+                turn_id: Some("t1".into()),
+                parent_id: None,
+            },
+        );
+        let parent = run(
+            "parent",
+            CommandPayload::RequestSubagent {
+                session_id: None,
+                agent_id: "helper".into(),
+                tool_call_id: "call-sa".into(),
+                message: None,
+                retry: RetryPolicy::no_retry(),
+                decision_id: "d".into(),
+                mode: None,
+            },
+        );
+        let child = parent
+            .state()
+            .subagent("call-sa")
+            .unwrap()
+            .session_id
+            .clone();
+        run(&child, create(vec!["parent".into()]));
+        run(
+            &child,
+            CommandPayload::SendMessage {
+                message: message("do it"),
+                stream: false,
+                turn_id: Some("c1".into()),
+                parent_id: None,
+            },
+        );
+
+        local_cancel("parent", &db).unwrap();
+
+        let load = |id: &str| {
+            let store = stores.open(DEFAULT_TENANT, id);
+            Session::load(store.as_ref(), id, DEFAULT_TENANT, Settings::default()).unwrap()
+        };
+        assert!(load("parent").state().phase.turn_id().is_none());
+        let child = load(&child);
+        assert!(child.state().phase.turn_id().is_none());
+        assert!(child.state().completed_turn_ids.contains(&"c1".to_string()));
     }
 }

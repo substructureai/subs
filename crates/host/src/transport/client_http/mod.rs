@@ -38,6 +38,10 @@ pub fn router(state: ClientHttpState) -> Router {
             "/api/client/sessions/{session_id}/interrupt",
             post(routes::interrupt_session),
         )
+        .route(
+            "/api/client/sessions/{session_id}/cancel",
+            post(routes::cancel_session),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.auth.clone(),
             client_auth_middleware,

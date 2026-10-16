@@ -40,6 +40,7 @@ struct StubModel {
     seen: Mutex<Vec<PromptRequest>>,
     script: Mutex<Vec<ToolCall>>,
     follow_up: Mutex<Option<String>>,
+    stall: Mutex<Option<String>>,
 }
 
 fn answered_session(request: &PromptRequest) -> Option<String> {
@@ -57,6 +58,15 @@ impl LlmCallable for StubModel {
         _ctx: &CallContext<'_>,
     ) -> Result<LlmResponse, LlmCallError> {
         self.seen.lock().unwrap().push(request.clone());
+        let stall = self.stall.lock().unwrap().clone();
+        if stall.is_some_and(|text| {
+            request.messages.iter().any(|m| {
+                m.role == Role::User
+                    && m.content.as_ref().map(PromptContent::text_owned).as_deref() == Some(&text)
+            })
+        }) {
+            return std::future::pending().await;
+        }
         if let Some(scripted) = self.script.lock().unwrap().pop() {
             return Ok(LlmResponse {
                 model: request.model.clone(),
@@ -268,6 +278,7 @@ async fn start_with(
         seen: Mutex::new(Vec::new()),
         script: Mutex::new(Vec::new()),
         follow_up: Mutex::new(None),
+        stall: Mutex::new(None),
     });
     let providers = LlmProviderRegistry::new(BTreeMap::from([(
         "claude".to_string(),
@@ -1050,6 +1061,130 @@ async fn a_subagent_call_opens_its_child_with_the_message() {
                 == Some("do it"))),
         "the child is prompted with the delegating message"
     );
+}
+
+async fn until(
+    h: &Harness,
+    session_id: &str,
+    stop: impl Fn(&EventPayload) -> bool,
+) -> Vec<EventPayload> {
+    let mut events = h
+        .runtime
+        .stream(
+            SessionSubscriptionSpec {
+                session_id: session_id.to_string(),
+                caller: Caller::System {
+                    tenant_id: TENANT.to_string(),
+                },
+                scope: SubscriptionScope::All,
+            },
+            Some(Seq(0)),
+        )
+        .await
+        .expect("streams");
+    let mut seen = Vec::new();
+    let found = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while let Some(event) = events.recv().await {
+            let hit = stop(&event.payload);
+            seen.push(event.payload);
+            if hit {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(found.is_ok(), "the event never came: {seen:#?}");
+    seen
+}
+
+#[tokio::test]
+async fn cancel_ends_the_run_and_its_subagents_and_keeps_the_session() {
+    let h = start(team(delegating(None))).await;
+    *h.model.stall.lock().unwrap() = Some("do it".to_string());
+    let parent = uuid::Uuid::now_v7().to_string();
+    let send = |text: &str| HandleClientInput {
+        session_id: parent.clone(),
+        caller: Caller::System {
+            tenant_id: TENANT.to_string(),
+        },
+        agent: None,
+        worker: None,
+        owner: SessionOwner {
+            tenant_id: TENANT.to_string(),
+            requester: Requester::new(
+                Subject::new(h.issuer.clone(), "user-1".to_string()),
+                Default::default(),
+            ),
+            metadata: Default::default(),
+        },
+        input: ClientInput::Message {
+            agent_id: "boss".to_string(),
+            turn_id: None,
+            message: DraftMessage {
+                id: None,
+                role: Role::User,
+                content: Some(Content::Text(text.to_string())),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                reasoning: None,
+            },
+            stream: false,
+            queue: Default::default(),
+        },
+        span: SpanContext::root(),
+    };
+    h.runtime
+        .handle_client_input(send("hi"))
+        .await
+        .expect("the input is accepted");
+    let started = until(&h, &parent, |e| {
+        matches!(e, EventPayload::SubagentStarted(_))
+    })
+    .await;
+    let child = started
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::SubagentRequested(r) => Some(r.session_id.clone()),
+            _ => None,
+        })
+        .expect("a child was asked for");
+
+    h.runtime
+        .cancel_session(
+            parent.clone(),
+            Caller::System {
+                tenant_id: TENANT.to_string(),
+            },
+            SpanContext::root(),
+        )
+        .await
+        .expect("the cancel is accepted");
+
+    let ended = until(&h, &parent, |e| matches!(e, EventPayload::TurnCompleted(_))).await;
+    let error = ended.iter().find_map(|e| match e {
+        EventPayload::TurnCompleted(t) => t.error.clone(),
+        _ => None,
+    });
+    assert_eq!(error.map(|e| e.code), Some(ErrorCode::Cancelled));
+    until(&h, &child, |e| matches!(e, EventPayload::SessionCancelled)).await;
+
+    *h.model.stall.lock().unwrap() = None;
+    let next = h
+        .runtime
+        .handle_client_input(send("again"))
+        .await
+        .expect("the session takes a new message");
+    let completed = until(
+        &h,
+        &parent,
+        |e| matches!(e, EventPayload::TurnCompleted(t) if t.turn_id == next.turn_id),
+    )
+    .await;
+    assert!(completed.iter().any(|e| matches!(
+        e,
+        EventPayload::TurnCompleted(t) if t.turn_id == next.turn_id && t.error.is_none()
+    )));
 }
 
 #[tokio::test]

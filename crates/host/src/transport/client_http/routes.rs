@@ -89,6 +89,18 @@ pub async fn interrupt_session(
     }
 }
 
+pub async fn cancel_session(
+    State(state): State<ClientHttpState>,
+    Extension(caller): Extension<Caller>,
+    Path(session_id): Path<String>,
+) -> Response {
+    let span = crate::span::SpanContext::root().child("client_cancel");
+    match state.runtime.cancel_session(session_id, caller, span).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => runtime_error_response(e),
+    }
+}
+
 pub async fn get_blob(
     State(state): State<ClientHttpState>,
     Extension(caller): Extension<Caller>,

@@ -1164,11 +1164,16 @@
           "trigger": {
             "$ref": "#/components/schemas/DecisionTrigger"
           },
-          "turn_id": {
-            "type": [
-              "string",
-              "null"
-            ]
+          "turn": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DecisionTurn"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The turn this decision belongs to. `null` outside a turn."
           },
           "worker": {
             "anyOf": [
@@ -1654,6 +1659,25 @@
         ],
         "title": "DecisionTrigger"
       },
+      "DecisionTurn": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "metadata": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "The `metadata` the turn was submitted with.",
+            "type": "object"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
       "DeferTools": {
         "additionalProperties": {
           "not": {}
@@ -1911,7 +1935,8 @@
           "worker_unreachable",
           "unroutable",
           "internal",
-          "context_overflow"
+          "context_overflow",
+          "cancelled"
         ],
         "title": "ErrorCode",
         "type": "string"

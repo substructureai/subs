@@ -178,6 +178,7 @@ async fn run(
                 turn_id: Some(input.run_id.clone()),
                 continue_turn: resuming,
                 queue: Default::default(),
+                metadata: Default::default(),
             })
             .await;
         if let Err(e) = submit {
