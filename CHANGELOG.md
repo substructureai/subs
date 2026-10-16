@@ -36,7 +36,7 @@ The `@substructure.ai/cli` package and the `subs`, `substructure-host` and
 - A client action now runs in the running turn, or in its own turn with the id and `metadata` of its submit. The submit returns the id of that turn. When its own turn has no more work, the turn ends.
 - The Slack bot posts no reply for a turn that shows nothing and returns no data.
 - When `done`, `fail` or a new branch ends a blocking subagent call, the engine now cancels the child's run.
-- A cancel now stops the current run and keeps the session usable. The turn ends with the error code `cancelled`, and the work that waits is dropped.
+- A cancel now stops the current run and keeps the session usable. The turn ends with the error code `cancelled`, the open interrupts end as cancelled, and the work that waits is dropped.
 - The engine now stops a running model call or tool when its call ends.
 - `Ctrl-C` during a turn in `subs chat` and `subs run` now cancels the turn. `subs chat` then shows the prompt again.
 - `subs chat` no longer shows a tool call of a failed turn as waiting.

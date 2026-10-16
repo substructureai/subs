@@ -19,7 +19,6 @@ use crate::runtime::span::SpanContext;
 use crate::runtime::Caller;
 
 const RESULT_NOT_SAVED: Duration = Duration::from_secs(5);
-const WATCH: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub struct TaskBound {
@@ -193,15 +192,9 @@ async fn watched(
 }
 
 async fn closed(inbox: &dyn Inbox, bound: &TaskBound) {
-    loop {
-        tokio::time::sleep(WATCH).await;
-        if !inbox
-            .is_open(&bound.tenant_id, &bound.session_id, &bound.work())
-            .await
-        {
-            return;
-        }
-    }
+    inbox
+        .ended(&bound.tenant_id, &bound.session_id, &bound.work())
+        .await
 }
 
 async fn run_bounded<T, F, Fut, E, EFut>(

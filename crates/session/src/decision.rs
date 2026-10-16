@@ -230,13 +230,17 @@ pub enum Trigger {
     },
 }
 
+pub fn spare_turn_id(decision_id: &str) -> String {
+    format!("action:{decision_id}")
+}
+
 impl Trigger {
     pub fn own_turn(&self, decision_id: &str, phase: &TurnPhase) -> Option<String> {
         match (self, phase) {
             (Trigger::ClientAction { turn_id, .. }, TurnPhase::Idle) => Some(
                 turn_id
                     .clone()
-                    .unwrap_or_else(|| format!("action:{decision_id}")),
+                    .unwrap_or_else(|| spare_turn_id(decision_id)),
             ),
             _ => None,
         }
@@ -246,7 +250,7 @@ impl Trigger {
         match self {
             Trigger::ClientAction {
                 turn_id: opened, ..
-            } => opened.as_deref() == Some(turn_id) || turn_id == format!("action:{decision_id}"),
+            } => opened.as_deref() == Some(turn_id) || turn_id == spare_turn_id(decision_id),
             _ => false,
         }
     }

@@ -149,7 +149,7 @@ fn own_turn_started(state: &SessionState, id: &str) -> Option<EventPayload> {
     }
     let turn_id = decision.trigger.own_turn(id, &state.phase)?;
     let turn_id = match completed(&turn_id) {
-        true => format!("action:{id}"),
+        true => crate::decision::spare_turn_id(id),
         false => turn_id,
     };
     Some(EventPayload::TurnStarted(TurnStarted {

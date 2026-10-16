@@ -193,7 +193,7 @@ pub(super) fn decision_queued(ids: &Ids, trigger: Trigger) -> EventPayload {
     })
 }
 
-pub fn stops(kind: EffectKind, tracking: &EffectTracking, _anchor: Option<&str>) -> bool {
+pub fn stops(kind: EffectKind, tracking: &EffectTracking) -> bool {
     tracking.is_open()
         || (tracking.status() == EffectStatus::Running && kind.spec().voids_when_running())
 }

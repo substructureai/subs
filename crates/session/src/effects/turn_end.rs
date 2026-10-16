@@ -7,7 +7,8 @@ use crate::events::*;
 use crate::ids::Ids;
 use crate::propose::{settled_content, subagent_text};
 use crate::protocol::{
-    Content, DraftMessage, EffectStatus, ErrorCode, ErrorInfo, NewMessage, Role,
+    Content, DraftMessage, EffectStatus, ErrorCode, ErrorInfo, InterruptResolution, NewMessage,
+    ResumeStatus, Role,
 };
 use crate::schedule::Dep;
 use crate::state::{EffectKind, SessionState, TurnPhase};
@@ -202,7 +203,23 @@ impl SessionState {
     }
 
     pub fn cancel_run(&self) -> Vec<EventPayload> {
-        let mut events = self.void_effects(|_, tracking, _| tracking.is_unsettled());
+        let cancelled = serde_json::to_value(InterruptResolution {
+            status: ResumeStatus::Cancelled,
+            payload: serde_json::Value::Null,
+            responder: None,
+        })
+        .unwrap_or_default();
+        let mut events: Vec<EventPayload> = self
+            .open_interrupts
+            .iter()
+            .map(|i| {
+                EventPayload::InterruptResumed(InterruptResumed {
+                    interrupt_id: i.interrupt_id.clone(),
+                    payload: cancelled.clone(),
+                })
+            })
+            .collect();
+        events.extend(self.void_effects(|_, tracking, _| tracking.is_unsettled()));
         events.extend(
             self.effects_of(EffectKind::Decision)
                 .filter(|e| {
@@ -246,7 +263,7 @@ impl SessionState {
     }
 
     pub fn fail_run(&self, error: &ErrorInfo) -> Vec<EventPayload> {
-        let mut events = self.void_effects(stops);
+        let mut events = self.void_effects(|kind, tracking, _| stops(kind, tracking));
         events.extend(self.drop_queued_decisions());
         if self.phase.finalizing().is_some() {
             events.extend(self.finalize_run(Some(error)));

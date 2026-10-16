@@ -1061,6 +1061,45 @@ fn cancelling_ends_the_run_and_keeps_the_session() {
 }
 
 #[test]
+fn cancelling_resolves_the_open_interrupts_as_cancelled() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let raise = dispatched_action_decision(&mut agg);
+    dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: raise,
+            transcript: vec![],
+            actions: vec![Action::Interrupt {
+                interrupt_id: "int-1".to_string(),
+                reason: "hold".to_string(),
+                payload: serde_json::Value::Null,
+            }],
+            state: None,
+            agent: None,
+        },
+        &Caller::System {
+            tenant_id: "tenant-a".to_string(),
+        },
+    );
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::CancelSession,
+        &frontend_caller("tenant-a", "user-1"),
+    );
+    let resumed = events.iter().find_map(|e| match e {
+        EventPayload::InterruptResumed(p) if p.interrupt_id == "int-1" => Some(p),
+        _ => None,
+    });
+    assert_eq!(
+        resumed.map(|p| &p.payload["status"]),
+        Some(&serde_json::json!("cancelled")),
+        "got {events:?}"
+    );
+    assert!(agg.state.open_interrupts.is_empty());
+}
+
+#[test]
 fn only_the_owner_cancels_from_a_client() {
     let agg = session_mid_turn();
     let err = agg
@@ -4653,6 +4692,57 @@ fn an_action_answer_without_work_ends_its_turn() {
         })
         .expect("no work ends the turn");
     assert_eq!(finished, "turn-a");
+}
+
+#[test]
+fn an_action_without_a_turn_id_opens_and_ends_its_own_turn() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let system = Caller::System {
+        tenant_id: "tenant-a".to_string(),
+    };
+    let decision_id = dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Action(crate::protocol::ClientAction {
+                name: "summarize".to_string(),
+                args: None,
+            }),
+            turn: TurnTarget::Detached,
+            queue: QueueMode::Refuse,
+            metadata: Default::default(),
+        },
+        &system,
+    )
+    .iter()
+    .find_map(|e| match e {
+        EventPayload::DecisionDispatched(p) => Some(p.id.clone()),
+        _ => None,
+    })
+    .expect("the action decision dispatches");
+    let turn = agg
+        .state
+        .phase
+        .turn_id()
+        .expect("the action opened a turn")
+        .to_string();
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id,
+            transcript: vec![],
+            actions: vec![],
+            state: None,
+            agent: None,
+        },
+        &system,
+    );
+    assert!(
+        events.iter().any(|e| matches!(e,
+            EventPayload::DecisionQueued(q)
+                if matches!(&q.trigger, Trigger::TurnFinished { turn_id, .. } if *turn_id == turn))),
+        "no work ends the turn: {events:?}"
+    );
 }
 
 #[test]

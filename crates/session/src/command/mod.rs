@@ -334,7 +334,7 @@ impl SessionState {
     fn void_stranded_work(&self, node: Option<&str>) -> Vec<EventPayload> {
         let at = self.at(node);
         let mut events = self.void_effects(|kind, tracking, anchor| {
-            crate::effects::stops(kind, tracking, anchor) && !at.anchor_on_path(anchor)
+            crate::effects::stops(kind, tracking) && !at.anchor_on_path(anchor)
         });
         for e in self.effects_of(EffectKind::Decision) {
             let Some(wd) = e.decision() else { continue };
@@ -358,8 +358,12 @@ impl SessionState {
         caller: &Caller,
     ) -> Result<Vec<EventPayload>, SessionError> {
         SessionState::ensure_internal(caller)?;
+        Ok(self.turn_finished_events(ids, data))
+    }
+
+    fn turn_finished_events(&self, ids: &Ids, data: serde_json::Value) -> Vec<EventPayload> {
         match &self.phase {
-            TurnPhase::Active { turn_id } => Ok(vec![decision_queued(
+            TurnPhase::Active { turn_id } => vec![decision_queued(
                 ids,
                 Trigger::turn_finished(
                     turn_id.clone(),
@@ -367,9 +371,9 @@ impl SessionState {
                     self.turn_cost,
                     self.turn_token_usage.clone(),
                 ),
-            )]),
+            )],
             TurnPhase::Idle | TurnPhase::Finalizing(_) => {
-                Ok(vec![EventPayload::SessionDone(SessionDone {})])
+                vec![EventPayload::SessionDone(SessionDone {})]
             }
         }
     }
@@ -546,9 +550,7 @@ impl Working {
                 self.then(|s| kind.spec().resend(s, &id));
             }
             ScheduleStep::EndQuietTurn => {
-                let system = self.system();
-                let _ = self
-                    .try_then(|s| s.finish_turn_events(s.ids(), serde_json::Value::Null, &system));
+                self.then(|s| s.turn_finished_events(s.ids(), serde_json::Value::Null));
             }
             ScheduleStep::RedispatchDecision { decision_id } => {
                 self.then(|s| EffectKind::Decision.spec().resend(s, &decision_id));
@@ -660,6 +662,22 @@ impl Working {
         }
         self.turn_taken(turn_id)?;
         Ok(Some(turn_id.clone()))
+    }
+
+    fn action_turn(&self, turn: TurnTarget) -> Result<(TurnTarget, String), SessionError> {
+        let own = match turn {
+            TurnTarget::Open(id) | TurnTarget::Continue(id)
+                if self.phase.active_turn_id() != Some(id.as_str()) =>
+            {
+                id
+            }
+            _ => self.ids.next(),
+        };
+        if matches!(self.phase, TurnPhase::Idle) {
+            return Ok((TurnTarget::Open(own.clone()), own));
+        }
+        self.turn_taken(&own)?;
+        Ok((TurnTarget::Detached, own))
     }
 
     fn turn_taken(&self, turn_id: &str) -> Result<(), SessionError> {
@@ -916,25 +934,14 @@ impl Working {
                 let Some(payload) = self.outside.drop_known(payload) else {
                     return Ok(());
                 };
-                let action = matches!(payload, ClientPayload::Action(_));
-                let own_turn = match &turn {
-                    TurnTarget::Open(id) if action => Some(id.clone()),
-                    _ => None,
-                }
-                .filter(|id| self.phase.active_turn_id() != Some(id.as_str()));
-                let turn = match turn {
-                    TurnTarget::Open(id) if action && matches!(self.phase, TurnPhase::Idle) => {
-                        TurnTarget::Open(id)
+                let (turn, own_turn) = match payload {
+                    ClientPayload::Action(_) => {
+                        let (turn, own) = self.action_turn(turn)?;
+                        (turn, Some(own))
                     }
-                    TurnTarget::Open(_) if action => {
-                        if let Some(id) = &own_turn {
-                            self.turn_taken(id)?;
-                        }
-                        TurnTarget::Detached
-                    }
-                    turn => turn,
+                    _ => (turn, None),
                 };
-                let action_waits = own_turn.is_some() && self.phase.finalizing().is_some();
+                let action_waits = self.phase.finalizing().is_some();
                 let deferred = self.deferred_turn(&turn, queue, &payload)?;
                 if deferred.is_none() {
                     self.begin_turn(turn, metadata.clone())?;

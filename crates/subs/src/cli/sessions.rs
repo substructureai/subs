@@ -102,7 +102,7 @@ pub async fn run(command: SessionsCommand) -> Result<()> {
         },
         SessionsCommand::Cancel(cmd) => {
             match source(&cmd.scope.globals, cmd.db.clone())? {
-                Source::Local(db) => local_cancel(&cmd.session_id, &db)?,
+                Source::Local(db) => local_cancel(&cmd.session_id, &db).await?,
                 Source::Remote => remote_cancel(&cmd).await?,
             }
             eprintln!("cancelled {}", cmd.session_id);
@@ -123,41 +123,44 @@ async fn remote_cancel(cmd: &CancelCommand) -> Result<()> {
     Ok(())
 }
 
-fn local_cancel(session_id: &str, db: &str) -> Result<()> {
-    use crate::runtime::sessions::SessionStores as _;
+async fn local_cancel(session_id: &str, db: &str) -> Result<()> {
+    use crate::runtime::consumers::{IndexReader, MailReader};
+    use crate::runtime::inbox::{execute, ExecuteInput};
+    use crate::runtime::sessions::{Reader, Sessions};
     use crate::session::command::CommandPayload;
-    use crate::session::{Command, Session, Settings};
 
-    let stores = crate::providers::sqlite::SqliteSessionStores::new(open_db(db)?);
-    let mut mail = vec![(
-        session_id.to_string(),
-        Command::system(
-            format!("cli-cancel:{}", uuid::Uuid::now_v7()),
-            DEFAULT_TENANT,
-            CommandPayload::CancelSession,
-        ),
-    )];
-    while let Some((to, command)) = mail.pop() {
-        let store = stores.open(DEFAULT_TENANT, &to);
-        let mut session = Session::load(store.as_ref(), &to, DEFAULT_TENANT, Settings::default())?;
-        if !session.exists() {
-            if to == session_id {
-                bail!("no session {session_id} in {db}");
-            }
-            continue;
-        }
-        let ran = session.run(store.as_ref(), chrono::Utc::now(), command)?;
-        if let Err(rejected) = ran.result {
-            bail!("{to}: {:?}", rejected.error);
-        }
-        for sent in ran
-            .written
-            .map(|entry| session.mail(&entry.events))
-            .unwrap_or_default()
-        {
-            mail.push((sent.to, sent.command));
-        }
+    let db = open_db(db)?;
+    let readers: Vec<Arc<dyn Reader>> = vec![
+        Arc::new(IndexReader(Arc::new(SqliteSessionIndexStore::new(
+            db.clone(),
+        )?))),
+        Arc::new(MailReader),
+    ];
+    let sessions = Sessions::new(
+        Arc::new(crate::providers::sqlite::SqliteSessionStores::new(
+            db.clone(),
+        )),
+        Arc::new(crate::providers::sqlite::SqliteAlarms::new(db)),
+        readers,
+        Vec::new(),
+        None,
+        Default::default(),
+    );
+    if sessions.load(DEFAULT_TENANT, session_id).await?.is_none() {
+        bail!("no session {session_id} in the database");
     }
+    execute(
+        sessions.as_ref(),
+        ExecuteInput {
+            id: None,
+            session_id: session_id.to_string(),
+            caller: caller(),
+            command: CommandPayload::CancelSession,
+            span: crate::span::SpanContext::root().child("cli_cancel"),
+        },
+    )
+    .await?;
+    sessions.settled().await;
     Ok(())
 }
 
@@ -776,8 +779,8 @@ mod cancel_tests {
         }
     }
 
-    #[test]
-    fn a_local_cancel_ends_the_run_and_its_child() {
+    #[tokio::test]
+    async fn a_local_cancel_ends_the_run_and_its_subagents() {
         let dir = std::env::temp_dir().join(format!("subs-cancel-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("t.db").display().to_string();
@@ -837,16 +840,48 @@ mod cancel_tests {
                 parent_id: None,
             },
         );
+        let grandchild = run(
+            &child,
+            CommandPayload::RequestSubagent {
+                session_id: None,
+                agent_id: "helper".into(),
+                tool_call_id: "call-gc".into(),
+                message: None,
+                retry: RetryPolicy::no_retry(),
+                decision_id: "d2".into(),
+                mode: None,
+            },
+        )
+        .state()
+        .subagent("call-gc")
+        .unwrap()
+        .session_id
+        .clone();
+        run(&grandchild, create(vec!["parent".into(), child.clone()]));
+        run(
+            &grandchild,
+            CommandPayload::SendMessage {
+                message: message("dig"),
+                stream: false,
+                turn_id: Some("g1".into()),
+                parent_id: None,
+            },
+        );
 
-        local_cancel("parent", &db).unwrap();
+        local_cancel("parent", &db).await.unwrap();
 
         let load = |id: &str| {
             let store = stores.open(DEFAULT_TENANT, id);
             Session::load(store.as_ref(), id, DEFAULT_TENANT, Settings::default()).unwrap()
         };
         assert!(load("parent").state().phase.turn_id().is_none());
-        let child = load(&child);
-        assert!(child.state().phase.turn_id().is_none());
-        assert!(child.state().completed_turn_ids.contains(&"c1".to_string()));
+        for (id, turn) in [(&child, "c1"), (&grandchild, "g1")] {
+            let session = load(id);
+            assert!(session.state().phase.turn_id().is_none(), "{id} still runs");
+            assert!(session
+                .state()
+                .completed_turn_ids
+                .contains(&turn.to_string()));
+        }
     }
 }

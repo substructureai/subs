@@ -1177,8 +1177,10 @@ impl SessionState {
     }
 
     fn apply_decision_queued(&mut self, p: &DecisionQueued, ctx: &ApplyContext) {
-        if matches!(p.trigger, Trigger::SessionStart) {
-            self.session_start_failed = false;
+        match p.trigger {
+            Trigger::SessionStart => self.session_start_failed = false,
+            Trigger::TurnFinished { .. } => self.quiet_end = None,
+            _ => {}
         }
         let retry_policy = self.worker_retry.clone().unwrap_or(RetryPolicy::no_retry());
         self.insert_effect(
@@ -1464,7 +1466,6 @@ impl SessionState {
             }
             EventPayload::SessionCancelled => {
                 self.limited = None;
-                self.open_interrupts.clear();
             }
             EventPayload::SessionDone(_) => {
                 if !self.ancestry.is_empty() {

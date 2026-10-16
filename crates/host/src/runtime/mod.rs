@@ -244,7 +244,7 @@ impl Runtime {
     }
 
     pub async fn settled(&self) {
-        self.sessions.flushed().await;
+        self.sessions.settled().await;
     }
 
     pub fn decisions(&self) -> Arc<dyn Queue<WorkerDecisionRequest>> {

@@ -115,13 +115,14 @@ curl -X POST $BASE/api/machine/sessions/$SESSION/cancel \
 
 The engine:
 
-- stops the model calls and tools that the engine runs, within a few seconds;
+- stops the model calls and tools that the engine runs;
 - ends each open tool call with the result `cancelled: the turn ended`. A
   worker that runs its own call is not told. Its later result is refused;
 - cancels the subagents of the run, and their subagents;
 - drops the decisions that wait, the turns that wait with `queue`, and the
   client actions that wait;
-- clears the open interrupts;
+- ends each open interrupt with `session.interrupt_resumed` and the payload
+  `{ "status": "cancelled" }`;
 - ends the turn with `turn.completed` and the error code `cancelled`.
 
 The session stays usable. The next message starts a new turn. A session with no
