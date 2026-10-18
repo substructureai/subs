@@ -8,14 +8,14 @@ use crate::decision::Trigger;
 use crate::ids::Ids;
 use crate::propose::{propose, Proposing};
 use crate::protocol::{
-    AgentConfig, ClientContext, DecisionRequest, DecisionResponse, DecisionTrigger,
+    AgentConfig, ClientContext, DecisionRequest, DecisionResponse, DecisionTrigger, DecisionTurn,
     DeferToolsStrategy, DraftMessage, Effect, InterruptResumption, LlmFormat, LlmRequest, Message,
     MessageTree, SessionOwner, WorkerIdentity, WorkerRef, WorkerState,
 };
 use crate::reconcile::news_start;
 use crate::session::Session;
 use crate::span::SpanContext;
-use crate::state::{EffectState, EventMeta, SessionState};
+use crate::state::{EffectState, EventMeta};
 use crate::tool_contract::{classify_arguments, declared_tool, DeclaredTool};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,7 +57,7 @@ pub struct WorkerDecisionRequest {
     pub attempts: u32,
     pub deadline: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub turn_id: Option<String>,
+    pub turn: Option<DecisionTurn>,
 }
 
 impl WorkerDecisionRequest {
@@ -87,16 +87,12 @@ impl<'a> From<&'a WorkerDecisionRequest> for DecisionRequest<'a> {
             ancestry: &r.ancestry,
             attempts: r.attempts,
             deadline: &r.deadline,
-            turn_id: &r.turn_id,
+            turn: &r.turn,
         }
     }
 }
 
 impl Session {
-    pub fn state_at(&self, seq: u64, head_id: Option<&str>) -> SessionState {
-        self.state.clone().rewind(seq, head_id)
-    }
-
     pub fn decision_request(
         &self,
         decision_id: &str,
@@ -110,16 +106,16 @@ impl Session {
             .decisions
             .iter()
             .find(|d| d.decision_id == decision_id)?;
-        let mut trigger = self.state.worker_decision(decision_id)?.trigger.clone();
+        let worker_decision = self.state.worker_decision(decision_id)?;
+        let mut trigger = worker_decision.trigger.clone();
         let worker = self.state.worker.clone();
-        let state = self.state_at(seq, meta.head_id.as_deref());
-        let message_tree = state.message_tree();
+        let at = self.state.at(meta.head_id.as_deref()).until(seq);
+        let message_tree = at.message_tree();
         let transcript = message_tree
             .head_id
             .as_deref()
             .map(|h| message_tree.path_to(h))
             .unwrap_or_default();
-        let at = state.at_head();
         let open_llm_calls = at.open_llm_calls();
         let pending_calls = meta.pending_work(decision_id);
         let worker_state = at.resolve_state_for();
@@ -159,7 +155,7 @@ impl Session {
             span: span.clone(),
             attempts: decision.attempts,
             deadline: decision.deadline,
-            turn_id: meta.turn_id.clone(),
+            turn: worker_decision.turn.as_deref().cloned(),
         };
         Some((request, prompt))
     }
@@ -229,7 +225,7 @@ pub fn wire_trigger(
                 client,
             }
         }
-        Trigger::ClientAction { name, args } => DecisionTrigger::ClientAction { name, args },
+        Trigger::ClientAction { name, args, .. } => DecisionTrigger::ClientAction { name, args },
         Trigger::ContextLimit {
             reason,
             strategy,

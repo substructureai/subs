@@ -242,6 +242,7 @@ fn command_path(cmd: &Command) -> &'static str {
         Command::Sessions { command } => match command {
             SessionsCommand::List(_) => "sessions list",
             SessionsCommand::Events(_) => "sessions events",
+            SessionsCommand::Cancel(_) => "sessions cancel",
         },
     }
 }

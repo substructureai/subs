@@ -16,7 +16,18 @@ pub trait Inbox: Send + Sync {
     ) -> Result<CommandResult, substructure_session::Error>;
 
     async fn is_open(&self, tenant_id: &str, session_id: &str, work: &WorkId) -> bool;
+
+    async fn ended(&self, tenant_id: &str, session_id: &str, work: &WorkId) {
+        loop {
+            tokio::time::sleep(RECHECK).await;
+            if !self.is_open(tenant_id, session_id, work).await {
+                return;
+            }
+        }
+    }
 }
+
+pub const RECHECK: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub struct ExecuteInput {
     pub id: Option<CommandId>,

@@ -283,7 +283,7 @@ mod tests {
             span: SpanContext::root(),
             attempts: 0,
             deadline: None,
-            turn_id: None,
+            turn: None,
         }
     }
 

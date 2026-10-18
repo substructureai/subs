@@ -16,6 +16,7 @@ pub enum Dep {
     EntryDispatched { kind: EffectKind, id: String },
     InterruptResumed { interrupt_id: String },
     TurnSettled { turn_id: String },
+    WorkSettled { kind: EffectKind, id: String },
 }
 
 impl Dep {
@@ -26,6 +27,7 @@ impl Dep {
             Dep::EntryDispatched { kind, id } => format!("queued_behind:{}:{id}", kind.label()),
             Dep::InterruptResumed { interrupt_id } => format!("interrupt:{interrupt_id}"),
             Dep::TurnSettled { turn_id } => format!("turn:{turn_id}"),
+            Dep::WorkSettled { kind, id } => format!("{}:{id}", kind.label()),
         }
     }
 }
@@ -39,6 +41,7 @@ pub enum ScheduleStep {
     Retry { kind: EffectKind, id: String },
     Resend { kind: EffectKind, id: String },
     RedispatchDecision { decision_id: String },
+    EndQuietTurn,
 }
 
 impl ScheduleStep {
@@ -61,6 +64,9 @@ pub fn plan(state: &SessionState, now: DateTime<Utc>) -> Vec<ScheduleStep> {
     let dispatches = walk(state);
     if !dispatches.is_empty() {
         return dispatches;
+    }
+    if state.quiet_turn_ended() {
+        return vec![ScheduleStep::EndQuietTurn];
     }
     sweep(state, now).into_iter().collect()
 }
@@ -357,6 +363,7 @@ mod tests {
                 trigger,
                 source_event_sequence: seq,
                 dispatched_seq: None,
+                turn: None,
             }),
         ));
     }
@@ -396,6 +403,7 @@ mod tests {
             client: Default::default(),
             turn_id: None,
             merge: false,
+            metadata: Default::default(),
         }
     }
 
@@ -405,6 +413,7 @@ mod tests {
             client: Default::default(),
             turn_id: Some(turn_id.to_string()),
             merge: false,
+            metadata: Default::default(),
         }
     }
 

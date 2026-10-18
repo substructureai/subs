@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -122,6 +123,8 @@ pub struct SubmitClientPayload {
     pub continue_turn: bool,
 
     pub queue: QueueMode,
+
+    pub metadata: BTreeMap<String, String>,
 }
 
 pub struct SubmitClientPayloadOutput {
@@ -241,7 +244,7 @@ impl Runtime {
     }
 
     pub async fn settled(&self) {
-        self.sessions.flushed().await;
+        self.sessions.settled().await;
     }
 
     pub fn decisions(&self) -> Arc<dyn Queue<WorkerDecisionRequest>> {
@@ -316,6 +319,7 @@ impl Runtime {
         )
         .await?;
 
+        let action = matches!(input.payload, ClientPayload::Action(_));
         let send_result = execute(
             self.sessions.as_ref(),
             ExecuteInput {
@@ -324,12 +328,14 @@ impl Runtime {
                 caller: input.caller,
                 command: CommandPayload::SubmitClientPayload {
                     turn: match (&input.payload, input.continue_turn) {
-                        (ClientPayload::Action(_), _) => TurnTarget::Detached,
+                        (ClientPayload::Action(_), _) | (_, false) => {
+                            TurnTarget::Open(turn_id.clone())
+                        }
                         (_, true) => TurnTarget::Continue(turn_id.clone()),
-                        (_, false) => TurnTarget::Open(turn_id.clone()),
                     },
                     payload: input.payload,
                     queue: input.queue,
+                    metadata: input.metadata,
                 },
                 span: span.child("submit_client_payload"),
             },
@@ -337,10 +343,14 @@ impl Runtime {
         .await;
 
         let (effective_turn_id, queued) = match send_result {
-            Ok(out) if input.continue_turn => (out.turn_id.unwrap_or(turn_id), false),
-            Ok(out) if out.queued => (out.turn_id.unwrap_or(turn_id), true),
-            Ok(_) => (turn_id, false),
+            Ok(out) => (
+                out.turn_id.unwrap_or(turn_id),
+                out.queued && !input.continue_turn,
+            ),
 
+            Err(ExecuteError::Command(e @ SessionError::TurnAlreadyActive { .. })) if action => {
+                return Err(ExecuteError::Command(e).into())
+            }
             Err(ExecuteError::Command(SessionError::TurnAlreadyActive { turn_id: held })) => {
                 let queued = input.queue.holds()
                     && held == turn_id
@@ -539,6 +549,7 @@ impl Runtime {
                 turn_id,
                 continue_turn: false,
                 queue,
+                metadata: BTreeMap::new(),
             })
             .await?;
         Ok(ClientInputOutput {
@@ -779,6 +790,27 @@ impl Runtime {
                     payload: input.payload,
                 },
                 span: input.span,
+            },
+        )
+        .await
+        .map(|_| ())
+        .map_err(RuntimeError::from)
+    }
+
+    pub async fn cancel_session(
+        &self,
+        session_id: String,
+        caller: Caller,
+        span: SpanContext,
+    ) -> Result<(), RuntimeError> {
+        execute(
+            self.sessions.as_ref(),
+            ExecuteInput {
+                id: None,
+                session_id,
+                caller,
+                command: CommandPayload::CancelSession,
+                span,
             },
         )
         .await

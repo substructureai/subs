@@ -1,4 +1,5 @@
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use async_trait::async_trait;
@@ -12,8 +13,9 @@ use tokio::sync::{mpsc, oneshot};
 use crate::protocol::MessageTree;
 
 use crate::runtime::event_store::{BroadcastBus, EventBus, EventFilter, EventTap, StoreError};
-use crate::runtime::inbox::Inbox;
 pub use crate::runtime::inbox::{execute, ExecuteError, ExecuteInput, ExecuteOutput};
+use crate::runtime::inbox::{Inbox, RECHECK};
+use crate::runtime::session::events::EventPayload;
 use crate::runtime::session::SessionEvent;
 use crate::runtime::wake::Alarms;
 
@@ -113,6 +115,10 @@ pub trait Dispatch: Send + Sync {
 
     fn send_outside(&self, sessions: &Weak<Sessions>, hint: OutsideHint);
 
+    async fn settled(&self) {
+        self.flushed().await;
+    }
+
     async fn flushed(&self);
 }
 
@@ -145,6 +151,7 @@ enum Job {
 pub struct Shards {
     main: OnceLock<Vec<mpsc::UnboundedSender<Job>>>,
     outside: OnceLock<Vec<mpsc::UnboundedSender<Job>>>,
+    sent: AtomicU64,
 }
 
 fn shard_of(
@@ -201,6 +208,7 @@ impl Shards {
 #[async_trait]
 impl Dispatch for Shards {
     fn send(&self, sessions: &Weak<Sessions>, hint: Hint) {
+        self.sent.fetch_add(1, Ordering::SeqCst);
         let shards = self.main.get_or_init(|| Self::spawn(sessions, SHARDS));
         let Some(shard) = shard_of(shards, (&hint.tenant_id, &hint.session_id)) else {
             return;
@@ -211,6 +219,7 @@ impl Dispatch for Shards {
     }
 
     fn send_outside(&self, sessions: &Weak<Sessions>, hint: OutsideHint) {
+        self.sent.fetch_add(1, Ordering::SeqCst);
         let shards = self
             .outside
             .get_or_init(|| Self::spawn(sessions, OUTSIDE_SHARDS));
@@ -226,6 +235,16 @@ impl Dispatch for Shards {
     async fn flushed(&self) {
         flush(self.main.get()).await;
         flush(self.outside.get()).await;
+    }
+
+    async fn settled(&self) {
+        loop {
+            let sent = self.sent.load(Ordering::SeqCst);
+            self.flushed().await;
+            if self.sent.load(Ordering::SeqCst) == sent {
+                return;
+            }
+        }
     }
 }
 
@@ -415,6 +434,10 @@ impl Sessions {
 
     pub async fn flushed(&self) {
         self.dispatch.flushed().await;
+    }
+
+    pub async fn settled(&self) {
+        self.dispatch.settled().await;
     }
 
     pub async fn load(
@@ -739,6 +762,31 @@ impl Inbox for Sessions {
     async fn is_open(&self, tenant_id: &str, session_id: &str, work: &WorkId) -> bool {
         Sessions::is_open(self, tenant_id, session_id, work).await
     }
+
+    async fn ended(&self, tenant_id: &str, session_id: &str, work: &WorkId) {
+        let mut tap = self.subscribe();
+        let mut recheck = tokio::time::interval(RECHECK);
+        recheck.tick().await;
+        loop {
+            tokio::select! {
+                Some(batch) = tap.recv() => {
+                    if !batch.iter().any(|e| voids(e, tenant_id, session_id, work)) {
+                        continue;
+                    }
+                }
+                _ = recheck.tick() => {}
+            }
+            if !self.is_open(tenant_id, session_id, work).await {
+                return;
+            }
+        }
+    }
+}
+
+fn voids(event: &SessionEvent, tenant_id: &str, session_id: &str, work: &WorkId) -> bool {
+    event.tenant_id == tenant_id
+        && event.session_id == session_id
+        && matches!(&event.payload, EventPayload::CallVoided(v) if v.kind == work.kind && v.id == work.id)
 }
 
 async fn step<T: Send + 'static>(
@@ -841,6 +889,7 @@ mod tests {
     use crate::protocol::{Issuer, Requester, RetryPolicy, SessionOwner};
     use crate::runtime::caller::Caller;
     use crate::runtime::session::command::{CommandPayload, SessionError};
+    use crate::runtime::session::state::EffectKind;
     use crate::runtime::span::SpanContext;
 
     #[derive(Default)]
@@ -1242,6 +1291,7 @@ mod tests {
                 }),
                 turn: TurnTarget::Open(turn.to_string()),
                 queue: QueueMode::Refuse,
+                metadata: Default::default(),
             })
         };
         decide(vec![]).await;
@@ -1373,5 +1423,66 @@ mod tests {
         let sent = sink.sent.lock().unwrap().clone();
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].attempt, Some(0));
+    }
+
+    fn voided(session_id: &str, id: &str) -> SessionEvent {
+        let at = Utc::now();
+        SessionEvent {
+            id: uuid::Uuid::nil(),
+            tenant_id: "t".into(),
+            session_id: session_id.into(),
+            seq: 1,
+            span: SpanContext::root(),
+            occurred_at: at,
+            payload: EventPayload::CallVoided(crate::runtime::session::events::CallVoided {
+                kind: EffectKind::LlmCall,
+                id: id.into(),
+            }),
+            meta: crate::runtime::session::state::EventMeta {
+                status: crate::runtime::session::state::SessionStatus::Idle,
+                wake_at: None,
+                owner: None,
+                agent_id: None,
+                ancestry: Vec::new(),
+                turn_id: None,
+                cost: Default::default(),
+                subagent_cost: Default::default(),
+                head_id: None,
+                calls: Vec::new(),
+                decisions: Vec::new(),
+            },
+            start_time: at,
+            end_time: at,
+            command_id: None,
+        }
+    }
+
+    async fn ends_within(s: &Sessions, published: SessionEvent) -> bool {
+        let work = WorkId::new(EffectKind::LlmCall, "call-1", Some(0));
+        let publish = async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            s.bus.publish(Arc::new(vec![published]));
+        };
+        let ended = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            Inbox::ended(s, "t", "s1", &work),
+        );
+        tokio::join!(ended, publish).0.is_ok()
+    }
+
+    #[tokio::test]
+    async fn a_task_learns_at_once_that_its_call_was_voided() {
+        let disk = testing::disk();
+        let s = Sessions::new(
+            disk.stores(),
+            disk.alarms(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            SessionsConfig::default(),
+        );
+        assert!(ends_within(&s, voided("s1", "call-1")).await);
+        assert!(!ends_within(&s, voided("s1", "call-2")).await);
+        assert!(!ends_within(&s, voided("s2", "call-1")).await);
     }
 }

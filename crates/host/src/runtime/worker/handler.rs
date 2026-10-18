@@ -237,6 +237,7 @@ mod tests {
                 }),
                 turn: TurnTarget::Detached,
                 queue: Default::default(),
+                metadata: Default::default(),
             },
             &system(),
         )

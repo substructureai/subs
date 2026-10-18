@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use super::{Completion, SessionError};
 use crate::decision::{ToolHandler, Trigger};
 use crate::effects::{decision_queued, tool};
@@ -135,8 +137,9 @@ impl SessionState {
         ids: &Ids,
         payload: ClientPayload,
         caller: &Caller,
-        deferred_turn: Option<String>,
+        turn_id: Option<String>,
         merge: bool,
+        metadata: BTreeMap<String, String>,
     ) -> Result<(Vec<EventPayload>, Option<String>), SessionError> {
         self.ensure_owns_session(caller)?;
         match payload {
@@ -155,8 +158,9 @@ impl SessionState {
                         ids,
                         vec![message],
                         ClientContext::default(),
-                        deferred_turn,
+                        turn_id,
                         merge,
+                        metadata,
                     );
                     events.extend(queued);
                     waiting = turn;
@@ -177,7 +181,7 @@ impl SessionState {
                     events.push(decision_queued(ids, Trigger::SessionStart));
                 }
                 let (queued, waiting) =
-                    self.client_turn(ids, messages, client, deferred_turn, merge);
+                    self.client_turn(ids, messages, client, turn_id, merge, metadata);
                 events.extend(queued);
                 Ok((events, waiting))
             }
@@ -194,6 +198,8 @@ impl SessionState {
                     Trigger::ClientAction {
                         name: action.name,
                         args: action.args,
+                        turn_id,
+                        metadata,
                     },
                 )],
                 None,
@@ -208,6 +214,7 @@ impl SessionState {
         client: ClientContext,
         turn_id: Option<String>,
         merge: bool,
+        metadata: BTreeMap<String, String>,
     ) -> (Vec<EventPayload>, Option<String>) {
         let waiting = merge.then(|| self.waiting_merge()).flatten();
         let Some(waiting) = waiting else {
@@ -218,6 +225,7 @@ impl SessionState {
                     client,
                     turn_id: turn_id.clone(),
                     merge,
+                    metadata,
                 },
             )];
             return (queued, turn_id);
@@ -235,6 +243,7 @@ impl SessionState {
             id: waiting.decision_id.to_string(),
             messages: fresh,
             client,
+            metadata,
         })];
         (queued, Some(waiting.turn_id.to_string()))
     }

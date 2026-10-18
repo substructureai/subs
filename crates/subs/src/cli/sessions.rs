@@ -33,6 +33,20 @@ pub enum SessionsCommand {
     /// Print a session's events. Prints all events and exits; pass --stream to
     /// follow live (Ctrl-C to stop).
     Events(EventsCommand),
+    /// Cancel a session's current run and its subagents. The session stays
+    /// usable.
+    Cancel(CancelCommand),
+}
+
+#[derive(Args)]
+pub struct CancelCommand {
+    pub session_id: String,
+    /// Use this SQLite database instead of a deployment. [default: the
+    /// engine's, when the file names no `[remote]`]
+    #[arg(long)]
+    pub db: Option<String>,
+    #[command(flatten)]
+    pub scope: ProjectScope,
 }
 
 #[derive(Args)]
@@ -86,7 +100,68 @@ pub async fn run(command: SessionsCommand) -> Result<()> {
             Source::Local(db) => local_events(&cmd, &db).await,
             Source::Remote => remote_events(&cmd).await,
         },
+        SessionsCommand::Cancel(cmd) => {
+            match source(&cmd.scope.globals, cmd.db.clone())? {
+                Source::Local(db) => local_cancel(&cmd.session_id, &db).await?,
+                Source::Remote => remote_cancel(&cmd).await?,
+            }
+            eprintln!("cancelled {}", cmd.session_id);
+            Ok(())
+        }
     }
+}
+
+async fn remote_cancel(cmd: &CancelCommand) -> Result<()> {
+    let (ctx, project) = Context::from_project(&cmd.scope).await?;
+    let _: serde_json::Value = ctx
+        .client
+        .post_empty(&format!(
+            "/api/v1/projects/{project}/sessions/{}/cancel",
+            cmd.session_id
+        ))
+        .await?;
+    Ok(())
+}
+
+async fn local_cancel(session_id: &str, db: &str) -> Result<()> {
+    use crate::runtime::consumers::{IndexReader, MailReader};
+    use crate::runtime::inbox::{execute, ExecuteInput};
+    use crate::runtime::sessions::{Reader, Sessions};
+    use crate::session::command::CommandPayload;
+
+    let db = open_db(db)?;
+    let readers: Vec<Arc<dyn Reader>> = vec![
+        Arc::new(IndexReader(Arc::new(SqliteSessionIndexStore::new(
+            db.clone(),
+        )?))),
+        Arc::new(MailReader),
+    ];
+    let sessions = Sessions::new(
+        Arc::new(crate::providers::sqlite::SqliteSessionStores::new(
+            db.clone(),
+        )),
+        Arc::new(crate::providers::sqlite::SqliteAlarms::new(db)),
+        readers,
+        Vec::new(),
+        None,
+        Default::default(),
+    );
+    if sessions.load(DEFAULT_TENANT, session_id).await?.is_none() {
+        bail!("no session {session_id} in the database");
+    }
+    execute(
+        sessions.as_ref(),
+        ExecuteInput {
+            id: None,
+            session_id: session_id.to_string(),
+            caller: caller(),
+            command: CommandPayload::CancelSession,
+            span: crate::span::SpanContext::root().child("cli_cancel"),
+        },
+    )
+    .await?;
+    sessions.settled().await;
+    Ok(())
 }
 
 enum Source {
@@ -660,5 +735,153 @@ mod tests {
         let decoded = SessionCursor::decode(&cursor.encode().unwrap()).unwrap();
         assert_eq!(decoded.session_id, "sess-1");
         assert_eq!(decoded.at, cursor.at);
+    }
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::protocol::{
+        DraftMessage, Issuer, Requester, RetryPolicy, Role, SessionOwner, Subject,
+    };
+    use crate::runtime::sessions::SessionStores as _;
+    use crate::session::command::CommandPayload;
+    use crate::session::{Command, Session, Settings};
+
+    fn message(text: &str) -> DraftMessage {
+        DraftMessage {
+            id: None,
+            role: Role::User,
+            content: Some(crate::protocol::Content::Text(text.to_string())),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            reasoning: None,
+        }
+    }
+
+    fn create(ancestry: Vec<String>) -> CommandPayload {
+        CommandPayload::CreateSession {
+            agent_id: "agent".into(),
+            owner: SessionOwner {
+                tenant_id: DEFAULT_TENANT.into(),
+                requester: Requester::new(Subject::new(Issuer::app(), "u"), Default::default()),
+                metadata: HashMap::new(),
+            },
+            ancestry,
+            worker_retry: RetryPolicy::no_retry(),
+            agent: None,
+            worker: None,
+            events: None,
+            state: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_local_cancel_ends_the_run_and_its_subagents() {
+        let dir = std::env::temp_dir().join(format!("subs-cancel-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("t.db").display().to_string();
+        let stores = crate::providers::sqlite::SqliteSessionStores::new(
+            SqliteDb::open(&db, BUSY_TIMEOUT).unwrap(),
+        );
+        let run = |id: &str, payload: CommandPayload| -> Session {
+            let store = stores.open(DEFAULT_TENANT, id);
+            let mut session =
+                Session::load(store.as_ref(), id, DEFAULT_TENANT, Settings::default()).unwrap();
+            let ran = session
+                .run(
+                    store.as_ref(),
+                    chrono::Utc::now(),
+                    Command::system(uuid::Uuid::now_v7().to_string(), DEFAULT_TENANT, payload),
+                )
+                .unwrap();
+            assert!(ran.result.is_ok(), "{:?}", ran.result);
+            session
+        };
+
+        run("parent", create(vec![]));
+        run(
+            "parent",
+            CommandPayload::SendMessage {
+                message: message("hi"),
+                stream: false,
+                turn_id: Some("t1".into()),
+                parent_id: None,
+            },
+        );
+        let parent = run(
+            "parent",
+            CommandPayload::RequestSubagent {
+                session_id: None,
+                agent_id: "helper".into(),
+                tool_call_id: "call-sa".into(),
+                message: None,
+                retry: RetryPolicy::no_retry(),
+                decision_id: "d".into(),
+                mode: None,
+            },
+        );
+        let child = parent
+            .state()
+            .subagent("call-sa")
+            .unwrap()
+            .session_id
+            .clone();
+        run(&child, create(vec!["parent".into()]));
+        run(
+            &child,
+            CommandPayload::SendMessage {
+                message: message("do it"),
+                stream: false,
+                turn_id: Some("c1".into()),
+                parent_id: None,
+            },
+        );
+        let grandchild = run(
+            &child,
+            CommandPayload::RequestSubagent {
+                session_id: None,
+                agent_id: "helper".into(),
+                tool_call_id: "call-gc".into(),
+                message: None,
+                retry: RetryPolicy::no_retry(),
+                decision_id: "d2".into(),
+                mode: None,
+            },
+        )
+        .state()
+        .subagent("call-gc")
+        .unwrap()
+        .session_id
+        .clone();
+        run(&grandchild, create(vec!["parent".into(), child.clone()]));
+        run(
+            &grandchild,
+            CommandPayload::SendMessage {
+                message: message("dig"),
+                stream: false,
+                turn_id: Some("g1".into()),
+                parent_id: None,
+            },
+        );
+
+        local_cancel("parent", &db).await.unwrap();
+
+        let load = |id: &str| {
+            let store = stores.open(DEFAULT_TENANT, id);
+            Session::load(store.as_ref(), id, DEFAULT_TENANT, Settings::default()).unwrap()
+        };
+        assert!(load("parent").state().phase.turn_id().is_none());
+        for (id, turn) in [(&child, "c1"), (&grandchild, "g1")] {
+            let session = load(id);
+            assert!(session.state().phase.turn_id().is_none(), "{id} still runs");
+            assert!(session
+                .state()
+                .completed_turn_ids
+                .contains(&turn.to_string()));
+        }
     }
 }

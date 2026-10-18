@@ -462,7 +462,7 @@ fn unconfigured(view: &[DraftMessage]) -> DecisionResponse {
     }
 }
 
-fn subagent_text(
+pub(crate) fn subagent_text(
     ok: bool,
     session_id: &str,
     result: &Option<String>,
@@ -522,7 +522,11 @@ fn tool_error(id: &str, error: String, transcript: &[Message]) -> DecisionRespon
     }
 }
 
-fn settled_content(ok: bool, result: &Option<StoredResult>, error: &Option<ErrorInfo>) -> Content {
+pub(crate) fn settled_content(
+    ok: bool,
+    result: &Option<StoredResult>,
+    error: &Option<ErrorInfo>,
+) -> Content {
     if !ok {
         let text = error
             .as_ref()

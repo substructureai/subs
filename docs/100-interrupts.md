@@ -104,6 +104,35 @@ that wants its own rules, such as who may answer, reads the `responder` there
 and can raise the interrupt again. A second click on a prompt that is already
 answered does nothing.
 
+## Cancel a run
+
+An interrupt pauses a run. A cancel stops it.
+
+```sh
+curl -X POST $BASE/api/machine/sessions/$SESSION/cancel \
+    -H "Authorization: Bearer $API_KEY"
+```
+
+The engine:
+
+- stops the model calls and tools that the engine runs;
+- ends each open tool call with the result `cancelled: the turn ended`. A
+  worker that runs its own call is not told. Its later result is refused;
+- cancels the subagents of the run, and their subagents;
+- drops the decisions that wait, the turns that wait with `queue`, and the
+  client actions that wait;
+- ends each open interrupt with `session.interrupt_resumed` and the payload
+  `{ "status": "cancelled" }`;
+- ends the turn with `turn.completed` and the error code `cancelled`.
+
+The session stays usable. The next message starts a new turn. A session with no
+run is not changed.
+
+Clients cancel with `POST /api/client/sessions/{session_id}/cancel`. In
+`subs chat` and `subs run`, `Ctrl-C` during a turn cancels it.
+`subs sessions cancel <session-id>` cancels a run from another terminal. On a
+local database, use it only when no engine runs on that file.
+
 ## Reference
 
 ```typescript

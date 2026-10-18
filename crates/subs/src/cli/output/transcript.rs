@@ -177,6 +177,7 @@ impl PrettyPrinter {
             }
             AgUiEvent::RunError { message } => {
                 self.status.set(Phase::Idle);
+                self.tools.clear();
                 self.break_line(w)?;
                 self.write_styled(w, BOLD, &format!("✗ error: {message}"))?;
                 self.newline(w)?;
@@ -582,6 +583,17 @@ mod tests {
              which this chat cannot settle.\n"
         );
         assert!(!out.contains("--input"), "got {out}");
+    }
+
+    #[test]
+    fn a_failed_run_leaves_no_call_pending_for_the_next() {
+        let mut evs = call("call_a", "writer");
+        evs.push(AgUiEvent::RunError {
+            message: "session cancelled".into(),
+        });
+        evs.push(run_finished());
+        let out = render_with(at_a_prompt(), evs);
+        assert_eq!(out, "✗ error: session cancelled\n");
     }
 
     #[test]

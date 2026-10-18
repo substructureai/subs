@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroUsize;
 
 use chrono::{DateTime, Utc};
@@ -1795,6 +1795,7 @@ pub enum ErrorCode {
     Unroutable,
     Internal,
     ContextOverflow,
+    Cancelled,
 }
 
 /// Why something failed. One shape on every event and on the wire.
@@ -2051,16 +2052,6 @@ pub struct ClientAction {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub args: Option<Value>,
-}
-
-impl ClientPayload {
-    pub fn client_state(&self) -> Option<&Value> {
-        match self {
-            ClientPayload::Messages(m) => m.client.state.as_ref(),
-            ClientPayload::Append(a) => a.client.state.as_ref(),
-            ClientPayload::Message(_) | ClientPayload::Action(_) => None,
-        }
-    }
 }
 
 /// What a client submits: a message, its full conversation view, an append
@@ -2721,7 +2712,16 @@ pub struct DecisionRequest<'a> {
     pub ancestry: &'a [String],
     pub attempts: u32,
     pub deadline: &'a Option<DateTime<Utc>>,
-    pub turn_id: &'a Option<String>,
+    /// The turn this decision belongs to. `null` outside a turn.
+    pub turn: &'a Option<DecisionTurn>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DecisionTurn {
+    pub id: String,
+    /// The `metadata` the turn was submitted with.
+    #[serde(default)]
+    pub metadata: BTreeMap<String, String>,
 }
 
 impl LlmTool {

@@ -20,7 +20,7 @@ use super::cloud::context::Context as CloudContext;
 use super::cloud::project_config::{self, ProjectConfig};
 use super::cloud::{CloudGlobals, ProjectScope};
 use super::env::{EnvVars, OutputFormat};
-use super::output::Renderer;
+use super::output::{self, Renderer};
 use super::output::{unfinished, TurnEnd, TurnRender};
 use super::target::target;
 use super::{local, run_remote, DEFAULT_TENANT, LOCAL_SUBJECT};
@@ -62,11 +62,34 @@ pub(crate) fn declared_agent(agent_id: String, cfg: &ProjectConfig) -> Result<St
 
 #[async_trait]
 pub(crate) trait Turns: Send + Sync {
-    async fn drive(&mut self, input: ClientInput, renderer: &mut Renderer) -> Result<TurnEnd>;
+    async fn drive(&self, input: ClientInput, renderer: &mut Renderer) -> Result<TurnEnd>;
+
+    async fn cancel(&self) -> Result<()>;
 
     async fn parked(&self) -> Result<Vec<AgUiInterrupt>>;
 
     async fn settled(&self) {}
+}
+
+pub(crate) async fn drive_or_cancel(
+    turns: &dyn Turns,
+    input: ClientInput,
+    renderer: &mut Renderer,
+) -> Result<Option<TurnEnd>> {
+    let driven = turns.drive(input, renderer);
+    tokio::pin!(driven);
+    tokio::select! {
+        end = &mut driven => return end.map(Some),
+        _ = tokio::signal::ctrl_c() => {}
+    }
+    match turns.cancel().await {
+        Ok(()) => output::note("\ncancelling. Press Ctrl-C again to stop watching."),
+        Err(e) => output::note(&format!("\ncancel failed: {e:#}")),
+    }
+    tokio::select! {
+        end = &mut driven => end.map(Some),
+        _ = tokio::signal::ctrl_c() => Ok(None),
+    }
 }
 
 pub(crate) struct Open {
@@ -133,7 +156,7 @@ struct LocalTurns {
 
 #[async_trait]
 impl Turns for LocalTurns {
-    async fn drive(&mut self, input: ClientInput, renderer: &mut Renderer) -> Result<TurnEnd> {
+    async fn drive(&self, input: ClientInput, renderer: &mut Renderer) -> Result<TurnEnd> {
         let translated = !renderer.is_raw();
         let turn = ag_ui_run::start(
             &self.ctx,
@@ -182,6 +205,17 @@ impl Turns for LocalTurns {
         Ok(render.into_end())
     }
 
+    async fn cancel(&self) -> Result<()> {
+        self.rt
+            .cancel_session(
+                self.session_id.clone(),
+                self.caller.clone(),
+                crate::span::SpanContext::root().child(SPAN),
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn parked(&self) -> Result<Vec<AgUiInterrupt>> {
         let Ok(session) = self.rt.get_session(DEFAULT_TENANT, &self.session_id).await else {
             return Ok(Vec::new());
@@ -209,7 +243,7 @@ struct RemoteTurns {
 
 #[async_trait]
 impl Turns for RemoteTurns {
-    async fn drive(&mut self, input: ClientInput, renderer: &mut Renderer) -> Result<TurnEnd> {
+    async fn drive(&self, input: ClientInput, renderer: &mut Renderer) -> Result<TurnEnd> {
         run_remote::drive(
             &self.ctx,
             &self.project,
@@ -219,6 +253,15 @@ impl Turns for RemoteTurns {
             self.format,
         )
         .await
+    }
+
+    async fn cancel(&self) -> Result<()> {
+        let path = format!(
+            "/api/v1/projects/{}/sessions/{}/cancel",
+            self.project, self.session_id
+        );
+        let _: serde_json::Value = self.ctx.client.post_empty(&path).await?;
+        Ok(())
     }
 
     async fn parked(&self) -> Result<Vec<AgUiInterrupt>> {

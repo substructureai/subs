@@ -141,9 +141,9 @@ Two more inputs help a chat app:
 
 - [`queue: "merge"`](./120-conversations.md#one-turn-at-a-time) puts the
   messages that arrive during a turn into one next turn.
-- `client.state` on `client.append` carries data for the turn, such as the
-  message it answers. It arrives on the first decision of the turn, and on its
-  `turn.started` event as `client_state`.
+- `metadata` on the submit carries data for the turn, such as the message it
+  answers. It arrives on each decision of the turn as `turn.metadata`, and on
+  its `turn.started` event as `metadata`.
 
 ## Chat apps
 

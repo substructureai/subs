@@ -1,5 +1,5 @@
 use crate::protocol::StoredResult;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use chrono::{DateTime, Duration, Utc};
 
@@ -178,6 +178,13 @@ fn config_with_mcp(connection: &str) -> AgentConfig {
     }
 }
 
+fn meta(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
 fn retrying() -> RetryPolicy {
     RetryPolicy {
         queue_timeout_secs: None,
@@ -192,7 +199,7 @@ fn retrying() -> RetryPolicy {
 struct Trace {
     agg: Session,
     names: Vec<String>,
-    started: Vec<(String, Option<serde_json::Value>)>,
+    started: Vec<(String, BTreeMap<String, String>)>,
     arms: BTreeSet<&'static str>,
     now: DateTime<Utc>,
 }
@@ -256,7 +263,7 @@ impl Trace {
         );
         self.names.extend(events.iter().map(name));
         self.started.extend(events.iter().filter_map(|e| match e {
-            EventPayload::TurnStarted(t) => Some((t.turn_id.clone(), t.client_state.clone())),
+            EventPayload::TurnStarted(t) => Some((t.turn_id.clone(), t.metadata.clone())),
             _ => None,
         }));
         events
@@ -295,10 +302,17 @@ impl Trace {
             }),
             turn: turn_id.map_or(TurnTarget::Detached, |t| TurnTarget::Open(t.to_string())),
             queue: queue.into(),
+            metadata: Default::default(),
         }
     }
 
-    fn merge(&mut self, messages: Vec<DraftMessage>, turn_id: &str, state: serde_json::Value) {
+    fn merge(
+        &mut self,
+        messages: Vec<DraftMessage>,
+        turn_id: &str,
+        state: serde_json::Value,
+        metadata: &[(&str, &str)],
+    ) {
         self.run(
             CommandPayload::SubmitClientPayload {
                 payload: ClientPayload::Append(ClientAppend {
@@ -311,9 +325,20 @@ impl Trace {
                 }),
                 turn: TurnTarget::Open(turn_id.to_string()),
                 queue: QueueMode::Merge,
+                metadata: meta(metadata),
             },
             &frontend(),
         );
+    }
+
+    fn click(&mut self, turn_id: &str, metadata: &[(&str, &str)]) {
+        self.run(click_command(turn_id, metadata), &frontend());
+    }
+
+    fn live_turn(&self) -> Option<String> {
+        let id = self.live_decision();
+        let turn = self.agg.state.worker_decision(&id)?.turn.as_ref()?;
+        Some(turn.id.clone())
     }
 
     fn waiting_turns(&self) -> Vec<(String, Vec<String>)> {
@@ -506,6 +531,370 @@ fn flow_full_loop() -> Trace {
     assert!(matches!(t.live_trigger(), Trigger::TurnFinished { .. }));
     t.decide(vec![], vec![done()]);
     t
+}
+
+#[test]
+fn done_closes_the_calls_still_open() {
+    let mut t = Trace::create();
+    t.decide(vec![], vec![]);
+    t.submit("render it", Some("turn-1"));
+    t.decide_appending(
+        user_message("render it"),
+        vec![call_llm("call-1", RetryPolicy::no_retry())],
+    );
+    t.run(
+        CommandPayload::settle(
+            EffectKind::LlmCall,
+            "call-1".to_string(),
+            Some(0),
+            Outcome::Llm(Box::new(llm_response(vec![tool_call("tc-1", "render")]))),
+        ),
+        &system(),
+    );
+    let assistant = DraftMessage {
+        id: Some("call-1".to_string()),
+        role: Role::Assistant,
+        content: None,
+        tool_calls: Some(vec![tool_call("tc-1", "render")]),
+        tool_call_id: None,
+        name: None,
+        reasoning: None,
+    };
+    t.decide_appending(assistant, vec![call_tool("tc-1", "render")]);
+    assert!(matches!(t.live_trigger(), Trigger::ToolExecute { .. }));
+
+    t.decide(vec![], vec![done()]);
+
+    let last = t.recorded().pop().expect("a message closes the call");
+    assert_eq!(last.tool_call_id.as_deref(), Some("tc-1"));
+    assert_eq!(
+        last.content.as_ref().map(Content::text_owned).as_deref(),
+        Some(crate::effects::turn_end::CANCELLED_AT_TURN_END)
+    );
+    assert_eq!(
+        t.agg
+            .state
+            .effect(EffectKind::ToolCall, "tc-1")
+            .map(|e| e.tracking.status()),
+        Some(EffectStatus::Failed),
+        "the call is voided"
+    );
+    assert!(matches!(t.live_trigger(), Trigger::TurnFinished { .. }));
+    let late = t.reject(
+        CommandPayload::settle(
+            EffectKind::ToolCall,
+            "tc-1".to_string(),
+            None,
+            Outcome::Tool {
+                result: StoredResult::text("https://reports/42.pdf".to_string()),
+            },
+        ),
+        &Caller::ApiKey {
+            tenant_id: TENANT.to_string(),
+            key_id: "key-1".to_string(),
+        },
+    );
+    assert_eq!(
+        late,
+        SessionError::EffectNotPending,
+        "a late result is refused"
+    );
+}
+
+fn click_command(turn_id: &str, metadata: &[(&str, &str)]) -> CommandPayload {
+    CommandPayload::SubmitClientPayload {
+        payload: ClientPayload::Action(crate::protocol::ClientAction {
+            name: "approve".to_string(),
+            args: None,
+        }),
+        turn: TurnTarget::Open(turn_id.to_string()),
+        queue: QueueMode::Refuse,
+        metadata: meta(metadata),
+    }
+}
+
+fn at_tool_execute() -> Trace {
+    let mut t = Trace::create();
+    t.decide(vec![], vec![]);
+    t.submit("render it", Some("turn-1"));
+    t.decide_appending(
+        user_message("render it"),
+        vec![call_llm("call-1", RetryPolicy::no_retry())],
+    );
+    t.run(
+        CommandPayload::settle(
+            EffectKind::LlmCall,
+            "call-1".to_string(),
+            Some(0),
+            Outcome::Llm(Box::new(llm_response(vec![tool_call("tc-1", "render")]))),
+        ),
+        &system(),
+    );
+    let assistant = DraftMessage {
+        id: Some("call-1".to_string()),
+        role: Role::Assistant,
+        content: None,
+        tool_calls: Some(vec![tool_call("tc-1", "render")]),
+        tool_call_id: None,
+        name: None,
+        reasoning: None,
+    };
+    t.decide_appending(assistant, vec![call_tool("tc-1", "render")]);
+    t
+}
+
+#[test]
+fn cancel_closes_the_open_calls_and_keeps_the_session() {
+    let mut t = at_tool_execute();
+    t.run(CommandPayload::CancelSession, &frontend());
+    let last = t.recorded().pop().expect("the call gets a result");
+    assert_eq!(last.tool_call_id.as_deref(), Some("tc-1"));
+    assert!(t.agg.state.phase.turn_id().is_none());
+    t.submit("again", Some("turn-2"));
+    assert_eq!(t.agg.state.phase.turn_id(), Some("turn-2"));
+}
+
+#[test]
+fn done_keeps_a_result_that_arrived_with_it() {
+    let mut t = at_tool_execute();
+    t.decide(
+        vec![],
+        vec![
+            Action::ToolResult {
+                id: "tc-1".to_string(),
+                attempt: Some(0),
+                result: StoredResult::text("https://reports/42.pdf".to_string()),
+            },
+            done(),
+        ],
+    );
+    let last = t.recorded().pop().expect("the result is recorded");
+    assert_eq!(last.tool_call_id.as_deref(), Some("tc-1"));
+    assert_eq!(
+        last.content.as_ref().map(Content::text_owned).as_deref(),
+        Some("https://reports/42.pdf")
+    );
+}
+
+#[test]
+fn done_keeps_the_result_of_the_decision_it_answers() {
+    let mut t = at_tool_execute();
+    t.decide(
+        vec![],
+        vec![Action::ToolResult {
+            id: "tc-1".to_string(),
+            attempt: Some(0),
+            result: StoredResult::text("https://reports/42.pdf".to_string()),
+        }],
+    );
+    assert!(matches!(t.live_trigger(), Trigger::ToolFinished { .. }));
+    t.decide(vec![], vec![done()]);
+    let last = t.recorded().pop().expect("the result is recorded");
+    assert_eq!(
+        last.content.as_ref().map(Content::text_owned).as_deref(),
+        Some("https://reports/42.pdf")
+    );
+}
+
+#[test]
+fn a_turn_id_a_click_holds_is_refused_to_a_message() {
+    let mut t = Trace::create();
+    t.decide(vec![], vec![]);
+    t.submit("hi", Some("turn-1"));
+    t.click("t9", &[]);
+    let err = t.reject(t.submission("later", Some("t9"), true), &frontend());
+    assert!(
+        matches!(err, SessionError::TurnAlreadyActive { .. }),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn a_click_naming_the_ending_turn_is_refused() {
+    let mut t = Trace::create();
+    t.decide(vec![], vec![]);
+    t.submit("hi", Some("turn-1"));
+    t.decide_appending(user_message("hi"), vec![done()]);
+    let err = t.reject(click_command("turn-1", &[]), &frontend());
+    assert!(
+        matches!(err, SessionError::TurnAlreadyActive { .. }),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn a_retried_click_opens_its_own_turn_after_the_joined_turn_ends() {
+    let mut t = Trace::create_with(retrying());
+    t.decide(vec![], vec![]);
+    t.submit("hi", Some("turn-1"));
+    t.decide_appending(
+        user_message("hi"),
+        vec![call_llm("call-1", RetryPolicy::no_retry())],
+    );
+    t.click("turn-2", &[("ref", "m3")]);
+    let click = t.live_decision();
+    assert_eq!(t.live_turn().as_deref(), Some("turn-1"), "the click joins");
+    t.run(
+        CommandPayload::settle(
+            EffectKind::Decision,
+            click.clone(),
+            None,
+            SettleError::new(ErrorInfo::internal("worker down".to_string()), true),
+        ),
+        &system(),
+    );
+    t.run(
+        CommandPayload::settle(
+            EffectKind::LlmCall,
+            "call-1".to_string(),
+            Some(0),
+            Outcome::Llm(Box::new(llm_response(vec![]))),
+        ),
+        &system(),
+    );
+    t.decide(vec![], vec![done()]);
+    t.decide(vec![], vec![done()]);
+    assert_eq!(t.agg.state.completed_turn_ids, vec!["turn-1".to_string()]);
+
+    t.advance(2);
+    t.wake();
+    assert_eq!(t.live_decision(), click);
+    assert_eq!(t.live_turn().as_deref(), Some("turn-2"));
+    assert_eq!(
+        t.started.last(),
+        Some(&("turn-2".to_string(), meta(&[("ref", "m3")])))
+    );
+}
+
+#[test]
+fn a_click_while_a_turn_ends_waits_for_it() {
+    let mut t = Trace::create();
+    t.decide(vec![], vec![]);
+    t.submit("hi", Some("turn-1"));
+    t.decide_appending(user_message("hi"), vec![done()]);
+    assert!(matches!(t.live_trigger(), Trigger::TurnFinished { .. }));
+
+    t.click("turn-2", &[("ref", "m1")]);
+    assert_eq!(
+        t.agg.state.phase.turn_id(),
+        Some("turn-1"),
+        "turn-1 still ends"
+    );
+    assert!(matches!(t.live_trigger(), Trigger::TurnFinished { .. }));
+
+    t.decide(vec![], vec![done()]);
+    assert_eq!(t.agg.state.completed_turn_ids, vec!["turn-1".to_string()]);
+    assert!(matches!(t.live_trigger(), Trigger::ClientAction { .. }));
+    assert_eq!(t.live_turn().as_deref(), Some("turn-2"));
+    assert_eq!(
+        t.started.last(),
+        Some(&("turn-2".to_string(), meta(&[("ref", "m1")])))
+    );
+}
+
+#[test]
+fn a_joined_click_runs_in_its_own_turn_when_the_turn_ends_first() {
+    let mut t = Trace::create();
+    t.decide(vec![], vec![]);
+    t.submit("hi", Some("turn-1"));
+    t.click("turn-2", &[("ref", "m2")]);
+    assert_eq!(t.agg.state.phase.turn_id(), Some("turn-1"));
+
+    t.decide_appending(user_message("hi"), vec![done()]);
+    t.decide(vec![], vec![done()]);
+    assert!(matches!(t.live_trigger(), Trigger::ClientAction { .. }));
+    assert_eq!(t.live_turn().as_deref(), Some("turn-2"));
+    assert_eq!(
+        t.started.last(),
+        Some(&("turn-2".to_string(), meta(&[("ref", "m2")])))
+    );
+}
+
+#[test]
+fn a_click_turn_does_not_wait_for_a_connector_sync() {
+    let mut t = Trace::create();
+    t.decide(vec![], vec![]);
+    t.click("turn-a", &[]);
+    t.decide_with(vec![], vec![], Some(config_with_mcp("conn-1")));
+    assert_eq!(
+        t.agg.state.phase.finalizing().map(|f| f.turn_id.as_str()),
+        Some("turn-a"),
+        "a sync is not the turn's work"
+    );
+
+    t.run(
+        CommandPayload::settle(
+            EffectKind::ConnectorSync,
+            "mcp.conn-1".to_string(),
+            Some(0),
+            Outcome::Connector {
+                server: None,
+                prefix: None,
+                tools: vec![],
+                instructions: None,
+            },
+        ),
+        &system(),
+    );
+    assert!(matches!(
+        t.live_trigger(),
+        Trigger::TurnFinished { turn_id, .. } if turn_id == "turn-a"
+    ));
+}
+
+#[test]
+fn an_ending_turn_waits_for_the_work_its_last_step_starts() {
+    let mut t = Trace::create();
+    t.decide(vec![], vec![]);
+    t.submit("hi", Some("turn-1"));
+    t.decide_appending(user_message("hi"), vec![done()]);
+    t.click("turn-2", &[]);
+
+    t.decide(vec![], vec![call_llm("call-9", RetryPolicy::no_retry())]);
+    assert!(t.agg.state.completed_turn_ids.is_empty(), "turn-1 waits");
+    assert_eq!(t.agg.state.phase.turn_id(), Some("turn-1"));
+
+    t.run(
+        CommandPayload::settle(
+            EffectKind::LlmCall,
+            "call-9".to_string(),
+            Some(0),
+            Outcome::Llm(Box::new(llm_response(vec![]))),
+        ),
+        &system(),
+    );
+    assert!(matches!(t.live_trigger(), Trigger::LlmFinished { .. }));
+    assert_eq!(t.live_turn().as_deref(), Some("turn-1"));
+
+    t.decide(vec![], vec![done()]);
+    assert_eq!(t.agg.state.completed_turn_ids, vec!["turn-1".to_string()]);
+    assert!(matches!(t.live_trigger(), Trigger::ClientAction { .. }));
+    assert_eq!(t.live_turn().as_deref(), Some("turn-2"));
+}
+
+#[test]
+fn a_click_that_resolves_an_interrupt_keeps_its_turn() {
+    let mut t = Trace::create();
+    t.decide(vec![], vec![]);
+    t.run(
+        CommandPayload::Interrupt {
+            interrupt_id: "int-1".to_string(),
+            reason: "approve?".to_string(),
+            payload: serde_json::Value::Null,
+        },
+        &frontend(),
+    );
+    t.click("turn-a", &[]);
+    t.decide(
+        vec![],
+        vec![Action::ResolveInterrupt {
+            interrupt_id: "int-1".to_string(),
+            payload: serde_json::Value::Null,
+        }],
+    );
+    assert_eq!(t.agg.state.phase.active_turn_id(), Some("turn-a"));
+    assert!(matches!(t.live_trigger(), Trigger::InterruptResumed { .. }));
+    assert_eq!(t.live_turn().as_deref(), Some("turn-a"));
 }
 
 #[test]
@@ -707,6 +1096,7 @@ fn flow_interrupt_and_resume() -> Trace {
             }),
             turn: TurnTarget::Detached,
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &frontend(),
     );
@@ -841,11 +1231,13 @@ fn flow_merged_turn() -> Trace {
         vec![user_message("Sam: had 120ml")],
         "turn-2",
         serde_json::json!({"ref": "m1"}),
+        &[("ref", "m1"), ("room", "r1")],
     );
     t.merge(
         vec![user_message("Sam: nap at 2")],
         "turn-3",
         serde_json::json!({"ref": "m2"}),
+        &[("ref", "m2")],
     );
     assert_eq!(
         t.waiting_turns(),
@@ -880,10 +1272,10 @@ fn trace_merged_turn() {
     assert_eq!(
         t.started,
         vec![
-            ("turn-1".to_string(), None),
-            ("turn-2".to_string(), Some(serde_json::json!({"ref": "m2"}))),
+            ("turn-1".to_string(), BTreeMap::new()),
+            ("turn-2".to_string(), meta(&[("ref", "m2"), ("room", "r1")])),
         ],
-        "a turn says what its client sent when it starts"
+        "a merged turn starts with the metadata of each submit, the later key wins"
     );
     t.assert_trace(&[
         "session.created",
@@ -915,12 +1307,14 @@ fn a_merge_with_no_turn_running_starts_at_once() {
         vec![user_message("hi")],
         "turn-1",
         serde_json::json!({"ref": "m0"}),
+        &[("ref", "m0")],
     );
     assert_eq!(t.agg.state.phase.turn_id(), Some("turn-1"));
     assert_eq!(
         t.started,
-        vec![("turn-1".to_string(), Some(serde_json::json!({"ref": "m0"})))]
+        vec![("turn-1".to_string(), meta(&[("ref", "m0")]))]
     );
+    assert_eq!(t.agg.state.turn_metadata, meta(&[("ref", "m0")]));
     assert!(t.waiting_turns().is_empty());
 }
 
@@ -929,10 +1323,25 @@ fn a_merge_keeps_arrival_order_behind_a_held_turn() {
     let mut t = Trace::create();
     t.decide(vec![], vec![]);
     t.submit("hi", Some("turn-1"));
-    t.merge(vec![user_message("a")], "turn-2", serde_json::json!({}));
+    t.merge(
+        vec![user_message("a")],
+        "turn-2",
+        serde_json::json!({}),
+        &[],
+    );
     t.submit_queued("b", "turn-3");
-    t.merge(vec![user_message("c")], "turn-4", serde_json::json!({}));
-    t.merge(vec![user_message("d")], "turn-5", serde_json::json!({}));
+    t.merge(
+        vec![user_message("c")],
+        "turn-4",
+        serde_json::json!({}),
+        &[],
+    );
+    t.merge(
+        vec![user_message("d")],
+        "turn-5",
+        serde_json::json!({}),
+        &[],
+    );
     assert_eq!(
         t.waiting_turns(),
         vec![
@@ -948,11 +1357,17 @@ fn a_merge_drops_a_message_already_waiting() {
     let mut t = Trace::create();
     t.decide(vec![], vec![]);
     t.submit("hi", Some("turn-1"));
-    t.merge(vec![with_id("c1", "a")], "turn-2", serde_json::json!({}));
+    t.merge(
+        vec![with_id("c1", "a")],
+        "turn-2",
+        serde_json::json!({}),
+        &[],
+    );
     t.merge(
         vec![with_id("c1", "a"), with_id("c2", "b")],
         "turn-3",
         serde_json::json!({}),
+        &[],
     );
     assert_eq!(
         t.waiting_turns(),
@@ -1427,11 +1842,27 @@ fn flow_direct_commands_then_cancel() -> Trace {
 
 #[test]
 fn trace_direct_commands_then_cancel() {
-    let t = flow_direct_commands_then_cancel();
-    assert!(
-        matches!(t.agg.state.status, SessionStatus::Done),
-        "a cancelled session is done"
+    let mut t = flow_direct_commands_then_cancel();
+    assert!(t.agg.state.phase.turn_id().is_none(), "the run ends");
+    assert_eq!(
+        t.agg.state.completed_turn_ids,
+        vec!["turn-1".to_string(), "turn-2".to_string()]
     );
+    assert!(
+        t.agg
+            .state
+            .effects_of(EffectKind::Decision)
+            .next()
+            .is_none(),
+        "no waiting work is left"
+    );
+    t.submit("and again", Some("turn-3"));
+    assert_eq!(
+        t.agg.state.phase.turn_id(),
+        Some("turn-3"),
+        "the session is usable"
+    );
+    t.names.truncate(t.names.len() - 3);
     t.assert_trace(&[
         "session.created",
         "decision.queued",
@@ -1460,6 +1891,12 @@ fn trace_direct_commands_then_cancel() {
         "turn.started",
         "decision.queued",
         "session.cancelled",
+        "decision.dropped",
+        "decision.dropped",
+        "decision.dropped",
+        "decision.dropped",
+        "turn.completed",
+        "session.done",
     ]);
 }
 

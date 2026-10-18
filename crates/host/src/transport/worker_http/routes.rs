@@ -134,6 +134,21 @@ pub async fn mint_client_token(
     }
 }
 
+pub async fn cancel_session(
+    State(state): State<WorkerHttpState>,
+    Extension(caller): Extension<Caller>,
+    Path(session_id): Path<String>,
+) -> Response {
+    let span = SpanContext::root().child("machine_cancel");
+    match state.runtime.cancel_session(session_id, caller, span).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => {
+            let (status, message) = runtime_error_status(&e);
+            (status, Json(serde_json::json!({"error": message}))).into_response()
+        }
+    }
+}
+
 pub async fn settle_effect(
     State(state): State<WorkerHttpState>,
     Extension(caller): Extension<Caller>,
@@ -290,6 +305,7 @@ pub async fn submit_client_payload(
             turn_id: req.turn_id,
             continue_turn: false,
             queue: req.queue,
+            metadata: req.metadata,
         })
         .await;
 

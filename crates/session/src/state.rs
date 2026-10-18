@@ -63,8 +63,8 @@ use rust_decimal::Decimal;
 
 pub use crate::protocol::EffectKind;
 use crate::protocol::{
-    AgentConfig, ClientContext, ContextReason, DraftMessage, Effect, EffectStatus, HeldCall,
-    InterruptOrigin, LlmFormat, LlmRequest, LlmTool, Message, MessageTree, NewMessage,
+    AgentConfig, ClientContext, ContextReason, DecisionTurn, DraftMessage, Effect, EffectStatus,
+    HeldCall, InterruptOrigin, LlmFormat, LlmRequest, LlmTool, Message, MessageTree, NewMessage,
     ReasoningConfig, RetryConfig, RetryPolicy, Role, SessionOwner, SpawnMode, SubagentTools, Usage,
     WorkerRef, WorkerState,
 };
@@ -543,10 +543,11 @@ impl<T> std::ops::Deref for Logged<T> {
     }
 }
 
-fn rewind_log<T>(log: &mut Vec<Logged<T>>, seq: u64) {
-    #[cfg(test)]
-    assert!(log.windows(2).all(|w| w[0].seq <= w[1].seq));
-    log.truncate(log.partition_point(|e| e.seq <= seq));
+fn logged_until<T>(log: &[Logged<T>], until: Option<u64>) -> &[Logged<T>] {
+    match until {
+        Some(seq) => &log[..log.partition_point(|e| e.seq <= seq)],
+        None => log,
+    }
 }
 
 pub trait Anchored {
@@ -588,6 +589,8 @@ pub struct WorkerDecisionState {
     pub source_event_sequence: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatched_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<Box<DecisionTurn>>,
 }
 
 impl WorkerDecisionState {
@@ -631,6 +634,13 @@ impl TurnPhase {
             TurnPhase::Idle => None,
             TurnPhase::Active { turn_id } => Some(turn_id),
             TurnPhase::Finalizing(end) => Some(&end.turn_id),
+        }
+    }
+
+    pub fn active_turn_id(&self) -> Option<&str> {
+        match self {
+            TurnPhase::Active { turn_id } => Some(turn_id),
+            _ => None,
         }
     }
 
@@ -771,6 +781,12 @@ pub struct SessionState {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub turn_called: bool,
 
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub turn_metadata: BTreeMap<String, String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quiet_end: Option<String>,
+
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub context_kept: bool,
 
@@ -849,6 +865,8 @@ impl SessionState {
             limited: None,
             turn_head: None,
             turn_called: false,
+            turn_metadata: BTreeMap::new(),
+            quiet_end: None,
             context_kept: false,
             subagent_token_usage: Usage::default(),
             state_versions: Vec::new(),
@@ -872,7 +890,11 @@ impl SessionState {
     }
 
     pub fn at<'a, 'n>(&'a self, node: Option<&'n str>) -> SessionStateAtNode<'a, 'n> {
-        SessionStateAtNode { state: self, node }
+        SessionStateAtNode {
+            state: self,
+            node,
+            until: None,
+        }
     }
 
     pub fn at_head(&self) -> SessionStateAtNode<'_, '_> {
@@ -1155,8 +1177,10 @@ impl SessionState {
     }
 
     fn apply_decision_queued(&mut self, p: &DecisionQueued, ctx: &ApplyContext) {
-        if matches!(p.trigger, Trigger::SessionStart) {
-            self.session_start_failed = false;
+        match p.trigger {
+            Trigger::SessionStart => self.session_start_failed = false,
+            Trigger::TurnFinished { .. } => self.quiet_end = None,
+            _ => {}
         }
         let retry_policy = self.worker_retry.clone().unwrap_or(RetryPolicy::no_retry());
         self.insert_effect(
@@ -1166,6 +1190,7 @@ impl SessionState {
                 trigger: p.trigger.clone(),
                 source_event_sequence: ctx.sequence,
                 dispatched_seq: None,
+                turn: None,
             }),
         );
         self.enqueue(ctx.sequence, EffectKind::Decision, &p.id);
@@ -1312,16 +1337,38 @@ impl SessionState {
                     .retain(|i| i.interrupt_id != p.interrupt_id);
             }
             EventPayload::DecisionDispatched(p) => {
+                let turn = self.phase.turn_id().map(|id| {
+                    Box::new(DecisionTurn {
+                        id: id.to_string(),
+                        metadata: self.turn_metadata.clone(),
+                    })
+                });
+                let stamped = self
+                    .worker_decision(&p.id)
+                    .and_then(|d| d.turn.as_ref())
+                    .is_some_and(|t| !self.completed_turn_ids.contains(&t.id));
                 if let Some(e) = self.effect_mut(EffectKind::Decision, &p.id) {
                     e.tracking.dispatch(now);
                     if let Some(d) = e.decision_mut() {
                         d.dispatched_seq = Some(ctx.sequence);
+                        if !stamped {
+                            d.turn = turn;
+                        }
                     }
                 }
                 self.dequeue(EffectKind::Decision, &p.id);
                 self.status = SessionStatus::Idle;
             }
             EventPayload::DecisionCompleted(p) => {
+                let owned = self.worker_decision(&p.id).and_then(|d| {
+                    let turn = d.turn.as_ref()?;
+                    d.trigger
+                        .owns_turn(&p.id, &turn.id)
+                        .then(|| turn.id.clone())
+                });
+                if let Some(turn) = owned.filter(|t| self.phase.active_turn_id() == Some(t)) {
+                    self.quiet_end = Some(turn);
+                }
                 self.remove_effect(EffectKind::Decision, &p.id);
                 self.dequeue(EffectKind::Decision, &p.id);
             }
@@ -1330,7 +1377,10 @@ impl SessionState {
             EventPayload::DecisionQueued(p) => self.apply_decision_queued(p, ctx),
             EventPayload::DecisionAmended(p) => {
                 if let Some(Trigger::ClientMessage {
-                    messages, client, ..
+                    messages,
+                    client,
+                    metadata,
+                    ..
                 }) = self
                     .effect_mut(EffectKind::Decision, &p.id)
                     .and_then(|e| e.decision_mut())
@@ -1338,6 +1388,7 @@ impl SessionState {
                 {
                     messages.extend(p.messages.iter().cloned());
                     *client = std::mem::take(client).followed_by(p.client.clone());
+                    metadata.extend(p.metadata.clone());
                 }
             }
             EventPayload::DecisionDropped(p) => {
@@ -1414,11 +1465,7 @@ impl SessionState {
                 });
             }
             EventPayload::SessionCancelled => {
-                self.status = SessionStatus::Done;
                 self.limited = None;
-                self.effects.retain(|(kind, _), e| {
-                    *kind != EffectKind::Decision || e.tracking.status() != EffectStatus::Pending
-                });
             }
             EventPayload::SessionDone(_) => {
                 if !self.ancestry.is_empty() {
@@ -1463,6 +1510,8 @@ impl SessionState {
                 };
                 self.turn_started_seq = Some(ctx.sequence);
                 self.turn_head = self.head_id.clone();
+                self.turn_metadata = p.metadata.clone();
+                self.quiet_end = None;
                 self.turn_called = false;
                 self.context_kept = false;
                 self.turn_cost = Decimal::ZERO;
@@ -1479,6 +1528,8 @@ impl SessionState {
                 self.phase = TurnPhase::Idle;
                 self.turn_started_seq = None;
                 self.limited = None;
+                self.turn_metadata.clear();
+                self.quiet_end = None;
                 self.dequeue(EffectKind::TurnEnd, &payload.turn_id);
             }
             EventPayload::WorkUnsent(p) => {
@@ -1653,6 +1704,11 @@ impl SessionState {
         if let Some(interrupt) = self.decision_park_interrupt(trigger) {
             return Some(DecisionPark::Interrupt(interrupt));
         }
+        if let (Trigger::ClientAction { .. }, Some(end)) = (trigger, self.phase.finalizing()) {
+            if !self.head_parked() {
+                return Some(DecisionPark::Turn(&end.turn_id));
+            }
+        }
         match (trigger.deferred_turn_id(), self.phase.turn_id()) {
             (Some(turn_id), Some(active)) if active != turn_id => Some(DecisionPark::Turn(active)),
             _ => None,
@@ -1706,6 +1762,7 @@ impl SessionState {
                 client,
                 turn_id: Some(turn_id),
                 merge: true,
+                ..
             } => Some(WaitingMerge {
                 decision_id: &last.id,
                 messages,
@@ -2076,15 +2133,6 @@ impl SessionState {
         }
     }
 
-    #[must_use]
-    pub fn rewind(mut self, seq: u64, head_id: Option<&str>) -> Self {
-        rewind_log(&mut self.nodes, seq);
-        rewind_log(&mut self.state_versions, seq);
-        rewind_log(&mut self.agent_versions, seq);
-        self.head_id = head_id.map(str::to_string);
-        self
-    }
-
     fn track_usage(&mut self, usage: &Option<Usage>) {
         if let Some(u) = usage {
             self.token_usage.add(u);
@@ -2102,11 +2150,31 @@ impl SessionState {
 pub struct SessionStateAtNode<'a, 'n> {
     state: &'a SessionState,
     node: Option<&'n str>,
+    until: Option<u64>,
 }
 
 impl<'a, 'n> SessionStateAtNode<'a, 'n> {
     pub fn state(&self) -> &'a SessionState {
         self.state
+    }
+
+    /// Reads the logs as they were at `seq`. Everything else is current.
+    #[must_use]
+    pub fn until(self, seq: u64) -> Self {
+        Self {
+            until: Some(seq),
+            ..self
+        }
+    }
+
+    pub fn message_tree(&self) -> MessageTree {
+        MessageTree {
+            nodes: logged_until(&self.state.nodes, self.until)
+                .iter()
+                .map(|n| n.entry.clone())
+                .collect(),
+            head_id: self.node.map(str::to_string),
+        }
     }
 
     fn path_set(&self) -> std::collections::HashSet<&str> {
@@ -2136,13 +2204,20 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
     }
 
     pub fn resolve_state_for(&self) -> WorkerState {
-        resolve_on_path(&self.state.state_versions, &self.path_set())
-            .map(|v| v.value.clone())
-            .unwrap_or_default()
+        resolve_on_path(
+            logged_until(&self.state.state_versions, self.until),
+            &self.path_set(),
+        )
+        .map(|v| v.value.clone())
+        .unwrap_or_default()
     }
 
     pub fn resolve_agent_for(&self) -> Option<AgentConfig> {
-        resolve_on_path(&self.state.agent_versions, &self.path_set()).map(|v| v.value.clone())
+        resolve_on_path(
+            logged_until(&self.state.agent_versions, self.until),
+            &self.path_set(),
+        )
+        .map(|v| v.value.clone())
     }
 
     pub fn connector_tools(&self) -> filter::Merged {
@@ -2588,7 +2663,7 @@ mod state_version_tests {
     }
 
     #[test]
-    fn rewind_restores_each_log_to_the_events_prefix() {
+    fn until_reads_each_log_as_it_was_at_a_seq() {
         let mut s = SessionState::new("sess-1".to_string());
         let apply = |s: &mut SessionState, seq: u64, payload: EventPayload| {
             s.apply(
@@ -2624,13 +2699,13 @@ mod state_version_tests {
         apply(&mut s, 1, msg("u1", None));
         apply(&mut s, 2, state(json!({"v": 1}), "u1"));
         apply(&mut s, 3, msg("u2", Some("u1")));
-        apply(&mut s, 4, state(json!({"v": 2}), "u2"));
+        apply(&mut s, 4, state(json!({"v": 2}), "u1"));
 
-        let s = s.rewind(2, Some("u1"));
-        assert_eq!(s.nodes.len(), 1);
-        assert_eq!(s.state_versions.len(), 1);
-        assert_eq!(s.head_id.as_deref(), Some("u1"));
-        assert_eq!(s.at_head().resolve_state_for().0, json!({"v": 1}));
+        let at = s.at(Some("u1")).until(2);
+        assert_eq!(at.message_tree().nodes.len(), 1);
+        assert_eq!(at.message_tree().head_id.as_deref(), Some("u1"));
+        assert_eq!(at.resolve_state_for().0, json!({"v": 1}));
+        assert_eq!(s.at(Some("u1")).resolve_state_for().0, json!({"v": 2}));
     }
 }
 

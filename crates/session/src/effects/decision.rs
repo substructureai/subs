@@ -50,10 +50,14 @@ impl KindSpec for DecisionSpec {
     }
 
     fn terminal(&self, state: &Cx<'_>, id: &str, e: &SettleError) -> Vec<EventPayload> {
-        let turnless = state
-            .worker_decision(id)
-            .is_some_and(|d| matches!(d.trigger, Trigger::ClientAction { .. }));
-        if turnless {
+        let joined = state.worker_decision(id).is_some_and(|d| {
+            matches!(d.trigger, Trigger::ClientAction { .. })
+                && !d
+                    .turn
+                    .as_ref()
+                    .is_some_and(|t| d.trigger.owns_turn(id, &t.id))
+        });
+        if joined {
             return Vec::new();
         }
         state.fail_run(&e.error)
@@ -63,10 +67,13 @@ impl KindSpec for DecisionSpec {
         false
     }
 
-    fn resend(&self, _state: &SessionState, id: &str) -> Vec<EventPayload> {
-        vec![EventPayload::DecisionDispatched(DecisionDispatched {
-            id: id.to_string(),
-        })]
+    fn resend(&self, state: &SessionState, id: &str) -> Vec<EventPayload> {
+        own_turn_started(state, id)
+            .into_iter()
+            .chain([EventPayload::DecisionDispatched(DecisionDispatched {
+                id: id.to_string(),
+            })])
+            .collect()
     }
 
     fn voids_when_missing(&self) -> bool {
@@ -122,8 +129,10 @@ impl KindSpec for DecisionSpec {
             }
             events.push(EventPayload::TurnStarted(TurnStarted {
                 turn_id: turn_id.to_string(),
-                client_state: decision.trigger.client_state().cloned(),
+                metadata: decision.trigger.turn_metadata(),
             }));
+        } else {
+            events.extend(own_turn_started(state, id));
         }
         events.push(EventPayload::DecisionDispatched(DecisionDispatched {
             id: id.to_string(),
@@ -132,13 +141,32 @@ impl KindSpec for DecisionSpec {
     }
 }
 
+fn own_turn_started(state: &SessionState, id: &str) -> Option<EventPayload> {
+    let decision = state.worker_decision(id)?;
+    let completed = |turn: &str| state.completed_turn_ids.iter().any(|t| t == turn);
+    if decision.turn.as_ref().is_some_and(|t| !completed(&t.id)) {
+        return None;
+    }
+    let turn_id = decision.trigger.own_turn(id, &state.phase)?;
+    let turn_id = match completed(&turn_id) {
+        true => crate::decision::spare_turn_id(id),
+        false => turn_id,
+    };
+    Some(EventPayload::TurnStarted(TurnStarted {
+        turn_id,
+        metadata: decision.trigger.turn_metadata(),
+    }))
+}
+
 impl SessionState {
     pub fn drop_queued_decisions(&self) -> Vec<EventPayload> {
         self.queued_decisions()
             .into_iter()
             .filter(|e| {
-                e.decision()
-                    .is_none_or(|d| d.trigger.deferred_turn_id().is_none())
+                e.decision().is_none_or(|d| {
+                    d.trigger.deferred_turn_id().is_none()
+                        && !matches!(d.trigger, Trigger::ClientAction { .. })
+                })
             })
             .map(|e| EventPayload::DecisionDropped(DecisionDropped { id: e.id.clone() }))
             .collect()

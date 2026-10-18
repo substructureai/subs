@@ -9,4 +9,4 @@ pub use substructure_session::{
 };
 
 pub use crate::runtime::sessions::{execute, ExecuteError, ExecuteInput, ExecuteOutput};
-pub use substructure_session::{CommitContext, Session, SessionEvent};
+pub use substructure_session::{Command, CommitContext, Session, SessionEvent, Settings};

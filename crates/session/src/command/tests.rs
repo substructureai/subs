@@ -1,5 +1,6 @@
 use crate::connectors::ConnectionPath;
 use crate::protocol::StoredResult;
+use crate::state::SessionStatus;
 use std::collections::HashMap;
 
 use crate::protocol::{
@@ -720,6 +721,7 @@ fn submit_client_payload_with_active_turn_id_is_rejected() {
             payload: payload.clone(),
             turn: TurnTarget::Open("turn-1".to_string()),
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &Caller::System {
             tenant_id: "tenant-a".to_string(),
@@ -732,6 +734,7 @@ fn submit_client_payload_with_active_turn_id_is_rejected() {
                 payload,
                 turn: TurnTarget::Open("turn-1".to_string()),
                 queue: QueueMode::Refuse,
+                metadata: Default::default(),
             },
             &Caller::System {
                 tenant_id: "tenant-a".to_string(),
@@ -765,6 +768,7 @@ fn submit_worker_decision_dispatches_action_and_completes_decision() {
             }),
             turn: TurnTarget::Open("turn-1".to_string()),
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &Caller::System {
             tenant_id: "tenant-a".to_string(),
@@ -835,6 +839,7 @@ fn duplicate_submit_worker_decision_is_no_op() {
             }),
             turn: TurnTarget::Open("turn-1".to_string()),
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &Caller::System {
             tenant_id: "tenant-a".to_string(),
@@ -923,6 +928,7 @@ fn user_message_rejected_while_session_interrupted() {
                 payload: user_message,
                 turn: TurnTarget::Open("turn-1".to_string()),
                 queue: QueueMode::Refuse,
+                metadata: Default::default(),
             },
             &Caller::System {
                 tenant_id: "tenant-a".to_string(),
@@ -1004,22 +1010,105 @@ fn send_message_wakes_a_decision() {
 }
 
 #[test]
-fn cancel_session_emits_cancelled() {
+fn cancelling_an_idle_session_does_nothing() {
     let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let events = dispatch(&mut agg, CommandPayload::CancelSession, &system());
+    assert!(events.is_empty(), "got {events:?}");
+}
+
+#[test]
+fn cancelling_ends_the_run_and_keeps_the_session() {
+    let mut agg = session_mid_turn();
+    submit_queued(&mut agg, "and another thing", "turn-2").expect("queued submit");
 
     let events = dispatch(
         &mut agg,
         CommandPayload::CancelSession,
+        &frontend_caller("tenant-a", "user-1"),
+    );
+    assert!(matches!(
+        events.first(),
+        Some(EventPayload::SessionCancelled)
+    ));
+    let ended = events.iter().find_map(|e| match e {
+        EventPayload::TurnCompleted(t) => Some(t),
+        _ => None,
+    });
+    assert_eq!(ended.map(|t| t.turn_id.as_str()), Some("turn-1"));
+    assert_eq!(
+        ended.and_then(|t| t.error.as_ref()).map(|e| e.code.clone()),
+        Some(crate::protocol::ErrorCode::Cancelled)
+    );
+    assert!(
+        agg.state.effects_of(EffectKind::Decision).next().is_none(),
+        "the waiting turn is dropped"
+    );
+
+    dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: node_msg("", Role::User, "again"),
+                stream: false,
+            }),
+            turn: TurnTarget::Open("turn-3".to_string()),
+            queue: QueueMode::Refuse,
+            metadata: Default::default(),
+        },
+        &frontend(),
+    );
+    assert_eq!(agg.state.phase.turn_id(), Some("turn-3"));
+}
+
+#[test]
+fn cancelling_resolves_the_open_interrupts_as_cancelled() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let raise = dispatched_action_decision(&mut agg);
+    dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: raise,
+            transcript: vec![],
+            actions: vec![Action::Interrupt {
+                interrupt_id: "int-1".to_string(),
+                reason: "hold".to_string(),
+                payload: serde_json::Value::Null,
+            }],
+            state: None,
+            agent: None,
+        },
         &Caller::System {
             tenant_id: "tenant-a".to_string(),
         },
     );
 
-    assert!(
-        matches!(events.as_slice(), [EventPayload::SessionCancelled]),
-        "expected [SessionCancelled]; got {events:?}"
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::CancelSession,
+        &frontend_caller("tenant-a", "user-1"),
     );
-    assert_eq!(agg.state.status, SessionStatus::Done);
+    let resumed = events.iter().find_map(|e| match e {
+        EventPayload::InterruptResumed(p) if p.interrupt_id == "int-1" => Some(p),
+        _ => None,
+    });
+    assert_eq!(
+        resumed.map(|p| &p.payload["status"]),
+        Some(&serde_json::json!("cancelled")),
+        "got {events:?}"
+    );
+    assert!(agg.state.open_interrupts.is_empty());
+}
+
+#[test]
+fn only_the_owner_cancels_from_a_client() {
+    let agg = session_mid_turn();
+    let err = agg
+        .try_handle(
+            CommandPayload::CancelSession,
+            &frontend_caller("tenant-a", "user-2"),
+        )
+        .expect_err("a stranger is refused");
+    assert_eq!(err, SessionError::SessionAccessDenied);
 }
 
 #[test]
@@ -1139,6 +1228,7 @@ fn append_via_worker(agg: &mut Session, transcript: Vec<DraftMessage>) {
             }),
             turn: TurnTarget::Detached,
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &system(),
     );
@@ -1222,6 +1312,7 @@ fn submit_messages_forwards_a_replace_submission() {
             }),
             turn: TurnTarget::Detached,
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &Caller::System {
             tenant_id: "tenant-a".to_string(),
@@ -1265,6 +1356,7 @@ fn submit_append_queues_the_batch_as_a_client_message_trigger() {
             }),
             turn: TurnTarget::Detached,
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &Caller::System {
             tenant_id: "tenant-a".to_string(),
@@ -1321,6 +1413,7 @@ fn seed_tree(agg: &mut Session, transcript: Vec<DraftMessage>) {
             }),
             turn: TurnTarget::Detached,
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &system(),
     );
@@ -1362,6 +1455,7 @@ fn submit_messages(agg: &mut Session, messages: Vec<DraftMessage>) -> Vec<EventP
             }),
             turn: TurnTarget::Detached,
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &system(),
     )
@@ -1558,6 +1652,7 @@ fn plain_transcript_rejected_while_interrupted() {
                 }),
                 turn: TurnTarget::Detached,
                 queue: QueueMode::Refuse,
+                metadata: Default::default(),
             },
             &system(),
         )
@@ -1833,6 +1928,7 @@ fn queued_client_message_stays_a_delta_until_delivery() {
             }),
             turn: TurnTarget::Detached,
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &system(),
     );
@@ -1850,6 +1946,7 @@ fn queued_client_message_stays_a_delta_until_delivery() {
             }),
             turn: TurnTarget::Detached,
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &system(),
     );
@@ -1874,6 +1971,7 @@ fn reconcile_re_records_known_ids_past_the_first_new_node() {
             }),
             turn: TurnTarget::Detached,
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &system(),
     );
@@ -1904,6 +2002,7 @@ fn reconcile_re_records_known_ids_past_the_first_new_node() {
             }),
             turn: TurnTarget::Detached,
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &system(),
     );
@@ -2829,6 +2928,84 @@ fn cancelling_voids_a_running_subagent() {
     );
 }
 
+fn running_subagent_mid_turn() -> (Session, String) {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let setup = dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: node_msg("", Role::User, "go"),
+                stream: false,
+            }),
+            turn: TurnTarget::Open("turn-1".to_string()),
+            queue: QueueMode::Refuse,
+            metadata: Default::default(),
+        },
+        &system(),
+    );
+    let decision = decision_with(&setup, |t| matches!(t, Trigger::ClientMessage { .. }))
+        .expect("the message opens a decision");
+    dispatch(&mut agg, spawn("call-sa"), &system());
+    dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::Subagent,
+            "call-sa".to_string(),
+            None,
+            Outcome::SubagentStarted,
+        ),
+        &system(),
+    );
+    (agg, decision)
+}
+
+fn voids_call_sa(events: &[EventPayload]) -> bool {
+    events.iter().any(|e| {
+        matches!(
+            e,
+            EventPayload::CallVoided(v) if v.kind == EffectKind::Subagent && v.id == "call-sa"
+        )
+    })
+}
+
+#[test]
+fn done_voids_a_running_subagent() {
+    let (mut agg, decision) = running_subagent_mid_turn();
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: decision,
+            transcript: vec![],
+            actions: vec![Action::Done {
+                data: serde_json::Value::Null,
+            }],
+            state: None,
+            agent: None,
+        },
+        &system(),
+    );
+    assert!(voids_call_sa(&events), "got {events:?}");
+}
+
+#[test]
+fn failing_voids_a_running_subagent() {
+    let (mut agg, decision) = running_subagent_mid_turn();
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: decision,
+            transcript: vec![],
+            actions: vec![Action::Fail {
+                error: ErrorInfo::internal("boom".to_string()),
+            }],
+            state: None,
+            agent: None,
+        },
+        &system(),
+    );
+    assert!(voids_call_sa(&events), "got {events:?}");
+}
+
 #[test]
 fn complete_subagent_turn_emits_completed() {
     let mut agg = create_session("sess-1", "tenant-a", "user-1");
@@ -3687,6 +3864,7 @@ fn worker_tool_fires_tool_result_in_the_completion_commit() {
             }),
             turn: TurnTarget::Open("turn-1".to_string()),
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &system(),
     );
@@ -3810,6 +3988,7 @@ fn tool_and_subagent_from_one_turn_dispatch_concurrently() {
             }),
             turn: TurnTarget::Open("turn-1".to_string()),
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &system(),
     );
@@ -4399,6 +4578,7 @@ fn client_action_dispatches_while_interrupted() {
             }),
             turn: TurnTarget::Detached,
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &Caller::System {
             tenant_id: "tenant-a".to_string(),
@@ -4420,8 +4600,9 @@ fn dispatched_action_decision(agg: &mut Session) -> String {
                 name: "summarize".to_string(),
                 args: None,
             }),
-            turn: TurnTarget::Detached,
+            turn: TurnTarget::Open("turn-a".to_string()),
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &Caller::System {
             tenant_id: "tenant-a".to_string(),
@@ -4436,14 +4617,25 @@ fn dispatched_action_decision(agg: &mut Session) -> String {
 }
 
 #[test]
-fn an_action_answer_with_work_opens_a_turn() {
+fn an_action_opens_the_turn_it_names() {
     let mut agg = create_session("sess-1", "tenant-a", "user-1");
     let decision_id = dispatched_action_decision(&mut agg);
+    let turn = "turn-a".to_string();
+
+    assert_eq!(agg.state.phase.turn_id(), Some(turn.as_str()));
+    assert_eq!(
+        agg.state
+            .worker_decision(&decision_id)
+            .and_then(|d| d.turn.as_ref())
+            .map(|t| t.id.as_str()),
+        Some(turn.as_str()),
+        "the request names the action's turn"
+    );
 
     let events = agg
         .try_handle(
             CommandPayload::SubmitWorkerDecision {
-                decision_id: decision_id.clone(),
+                decision_id,
                 transcript: vec![],
                 actions: vec![Action::CallTool {
                     id: "tc-1".to_string(),
@@ -4459,25 +4651,24 @@ fn an_action_answer_with_work_opens_a_turn() {
             },
         )
         .expect("submit succeeds");
-    let turn = events
-        .iter()
-        .find_map(|e| match e {
-            EventPayload::TurnStarted(t) => Some(t.turn_id.clone()),
-            _ => None,
-        })
-        .expect("work opens a turn");
-    assert_eq!(turn, format!("action:{decision_id}"));
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            EventPayload::DecisionQueued(q) if matches!(q.trigger, Trigger::TurnFinished { .. })
+        )),
+        "work keeps the turn open; got {events:?}"
+    );
 }
 
 #[test]
-fn an_action_answer_without_work_opens_no_turn() {
+fn an_action_answer_without_work_ends_its_turn() {
     let mut agg = create_session("sess-1", "tenant-a", "user-1");
     let decision_id = dispatched_action_decision(&mut agg);
 
     let events = agg
         .try_handle(
             CommandPayload::SubmitWorkerDecision {
-                decision_id,
+                decision_id: decision_id.clone(),
                 transcript: vec![],
                 actions: vec![],
                 state: Some(crate::protocol::WorkerState(serde_json::json!({
@@ -4490,11 +4681,67 @@ fn an_action_answer_without_work_opens_no_turn() {
             },
         )
         .expect("submit succeeds");
+    let finished = events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionQueued(q) => match &q.trigger {
+                Trigger::TurnFinished { turn_id, .. } => Some(turn_id.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("no work ends the turn");
+    assert_eq!(finished, "turn-a");
+}
+
+#[test]
+fn an_action_without_a_turn_id_opens_and_ends_its_own_turn() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let system = Caller::System {
+        tenant_id: "tenant-a".to_string(),
+    };
+    let decision_id = dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Action(crate::protocol::ClientAction {
+                name: "summarize".to_string(),
+                args: None,
+            }),
+            turn: TurnTarget::Detached,
+            queue: QueueMode::Refuse,
+            metadata: Default::default(),
+        },
+        &system,
+    )
+    .iter()
+    .find_map(|e| match e {
+        EventPayload::DecisionDispatched(p) => Some(p.id.clone()),
+        _ => None,
+    })
+    .expect("the action decision dispatches");
+    let turn = agg
+        .state
+        .phase
+        .turn_id()
+        .expect("the action opened a turn")
+        .to_string();
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id,
+            transcript: vec![],
+            actions: vec![],
+            state: None,
+            agent: None,
+        },
+        &system,
+    );
     assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e, EventPayload::TurnStarted(_))),
-        "no work, no turn; got {events:?}"
+        events.iter().any(|e| matches!(e,
+            EventPayload::DecisionQueued(q)
+                if matches!(&q.trigger, Trigger::TurnFinished { turn_id, .. } if *turn_id == turn))),
+        "no work ends the turn: {events:?}"
     );
 }
 
@@ -4607,6 +4854,7 @@ fn a_failed_action_decision_does_not_end_the_running_turn() {
             }),
             turn: TurnTarget::Open("turn-1".to_string()),
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &Caller::System {
             tenant_id: "tenant-a".to_string(),
@@ -4696,6 +4944,7 @@ fn cancel_voids_pending_effects() {
             }),
             turn: TurnTarget::Open("turn-1".to_string()),
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &Caller::System {
             tenant_id: "tenant-a".to_string(),
@@ -4850,6 +5099,7 @@ fn interrupt_voids_pending_worker_decision() {
             }),
             turn: TurnTarget::Open("turn-1".to_string()),
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &Caller::System {
             tenant_id: "tenant-a".to_string(),
@@ -4942,6 +5192,7 @@ fn tool_result_during_interrupt_queues_until_resume() {
             }),
             turn: TurnTarget::Open("turn-1".to_string()),
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &system,
     );
@@ -5081,6 +5332,7 @@ fn worker_interrupt_action_pauses_session_and_resume_carries_payload() {
             }),
             turn: TurnTarget::Open("turn-1".to_string()),
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &Caller::System {
             tenant_id: "tenant-a".to_string(),
@@ -5172,6 +5424,7 @@ fn fail_worker_decision_emits_errored() {
             }),
             turn: TurnTarget::Open("turn-1".to_string()),
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &Caller::System {
             tenant_id: "tenant-a".to_string(),
@@ -5533,6 +5786,7 @@ fn worker_append_action_writes_a_tree_node() {
             }),
             turn: TurnTarget::Open("turn-1".to_string()),
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &system(),
     );
@@ -5930,6 +6184,7 @@ fn submit_decision_with(agg: &mut Session, actions: Vec<Action>) -> Vec<EventPay
             }),
             turn: TurnTarget::Detached,
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &system(),
     );
@@ -6310,6 +6565,7 @@ fn drive_turn_done(agg: &mut Session, turn_id: &str, data: serde_json::Value) ->
             }),
             turn: TurnTarget::Open(turn_id.to_string()),
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &system(),
     );
@@ -6396,6 +6652,7 @@ fn a_submit_during_an_active_turn_is_refused() {
             }),
             turn: TurnTarget::Open("t1".to_string()),
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &system(),
     );
@@ -6421,6 +6678,7 @@ fn a_submit_during_an_active_turn_is_refused() {
                 }),
                 turn: TurnTarget::Open("t2".to_string()),
                 queue: QueueMode::Refuse,
+                metadata: Default::default(),
             },
             &system(),
             Utc::now(),
@@ -6463,6 +6721,7 @@ fn a_new_turn_completes_the_finalizing_one_first() {
             }),
             turn: TurnTarget::Open("t2".to_string()),
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &system(),
     );
@@ -6498,6 +6757,7 @@ fn a_continuing_submit_joins_the_running_turn() {
             }),
             turn: TurnTarget::Open("t1".to_string()),
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &system(),
     );
@@ -6523,6 +6783,7 @@ fn a_continuing_submit_joins_the_running_turn() {
             }),
             turn: TurnTarget::Continue("t2".to_string()),
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &system(),
     );
@@ -6557,6 +6818,7 @@ fn a_continuing_submit_opens_its_fallback_turn_when_none_is_running() {
             }),
             turn: TurnTarget::Continue("t2".to_string()),
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &system(),
     );
@@ -6835,6 +7097,7 @@ fn open_decision(agg: &mut Session, text: &str) -> String {
             }),
             turn: TurnTarget::Detached,
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &system(),
     );
@@ -7130,6 +7393,7 @@ fn declaring_a_connector_fetches_it_and_parks_the_turn() {
             }),
             turn: TurnTarget::Detached,
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &system(),
     );
@@ -7532,6 +7796,7 @@ fn a_terminally_failed_fetch_releases_the_turn_rather_than_parking_it() {
             }),
             turn: TurnTarget::Detached,
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &system(),
     );
@@ -9163,20 +9428,6 @@ fn a_filter_change_re_derives_without_another_fetch() {
 }
 
 #[test]
-fn a_fork_keeps_the_offer_it_already_fetched() {
-    let agg = session_with_connectors(&["sentry"], &["search_issues"]);
-
-    let rewound = agg.state.clone().rewind(0, None);
-    assert!(
-        rewound
-            .tracking(EffectKind::ConnectorSync, "mcp.sentry")
-            .unwrap()
-            .is_ready(),
-        "a fork refetches nothing"
-    );
-}
-
-#[test]
 fn changed_agent_config_anchors_at_head_and_dedups() {
     let mut agg = create_session("sess-1", "tenant-a", "user-1");
 
@@ -9444,6 +9695,7 @@ fn session_start_config_is_visible_to_a_queued_client_decision() {
             }),
             turn: TurnTarget::Detached,
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &system(),
     );
@@ -9562,6 +9814,7 @@ fn client_message_parks_while_session_start_retry_is_scheduled() {
             }),
             turn: TurnTarget::Detached,
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &system(),
     );
@@ -9667,6 +9920,7 @@ fn terminal_session_start_failure_restarts_on_the_next_message() {
             }),
             turn: TurnTarget::Detached,
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &system(),
     );
@@ -9713,6 +9967,7 @@ fn terminal_session_start_failure_restarts_on_the_next_message() {
             }),
             turn: TurnTarget::Detached,
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &system(),
     );
@@ -10762,6 +11017,7 @@ fn appending_to_a_parked_branch_is_rejected() {
                 }),
                 turn: TurnTarget::Detached,
                 queue: QueueMode::Refuse,
+                metadata: Default::default(),
             },
             &system(),
         )
@@ -10784,6 +11040,7 @@ fn global_interrupt_gates_all_new_views() {
                 }),
                 turn: TurnTarget::Detached,
                 queue: QueueMode::Refuse,
+                metadata: Default::default(),
             },
             &system(),
         )
@@ -11074,6 +11331,7 @@ fn wake_promotes_a_queued_decision_on_an_unparked_branch() {
                 client: ClientContext::default(),
                 turn_id: None,
                 merge: false,
+                metadata: Default::default(),
             },
         })],
         &CommitContext {
@@ -11271,6 +11529,7 @@ fn submit_queued(
         }),
         turn: TurnTarget::Open(turn_id.to_string()),
         queue: QueueMode::Turn,
+        metadata: Default::default(),
     };
     let now = Utc::now();
     let events = agg.handle(cmd, &frontend(), now)?;
@@ -11295,6 +11554,7 @@ fn session_mid_turn() -> Session {
             }),
             turn: TurnTarget::Open("turn-1".to_string()),
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &frontend(),
     );
@@ -11429,6 +11689,7 @@ fn a_fail_completes_the_turn_with_the_error_and_takes_the_next_message() {
             }),
             turn: TurnTarget::Open("turn-2".to_string()),
             queue: QueueMode::Refuse,
+            metadata: Default::default(),
         },
         &frontend(),
     );
@@ -11520,35 +11781,57 @@ fn a_queued_submit_on_an_idle_session_starts_its_turn_now() {
 }
 
 #[test]
-fn a_view_or_action_is_still_refused_mid_turn() {
+fn a_view_is_still_refused_mid_turn() {
     let agg = session_mid_turn();
-    let refused = [
-        ClientPayload::Messages(ClientMessages {
-            messages: vec![node_msg("", Role::User, "again")],
-            stream: false,
-            client: ClientContext::default(),
-        }),
-        ClientPayload::Action(crate::protocol::ClientAction {
-            name: "regenerate".to_string(),
-            args: None,
-        }),
-    ];
-    for payload in refused {
-        let err = agg
-            .try_handle(
-                CommandPayload::SubmitClientPayload {
-                    payload: payload.clone(),
-                    turn: TurnTarget::Open("turn-2".to_string()),
-                    queue: QueueMode::Turn,
-                },
-                &frontend(),
-            )
-            .expect_err("only the message shapes defer");
-        assert!(
-            matches!(err, SessionError::TurnAlreadyActive { .. }),
-            "got {err:?} for {payload:?}"
-        );
-    }
+    let err = agg
+        .try_handle(
+            CommandPayload::SubmitClientPayload {
+                payload: ClientPayload::Messages(ClientMessages {
+                    messages: vec![node_msg("", Role::User, "again")],
+                    stream: false,
+                    client: ClientContext::default(),
+                }),
+                turn: TurnTarget::Open("turn-2".to_string()),
+                queue: QueueMode::Turn,
+                metadata: Default::default(),
+            },
+            &frontend(),
+        )
+        .expect_err("only the message shapes defer");
+    assert!(
+        matches!(err, SessionError::TurnAlreadyActive { .. }),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn an_action_mid_turn_joins_the_running_turn() {
+    let mut agg = session_mid_turn();
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Action(crate::protocol::ClientAction {
+                name: "regenerate".to_string(),
+                args: None,
+            }),
+            turn: TurnTarget::Open("turn-2".to_string()),
+            queue: QueueMode::Refuse,
+            metadata: Default::default(),
+        },
+        &frontend(),
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, EventPayload::TurnStarted(_))),
+        "no second turn opens; got {events:?}"
+    );
+    assert_eq!(agg.state.phase.turn_id(), Some("turn-1"));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        EventPayload::DecisionQueued(q)
+            if matches!(&q.trigger, Trigger::ClientAction { turn_id: Some(t), .. } if t == "turn-2")
+    )));
 }
 
 #[test]

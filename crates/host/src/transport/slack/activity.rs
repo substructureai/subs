@@ -45,6 +45,10 @@ impl TurnActivity {
         }
     }
 
+    pub(super) fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
     #[cfg(test)]
     pub(super) fn fold(events: &[SessionEvent]) -> Option<Self> {
         let mut turn: Option<Self> = None;
@@ -288,7 +292,7 @@ pub(in crate::transport::slack) mod tests {
             seq,
             EventPayload::TurnStarted(TurnStarted {
                 turn_id: turn.into(),
-                client_state: None,
+                metadata: Default::default(),
             }),
         )
     }

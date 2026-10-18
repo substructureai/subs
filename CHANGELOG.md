@@ -21,15 +21,27 @@ The `@substructure.ai/cli` package and the `subs`, `substructure-host` and
 - Add an admin route that resumes a parked reader of a session.
 - A host can now give a `SlackBot` to the runtime as a session reader.
 - A host can now give the runtime the HTTP client it uses for events URLs.
-- `turn.started` now carries the `client.state` its turn was submitted with.
+- A machine submit can set `metadata` for its turn. `turn.started` and each decision of the turn carry it.
 - Add `[agent.<id>.context]` strategies. Before a model call that has no room, the engine sends a `context.limit` decision with a plan to reset or summarize.
 - Add the `context.replace` action. It sets the history on a new branch and keeps the state and the config.
+- Add `POST /api/machine/sessions/{id}/cancel`, `POST /api/client/sessions/{id}/cancel` and `subs sessions cancel`. They cancel the current run of a session and its subagents.
 - When a provider refuses a call as too long, the engine summarizes and tries the call one more time.
 - An `llm.call` with no messages after a `context.replace` reads the new history.
 - An LLM call with an empty tool list now sends no tools to the provider.
 
 ### Changed
 
+- A decision request now has `turn: { id, metadata }` in place of `turn_id`. A decision that runs outside a turn has no turn.
+- `done` now ends each tool call that has no result in the history. The call gets the result that arrived, or `cancelled: the turn ended`. A later result gets an error.
+- A client action now runs in the running turn, or in its own turn with the id and `metadata` of its submit. The submit returns the id of that turn. When its own turn has no more work, the turn ends.
+- The Slack bot posts no reply for a turn that shows nothing and returns no data.
+- When `done`, `fail` or a new branch ends a blocking subagent call, the engine now cancels the child's run.
+- A cancel now stops the current run and keeps the session usable. The turn ends with the error code `cancelled`, the open interrupts end as cancelled, and the work that waits is dropped.
+- The engine now stops a running model call or tool when its call ends.
+- `Ctrl-C` during a turn in `subs chat` and `subs run` now cancels the turn. `subs chat` then shows the prompt again.
+- `subs chat` no longer shows a tool call of a failed turn as waiting.
+- A turn now waits for the work that its `turn.finished` answer starts.
+- A failed turn now keeps the client actions that wait.
 - The `substructure-core` crate is now two crates: `substructure-host` and `subs`, which holds the CLI.
 - Log filters now name `substructure_host`, `substructure_session` and `subs` in place of `substructure_core`.
 - Each session now keeps its own log of entries in the database.

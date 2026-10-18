@@ -56,7 +56,7 @@ The model called your `get_weather` tool.
   "ancestry": [],
   "attempts": 1,
   "deadline": "2026-08-05T18:04:00Z",
-  "turn_id": "0193a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a60"
+  "turn": { "id": "0193a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a60", "metadata": {} }
 }
 ```
 
@@ -95,7 +95,7 @@ type DecisionRequest = {
     ancestry: string[]
     attempts: number
     deadline: string | null
-    turn_id: string | null
+    turn: { id: string, metadata: Record<string, string> } | null
 }
 ```
 
@@ -115,7 +115,7 @@ type DecisionRequest = {
 | `ancestry` | Parent session IDs, for a subagent. Empty for a root session. |
 | `attempts` | How many times the engine has delivered this decision. |
 | `deadline` | When this attempt expires. |
-| `turn_id` | The turn this decision belongs to. |
+| `turn` | The turn this decision belongs to. `null` for `session.start` and the work it starts. `metadata` is what the submit of the turn set. It is empty when the submit set none. |
 
 ```typescript
 type Subject = {
@@ -176,7 +176,7 @@ What fires, what the engine proposes, and what you return.
 | --- | --- | --- | --- |
 | `session.start` | The session was created. | The config from the file. Empty when the section sets none. | An `agent` config. |
 | `client.messages` | A client sent or edited messages. | Record the view, then call the model. | `proposed` |
-| `client.action` | A client called a named action. | Empty. | Your own actions. |
+| `client.action` | A client called a named action. It joins the running turn, or opens the turn that the submit named. While a turn ends, it waits. A submit that names a turn id in use is refused. When its own turn has no more work, that turn ends. | Empty. | Your own actions. |
 | `context.limit` | A model call waits for room. See [Make room](./120-conversations.md#make-room). | The plan of the strategy that applied. | `proposed`, `context.replace` and `call`, a summary `llm.call`, or `call` alone. |
 | `tool.execute` | The model called your tool. | Empty. A `tool.error` when the arguments failed validation or the tool is undeclared. | `tool.result` or `tool.error`. |
 | `tool.finished` | A tool call ended, after retries. | Record the result, then call the model. Waits when other calls are in flight. | `proposed` |
@@ -184,7 +184,7 @@ What fires, what the engine proposes, and what you return.
 | `llm.finished` | A model call ended. | Record the reply, then start its tool calls or end the turn. A failed, truncated, or refused call fails the turn. | `proposed` |
 | `subagent.finished` | A child session's turn ended. | Record the child's result as the tool result, then call the model. | `proposed` |
 | `interrupt.resumed` | Someone resumed a paused branch. | Call the model again over the transcript. | `proposed` |
-| `turn.finished` | A turn completed. Carries its cost and output. | `done`. | `proposed` |
+| `turn.finished` | A turn completed. Carries its cost and output. If your answer starts work, the turn ends when that work ends. | `done`. | `proposed` |
 
 ```typescript
 type Trigger =
@@ -293,7 +293,7 @@ type ClientContext = {
 | `fail` | End the turn as a failed run. | Any trigger. |
 | `context.replace` | Set what the model reads, on a new branch. | Any trigger. |
 | `connector.sync` | Fetch a connection's tools again. | Any trigger. |
-| `done` | End the turn. | Any trigger. |
+| `done` | End the turn. Each tool call with no result in the history gets the result that arrived, or `cancelled: the turn ended`. | Any trigger. |
 
 ```typescript
 type Action =

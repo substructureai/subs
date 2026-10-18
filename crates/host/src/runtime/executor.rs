@@ -146,6 +146,7 @@ where
     let result = match open {
         false => Ok(()),
         true => {
+            let watch = bound.clone();
             let run = run_bounded(
                 bound,
                 envelope.task,
@@ -153,7 +154,7 @@ where
                 handle,
                 |bound, message| async move { expire(inbox, &bound, message).await },
             );
-            holding(queue, &receipt, run).await
+            holding(queue, &receipt, watched(inbox, watch.as_ref(), run)).await
         }
     };
     let finished = match result {
@@ -166,6 +167,34 @@ where
     if let Err(error) = finished {
         tracing::warn!(id = %envelope.id, %error, "finishing a task failed");
     }
+}
+
+async fn watched(
+    inbox: &dyn Inbox,
+    bound: Option<&TaskBound>,
+    run: impl Future<Output = Result<(), String>>,
+) -> Result<(), String> {
+    let Some(bound) = bound else {
+        return run.await;
+    };
+    tokio::select! {
+        result = run => result,
+        () = closed(inbox, bound) => {
+            tracing::info!(
+                session_id = %bound.session_id,
+                kind = bound.kind.label(),
+                id = %bound.id,
+                "stopping a task whose call ended"
+            );
+            Ok(())
+        }
+    }
+}
+
+async fn closed(inbox: &dyn Inbox, bound: &TaskBound) {
+    inbox
+        .ended(&bound.tenant_id, &bound.session_id, &bound.work())
+        .await
 }
 
 async fn run_bounded<T, F, Fut, E, EFut>(
@@ -382,6 +411,48 @@ mod tests {
     async fn a_stamp_in_the_future_is_no_wait() {
         let (ran, _) = drive(Task(bound(Some(10), Some(500), -5_000)), Duration::ZERO).await;
         assert!(ran);
+    }
+
+    struct Closing(AtomicBool);
+
+    #[async_trait::async_trait]
+    impl Inbox for Closing {
+        async fn submit(
+            &self,
+            _tenant_id: &str,
+            _session_id: &str,
+            _command: substructure_session::Command,
+        ) -> Result<substructure_session::CommandResult, substructure_session::Error> {
+            unreachable!("a watched task settles nothing")
+        }
+
+        async fn is_open(&self, _: &str, _: &str, _: &substructure_session::WorkId) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_task_stops_when_its_call_ends() {
+        let inbox = Closing(AtomicBool::new(true));
+        let bound = bound(None, None, 0);
+        let run = async {
+            inbox.0.store(false, Ordering::SeqCst);
+            std::future::pending::<Result<(), String>>().await
+        };
+        let result = watched(&inbox, bound.as_ref(), run).await;
+        assert_eq!(result, Ok(()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_task_whose_call_is_open_runs_to_the_end() {
+        let inbox = Closing(AtomicBool::new(true));
+        let bound = bound(None, None, 0);
+        let run = async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Err("finished".to_string())
+        };
+        let result = watched(&inbox, bound.as_ref(), run).await;
+        assert_eq!(result, Err("finished".to_string()));
     }
 
     struct Flaky {

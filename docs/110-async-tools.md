@@ -71,6 +71,11 @@ model never sees a half-finished turn.
 The wait is saved state. It uses no compute, and it survives a restart of the
 engine or your worker.
 
+If your worker answers `done` while a call is open, the engine ends the call
+with the result `cancelled: the turn ended`. A result that arrived before
+`done` is kept. A result that arrives later gets `409` with
+`effect is not pending`.
+
 ## End the call
 
 Report the result and name the call by `id`.

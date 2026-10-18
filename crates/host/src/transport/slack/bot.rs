@@ -1352,6 +1352,12 @@ impl SlackBot {
             Some(live) => Some(live),
             None => self.recover(ws, &key, seq).await,
         };
+        let silent = live
+            .as_ref()
+            .is_some_and(|s| s.ts.is_none() && s.turn.is_empty());
+        if silent && t.error.is_none() && t.data.is_null() {
+            return Ok(());
+        }
         let elapsed = live
             .as_ref()
             .and_then(|s| (at - s.started_at).to_std().ok());
@@ -2620,7 +2626,7 @@ mod tests {
         let (bot, ws) = bot_for(api_base);
         let started = EventPayload::TurnStarted(crate::runtime::session::events::TurnStarted {
             turn_id: "turn-1".into(),
-            client_state: None,
+            metadata: Default::default(),
         });
         bot.track(&ws, &thread(), &turn_event(started, Some("turn-1"), None))
             .await
@@ -2652,7 +2658,7 @@ mod tests {
             &turn_event(
                 EventPayload::TurnStarted(crate::runtime::session::events::TurnStarted {
                     turn_id: "turn-1".into(),
-                    client_state: None,
+                    metadata: Default::default(),
                 }),
                 Some("turn-1"),
                 None,
@@ -2957,7 +2963,7 @@ mod tests {
 
         let started = EventPayload::TurnStarted(crate::session::events::TurnStarted {
             turn_id: "turn-1".into(),
-            client_state: None,
+            metadata: Default::default(),
         });
         bot.apply(turn_event(started, Some("turn-1"), None))
             .await

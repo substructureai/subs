@@ -106,7 +106,7 @@ The actions in a decision tell the engine what to do.
 | `interrupt` | Pause the branch until someone resumes it. |
 | `interrupt.resolve` | Clear an open interrupt and resume. |
 | `connector.sync` | Fetch a connection's tools again. |
-| `done` | End the turn. |
+| `done` | End the turn. Open tool calls end as cancelled. |
 
 ## Where each call runs
 

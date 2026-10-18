@@ -62,6 +62,10 @@ pub fn router(admin: AdminHttpState) -> Router {
             "/api/v1/projects/{project}/sessions/{session_id}/ag-ui/connect",
             post(connect_session_ag_ui),
         )
+        .route(
+            "/api/v1/projects/{project}/sessions/{session_id}/cancel",
+            post(cancel_session),
+        )
         .route("/api/v1/projects/{project}/run", post(run))
         .route("/api/v1/orgs", get(list_orgs))
         .route("/api/v1/orgs/{org}/projects", get(list_projects))
@@ -107,6 +111,14 @@ async fn advertise_defaults(
         HeaderValue::from_static(LOCAL_PROJECT),
     );
     res
+}
+
+async fn cancel_session(
+    State(state): State<V1State>,
+    Extension(caller): Extension<Caller>,
+    Path((_project, session_id)): Path<(String, String)>,
+) -> Response {
+    routes::cancel_session(State(state.admin), Extension(caller), Path(session_id)).await
 }
 
 async fn run(
