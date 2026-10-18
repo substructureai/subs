@@ -9,6 +9,8 @@ The `@substructure.ai/cli` package and the `subs`, `substructure-host` and
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-18
+
 ### Added
 
 - A machine submit can set the agent state when it creates the session.
@@ -294,7 +296,8 @@ The `@substructure.ai/cli` package and the `subs`, `substructure-host` and
 - The changelog starts again at this release. For the changes before it, refer
   to the git history.
 
-[Unreleased]: https://github.com/substructureai/substructure/compare/v0.9.5...HEAD
+[Unreleased]: https://github.com/substructureai/substructure/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/substructureai/substructure/compare/v0.9.5...v0.10.0
 [0.9.5]: https://github.com/substructureai/substructure/compare/v0.9.4...v0.9.5
 [0.9.4]: https://github.com/substructureai/substructure/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/substructureai/substructure/compare/v0.9.2...v0.9.3

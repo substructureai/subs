@@ -1,6 +1,6 @@
 [package]
 name = "substructure-host"
-version = "0.9.5"
+version = "0.10.0"
 edition = "2021"
 description = "Runs Substructure sessions: server, providers, connectors and transports"
 license = "MIT"
