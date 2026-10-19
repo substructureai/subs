@@ -9,6 +9,18 @@ The `@substructure.ai/cli` package and the `subs`, `substructure-host` and
 
 ## [Unreleased]
 
+### Added
+
+- The session index keeps the title, user, turn count, token usage and activity of each session. The activity is `running`, `waiting`, `failed`, `done` or `idle`. A migration fills them in for the sessions you have.
+- The admin session list takes `user_id`, `activity` and `query`. `query` matches the title.
+- The session list sorts by start, spend, turns, tokens and cache rate, and `SessionFilter` takes ranges of spend, turns and start time.
+- `SessionIndexStore::aggregate_sessions` totals the sessions that match a filter.
+
+### Changed
+
+- `SessionCursor.at` is now optional, and the cursor has a `value` for the sorts that are not by time.
+- A `SessionIndexStore` must now implement `aggregate_sessions`.
+
 ## [0.10.0] - 2026-10-18
 
 ### Added

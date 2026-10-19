@@ -10,12 +10,12 @@ use crate::decision::{LlmHandler, ToolHandler};
 use crate::entry::{Command, CommandId};
 use crate::events::{ConnectorTarget, EventPayload};
 use crate::protocol::{
-    DeferToolsStrategy, DraftMessage, EffectKind, EffectStatus, LlmRequest, RetryPolicy,
-    SessionOwner,
+    DeferToolsStrategy, DraftMessage, EffectKind, EffectStatus, LlmRequest, RetryPolicy, Role,
+    SessionOwner, Usage,
 };
 use crate::request::{PendingPrompt, WorkerDecisionRequest};
 use crate::session::{Session, SessionEvent};
-use crate::state::{EffectState, SessionStatus};
+use crate::state::{title, EffectState, SessionStatus};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct WorkId {
@@ -119,6 +119,15 @@ pub struct Summary {
     pub first_event_at: Option<DateTime<Utc>>,
     pub last_event_at: Option<DateTime<Utc>>,
     pub wake_at: Option<DateTime<Utc>>,
+    /// The first thing the user said, as a one-line title.
+    pub title: Option<String>,
+    /// The owner's subject id: who the session is with.
+    pub user_id: Option<String>,
+    pub turns: u64,
+    pub running: bool,
+    pub last_turn_failed: bool,
+    /// The session's own usage and its subagents' together.
+    pub usage: Usage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,6 +169,15 @@ impl Session {
     pub fn summary(&self) -> Summary {
         let state = &self.state;
         let meta = state.event_meta(self.last_event_at.unwrap_or_default());
+        let running = state.phase.turn_id().is_some();
+        let title = state.title.clone().or_else(|| {
+            state
+                .nodes
+                .iter()
+                .find(|n| n.message.role == Role::User)
+                .and_then(|n| n.message.content.as_ref())
+                .and_then(|c| title(&c.text_owned()))
+        });
         Summary {
             session_id: self.id.clone(),
             tenant_id: self.tenant_id.clone(),
@@ -173,6 +191,20 @@ impl Session {
             first_event_at: self.first_event_at,
             last_event_at: self.last_event_at,
             wake_at: self.wake_at,
+            title,
+            user_id: state
+                .owner
+                .as_ref()
+                .and_then(|o| o.requester.subject.as_ref())
+                .map(|s| s.id.clone()),
+            turns: state.completed_turn_ids.len() as u64 + u64::from(running),
+            running,
+            last_turn_failed: state.last_turn_failed,
+            usage: {
+                let mut usage = state.token_usage.clone();
+                usage.add(&state.subagent_token_usage);
+                usage
+            },
         }
     }
 

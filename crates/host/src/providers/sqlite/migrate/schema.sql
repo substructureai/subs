@@ -9,11 +9,26 @@ CREATE INDEX idx_engine_queue_topic ON engine_queue (topic, visible_at, enqueued
 CREATE INDEX idx_session_entries_seq
             ON session_entries (tenant_id, session_id, last_seq);
 
+CREATE INDEX idx_session_index_activity
+             ON session_index (tenant_id, top_level, activity, last_event_at DESC, session_id DESC);
+
 CREATE INDEX idx_session_index_last_event
   ON session_index (tenant_id, last_event_at DESC, session_id DESC);
 
+CREATE INDEX idx_session_index_spend
+             ON session_index (tenant_id, top_level, spend DESC, session_id DESC);
+
+CREATE INDEX idx_session_index_tokens
+             ON session_index (tenant_id, top_level, total_tokens DESC, session_id DESC);
+
 CREATE INDEX idx_session_index_top_level_last_event
   ON session_index (tenant_id, top_level, last_event_at DESC, session_id DESC);
+
+CREATE INDEX idx_session_index_turns
+             ON session_index (tenant_id, top_level, turns DESC, session_id DESC);
+
+CREATE INDEX idx_session_index_user
+             ON session_index (tenant_id, user_id, last_event_at DESC, session_id DESC);
 
 CREATE INDEX idx_session_index_wake_at
   ON session_index (tenant_id, wake_at);
@@ -105,7 +120,7 @@ CREATE TABLE session_index (
     sub_agent_cost  TEXT NOT NULL,
     status_json     TEXT NOT NULL,
     turn_id         TEXT,
-    updated_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL, title TEXT, user_id TEXT, turns INTEGER NOT NULL DEFAULT 0, activity TEXT NOT NULL DEFAULT 'idle', input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, cache_read_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0, spend REAL NOT NULL DEFAULT 0,
     PRIMARY KEY (tenant_id, session_id)
 );
 

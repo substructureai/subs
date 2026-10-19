@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use crate::runtime::event_store::{EventFilter, Seq, StoreError};
 use crate::runtime::session::command::SessionError;
-use crate::runtime::session::index::{SessionFilter, SessionIndexStore, SessionPage};
+use crate::runtime::session::index::{
+    SessionFilter, SessionIndexStore, SessionPage, SessionTotals,
+};
 use crate::runtime::session::{Session, SessionEvent};
 use crate::runtime::sessions::Sessions;
 use crate::runtime::RuntimeError;
@@ -31,6 +33,13 @@ impl SessionReader {
     pub async fn count(&self, filter: &SessionFilter) -> Result<u64, RuntimeError> {
         self.session_index
             .count_sessions(filter)
+            .await
+            .map_err(internal)
+    }
+
+    pub async fn aggregate(&self, filter: &SessionFilter) -> Result<SessionTotals, RuntimeError> {
+        self.session_index
+            .aggregate_sessions(filter)
             .await
             .map_err(internal)
     }

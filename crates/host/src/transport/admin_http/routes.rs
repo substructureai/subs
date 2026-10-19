@@ -9,7 +9,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::event_store::Seq;
 use crate::session::index::SessionSort;
-use crate::session::index::{SessionCursor, SessionFilter};
+use crate::session::index::{SessionActivity, SessionCursor, SessionFilter};
 use crate::session::subscriptions::{SessionSubscriptionSpec, SubscriptionScope};
 use crate::transport::ag_ui::snapshot::snapshot_events;
 use crate::transport::ag_ui::types::RunAgentInput;
@@ -28,6 +28,9 @@ pub struct ListSessionsParams {
     pub cursor: Option<String>,
     pub session_id: Option<String>,
     pub agent_id: Option<String>,
+    pub user_id: Option<String>,
+    pub activity: Option<SessionActivity>,
+    pub query: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -58,10 +61,14 @@ pub async fn list_sessions(
         tenant_id: Some(tenant_id),
         session_id: params.session_id,
         agent_id: params.agent_id,
+        user_id: params.user_id,
+        activity: params.activity,
+        query: params.query,
         top_level: params.top_level,
         sort: params.sort,
         limit: params.limit,
         cursor,
+        ..Default::default()
     };
 
     match state.runtime.list_sessions(&filter).await {

@@ -281,6 +281,7 @@ async fn local_page(cmd: &ListCommand, db: &str) -> Result<Page> {
             .map(SessionCursor::decode)
             .transpose()
             .map_err(|e| anyhow::anyhow!(e))?,
+        ..Default::default()
     };
 
     let page = reader.list(&filter).await?;
@@ -597,6 +598,14 @@ mod tests {
             subagent_cost: Default::default(),
             status: crate::session::state::SessionStatus::Done,
             turn_id: None,
+            title: None,
+            user_id: None,
+            turns: 0,
+            activity: Default::default(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            total_tokens: 0,
         };
         let row = row(&item);
         assert_eq!(row.session_id.as_deref(), Some("sess-1"));
@@ -634,6 +643,14 @@ mod tests {
             subagent_cost: Default::default(),
             status: crate::session::state::SessionStatus::Done,
             turn_id: None,
+            title: None,
+            user_id: None,
+            turns: 0,
+            activity: Default::default(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            total_tokens: 0,
         }
     }
 
@@ -729,7 +746,8 @@ mod tests {
     #[test]
     fn a_cursor_survives_the_round_trip() {
         let cursor = SessionCursor {
-            at: chrono::DateTime::UNIX_EPOCH,
+            at: Some(chrono::DateTime::UNIX_EPOCH),
+            value: None,
             session_id: "sess-1".into(),
         };
         let decoded = SessionCursor::decode(&cursor.encode().unwrap()).unwrap();

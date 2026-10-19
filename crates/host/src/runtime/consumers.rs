@@ -9,7 +9,7 @@ use crate::runtime::blob::BlobStore;
 use crate::runtime::connector::{answer_locally, settle_call, ConnectorTask};
 use crate::runtime::llm::LlmTask;
 use crate::runtime::queue::{self, Envelope, Queue};
-use crate::runtime::session::index::{SessionIndexRecord, SessionIndexStore};
+use crate::runtime::session::index::{SessionActivity, SessionIndexRecord, SessionIndexStore};
 use crate::runtime::session::SessionEvent;
 use crate::runtime::sessions::{DeliveryError, Reader, Sessions, WorkSink};
 use crate::runtime::span::SpanContext;
@@ -239,8 +239,20 @@ impl Reader for IndexReader {
                 agent_id: summary.agent_id,
                 cost: summary.cost,
                 subagent_cost: summary.subagent_cost,
+                activity: SessionActivity::of(
+                    &summary.status,
+                    summary.running,
+                    summary.last_turn_failed,
+                ),
                 status: summary.status,
                 turn_id: summary.turn_id,
+                title: summary.title,
+                user_id: summary.user_id,
+                turns: summary.turns,
+                input_tokens: summary.usage.input,
+                output_tokens: summary.usage.output,
+                cache_read_tokens: summary.usage.cache_read,
+                total_tokens: summary.usage.total,
             })
             .await
             .map_err(DeliveryError::from)

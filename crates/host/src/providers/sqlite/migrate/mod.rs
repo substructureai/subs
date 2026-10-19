@@ -5,6 +5,8 @@ mod m004_secret_store;
 mod m005_auth_flows;
 mod m006_subject_issuer;
 mod m007_session_logs;
+mod m008_session_index_summary;
+mod m009_session_index_usage;
 
 use chrono::Utc;
 use rusqlite::{Connection, Transaction, TransactionBehavior};
@@ -56,6 +58,16 @@ pub const CORE_MIGRATIONS: &[Migration] = &[
         version: 7,
         name: "session_logs",
         up: m007_session_logs::up,
+    },
+    Migration {
+        version: 8,
+        name: "session_index_summary",
+        up: m008_session_index_summary::up,
+    },
+    Migration {
+        version: 9,
+        name: "session_index_usage",
+        up: m009_session_index_usage::up,
     },
 ];
 

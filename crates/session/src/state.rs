@@ -828,6 +828,13 @@ pub struct SessionState {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub completed_turn_ids: Vec<String>,
 
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub last_turn_failed: bool,
+
+    /// The first thing a client said, kept even when no turn ever answered it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub detached_turns: BTreeSet<String>,
 
@@ -881,6 +888,8 @@ impl SessionState {
             phase: TurnPhase::default(),
             turn_started_seq: None,
             completed_turn_ids: Vec::new(),
+            last_turn_failed: false,
+            title: None,
             detached_turns: BTreeSet::new(),
             head_id: None,
             nodes: Vec::new(),
@@ -1177,9 +1186,15 @@ impl SessionState {
     }
 
     fn apply_decision_queued(&mut self, p: &DecisionQueued, ctx: &ApplyContext) {
-        match p.trigger {
+        match &p.trigger {
             Trigger::SessionStart => self.session_start_failed = false,
             Trigger::TurnFinished { .. } => self.quiet_end = None,
+            Trigger::ClientMessage { messages, .. } if self.title.is_none() => {
+                self.title = messages
+                    .iter()
+                    .filter(|m| m.role == Role::User)
+                    .find_map(|m| m.content.as_ref().and_then(|c| title(&c.text_owned())));
+            }
             _ => {}
         }
         let retry_policy = self.worker_retry.clone().unwrap_or(RetryPolicy::no_retry());
@@ -1519,6 +1534,7 @@ impl SessionState {
             }
             EventPayload::TurnCompleted(payload) => {
                 self.completed_turn_ids.push(payload.turn_id.clone());
+                self.last_turn_failed = payload.error.is_some();
                 if !matches!(self.phase, TurnPhase::Finalizing(_)) {
                     self.last_turn_at = Some(now);
                 }
@@ -2926,4 +2942,67 @@ mod node_wire_compat_tests {
 
 pub fn waiting_on_client(calls: &[Effect]) -> bool {
     !calls.is_empty() && calls.iter().all(|c| c.handler == Some(Handler::Client))
+}
+
+const TITLE_CHARS: usize = 200;
+
+/// A message as a one-line title: whitespace collapsed, clipped.
+pub fn title(text: &str) -> Option<String> {
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!line.is_empty()).then(|| line.chars().take(TITLE_CHARS).collect())
+}
+
+#[cfg(test)]
+mod summary_fold_tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn apply(s: &mut SessionState, payload: serde_json::Value) {
+        let event: EventPayload = serde_json::from_value(payload).unwrap();
+        s.apply(
+            &event,
+            &ApplyContext {
+                occurred_at: Utc::now(),
+                sequence: 1,
+            },
+        );
+    }
+
+    fn client_message(id: &str, text: &str) -> serde_json::Value {
+        json!({
+            "type": "decision.queued",
+            "id": id,
+            "trigger": {"type": "client.message", "messages": [{"role": "user", "content": text}]},
+        })
+    }
+
+    #[test]
+    fn the_title_is_the_first_client_message_on_one_line() {
+        let mut s = SessionState::new("sess-1".to_string());
+        apply(&mut s, client_message("d1", "  Where is\n my   order? "));
+        apply(&mut s, client_message("d2", "Any update?"));
+        assert_eq!(s.title.as_deref(), Some("Where is my order?"));
+    }
+
+    #[test]
+    fn a_title_is_clipped() {
+        assert_eq!(
+            title(&"x".repeat(500)).unwrap().chars().count(),
+            TITLE_CHARS
+        );
+        assert_eq!(title("   "), None);
+    }
+
+    #[test]
+    fn the_last_turn_decides_whether_the_session_failed() {
+        let mut s = SessionState::new("sess-1".to_string());
+        apply(
+            &mut s,
+            json!({"type": "turn.completed", "turn_id": "t1", "error": {"message": "boom", "code": "invalid_response"}}),
+        );
+        assert!(s.last_turn_failed);
+        apply(&mut s, json!({"type": "turn.completed", "turn_id": "t2"}));
+        assert!(!s.last_turn_failed);
+    }
 }

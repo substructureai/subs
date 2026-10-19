@@ -112,6 +112,13 @@ pub(crate) fn sea_params(values: sea_query::Values) -> Vec<Box<dyn rusqlite::typ
                 sea_query::Value::Int(i) => Box::new(i),
                 sea_query::Value::BigInt(i) => Box::new(i),
                 sea_query::Value::BigUnsigned(u) => Box::new(u.map(|n| n as i64)),
+                sea_query::Value::TinyInt(i) => Box::new(i),
+                sea_query::Value::SmallInt(i) => Box::new(i),
+                sea_query::Value::TinyUnsigned(u) => Box::new(u),
+                sea_query::Value::SmallUnsigned(u) => Box::new(u),
+                sea_query::Value::Unsigned(u) => Box::new(u),
+                sea_query::Value::Float(f) => Box::new(f.map(f64::from)),
+                sea_query::Value::Double(f) => Box::new(f),
                 sea_query::Value::Bool(b) => Box::new(b),
                 _ => Box::new(Option::<String>::None),
             }

@@ -21,7 +21,7 @@ use queue::Queue;
 use retry::{DefaultWorkerRetryResolver, WorkerRetryResolver};
 use session::command::{CommandPayload, Outcome, SessionError, SettleError, TurnTarget};
 use session::decision::{EffectResultPayload, WorkKind};
-use session::index::{SessionFilter, SessionIndexStore, SessionPage};
+use session::index::{SessionFilter, SessionIndexStore, SessionPage, SessionTotals};
 use session::read::SessionReader;
 use session::state::EffectKind;
 use session::subscriptions::SessionSubscriptionSpec;
@@ -655,6 +655,13 @@ impl Runtime {
 
     pub async fn count_sessions(&self, filter: &SessionFilter) -> Result<u64, RuntimeError> {
         self.reader().count(filter).await
+    }
+
+    pub async fn aggregate_sessions(
+        &self,
+        filter: &SessionFilter,
+    ) -> Result<SessionTotals, RuntimeError> {
+        self.reader().aggregate(filter).await
     }
 
     pub async fn get_session(
