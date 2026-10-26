@@ -9,6 +9,8 @@ The `@substructure.ai/cli` package and the `subs`, `substructure-host` and
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-10-26
+
 ### Added
 
 - The session index keeps the title, user, turn count, token usage and activity of each session. The activity is `running`, `waiting`, `failed`, `done` or `idle`. A migration fills them in for the sessions you have.
@@ -312,7 +314,8 @@ The `@substructure.ai/cli` package and the `subs`, `substructure-host` and
 - The changelog starts again at this release. For the changes before it, refer
   to the git history.
 
-[Unreleased]: https://github.com/substructureai/substructure/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/substructureai/substructure/compare/v0.10.1...HEAD
+[0.10.1]: https://github.com/substructureai/substructure/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/substructureai/substructure/compare/v0.9.5...v0.10.0
 [0.9.5]: https://github.com/substructureai/substructure/compare/v0.9.4...v0.9.5
 [0.9.4]: https://github.com/substructureai/substructure/compare/v0.9.3...v0.9.4

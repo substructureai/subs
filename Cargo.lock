@@ -3162,7 +3162,7 @@ dependencies = [
 
 [[package]]
 name = "subs"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3198,7 +3198,7 @@ dependencies = [
 
 [[package]]
 name = "substructure-host"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3243,7 +3243,7 @@ dependencies = [
 
 [[package]]
 name = "substructure-session"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
