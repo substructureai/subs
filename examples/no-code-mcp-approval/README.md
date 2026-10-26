@@ -24,7 +24,7 @@ annotations, because they are what `destructive` reads.
 Install the CLI:
 
 ```sh
-npm i -g @substructure.ai/cli
+curl -fsSL https://subs.dev/cli.sh | bash
 ```
 
 Start the connection and give the engine a key. The connection is on this

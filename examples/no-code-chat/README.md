@@ -12,7 +12,7 @@ depend on the last one.
 Install the CLI:
 
 ```sh
-npm i -g @substructure.ai/cli
+curl -fsSL https://subs.dev/cli.sh | bash
 ```
 
 This file names no `[remote]`, so the turn runs on this machine, on your own

@@ -13,7 +13,7 @@ The protocol types in `protocol.go` are generated from the JSON Schema.
 Install the CLI:
 
 ```sh
-npm i -g @substructure.ai/cli
+curl -fsSL https://subs.dev/cli.sh | bash
 ```
 
 Two terminals.

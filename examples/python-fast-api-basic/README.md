@@ -7,7 +7,7 @@ The most basic chattable agent, served with [FastAPI](https://fastapi.tiangolo.c
 Install the CLI:
 
 ```sh
-npm i -g @substructure.ai/cli
+curl -fsSL https://subs.dev/cli.sh | bash
 ```
 
 Two terminals.

@@ -15,7 +15,7 @@ command.
 First, install the CLI:
 
 ```sh
-npm i -g @substructure.ai/cli
+curl -fsSL https://subs.dev/cli.sh | bash
 ```
 
 You must use two terminals.

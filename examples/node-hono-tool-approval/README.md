@@ -14,7 +14,7 @@ the CLI the same resolution is an `interrupt.resume` input.
 Install the CLI:
 
 ```sh
-npm i -g @substructure.ai/cli
+curl -fsSL https://subs.dev/cli.sh | bash
 ```
 
 Two terminals.

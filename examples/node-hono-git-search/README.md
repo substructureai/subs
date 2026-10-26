@@ -23,7 +23,7 @@ Requires `git` on your PATH.
 Install the CLI:
 
 ```sh
-npm i -g @substructure.ai/cli
+curl -fsSL https://subs.dev/cli.sh | bash
 ```
 
 Two terminals.

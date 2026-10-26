@@ -10,7 +10,7 @@ that thread continues the conversation.
 Install the CLI:
 
 ```sh
-npm i -g @substructure.ai/cli
+curl -fsSL https://subs.dev/cli.sh | bash
 ```
 
 Deploy the file and give it a key:

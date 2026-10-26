@@ -386,12 +386,7 @@ curl -fsSL https://subs.dev/cli.sh | bash
 ```
 
 The script verifies the release checksum and installs to `~/.local/bin`. Set
-`SUBS_INSTALL_DIR` to install elsewhere and `SUBS_VERSION` to pin a release. Or
-install from npm:
-
-```sh
-npm i -g @substructure.ai/cli
-```
+`SUBS_INSTALL_DIR` to install elsewhere and `SUBS_VERSION` to pin a release.
 
 ## Docs
 

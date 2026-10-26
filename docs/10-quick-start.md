@@ -17,8 +17,7 @@ subs login
 ```
 
 The script verifies the release checksum and installs to `~/.local/bin`. Set
-`SUBS_INSTALL_DIR` to install elsewhere and `SUBS_VERSION` to pin a release. To
-install from npm instead: `npm install -g @substructure.ai/cli`.
+`SUBS_INSTALL_DIR` to install elsewhere and `SUBS_VERSION` to pin a release.
 
 `subs login` authenticates in your browser and stores a token under
 `~/.config/subs`.

@@ -20,7 +20,7 @@ reads the new version.
 Install the CLI:
 
 ```sh
-npm i -g @substructure.ai/cli
+curl -fsSL https://subs.dev/cli.sh | bash
 ```
 
 Start the file server and give the engine a key. The server is on this

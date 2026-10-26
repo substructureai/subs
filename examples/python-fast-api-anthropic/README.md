@@ -16,7 +16,7 @@ answers the `llm.result` verbatim. No translation code in the worker.
 Install the CLI:
 
 ```sh
-npm i -g @substructure.ai/cli
+curl -fsSL https://subs.dev/cli.sh | bash
 ```
 
 Two terminals.

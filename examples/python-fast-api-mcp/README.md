@@ -12,7 +12,7 @@ server scoped to this directory; swap the command for any MCP server.
 Install the CLI:
 
 ```sh
-npm i -g @substructure.ai/cli
+curl -fsSL https://subs.dev/cli.sh | bash
 ```
 
 Two terminals.

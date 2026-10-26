@@ -21,6 +21,10 @@ The `@substructure.ai/cli` package and the `subs`, `substructure-host` and
 - `SessionCursor.at` is now optional, and the cursor has a `value` for the sorts that are not by time.
 - A `SessionIndexStore` must now implement `aggregate_sessions`.
 
+### Removed
+
+- The release does not publish the CLI to npm. Install it from `https://subs.dev/cli.sh`.
+
 ## [0.10.0] - 2026-10-18
 
 ### Added

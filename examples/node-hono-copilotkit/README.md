@@ -15,7 +15,7 @@ CopilotKit's `<CopilotChat>` pointed at the engine via an `HttpAgent`.
 Install the CLI:
 
 ```sh
-npm i -g @substructure.ai/cli
+curl -fsSL https://subs.dev/cli.sh | bash
 ```
 
 Three things: the engine, the app, the browser.

@@ -8,7 +8,7 @@ A chattable agent that delegates weather questions to a subagent, served with
 Install the CLI:
 
 ```sh
-npm i -g @substructure.ai/cli
+curl -fsSL https://subs.dev/cli.sh | bash
 ```
 
 Two terminals.

@@ -11,10 +11,6 @@ on:
         type: boolean
         default: true
 
-env:
-  PNPM_VERSION: 11.0.9
-  NODE_VERSION: 24
-
 jobs:
   build:
     name: Build (${{ matrix.platform }})
@@ -47,15 +43,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: pnpm/action-setup@v6
-        with:
-          version: ${{ env.PNPM_VERSION }}
-
-      - uses: actions/setup-node@v6
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: pnpm
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -79,32 +66,8 @@ jobs:
           echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
           echo "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++" >> "$GITHUB_ENV"
 
-      - name: Install workspace deps
-        run: pnpm install --no-frozen-lockfile
-
-      # ── CLI binary build ────────────────────────────────────────────────
       - name: Build CLI binary
         run: cargo build --release --bin subs -p subs --target ${{ matrix.target }}
-
-      - name: Build CLI platform package
-        shell: bash
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          if [ -z "$VERSION" ] || [ "$VERSION" = "$GITHUB_REF_NAME" ]; then
-            VERSION=$(node -p "require('./packages/cli/package.json').version")
-          fi
-          node scripts/build-cli-platform-package.mjs \
-            --target ${{ matrix.target }} \
-            --binary target/${{ matrix.target }}/release/${{ matrix.bin }} \
-            --version "$VERSION" \
-            --out-dir packages/cli/npm/${{ matrix.platform }}
-
-      - name: Upload CLI platform package
-        uses: actions/upload-artifact@v7
-        with:
-          name: cli-${{ matrix.platform }}
-          path: packages/cli/npm/${{ matrix.platform }}
-          if-no-files-found: error
 
       # ── Release tarball (https://subs.dev/cli.sh) ───────────────────────
       # Asset names carry no version, so `releases/latest/download/<name>`
@@ -130,28 +93,15 @@ jobs:
           if-no-files-found: error
 
   publish:
-    name: Publish to npm
+    name: Publish
     needs: build
     if: github.event_name == 'push' || inputs.dry_run == false
     runs-on: ubuntu-24.04
     environment: Publish
     permissions:
       contents: write
-      id-token: write
     steps:
       - uses: actions/checkout@v6
-
-      - uses: pnpm/action-setup@v6
-        with:
-          version: ${{ env.PNPM_VERSION }}
-
-      - uses: actions/setup-node@v6
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: pnpm
-          registry-url: 'https://registry.npmjs.org'
-
-      - run: pnpm install --no-frozen-lockfile
 
       - name: Resolve version
         id: version
@@ -163,42 +113,12 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Publishing version $VERSION"
 
-      - name: Download CLI platform packages
-        uses: actions/download-artifact@v8
-        with:
-          pattern: cli-*
-          path: packages/cli/npm
-
-      - name: Restore executable bit on CLI binaries
-        run: chmod +x packages/cli/npm/*/bin/subs
-
       - name: Download release tarballs
         uses: actions/download-artifact@v8
         with:
           pattern: tarball-*
           path: dist
           merge-multiple: true
-
-      # ── Publish CLI platform packages and main wrapper ───────────────────
-      - name: Publish CLI platform packages
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          for d in packages/cli/npm/*/; do
-            echo "Publishing $d"
-            (cd "$d" && npm publish --access public)
-          done
-
-      - name: Inject CLI optionalDependencies
-        run: node scripts/inject-cli-optional-deps.mjs "${{ steps.version.outputs.version }}"
-
-      - name: Publish CLI main wrapper
-        working-directory: packages/cli
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public
 
       # ── GitHub Release ───────────────────────────────────────────────────
       # Notes come straight from the CHANGELOG section for this version. If the

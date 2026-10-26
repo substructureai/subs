@@ -43,7 +43,7 @@ so a typo fails at startup instead of becoming a bot that never answers.
 Install the CLI:
 
 ```sh
-npm i -g @substructure.ai/cli
+curl -fsSL https://subs.dev/cli.sh | bash
 ```
 
 Put your own ids in the two `[slack.channel.…]` sections. Then deploy the file

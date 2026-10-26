@@ -52,7 +52,7 @@ Then collect the two tokens:
 Install the CLI:
 
 ```sh
-npm i -g @substructure.ai/cli
+curl -fsSL https://subs.dev/cli.sh | bash
 ```
 
 From this directory, with the tokens and an [OpenRouter](https://openrouter.ai)

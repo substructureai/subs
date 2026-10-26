@@ -14,7 +14,7 @@ pre-built `<Thread>` wired to the engine with `useAgUiRuntime`.
 Install the CLI:
 
 ```sh
-npm i -g @substructure.ai/cli
+curl -fsSL https://subs.dev/cli.sh | bash
 ```
 
 Three things: the engine, the app, the browser.
