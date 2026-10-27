@@ -97,7 +97,7 @@ async fn call(
     task: &System1Task,
 ) -> Result<substructure_session::system1::System1Response, LlmCallError> {
     let client = blocks
-        .resolve(&task.system1)
+        .resolve(&task.system1, &task.owner)
         .await
         .map_err(|e| LlmCallError::new(ErrorCode::ProviderError, e, false))?;
     let mut assets = BTreeMap::new();

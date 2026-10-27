@@ -83,7 +83,12 @@ pub async fn auth(cmd: AuthCommand) -> Result<()> {
             }
             return llm::set_key_at(block, scope).await;
         }
-        Target::System1(block) => return super::system1::key_at(&block, &scope, "set"),
+        Target::System1(block) => {
+            if no_browser {
+                bail!("`system1.{block}` takes a key rather than a consent, so --no-browser says nothing.");
+            }
+            return super::system1::set_key_at(block, scope).await;
+        }
         Target::SlackApp(agent) => {
             if no_browser {
                 bail!(
@@ -129,7 +134,7 @@ pub async fn revoke(cmd: RevokeCommand) -> Result<()> {
     let cfg = connections::environment(&scope.globals)?;
     let path = match target(path, &cfg)? {
         Target::Block(block) => return llm::delete_key_at(block, scope).await,
-        Target::System1(block) => return super::system1::key_at(&block, &scope, "delete"),
+        Target::System1(block) => return super::system1::delete_key_at(block, scope).await,
         Target::SlackApp(agent) => return slack_app::delete_credentials(agent, scope).await,
         Target::Connection(spec) => spec.path,
     };
@@ -149,9 +154,7 @@ pub async fn list(cmd: ListCommand) -> Result<()> {
         false => connections::list_remote(&scope, &cfg).await?,
     };
     rows.extend(llm::rows(&cfg, &scope, here).await?);
-    if here {
-        rows.extend(super::system1::rows(&cfg));
-    }
+    rows.extend(super::system1::rows(&cfg, &scope, here).await?);
     rows.extend(slack_app::rows(&cfg, &scope, here).await?);
     rows.sort_by(|a, b| a.path.cmp(&b.path));
 

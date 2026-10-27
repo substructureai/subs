@@ -4,6 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::llm::LlmCallError;
+use crate::protocol::SessionOwner;
 use substructure_session::system1::{System1Request, System1Response};
 
 #[derive(Debug, Clone)]
@@ -23,7 +24,11 @@ pub trait System1Callable: Send + Sync + 'static {
 
 #[async_trait]
 pub trait System1Resolver: Send + Sync {
-    async fn resolve(&self, block: &str) -> Result<Arc<dyn System1Callable>, String>;
+    async fn resolve(
+        &self,
+        block: &str,
+        owner: &SessionOwner,
+    ) -> Result<Arc<dyn System1Callable>, String>;
 
     fn is_empty(&self) -> bool {
         false
@@ -43,7 +48,11 @@ impl System1Registry {
 
 #[async_trait]
 impl System1Resolver for System1Registry {
-    async fn resolve(&self, block: &str) -> Result<Arc<dyn System1Callable>, String> {
+    async fn resolve(
+        &self,
+        block: &str,
+        _owner: &SessionOwner,
+    ) -> Result<Arc<dyn System1Callable>, String> {
         self.blocks.get(block).cloned().ok_or_else(|| {
             format!(
                 "no [system1.{block}] block — declared: {}",

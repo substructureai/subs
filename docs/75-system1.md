@@ -43,7 +43,9 @@ url = "http://localhost:8080/v1/systemone"
 model = "my-model"
 ```
 
-The hosted engine does not run `[system1.*]` blocks yet.
+On a deployment, upload the key with `subs auth system1.<id>`. A `workers-ai`
+block there names its `account_id`, and an `http` block's `url` must be a
+public https address.
 
 ## Ask a question
 

@@ -30,10 +30,11 @@ pub struct System1Client {
 
 impl System1Client {
     pub fn new(config: System1Config) -> Self {
-        Self {
-            config,
-            http: super::http_client(),
-        }
+        Self::with_http(config, super::http_client())
+    }
+
+    pub fn with_http(config: System1Config, http: reqwest::Client) -> Self {
+        Self { config, http }
     }
 
     fn endpoint(&self, model: &str) -> Result<String, LlmCallError> {

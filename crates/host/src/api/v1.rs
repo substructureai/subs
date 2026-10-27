@@ -180,6 +180,20 @@ pub struct LlmBlockView {
     pub key_bound: bool,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct System1BlockView {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub needs_key: bool,
+    #[serde(default)]
+    pub key_bound: bool,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RunRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
