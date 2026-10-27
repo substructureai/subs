@@ -475,9 +475,12 @@ type AgentConfig = {
     }
     mcp?: McpServer[]
     plugins?: AgentPlugin[]
+    skills?: AgentSkill[]       // skills of its own, in no plugin
     defer_tools?: boolean | {   // the default for every tool of this agent.
         strategy?: "search"     //   presence is the switch. omitted: no opinion
         max_matches?: number    //   matches per search, >= 1. omitted: 5
+        skills?: "list" | "search"  // "search": tool_search finds skills, the prompt lists none.
+                                //   omitted: "list"
     }
     mcp_announce?: "auto" | "never"  // tell the model a connection exists. omitted: "auto"
     attachments?: Attachments   // how a file reaches the model. omitted: as media
@@ -545,17 +548,32 @@ type AgentPlugin = {
     id: string                  // a plugin the engine holds. never a directory path
     description?: string
     servers?: string[]          // connection paths of this plugin's servers
-    skills?: { name: string; description?: string }[]   // listed to the model
+    skills?: SkillMeta[]        // listed to the model
     tools?: McpTools            // applied to each of the plugin's servers
     approve?: "never" | "destructive" | "always"
     auth_failure?: "interrupt" | "degrade"
     tool_sync_failure?: "warn" | "silent"
+    source?: "bundle" | "worker"  // "worker": the worker answers each skill. omitted: "bundle"
+}
+
+type SkillMeta = {
+    name: string
+    description?: string
+    tools?: string[]            // hidden, and refused, until the model loads this skill
+}
+
+type AgentSkill = {
+    name: string                // the model loads it by this bare name
+    description?: string
+    source?: "bundle" | "worker"  // omitted: "bundle", the project's [skill.<id>] directories
+    tools?: string[]            // hidden, and refused, until the model loads this skill
 }
 ```
 
 `effort` sits on the agent because it pairs with the model. Unset, it sends no
 reasoning config and leaves the provider its own default. See
-[Plugins](./45-plugins.md) for what an `AgentPlugin` names.
+[Plugins](./45-plugins.md) for what an `AgentPlugin` names, and
+[Skills](./47-skills.md) for an `AgentSkill`.
 
 Who runs a model call is not on the config. The `[llm.<id>]` block's `type`
 decides it, and that block's `format` sets the wire shape a worker answers in.

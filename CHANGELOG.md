@@ -12,10 +12,22 @@ The `@substructure.ai/cli` package and the `subs`, `substructure-host` and
 ### Added
 
 - A worker can give an agent a plugin with `source: "worker"`. The engine asks the worker for each of its skills as a `tool.execute` named `skill`.
+- An agent can have skills of its own, outside a plugin: `skills` on the agent config, and `[skill.<id>]` sections in `subs.toml`. A skill comes from a directory with a `SKILL.md`, or from the worker with `source = "worker"`. The model loads it by its bare name.
+- A skill can hold back tools with `tools`. Until the model loads the skill on the branch, the request does not carry them, `tool_search` does not find them, and a call to one is refused with an error that names the skill.
+- `defer_tools.skills = "search"` lists no skills in the system prompt. `tool_search` finds them beside tools, under `skills`.
+- `[plugin.<id>]` takes `source = "worker"`, with `description` and `skills`, for a plugin whose skills the worker answers.
+- `subs.toml` can declare the tools that the worker runs. Leave out `handler`. A tool's `input` or `output` can be the path of a JSON Schema file.
+- `SKILL.md` front matter takes `tools`.
 
 ### Changed
 
 - `call_tool` now requires `arguments`. A call without them is refused with an error that says where they go.
+- `call_tool` that names `tool_search` or `skill` now makes that call, as it does for any other tool. Before, it was refused with "no tool". `call_tool` that names itself is refused with an error that says what to pass.
+- `PluginSource` is now `SkillSource`.
+- `filter::search_tools` and `filter::find_answer` take the agent's skills.
+- A `skill` call with a bare name now loads the agent's own skill. Before, it was refused.
+- An agent that has a skill, a plugin or a tool that the worker answers must name a `worker`.
+- Deploy the new engine before you `subs apply` a file that uses `[skill.<id>]`, a worker plugin or a worker tool. An older deployment refuses those keys.
 
 ## [0.10.2] - 2026-10-27
 

@@ -64,9 +64,13 @@ A search gives each tool one name. `call_tool` takes that name back, exactly as
 the search gave it. It is the same name that the model calls directly when the
 tool is not deferred.
 
+`call_tool` can also name `tool_search` or `skill`. It then makes that call, as
+if the model had made it directly.
+
 A search covers every tool of the agent: from your worker, from a connection,
-or a subagent, deferred or not. So an empty answer means the agent has no
-tools.
+or a subagent, deferred or not. It leaves out a tool that a skill holds back
+until the model loads that skill. See
+[Tools that come with a skill](./47-skills.md#tools-that-come-with-a-skill).
 
 ## Set defer from any source
 
@@ -104,6 +108,7 @@ strategy = "search"
 | --- | --- | --- |
 | `strategy` | `search` | Which tools the engine gives the model. `search` is the only value today. |
 | `max_matches` | `5` | The most matches one search answers with. Must be at least 1. A match carries a whole schema, so a large answer is as big as the tool list the search replaced. An answer says how many matches it left out. |
+| `skills` | `list` | `search` finds the agent's skills with `tool_search` and does not list them in the system prompt. See [Skills](./47-skills.md#find-skills-by-search). |
 
 ## What a deferred call keeps
 

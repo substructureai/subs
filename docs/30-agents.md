@@ -111,11 +111,11 @@ A partial config is a parse error.
 | --- | --- | --- |
 | A connector | The engine | `mcp` on the agent |
 | A plugin | The engine | `plugins` on the agent |
-| Your code | Your worker | The config the worker returns |
+| Your code | Your worker | The config the worker returns, or `tools` on the agent |
 | The browser | The client | `tools` on the agent, with `handler = "client"` |
 
-Only browser tools go in the file. The tools that your worker runs are worker
-code.
+A tool that your worker runs can go in the file, but it does not have to. The
+worker has the last word on the config.
 
 ## Next steps
 

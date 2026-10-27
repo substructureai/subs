@@ -27,6 +27,8 @@ pub struct Skill {
     pub name: String,
     pub description: String,
     pub body: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub files: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -59,6 +61,7 @@ impl PluginBundle {
             .map(|s| SkillMeta {
                 name: s.name.clone(),
                 description: s.description.clone(),
+                tools: s.tools.clone(),
             })
             .collect()
     }
@@ -71,3 +74,7 @@ impl PluginBundle {
 }
 
 pub type PluginSet = BTreeMap<String, PluginBundle>;
+
+/// The bundle that holds a project's own skills, the `[skill.<id>]` sections
+/// with a `path`. It travels as a plugin does; no plugin id starts with `_`.
+pub const SKILLS_BUNDLE: &str = "_skills";

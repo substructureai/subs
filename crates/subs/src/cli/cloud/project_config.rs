@@ -10,7 +10,7 @@ use toml_edit::{DocumentMut, Item, Table, Value};
 use crate::cli::env::{ProviderBinding, ProviderKind, System1Binding};
 use crate::connectors::registry::{ConnectionDecl, ConnectionPath, ConnectionSpec};
 use crate::manifest::{
-    AgentSection, Manifest, PluginSpec, ProviderSpec, ResolvedPlugins, System1Spec,
+    AgentSection, Manifest, PluginSpec, ProviderSpec, ResolvedPlugins, SkillSpec, System1Spec,
 };
 use crate::runtime::llm::LlmBlocks;
 use crate::runtime::worker::AgentEntry;
@@ -60,6 +60,8 @@ pub struct ProjectConfig {
 
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub plugin: BTreeMap<String, PluginSpec>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub skill: BTreeMap<String, SkillSpec>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote: Option<Remote>,
 }
@@ -111,6 +113,7 @@ impl ProjectConfig {
             agent: self.agent.clone(),
             mcp: self.mcp.clone(),
             plugin: self.plugin.clone(),
+            skill: self.skill.clone(),
         }
     }
 
@@ -670,7 +673,7 @@ mod tests {
     }
 
     #[test]
-    fn a_file_declared_tool_must_be_client_handled() {
+    fn a_file_declared_worker_tool_needs_a_worker() {
         let err = parse(
             "[llm.claude]\ntype = \"anthropic\"\n\n\
              [agent.a]\nllm = \"claude\"\nmodel = \"m\"\n\
@@ -678,7 +681,28 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("handler = \"client\""), "got {err}");
+        assert!(
+            err.contains("the worker answers tool `get_time`"),
+            "got {err}"
+        );
+
+        ok(
+            "[llm.claude]\ntype = \"anthropic\"\n[worker.w]\nurl = \"https://w/agent\"\n\n\
+            [agent.a]\nllm = \"claude\"\nmodel = \"m\"\nworker = \"w\"\n\
+            tools = [{ name = \"get_time\" }]\n",
+        );
+
+        let err = parse(
+            "[llm.claude]\ntype = \"anthropic\"\n\n\
+             [agent.a]\nllm = \"claude\"\nmodel = \"m\"\n\
+             tools = [{ name = \"get_time\", handler = \"server\" }]\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("can't have `handler = \"server\"`"),
+            "got {err}"
+        );
     }
 
     #[test]

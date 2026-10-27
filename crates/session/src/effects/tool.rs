@@ -5,7 +5,10 @@ use crate::cx::Cx;
 use crate::decision::{ToolHandler, Trigger};
 use crate::events::*;
 use crate::ids::Ids;
-use crate::protocol::{ConnectorToolKind, ErrorCode, ErrorInfo, PluginSource, StoredResult};
+use crate::protocol::{
+    ConnectorToolKind, ErrorCode, ErrorInfo, SkillSource, StoredResult, CALL_TOOL, SKILL,
+    TOOL_SEARCH,
+};
 use crate::protocol::{RetryOverride, RetryPolicy};
 use crate::state::{inner_arguments, CallTarget, EffectKind, SessionState};
 use crate::tool_contract::{declared_tool, output_violation, DeclaredTool};
@@ -176,10 +179,18 @@ pub fn request(
     caller: &Caller,
 ) -> Result<Vec<EventPayload>, SessionError> {
     SessionState::ensure_internal(caller)?;
+    let (name, arguments) = engine_call(state, name, arguments);
     let engine_tool = state
         .connector_tool_for(&name)
         .filter(|t| t.kind != ConnectorToolKind::Subagent);
+    let locked = state.at_head().locked_tools().contains_key(&name);
     let (name, arguments, handler, target) = match engine_tool {
+        _ if locked => (
+            name,
+            arguments,
+            ToolHandler::Server,
+            Some(ConnectorTarget::Locked),
+        ),
         Some(tool) if tool.kind == ConnectorToolKind::Call => unwrap_call(state, name, arguments),
         Some(tool) if tool.kind == ConnectorToolKind::Attachment => (
             name,
@@ -189,15 +200,19 @@ pub fn request(
         ),
         Some(tool) if tool.kind == ConnectorToolKind::Skill => {
             let named = argument(&arguments, "name").unwrap_or_default();
-            let (plugin, skill) = crate::engine_tools::split_skill(&named);
-            if state.plugin_source(plugin) == Some(PluginSource::Worker) {
-                (name, arguments, ToolHandler::Worker, None)
-            } else {
-                let target = ConnectorTarget::Skill {
-                    plugin: plugin.to_string(),
-                    skill: skill.to_string(),
-                };
-                (name, arguments, ToolHandler::Server, Some(target))
+            let config = state.at_head().resolve_agent_for();
+            let found = config.as_ref().and_then(|c| c.named_skill(&named));
+            let (plugin, skill) = match &found {
+                Some(s) => (s.bundle, s.skill),
+                None => crate::engine_tools::split_skill(&named),
+            };
+            let target = ConnectorTarget::Skill {
+                plugin: plugin.to_string(),
+                skill: skill.to_string(),
+            };
+            match found.map(|s| s.source) {
+                Some(SkillSource::Worker) => (name, arguments, ToolHandler::Worker, None),
+                _ => (name, arguments, ToolHandler::Server, Some(target)),
             }
         }
         Some(tool) => {
@@ -226,6 +241,24 @@ pub fn request(
         target,
         retry,
     })])
+}
+
+/// `call_tool` that names `tool_search` or `skill` is that tool's call, as it
+/// is for any other tool.
+fn engine_call(state: &SessionState, name: String, arguments: String) -> (String, String) {
+    if name != CALL_TOOL {
+        return (name, arguments);
+    }
+    let raw: serde_json::Value = serde_json::from_str(&arguments).unwrap_or_default();
+    match raw.get("name").and_then(|v| v.as_str()) {
+        Some(named)
+            if [TOOL_SEARCH, SKILL].contains(&named)
+                && state.connector_tool_for(named).is_some() =>
+        {
+            (named.to_string(), inner_arguments(&raw))
+        }
+        _ => (name, arguments),
+    }
 }
 
 fn unwrap_call(

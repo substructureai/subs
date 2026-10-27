@@ -1,5 +1,6 @@
 use std::num::NonZeroUsize;
 
+use crate::agent_config::NamedSkill;
 use crate::connectors::RemoteTool;
 use crate::protocol::{
     Approve, BoundServer, ConnectionPath, ConnectorProtocol, ConnectorTool, ConnectorToolKind,
@@ -272,16 +273,17 @@ fn per_agent_subagent_tools(subagents: &[Subagent], default_defer: bool) -> Reso
 pub fn skill_tool() -> ConnectorTool {
     engine_tool(
         SKILL,
-        "Load a skill's instructions. The plugin catalog lists each plugin and its skills; \
-         name one as `<plugin>:<skill>` and follow what comes back. Pass `file` to read one \
-         of the files the instructions reference."
+        "Load a skill's instructions, and follow what comes back. Name the skill as it was \
+         listed or found: `<plugin>:<skill>` for a plugin's skill, the bare name for one of \
+         the agent's own. Some tools come with a skill and can't be found or called until it \
+         is loaded. Pass `file` to read one of the files the instructions reference."
             .to_string(),
         serde_json::json!({
             "type": "object",
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": "The skill, as `<plugin>:<skill>` from the catalog."
+                    "description": "The skill, as it was listed or found."
                 },
                 "file": {
                     "type": "string",
@@ -294,9 +296,9 @@ pub fn skill_tool() -> ConnectorTool {
     )
 }
 
-pub fn search_tools(search: DeferToolsStrategy) -> Vec<ConnectorTool> {
+pub fn search_tools(search: DeferToolsStrategy, skills: bool) -> Vec<ConnectorTool> {
     match search {
-        DeferToolsStrategy::Search => vec![find_tool(), call_tool()],
+        DeferToolsStrategy::Search => vec![find_tool(skills), call_tool()],
     }
 }
 
@@ -320,15 +322,23 @@ pub fn engine_tool(
     }
 }
 
-fn find_tool() -> ConnectorTool {
+fn find_tool(skills: bool) -> ConnectorTool {
+    let mut description = "Search the tools this agent can reach. They are not listed up front. \
+         Answers with the name, the description, and the input schema of each match, best match \
+         first. Any word can match, so a plain description of the task searches well. A \
+         connector's name is a word in every one of its tools, so adding it keeps the search to \
+         that connection. An empty query matches every tool: start there when you do not know \
+         what is available."
+        .to_string();
+    if skills {
+        description.push_str(
+            " It finds skills too, which are not listed either. Load one with `skill` before \
+             you start a task it covers.",
+        );
+    }
     engine_tool(
         TOOL_SEARCH,
-        "Search the tools this agent can reach. They are not listed up front. Answers with the \
-         name, the description, and the input schema of each match, best match first. Any word \
-         can match, so a plain description of the task searches well. A connector's name is a \
-         word in every one of its tools, so adding it keeps the search to that connection. An \
-         empty query matches every tool: start there when you do not know what is available."
-            .to_string(),
+        description,
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -372,9 +382,14 @@ const K1: f64 = 1.2;
 const B: f64 = 0.75;
 
 pub fn find<'a>(tools: &'a [LlmTool], query: &str) -> Vec<&'a LlmTool> {
+    rank(tools, query).into_iter().map(|i| &tools[i]).collect()
+}
+
+/// The indices of the tools that match, best match first.
+fn rank(tools: &[LlmTool], query: &str) -> Vec<usize> {
     let terms = words(query);
     if terms.is_empty() || tools.is_empty() {
-        return tools.iter().collect();
+        return (0..tools.len()).collect();
     }
 
     let docs: Vec<Vec<String>> = tools
@@ -391,8 +406,8 @@ pub fn find<'a>(tools: &'a [LlmTool], query: &str) -> Vec<&'a LlmTool> {
         })
         .collect();
 
-    let mut scored: Vec<(f64, usize, &LlmTool)> = Vec::new();
-    for (order, (tool, doc)) in tools.iter().zip(&docs).enumerate() {
+    let mut scored: Vec<(f64, usize)> = Vec::new();
+    for (order, doc) in docs.iter().enumerate() {
         let length = doc.len() as f64 / average_length;
         let score: f64 = terms
             .iter()
@@ -403,7 +418,7 @@ pub fn find<'a>(tools: &'a [LlmTool], query: &str) -> Vec<&'a LlmTool> {
             })
             .sum();
         if score > 0.0 {
-            scored.push((score, order, tool));
+            scored.push((score, order));
         }
     }
     scored.sort_by(|a, b| {
@@ -411,7 +426,7 @@ pub fn find<'a>(tools: &'a [LlmTool], query: &str) -> Vec<&'a LlmTool> {
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(a.1.cmp(&b.1))
     });
-    scored.into_iter().map(|(_, _, tool)| tool).collect()
+    scored.into_iter().map(|(_, order)| order).collect()
 }
 
 fn words(text: &str) -> Vec<String> {
@@ -425,16 +440,31 @@ fn frequency(doc: &[String], term: &str) -> f64 {
     doc.iter().filter(|word| word.starts_with(term)).count() as f64
 }
 
+/// Searches `skills` beside `tools`, when the agent's skills are searched.
 pub fn find_answer(
     tools: &[LlmTool],
+    skills: &[NamedSkill],
     query: &str,
     max_matches: NonZeroUsize,
     unavailable: &[ConnectionPath],
 ) -> String {
-    let matched = find(tools, query);
-    let shown: Vec<serde_json::Value> = matched
+    // A skill matches on the tools it brings, as well as on what it says.
+    let corpus: Vec<LlmTool> = tools
         .iter()
-        .take(max_matches.get())
+        .cloned()
+        .chain(skills.iter().map(|s| LlmTool {
+            name: s.name.clone(),
+            description: format!("{} {}", s.description, s.tools.join(" ")),
+            input: None,
+            output: None,
+            defer: true,
+        }))
+        .collect();
+    let matched = rank(&corpus, query);
+    let shown = &matched[..matched.len().min(max_matches.get())];
+    let found_tools: Vec<serde_json::Value> = shown
+        .iter()
+        .filter_map(|&i| tools.get(i))
         .map(|tool| {
             serde_json::json!({
                 "name": tool.name,
@@ -444,11 +474,29 @@ pub fn find_answer(
         })
         .collect();
     let mut answer = serde_json::json!({
-        "tools": shown,
+        "tools": found_tools,
         "matched": matched.len(),
-        "searched": tools.len(),
+        "searched": corpus.len(),
         "call_with": CALL_TOOL,
     });
+    if !skills.is_empty() {
+        let found_skills: Vec<serde_json::Value> = shown
+            .iter()
+            .filter_map(|&i| skills.get(i.checked_sub(tools.len())?))
+            .map(|skill| {
+                let mut found = serde_json::json!({
+                    "name": skill.name,
+                    "description": skill.description,
+                });
+                if !skill.tools.is_empty() {
+                    found["tools"] = serde_json::json!(skill.tools);
+                }
+                found
+            })
+            .collect();
+        answer["skills"] = serde_json::json!(found_skills);
+        answer["load_with"] = serde_json::json!(SKILL);
+    }
     if matched.is_empty() {
         answer["note"] = serde_json::json!(crate::copy::NOTHING_MATCHED);
     } else if matched.len() > shown.len() {
@@ -1048,7 +1096,7 @@ mod tests {
             "how a tool reaches the model says nothing about what it does"
         );
         assert!(
-            search_tools(DeferToolsStrategy::Search)
+            search_tools(DeferToolsStrategy::Search, false)
                 .iter()
                 .all(|t| !t.approve),
             "the engine's own tools reach nothing on their own"
@@ -1127,7 +1175,7 @@ mod tests {
 
     #[test]
     fn one_set_of_tools_serves_the_whole_agent() {
-        let tools = search_tools(DeferToolsStrategy::Search);
+        let tools = search_tools(DeferToolsStrategy::Search, false);
         assert_eq!(
             tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
             vec![TOOL_SEARCH, CALL_TOOL]
@@ -1141,7 +1189,7 @@ mod tests {
 
     #[test]
     fn a_search_answer_and_a_call_use_one_word_for_one_thing() {
-        let call = &search_tools(DeferToolsStrategy::Search)[1];
+        let call = &search_tools(DeferToolsStrategy::Search, false)[1];
         let properties = call.input.as_ref().unwrap()["properties"].clone();
         assert_eq!(
             call.input.as_ref().unwrap()["required"],
@@ -1225,7 +1273,7 @@ mod tests {
             llm("github__create_pr", "Open a pull request."),
         ];
         let answer: serde_json::Value =
-            serde_json::from_str(&find_answer(&tools, "", cap(), &[])).expect("json");
+            serde_json::from_str(&find_answer(&tools, &[], "", cap(), &[])).expect("json");
         assert_eq!(answer["matched"], 2, "no query is not no match");
         assert_eq!(
             answer["tools"][0]["input"]["type"], "object",
@@ -1237,7 +1285,7 @@ mod tests {
     fn a_search_that_matches_nothing_gives_the_next_move() {
         let tools = [llm("search_issues", "")];
         let answer: serde_json::Value =
-            serde_json::from_str(&find_answer(&tools, "kubernetes helm", cap(), &[]))
+            serde_json::from_str(&find_answer(&tools, &[], "kubernetes helm", cap(), &[]))
                 .expect("json");
         assert_eq!(answer["matched"], 0);
         assert!(
@@ -1252,7 +1300,7 @@ mod tests {
             .map(|i| llm(&format!("issue_tool_{i}"), ""))
             .collect();
         let answer: serde_json::Value =
-            serde_json::from_str(&find_answer(&tools, "issue", cap(), &[])).expect("json");
+            serde_json::from_str(&find_answer(&tools, &[], "issue", cap(), &[])).expect("json");
         assert_eq!(answer["tools"].as_array().unwrap().len(), cap().get());
         assert_eq!(answer["matched"], 15, "the count is of every match");
         assert!(answer["note"].is_string());
@@ -1262,7 +1310,7 @@ mod tests {
     fn a_match_reads_as_a_tool_definition() {
         let tools = [llm("sentry__search_issues", "Search the issues.")];
         let answer: serde_json::Value =
-            serde_json::from_str(&find_answer(&tools, "issues", cap(), &[])).expect("json");
+            serde_json::from_str(&find_answer(&tools, &[], "issues", cap(), &[])).expect("json");
         assert_eq!(answer["tools"][0]["name"], "sentry__search_issues");
         assert_eq!(answer["tools"][0]["input"]["type"], "object");
         assert_eq!(answer["call_with"], CALL_TOOL);
@@ -1577,7 +1625,7 @@ mod tests {
 
     #[test]
     fn a_declared_tool_still_wins_its_name_against_a_search_tool() {
-        let r = Resolution::of(search_tools(DeferToolsStrategy::Search));
+        let r = Resolution::of(search_tools(DeferToolsStrategy::Search, false));
         let merged = merge([r], [TOOL_SEARCH]);
         assert_eq!(
             merged

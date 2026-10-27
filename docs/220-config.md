@@ -58,7 +58,7 @@ A file has two roles. It can have one or both.
 | A deployment you administer | `[remote]` | `subs apply`, `subs keys`, `subs sessions` |
 
 The project itself stays the same for both roles: `name`, `[llm.<id>]`,
-`[agent.<id>]`, `[mcp.<id>]`, and `[plugin.<id>]`.
+`[agent.<id>]`, `[mcp.<id>]`, `[plugin.<id>]`, and `[skill.<id>]`.
 
 A second environment is a second file. `subs apply -c subs.staging.toml`
 deploys a separate project.
@@ -162,6 +162,7 @@ tool = { max_attempts = 3 }
 | `description` | string | none | What this agent does, shown to a parent that calls it. |
 | `mcp` | list | none | Connections this agent draws tools from. See [`mcp` and `plugins` entries](#mcp-and-plugins-entries). |
 | `plugins` | list | none | Plugins this agent uses. See [`mcp` and `plugins` entries](#mcp-and-plugins-entries). |
+| `skills` | list | none | The IDs of the `[skill.<id>]` sections this agent uses. See [Skills](./47-skills.md). |
 | `defer_tools` | bool or table | absent | Keeps every tool of this agent out of the request, whatever its source. See [Defer every tool](#defer-every-tool). |
 | `mcp_announce` | `auto`, `never` | `auto` | Whether the engine tells the model that a connection is available. See [Tell the model a connection exists](./40-connectors.md#tell-the-model-a-connection-exists). |
 | `mcp_auth_failure` | `interrupt`, `degrade` | `interrupt` | The default for every connection this agent reaches, including each plugin's. A connection overrides it with its own `auth_failure`. |
@@ -169,7 +170,7 @@ tool = { max_attempts = 3 }
 | `subagents` | list | none | Agents this one can call. Each entry is an `agent.<id>` path, or a table with `id`, `defer`, and `prefix`. See [Subagents](./80-subagents.md#how-the-tool-is-offered). |
 | `subagent_tools` | table | `{ strategy = "per_agent" }` | What shape the subagents take as tools. `per_agent` offers one tool per agent; `single` offers one `subagent` tool for all of them. See [Subagents](./80-subagents.md#one-tool-for-every-subagent). |
 | `max_subagent_depth` | integer | `5` | How deep this agent's subagents may nest. A session that deep may not delegate; `0` never delegates. See [Subagents](./80-subagents.md#how-deep-subagents-nest). |
-| `tools` | list | none | Browser tools. Each needs `handler = "client"`. |
+| `tools` | list | none | Tools the worker or the browser runs: `name`, `description`, `input`, `output`, `handler` and `defer`. Leave out `handler` for the worker, or set `handler = "client"`. `input` and `output` are a JSON Schema, or the path of a file that holds one. |
 | `attachments` | table | none | How files reach the model. See [`[agent.<id>.attachments]`](#agentidattachments). |
 | `context` | table | none | How the agent makes room when the model reads too much. See [`[agent.<id>.context]`](#agentidcontext). |
 | `worker` | url | none | Where decisions go. Leave it off and the engine decides. |
@@ -180,7 +181,9 @@ tool = { max_attempts = 3 }
 An agent that sets no config needs a `worker`. An agent that sets any config
 needs `llm` and `model`. See [Agents](./30-agents.md).
 
-The tools your worker runs are worker code. They do not go in the file.
+The tools your worker runs can go in the file, but they do not have to: the
+worker can return them in the config. An agent with a tool, a skill, or a
+plugin that the worker answers needs a `worker`.
 
 ### `mcp` and `plugins` entries
 
@@ -215,6 +218,7 @@ or a connection overrides it with its own `defer`.
 | --- | --- | --- | --- |
 | `strategy` | `search` | `search` | Which tools find the deferred ones. `search` is the only value today. |
 | `max_matches` | number, at least 1 | `5` | How many matches one search answers with. |
+| `skills` | `list`, `search` | `list` | `list` names every skill in the system prompt. `search` names none there, and `tool_search` finds them. See [Skills](./47-skills.md#find-skills-by-search). |
 
 See [Deferred tools](./65-deferred-tools.md).
 
@@ -341,8 +345,9 @@ A token written in the file is a parse error. Fill a connection with
 
 ## `[plugin.<id>]`
 
-A plugin directory the CLI resolves and sends to the deployment. An agent names
-a plugin by its ID.
+A plugin directory the CLI resolves and sends to the deployment, or a plugin
+whose skills the worker answers. An agent names a plugin by its ID. An ID that
+starts with `_` is the engine's.
 
 ```toml
 [plugin.pdf]
@@ -354,14 +359,39 @@ auth = "none"
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `path` | path | required | The plugin directory. |
+| `path` | path | required, unless `source = "worker"` | The plugin directory. |
 | `mcp.<server>` | table | the plugin's own | What this deployment says about one of the plugin's servers. See [`[plugin.<id>.mcp.<server>]`](#pluginidmcpserver). |
+| `source` | `bundle`, `worker` | `bundle` | Where the skills come from. `worker` takes no `path` and no servers. |
+| `description` | string | none | What the plugin is for. Only with `source = "worker"`. |
+| `skills` | list | none | Each skill's `name`, `description` and `tools`. Only with `source = "worker"`. See [A plugin the worker answers](./45-plugins.md#a-plugin-the-worker-answers). |
 
 The CLI resolves the directory to data, at startup for a local engine and at
 `subs apply` for a deployment, so a session never reads plugin files. A plugin's
 servers join the connection registry as `plugin.<id>.mcp.<server>` and authorize
 like any connection. The model sees their tools under
 `<plugin>_<server>__<tool>`. See [Plugins](./45-plugins.md).
+
+## `[skill.<id>]`
+
+A skill of the project's own: a directory with a `SKILL.md`, or a skill that the
+worker answers. An agent names it in `skills`. See [Skills](./47-skills.md).
+
+```toml
+[skill.automations]
+path = "./skills/automations"
+
+[skill.visits]
+source = "worker"
+description = "Who visited the clinic, and when"
+tools = ["find_bookings"]
+```
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `path` | path | required, unless `source = "worker"` | The skill directory. Its name, and the name in its front matter, must be the section's ID. |
+| `source` | `bundle`, `worker` | `bundle` | Where the skill comes from. `worker` takes no `path`. |
+| `description` | string | the front matter's | What the model reads before it loads the skill. Required with `source = "worker"`. |
+| `tools` | list | the front matter's | The tools that the model cannot see or call until it loads the skill. |
 
 ### `[plugin.<id>.mcp.<server>]`
 
@@ -469,6 +499,7 @@ The file names secrets. It never holds them.
 
 - [Agents](./30-agents.md): what an agent section declares.
 - [Plugins](./45-plugins.md): what a `[plugin.<id>]` directory holds.
+- [Skills](./47-skills.md): what a `[skill.<id>]` section declares.
 - [CLI](./260-cli.md): the commands that read this file.
 - [Cloud](./170-cloud.md): applying it to a deployment.
 - [Protocol](./230-protocol.md): the same types on the wire.

@@ -8,7 +8,7 @@ use crate::protocol::OCTET_STREAM;
 use crate::runtime::blob::{BlobStore, NewBlob};
 
 pub use substructure_session::plugins::{
-    Binary, BundleServer, Pending, PluginBundle, PluginSet, Skill,
+    Binary, BundleServer, Pending, PluginBundle, PluginSet, Skill, SKILLS_BUNDLE,
 };
 
 #[async_trait::async_trait]
@@ -88,27 +88,62 @@ pub fn load_dir(root: &Path) -> Result<Loaded> {
         skills,
         servers,
     };
-    let bytes = content_bytes(&bundle);
-    if bytes > MAX_BUNDLE_BYTES {
-        bail!(
-            "{} holds {bytes} bytes of skill content; the limit is {MAX_BUNDLE_BYTES}. \
-             Move large files out of the skills, or split the plugin.",
-            root.display()
-        );
-    }
-    let binary_bytes: usize = pending.iter().map(|p| p.bytes.len()).sum();
-    if binary_bytes > MAX_BINARY_BYTES {
-        bail!(
-            "{} holds {binary_bytes} bytes of binary skill files; the limit is \
-             {MAX_BINARY_BYTES}. Serve files this large from a server instead.",
-            root.display()
-        );
-    }
+    check_size(&root.display().to_string(), &bundle, &pending)?;
     Ok(Loaded {
         bundle,
         notices,
         pending,
     })
+}
+
+/// A project's own skills, each `[skill.<id>]` with a `path`, as one bundle
+/// that travels the way a plugin does.
+pub fn load_skill_dirs(dirs: &[(String, PathBuf)]) -> Result<Loaded> {
+    let mut notices = Vec::new();
+    let mut pending = Vec::new();
+    let mut skills = Vec::new();
+    for (id, dir) in dirs {
+        let skill = load_skill(dir, &mut pending, &mut notices)
+            .map_err(|e| anyhow::anyhow!("[skill.{id}]: {}: {e}", dir.display()))?;
+        if skill.name != *id {
+            bail!(
+                "[skill.{id}]: its SKILL.md names the skill `{}`. Name the section after the \
+                 skill: [skill.{}].",
+                skill.name,
+                skill.name
+            );
+        }
+        skills.push(skill);
+    }
+    let bundle = PluginBundle {
+        name: SKILLS_BUNDLE.to_string(),
+        skills,
+        ..Default::default()
+    };
+    check_size("the project's skills", &bundle, &pending)?;
+    Ok(Loaded {
+        bundle,
+        notices,
+        pending,
+    })
+}
+
+fn check_size(what: &str, bundle: &PluginBundle, pending: &[Pending]) -> Result<()> {
+    let bytes = content_bytes(bundle);
+    if bytes > MAX_BUNDLE_BYTES {
+        bail!(
+            "{what} holds {bytes} bytes of skill content; the limit is {MAX_BUNDLE_BYTES}. \
+             Move large files out of the skills, or split the plugin."
+        );
+    }
+    let binary_bytes: usize = pending.iter().map(|p| p.bytes.len()).sum();
+    if binary_bytes > MAX_BINARY_BYTES {
+        bail!(
+            "{what} holds {binary_bytes} bytes of binary skill files; the limit is \
+             {MAX_BINARY_BYTES}. Serve files this large from a server instead."
+        );
+    }
+    Ok(())
 }
 
 const MAX_BUNDLE_BYTES: usize = 10 * 1024 * 1024;
@@ -227,9 +262,33 @@ fn load_skill(dir: &Path, pending: &mut Vec<Pending>, notices: &mut Vec<String>)
         name,
         description: sanitize_line(&description),
         body: sanitize_text(body),
+        tools: frontmatter_list(front, "tools"),
         files,
         binaries: BTreeMap::new(),
     })
+}
+
+/// `key: a, b`, `key: [a, b]`, or a block list of `- a` lines under `key:`.
+fn frontmatter_list(front: &str, key: &str) -> Vec<String> {
+    let mut lines = front.lines();
+    let Some(rest) = lines.find_map(|line| line.strip_prefix(key)?.trim_start().strip_prefix(':'))
+    else {
+        return Vec::new();
+    };
+    let item = |s: &str| s.trim().trim_matches('"').trim_matches('\'').to_string();
+    let inline = rest.trim().trim_start_matches('[').trim_end_matches(']');
+    if !inline.trim().is_empty() {
+        return inline
+            .split(',')
+            .map(item)
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+    lines
+        .map_while(|line| line.trim_start().strip_prefix("- "))
+        .map(item)
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 fn split_frontmatter(text: &str) -> Result<(&str, &str)> {

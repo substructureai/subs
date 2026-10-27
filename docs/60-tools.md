@@ -272,7 +272,7 @@ The model reads `error` as the tool's result. Write it for the model to read.
 
 | Source | Runs on | Declared in |
 | --- | --- | --- |
-| Your code | Your worker | The config the worker returns |
+| Your code | Your worker | The config the worker returns, or `tools` on the agent |
 | A connector | The engine | `mcp` on the agent |
 | The browser | The client | `tools`, with `handler = "client"` |
 

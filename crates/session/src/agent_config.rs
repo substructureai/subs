@@ -1,6 +1,25 @@
+use std::collections::{BTreeMap, HashSet};
+
+use crate::plugins::SKILLS_BUNDLE;
 use crate::protocol::{
-    AgentConfig, AgentTool, ConnectorTool, Content, DraftMessage, LlmTool, Role,
+    AgentConfig, AgentTool, ConnectorTool, Content, DraftMessage, LlmTool, Role, SkillListing,
+    SkillSource, CALL_TOOL, SKILL, TOOL_SEARCH,
 };
+
+/// A skill as the model names it: bare for the agent's own, `<plugin>:<skill>`
+/// for a plugin's.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NamedSkill<'a> {
+    pub name: String,
+    pub description: &'a str,
+    pub tools: &'a [String],
+    pub source: SkillSource,
+    pub plugin: Option<&'a str>,
+    /// The bundle that holds it: its plugin's, or the project's skills bundle.
+    pub bundle: &'a str,
+    /// Its name in that bundle.
+    pub skill: &'a str,
+}
 
 impl AgentTool {
     pub fn to_llm_tool(&self, default: bool) -> LlmTool {
@@ -61,6 +80,69 @@ impl AgentConfig {
 
     pub fn tool(&self, tool_name: &str) -> Option<&AgentTool> {
         self.tools.iter().find(|t| t.name == tool_name)
+    }
+
+    pub fn named_skills(&self) -> Vec<NamedSkill<'_>> {
+        let own = self.skills.iter().map(|s| NamedSkill {
+            name: s.name.clone(),
+            description: &s.description,
+            tools: &s.tools,
+            source: s.source,
+            plugin: None,
+            bundle: SKILLS_BUNDLE,
+            skill: &s.name,
+        });
+        let in_plugins = self.plugins.iter().flat_map(|p| {
+            p.skills.iter().map(move |s| NamedSkill {
+                name: format!("{}:{}", p.id, s.name),
+                description: &s.description,
+                tools: &s.tools,
+                source: p.source,
+                plugin: Some(&p.id),
+                bundle: &p.id,
+                skill: &s.name,
+            })
+        });
+        own.chain(in_plugins).collect()
+    }
+
+    pub fn named_skill(&self, name: &str) -> Option<NamedSkill<'_>> {
+        self.named_skills().into_iter().find(|s| s.name == name)
+    }
+
+    pub fn has_skills(&self) -> bool {
+        !self.plugins.is_empty() || !self.skills.is_empty()
+    }
+
+    pub fn searches_skills(&self) -> bool {
+        self.defer_tools
+            .is_some_and(|d| d.skills == SkillListing::Search)
+    }
+
+    /// Each tool a skill holds back while none of its skills is in `loaded`,
+    /// with the skills that would bring it.
+    pub fn locked_tools(&self, loaded: &HashSet<String>) -> BTreeMap<String, Vec<String>> {
+        let skills = self.named_skills();
+        let unlocked: HashSet<&str> = skills
+            .iter()
+            .filter(|s| loaded.contains(&s.name))
+            .flat_map(|s| s.tools.iter().map(String::as_str))
+            .collect();
+        let mut locked: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for skill in &skills {
+            for tool in skill.tools {
+                if unlocked.contains(tool.as_str())
+                    || [SKILL, TOOL_SEARCH, CALL_TOOL].contains(&tool.as_str())
+                {
+                    continue;
+                }
+                locked
+                    .entry(tool.clone())
+                    .or_default()
+                    .push(skill.name.clone());
+            }
+        }
+        locked
     }
 
     pub fn prompt_for(&self, view: &[DraftMessage]) -> Vec<DraftMessage> {
@@ -214,5 +296,54 @@ mod tests {
             cfg.tool("researcher").is_none(),
             "a subagent is not a function tool"
         );
+    }
+
+    #[test]
+    fn a_tool_two_skills_name_comes_with_either() {
+        use crate::protocol::{AgentPlugin, AgentSkill, SkillMeta};
+        let config = AgentConfig {
+            skills: vec![AgentSkill {
+                name: "automations".to_string(),
+                description: String::new(),
+                source: Default::default(),
+                tools: vec!["get_audience".to_string(), "edit_automation".to_string()],
+            }],
+            plugins: vec![AgentPlugin {
+                id: "org".to_string(),
+                description: String::new(),
+                skills: vec![SkillMeta {
+                    name: "audiences".to_string(),
+                    description: String::new(),
+                    tools: vec!["get_audience".to_string(), "skill".to_string()],
+                }],
+                servers: vec![],
+                tools: None,
+                auth_failure: Default::default(),
+                tool_sync_failure: Default::default(),
+                approve: Default::default(),
+                source: Default::default(),
+            }],
+            ..config(vec![], vec![])
+        };
+        let locked = config.locked_tools(&HashSet::new());
+        assert_eq!(
+            locked.get("get_audience"),
+            Some(&vec![
+                "automations".to_string(),
+                "org:audiences".to_string()
+            ])
+        );
+        assert!(
+            !locked.contains_key("skill"),
+            "an engine tool is never held back"
+        );
+
+        let loaded = HashSet::from(["org:audiences".to_string()]);
+        let locked = config.locked_tools(&loaded);
+        assert!(
+            !locked.contains_key("get_audience"),
+            "either skill brings it"
+        );
+        assert!(locked.contains_key("edit_automation"));
     }
 }

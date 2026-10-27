@@ -17,7 +17,12 @@ pub struct PromptContext {
 
 pub type Contributor = fn(SessionStateAtNode, &str) -> Vec<PromptContext>;
 
-const CONTRIBUTORS: &[Contributor] = &[plugin_catalog, announce_servers, announce_unavailable];
+const CONTRIBUTORS: &[Contributor] = &[
+    plugin_catalog,
+    skill_catalog,
+    announce_servers,
+    announce_unavailable,
+];
 
 pub fn owed(at: SessionStateAtNode, call_id: &str) -> Vec<PromptContext> {
     CONTRIBUTORS
@@ -88,25 +93,32 @@ fn plugin_catalog(at: SessionStateAtNode, call_id: &str) -> Vec<PromptContext> {
         return Vec::new();
     };
     let said = at.context_ids_on_path(call_id);
+    let searched = config.searches_skills();
     config
         .plugins
         .iter()
         .map(|plugin| (plugin, format!("plugin.{}", plugin.id)))
         .filter(|(_, id)| !said.contains(id))
         .map(|(plugin, id)| {
-            let skills: Vec<SkillListing> = plugin
-                .skills
-                .iter()
-                .map(|s| SkillListing {
-                    name: format!("{}:{}", plugin.id, s.name),
-                    description: s.description.clone(),
-                })
-                .collect();
+            let skills: Vec<SkillListing> = match searched {
+                true => Vec::new(),
+                false => plugin
+                    .skills
+                    .iter()
+                    .map(|s| SkillListing {
+                        name: format!("{}:{}", plugin.id, s.name),
+                        description: s.description.clone(),
+                    })
+                    .collect(),
+            };
             let content = serde_json::to_string(&PluginListing {
                 plugin: &plugin.id,
                 about: (!plugin.description.is_empty()).then_some(&plugin.description),
                 skills,
-                usage: crate::copy::PLUGIN_USAGE,
+                usage: match searched {
+                    true => crate::copy::SEARCHED_SKILLS,
+                    false => crate::copy::PLUGIN_USAGE,
+                },
             })
             .unwrap_or_default();
             PromptContext {
@@ -118,12 +130,49 @@ fn plugin_catalog(at: SessionStateAtNode, call_id: &str) -> Vec<PromptContext> {
         .collect()
 }
 
+/// One entry for each of the agent's own skills, so a skill the worker adds
+/// later lists itself without rewriting what the model has read.
+fn skill_catalog(at: SessionStateAtNode, call_id: &str) -> Vec<PromptContext> {
+    let Some(config) = at.resolve_agent_for() else {
+        return Vec::new();
+    };
+    if config.searches_skills() {
+        return Vec::new();
+    }
+    let said = at.context_ids_on_path(call_id);
+    config
+        .skills
+        .iter()
+        .map(|skill| (skill, format!("skill.{}", skill.name)))
+        .filter(|(_, id)| !said.contains(id))
+        .map(|(skill, id)| PromptContext {
+            id,
+            placement: Placement::System,
+            content: serde_json::to_string(&OwnSkillListing {
+                skill: &skill.name,
+                about: &skill.description,
+                usage: crate::copy::PLUGIN_USAGE,
+            })
+            .unwrap_or_default(),
+        })
+        .collect()
+}
+
 #[derive(serde::Serialize)]
 struct PluginListing<'a> {
     plugin: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     about: Option<&'a String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     skills: Vec<SkillListing>,
+    usage: &'static str,
+}
+
+#[derive(serde::Serialize)]
+struct OwnSkillListing<'a> {
+    skill: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    about: &'a str,
     usage: &'static str,
 }
 
@@ -246,10 +295,12 @@ mod tests {
                             SkillMeta {
                                 name: "form-filling".to_string(),
                                 description: "long ".repeat(500),
+                                tools: vec![],
                             },
                             SkillMeta {
                                 name: "text-extraction".to_string(),
                                 description: "also long ".repeat(500),
+                                tools: vec![],
                             },
                         ],
                         servers: vec!["renderer".to_string()],

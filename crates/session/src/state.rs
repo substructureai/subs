@@ -11,7 +11,7 @@ use crate::connectors::ConnectionPath;
 use crate::connectors::{filter, AuthNeed, RemoteTool};
 use crate::protocol::{
     AgentTool, BoundServer, ConnectorTool, ConnectorToolKind, DeferToolsStrategy, Handler,
-    McpServer, PluginSource, StoredResult, SubagentToolsStrategy,
+    McpServer, StoredResult, SubagentToolsStrategy, CALL_TOOL, SKILL,
 };
 use crate::system1::System1Request;
 
@@ -1103,6 +1103,7 @@ impl SessionState {
             .or_else(|| self.head_id.clone());
         let at = self.at(node.as_deref());
         let connector_tools = at.connector_tools().tools;
+        let locked = at.locked_tools();
         let owed = prompt_context::owed(at, &payload.id);
         let system_open = at.system_prefix_open(&payload.id);
         if let Some(effect) = self.effect_mut(EffectKind::LlmCall, &payload.id) {
@@ -1115,6 +1116,9 @@ impl SessionState {
                             tools.push(tool.to_llm_tool());
                         }
                     }
+                }
+                if let Some(tools) = call.spec.tools.as_mut() {
+                    tools.retain(|t| !locked.contains_key(&t.name));
                 }
                 prompt_context::merge(
                     &mut call.prompt,
@@ -1913,17 +1917,6 @@ impl SessionState {
         ids
     }
 
-    /// Where the skills of the agent's plugin `id` come from; none for a
-    /// plugin the agent doesn't have.
-    pub fn plugin_source(&self, id: &str) -> Option<PluginSource> {
-        self.at_head()
-            .resolve_agent_for()?
-            .plugins
-            .into_iter()
-            .find(|plugin| plugin.id == id)
-            .map(|plugin| plugin.source)
-    }
-
     pub fn tool_handler_for(&self, name: &str) -> ToolHandler {
         let config = self.at_head().resolve_agent_for();
         let connector = || {
@@ -1988,9 +1981,10 @@ impl SessionState {
         if defers {
             resolutions.push(filter::Resolution::of(filter::search_tools(
                 config.defer_strategy(),
+                config.searches_skills(),
             )));
         }
-        if !config.plugins.is_empty() {
+        if config.has_skills() {
             resolutions.push(filter::Resolution::of(vec![filter::skill_tool()]));
         }
         if let Some(attachments) = &config.attachments {
@@ -2007,7 +2001,14 @@ impl SessionState {
         let node = effect.anchor.clone();
         let tc = effect.tool()?;
         let target = tc.target.as_ref()?;
-        super::engine_tools::answer(self.at(node.as_deref()), target.kind(), &tc.arguments)
+        let at = self.at(node.as_deref());
+        if *target == ConnectorTarget::Locked {
+            return Some(StoredResult::error(
+                at.locked_fault(&tc.name)
+                    .unwrap_or_else(|| crate::copy::CALL_NOT_ROUTED.to_string()),
+            ));
+        }
+        super::engine_tools::answer(at, target.kind(), &tc.arguments)
     }
 
     pub fn attachment_call(&self, tool_call_id: &str) -> Option<crate::attachments::tools::Call> {
@@ -2381,6 +2382,7 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
         let Some(config) = self.resolve_agent_for() else {
             return Vec::new();
         };
+        let locked = config.locked_tools(&self.loaded_skills());
         let declared = config
             .tools
             .iter()
@@ -2398,7 +2400,38 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
             })
             .map(|t| t.to_llm_tool())
             .collect::<Vec<_>>();
-        declared.chain(connector).collect()
+        declared
+            .chain(connector)
+            .filter(|t| !locked.contains_key(&t.name))
+            .collect()
+    }
+
+    /// The skills loaded on this path: each `skill` call that answered.
+    pub fn loaded_skills(&self) -> std::collections::HashSet<String> {
+        let path = self.path_set();
+        self.state
+            .effects
+            .values()
+            .filter(|e| SessionState::anchored_on(&path, e.anchor.as_deref()))
+            .filter(|e| e.tracking.status() == EffectStatus::Completed)
+            .filter_map(EffectState::tool)
+            .filter(|tc| tc.name == SKILL)
+            .filter_map(|tc| {
+                let arguments: serde_json::Value = serde_json::from_str(&tc.arguments).ok()?;
+                Some(arguments.get("name")?.as_str()?.to_string())
+            })
+            .collect()
+    }
+
+    pub fn locked_tools(&self) -> BTreeMap<String, Vec<String>> {
+        self.resolve_agent_for()
+            .map(|config| config.locked_tools(&self.loaded_skills()))
+            .unwrap_or_default()
+    }
+
+    pub fn locked_fault(&self, named: &str) -> Option<String> {
+        let locked = self.locked_tools();
+        Some(crate::copy::locked(named, locked.get(named)?))
     }
 
     pub fn connection_summary(&self, path: &ConnectionPath) -> Option<String> {
@@ -2464,6 +2497,12 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
 
     pub fn call_tool_target(&self, named: &str) -> Option<CallTarget> {
         let config = self.resolve_agent_for()?;
+        if config
+            .locked_tools(&self.loaded_skills())
+            .contains_key(named)
+        {
+            return None;
+        }
         if let Some(declared) = config.tool(named) {
             return Some(CallTarget::Declared(declared.clone()));
         }
@@ -2484,6 +2523,12 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
             .unwrap_or_default()
             .to_string();
 
+        if named == CALL_TOOL {
+            return Some(crate::copy::CALL_TOOL_IN_CALL.to_string());
+        }
+        if let Some(fault) = self.locked_fault(&named) {
+            return Some(fault);
+        }
         let Some(target) = self.call_tool_target(&named) else {
             let config = self.resolve_agent_for();
             let tools = self.searchable_tools();

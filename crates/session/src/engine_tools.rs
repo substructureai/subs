@@ -20,8 +20,14 @@ pub fn answer(
 
 fn find(at: SessionStateAtNode, arguments: &str) -> StoredResult {
     let config = at.resolve_agent_for();
+    let skills = config
+        .as_ref()
+        .filter(|c| c.searches_skills())
+        .map(AgentConfig::named_skills)
+        .unwrap_or_default();
     StoredResult::text(filter::find_answer(
         &at.searchable_tools(),
+        &skills,
         &argument(arguments, "query"),
         config
             .as_ref()
@@ -63,43 +69,17 @@ pub fn skill_answer(
     let Some(config) = at.resolve_agent_for() else {
         return StoredResult::error("this agent has no config on this branch");
     };
-    let catalog = || {
-        config
-            .plugins
-            .iter()
-            .map(|p| p.id.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-
-    let (plugin_id, skill_name) = split_skill(&named);
-    if plugin_id.is_empty() {
-        return StoredResult::error(format!(
-            "`{named}` is not a skill name. Skills are named `<plugin>:<skill>`; this agent's \
-             plugins: {}.",
-            catalog()
-        ));
-    }
-    let Some(plugin) = config.plugins.iter().find(|p| p.id == plugin_id) else {
-        return StoredResult::error(format!(
-            "no plugin `{plugin_id}` for this agent. Declared: {}.",
-            catalog()
-        ));
+    let Some(found) = config.named_skill(&named) else {
+        return StoredResult::error(no_such_skill(&config, &named));
     };
     let Some(bundle) = bundle else {
         return StoredResult::error(format!(
-            "plugin `{plugin_id}` has no data on this engine; re-apply the project"
+            "skill `{named}` has no data on this engine; re-apply the project"
         ));
     };
-    let Some(skill) = bundle.skill(skill_name) else {
-        let listed = plugin
-            .skills
-            .iter()
-            .map(|s| format!("{}:{} — {}", plugin.id, s.name, s.description))
-            .collect::<Vec<_>>()
-            .join("\n");
+    let Some(skill) = bundle.skill(found.skill) else {
         return StoredResult::error(format!(
-            "no skill `{skill_name}` in plugin `{plugin_id}`. Its skills:\n{listed}"
+            "skill `{named}` is not in the data this engine holds; re-apply the project"
         ));
     };
 
@@ -116,6 +96,44 @@ pub fn skill_answer(
             StoredResult::text(answer)
         }
     }
+}
+
+/// Lists what the model could have meant: a plugin's skills when it named
+/// the plugin, otherwise every skill unless they are searched.
+fn no_such_skill(config: &AgentConfig, named: &str) -> String {
+    let (plugin_id, skill_name) = split_skill(named);
+    let listing = |skills: Vec<crate::agent_config::NamedSkill>| {
+        skills
+            .iter()
+            .map(|s| format!("{} — {}", s.name, s.description))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let skills = config.named_skills();
+    if !plugin_id.is_empty() {
+        let Some(plugin) = config.plugins.iter().find(|p| p.id == plugin_id) else {
+            let plugins: Vec<&str> = config.plugins.iter().map(|p| p.id.as_str()).collect();
+            return format!(
+                "no plugin `{plugin_id}` for this agent. Declared: {}.",
+                crate::copy::declared(plugins)
+            );
+        };
+        let in_plugin = skills
+            .into_iter()
+            .filter(|s| s.plugin == Some(plugin.id.as_str()))
+            .collect();
+        return format!(
+            "no skill `{skill_name}` in plugin `{plugin_id}`. Its skills:\n{}",
+            listing(in_plugin)
+        );
+    }
+    if config.searches_skills() {
+        return format!("no skill `{named}`. Find skills with `tool_search`.");
+    }
+    format!(
+        "no skill `{named}`. This agent's skills:\n{}",
+        listing(skills)
+    )
 }
 
 fn file_answer(skill: &Skill, named: &str, path: &str) -> StoredResult {
@@ -165,6 +183,7 @@ mod tests {
                         skills: vec![SkillMeta {
                             name: "form-filling".to_string(),
                             description: "Fill out PDF forms.".to_string(),
+                            tools: vec![],
                         }],
                         servers: vec![],
                         tools: None,
@@ -194,6 +213,7 @@ mod tests {
                     name: "form-filling".to_string(),
                     description: "Fill out PDF forms.".to_string(),
                     body: "Read references/FORMS.md first.".to_string(),
+                    tools: vec![],
                     files: [("references/FORMS.md".to_string(), "field rules".to_string())].into(),
                     binaries: [(
                         "references/sample.pdf".to_string(),
@@ -258,7 +278,10 @@ mod tests {
     #[test]
     fn a_wrong_name_answers_with_the_directory() {
         let cases = [
-            (r#"{"name":"form-filling"}"#, "not a skill name"),
+            (
+                r#"{"name":"form-filling"}"#,
+                "no skill `form-filling`. This agent's skills:",
+            ),
             (r#"{"name":"typo:form-filling"}"#, "no plugin `typo`"),
             (
                 r#"{"name":"pdf:typo"}"#,

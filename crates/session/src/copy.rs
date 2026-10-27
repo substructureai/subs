@@ -7,6 +7,21 @@ pub const CALL_NOT_ROUTED: &str = "the call could not be routed";
 
 pub const PLUGIN_USAGE: &str = "load a skill with the `skill` tool";
 
+pub const SEARCHED_SKILLS: &str =
+    "find its skills with `tool_search`, and load one with the `skill` tool";
+
+pub const CALL_TOOL_IN_CALL: &str =
+    "`call_tool` can't call itself. Name the tool you want in `name`, beside its `arguments`.";
+
+pub fn locked(named: &str, skills: &[String]) -> String {
+    let named_skills = skills
+        .iter()
+        .map(|s| format!("`{s}`"))
+        .collect::<Vec<_>>()
+        .join(" or ");
+    format!("`{named}` comes with the skill {named_skills}. Load it with `skill` first, then call `{named}` again.")
+}
+
 pub fn declared<I>(ids: I) -> String
 where
     I: IntoIterator,

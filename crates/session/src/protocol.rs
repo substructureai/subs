@@ -957,6 +957,9 @@ pub struct AgentConfig {
     /// Plugins this agent uses.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub plugins: Vec<AgentPlugin>,
+    /// Skills of its own, outside any plugin.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<AgentSkill>,
     /// Defer every tool this agent offers, whatever its source. A tool or a
     /// connection overrides this with its own `defer`. Absent, the agent defers
     /// nothing; a connection can still defer on its own.
@@ -1029,6 +1032,8 @@ pub struct AgentConfigPatch {
     pub mcp: Option<Vec<McpServer>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugins: Option<Vec<AgentPlugin>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<AgentSkill>>,
     #[serde(
         default,
         deserialize_with = "present_defer_tools",
@@ -1066,6 +1071,7 @@ impl AgentConfigPatch {
             max_subagent_depth,
             mcp,
             plugins,
+            skills,
             defer_tools,
             mcp_announce,
             attachments,
@@ -1083,6 +1089,7 @@ impl AgentConfigPatch {
             max_subagent_depth: max_subagent_depth.unwrap_or(base.max_subagent_depth),
             mcp: mcp.unwrap_or(base.mcp),
             plugins: plugins.unwrap_or(base.plugins),
+            skills: skills.unwrap_or(base.skills),
             defer_tools: defer_tools.unwrap_or(base.defer_tools),
             mcp_announce: mcp_announce.unwrap_or(base.mcp_announce),
             attachments: attachments.unwrap_or(base.attachments),
@@ -1343,6 +1350,9 @@ pub struct DeferTools {
         skip_serializing_if = "is_default_max_matches"
     )]
     pub max_matches: NonZeroUsize,
+    /// How the model learns the agent's skills.
+    #[serde(default, skip_serializing_if = "SkillListing::is_default")]
+    pub skills: SkillListing,
 }
 
 impl Default for DeferTools {
@@ -1350,7 +1360,26 @@ impl Default for DeferTools {
         Self {
             strategy: DeferToolsStrategy::default(),
             max_matches: default_max_matches(),
+            skills: SkillListing::default(),
         }
+    }
+}
+
+/// `list` names every skill in the system prompt. `search` names none there:
+/// `tool_search` finds skills beside tools, so a growing set of skills costs
+/// the prompt nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(title = "SkillListing")]
+pub enum SkillListing {
+    #[default]
+    List,
+    Search,
+}
+
+impl SkillListing {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
     }
 }
 
@@ -1616,25 +1645,25 @@ pub struct AgentPlugin {
     #[serde(default, skip_serializing_if = "Approve::is_default")]
     pub approve: Approve,
     /// Where its skills come from. Absent ⇒ its bundle.
-    #[serde(default, skip_serializing_if = "PluginSource::is_bundle")]
-    pub source: PluginSource,
+    #[serde(default, skip_serializing_if = "SkillSource::is_bundle")]
+    pub source: SkillSource,
 }
 
-/// Where a plugin's skills come from: the bundle `subs apply` sent, or the
-/// worker, which lists them in the config it returns and answers each `skill`
-/// call as a `tool.execute`, so a skill can say what is true now.
+/// Where a skill comes from: the bundle `subs apply` sent, or the worker,
+/// which lists it in the config it returns and answers each `skill` call as a
+/// `tool.execute`, so a skill can say what is true now.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-#[schemars(title = "PluginSource")]
-pub enum PluginSource {
+#[schemars(title = "SkillSource")]
+pub enum SkillSource {
     #[default]
     Bundle,
     Worker,
 }
 
-impl PluginSource {
+impl SkillSource {
     pub fn is_bundle(&self) -> bool {
-        *self == PluginSource::Bundle
+        *self == SkillSource::Bundle
     }
 }
 
@@ -1660,6 +1689,27 @@ pub struct SkillMeta {
     pub name: String,
     #[serde(default)]
     pub description: String,
+    /// Tools the model can't see or call until it loads this skill. A tool
+    /// that several skills name comes with any of them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
+}
+
+/// A skill of the agent's own, in no plugin. The model loads it by its bare
+/// name.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[schemars(title = "AgentSkill")]
+pub struct AgentSkill {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// Absent ⇒ the project's skills bundle, which holds every `[skill.<id>]`
+    /// with a `path`.
+    #[serde(default, skip_serializing_if = "SkillSource::is_bundle")]
+    pub source: SkillSource,
+    /// See [`SkillMeta::tools`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
 }
 
 /// A subagent the model can delegate to. `id` names the child agent; the model

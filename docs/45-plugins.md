@@ -105,6 +105,22 @@ skills, the engine sends the worker a `tool.execute` decision with the name
 worker answers with a `tool.result`, and that is the skill. A worker plugin has
 no bundle and no servers.
 
+The file can declare a worker plugin too. The worker can still change it in
+the config that it returns.
+
+```toml title="subs.toml"
+[plugin.org]
+source = "worker"
+description = "The clinic's records"
+skills = [{ name = "automations", description = "Each automation's name, status and trigger" }]
+```
+
+## Tools that come with a skill
+
+A skill can hold back tools until the model loads it: `tools` in the front
+matter of its `SKILL.md`, or on a skill that the worker lists. See
+[Tools that come with a skill](./47-skills.md#tools-that-come-with-a-skill).
+
 ## Servers and credentials
 
 A plugin's `mcp.json` servers join the connection registry, and a file names one
@@ -142,6 +158,7 @@ url = "https://pdf.staging.example.com/mcp"
 ## Next steps
 
 - [Connectors](./40-connectors.md): the rules a plugin's servers follow.
+- [Skills](./47-skills.md): skills outside a plugin, and the tools they hold back.
 - [Agents](./30-agents.md): the section that names a plugin.
 - [Config](./220-config.md): every key of a `[plugin.<id>]` section.
 - [Tool calls](./60-tools.md): what the model does with the tools a plugin

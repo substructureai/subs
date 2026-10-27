@@ -95,6 +95,13 @@
             ],
             "description": "Boxed. Five per-kind overrides are too many bytes to carry inline."
           },
+          "skills": {
+            "description": "Skills of its own, outside any plugin.",
+            "items": {
+              "$ref": "#/components/schemas/AgentSkill"
+            },
+            "type": "array"
+          },
           "subagent_tools": {
             "anyOf": [
               {
@@ -163,7 +170,7 @@
             "type": "array"
           },
           "source": {
-            "$ref": "#/components/schemas/PluginSource",
+            "$ref": "#/components/schemas/SkillSource",
             "description": "Where its skills come from. Absent ⇒ its bundle."
           },
           "tool_sync_failure": {
@@ -185,6 +192,34 @@
           "id"
         ],
         "title": "AgentPlugin",
+        "type": "object"
+      },
+      "AgentSkill": {
+        "additionalProperties": false,
+        "description": "A skill of the agent's own, in no plugin. The model loads it by its bare\nname.",
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "source": {
+            "$ref": "#/components/schemas/SkillSource",
+            "description": "Absent ⇒ the project's skills bundle, which holds every `[skill.<id>]`\nwith a `path`."
+          },
+          "tools": {
+            "description": "See [`SkillMeta::tools`].",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "AgentSkill",
         "type": "object"
       },
       "AgentTool": {
@@ -1952,6 +1987,10 @@
             "minimum": 1,
             "type": "integer"
           },
+          "skills": {
+            "$ref": "#/components/schemas/SkillListing",
+            "description": "How the model learns the agent's skills."
+          },
           "strategy": {
             "$ref": "#/components/schemas/DeferToolsStrategy",
             "description": "Which tools the agent gets to reach the ones it defers."
@@ -2638,15 +2677,6 @@
         "title": "NoulCriteria",
         "type": "object"
       },
-      "PluginSource": {
-        "description": "Where a plugin's skills come from: the bundle `subs apply` sent, or the\nworker, which lists them in the config it returns and answers each `skill`\ncall as a `tool.execute`, so a skill can say what is true now.",
-        "enum": [
-          "bundle",
-          "worker"
-        ],
-        "title": "PluginSource",
-        "type": "string"
-      },
       "Question": {
         "description": "A named question about a `system1.call`'s state. Its type sets the type\nof its answer.",
         "oneOf": [
@@ -2981,6 +3011,15 @@
         "title": "Role",
         "type": "string"
       },
+      "SkillListing": {
+        "description": "`list` names every skill in the system prompt. `search` names none there:\n`tool_search` finds skills beside tools, so a growing set of skills costs\nthe prompt nothing.",
+        "enum": [
+          "list",
+          "search"
+        ],
+        "title": "SkillListing",
+        "type": "string"
+      },
       "SkillMeta": {
         "additionalProperties": false,
         "description": "What the model sees of a skill before it loads it.",
@@ -2990,6 +3029,13 @@
           },
           "name": {
             "type": "string"
+          },
+          "tools": {
+            "description": "Tools the model can't see or call until it loads this skill. A tool\nthat several skills name comes with any of them.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -2997,6 +3043,15 @@
         ],
         "title": "SkillMeta",
         "type": "object"
+      },
+      "SkillSource": {
+        "description": "Where a skill comes from: the bundle `subs apply` sent, or the worker,\nwhich lists it in the config it returns and answers each `skill` call as a\n`tool.execute`, so a skill can say what is true now.",
+        "enum": [
+          "bundle",
+          "worker"
+        ],
+        "title": "SkillSource",
+        "type": "string"
       },
       "SpawnMode": {
         "description": "How one subagent call returns.",

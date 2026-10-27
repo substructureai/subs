@@ -7275,6 +7275,7 @@ fn agent_config(model: &str) -> AgentConfig {
         defer_tools: None,
         mcp_announce: Default::default(),
         plugins: Vec::new(),
+        skills: Vec::new(),
         effort: None,
         attachments: None,
         context: None,
@@ -12093,6 +12094,7 @@ fn plugin_config() -> AgentConfig {
             skills: vec![crate::protocol::SkillMeta {
                 name: "form-filling".to_string(),
                 description: "Fill out PDF forms.".to_string(),
+                tools: vec![],
             }],
             servers: vec!["renderer".to_string()],
             tools: None,
@@ -12190,7 +12192,7 @@ fn using_a_skill_only_freezes_the_call() {
 #[test]
 fn a_worker_plugins_skill_is_asked_of_the_worker() {
     let mut config = plugin_config();
-    config.plugins[0].source = crate::protocol::PluginSource::Worker;
+    config.plugins[0].source = crate::protocol::SkillSource::Worker;
     config.plugins[0].servers = vec![];
     let mut agg = create_session_with_config("sess-1", "tenant-a", "user-1", Some(config));
     let opened = dispatch(
@@ -12750,4 +12752,280 @@ fn a_worker_can_set_a_temperature() {
         response.actions.as_slice(),
         [crate::protocol::DecisionAction::CallLlm { temperature: Some(t), .. }] if *t == 0.7
     ));
+}
+
+fn worker_tool(name: &str) -> AgentTool {
+    AgentTool {
+        name: name.to_string(),
+        description: format!("{name} for the clinic"),
+        input: None,
+        output: None,
+        handler: None,
+        defer: None,
+    }
+}
+
+fn skilled_config(source: crate::protocol::SkillSource) -> AgentConfig {
+    AgentConfig {
+        tools: vec![worker_tool("find_bookings"), worker_tool("get_time")],
+        skills: vec![crate::protocol::AgentSkill {
+            name: "visits".to_string(),
+            description: "Who visited, and when".to_string(),
+            source,
+            tools: vec!["find_bookings".to_string()],
+        }],
+        ..agent_config("m1")
+    }
+}
+
+fn dispatched_tools(agg: &mut Session, call_id: &str) -> Vec<String> {
+    let tools = agg
+        .state
+        .at_head()
+        .resolve_agent_for()
+        .and_then(|c| c.tools_as_llm());
+    dispatch(
+        agg,
+        CommandPayload::RequestLlmCall {
+            llm: "claude".to_string(),
+            call_id: call_id.to_string(),
+            request: LlmRequest {
+                tools,
+                ..request_with(vec![])
+            },
+            stream: false,
+            retry: RetryPolicy::no_retry(),
+            handler: LlmHandler::Server,
+            format: None,
+        },
+        &system(),
+    );
+    let call = agg.state.llm_call(call_id).expect("the call");
+    call.spec
+        .tools
+        .iter()
+        .flatten()
+        .map(|t| t.name.clone())
+        .collect()
+}
+
+fn load_worker_skill(agg: &mut Session, id: &str, named: &str) {
+    call(agg, id, "skill", &format!(r#"{{"name":"{named}"}}"#));
+    assert_eq!(
+        agg.state.tool_call(id).map(|t| t.handler),
+        Some(ToolHandler::Worker),
+        "the worker answers its own skill"
+    );
+    dispatch(
+        agg,
+        CommandPayload::settle(
+            EffectKind::ToolCall,
+            id.to_string(),
+            Some(0),
+            Outcome::Tool {
+                result: StoredResult::text("Bookings are by day.".to_string()),
+            },
+        ),
+        &machine(),
+    );
+}
+
+#[test]
+fn a_skills_tools_wait_until_it_loads() {
+    let mut agg = create_session_with_config(
+        "sess-1",
+        "tenant-a",
+        "user-1",
+        Some(skilled_config(crate::protocol::SkillSource::Worker)),
+    );
+    let before = dispatched_tools(&mut agg, "call-1");
+    assert!(
+        before.contains(&"get_time".to_string()) && before.contains(&"skill".to_string()),
+        "a tool no skill names is always there, and so is `skill`: {before:?}"
+    );
+    assert!(
+        !before.contains(&"find_bookings".to_string()),
+        "the skill's tool stays out of the request: {before:?}"
+    );
+
+    call(&mut agg, "tc-0", "find_bookings", "{}");
+    let refused = agg
+        .state
+        .local_connector_answer("tc-0")
+        .expect("the engine answers a locked call itself");
+    assert!(refused.is_error);
+    assert!(
+        refused.as_text().contains("comes with the skill `visits`"),
+        "the refusal names the skill to load: {}",
+        refused.as_text()
+    );
+
+    load_worker_skill(&mut agg, "tc-1", "visits");
+    assert!(
+        agg.state.at_head().locked_tools().is_empty(),
+        "loading the skill brings its tools"
+    );
+    let after = dispatched_tools(&mut agg, "call-2");
+    assert!(
+        after.contains(&"find_bookings".to_string()),
+        "the next call offers it: {after:?}"
+    );
+}
+
+#[test]
+fn an_agents_own_skill_is_listed_once_and_answered_from_the_skills_bundle() {
+    let mut agg = create_session_with_config(
+        "sess-1",
+        "tenant-a",
+        "user-1",
+        Some(skilled_config(crate::protocol::SkillSource::Bundle)),
+    );
+    dispatched_tools(&mut agg, "call-1");
+    let listed: Vec<String> = agg
+        .state
+        .llm_call("call-1")
+        .expect("the call")
+        .prompt
+        .iter()
+        .filter_map(|m| match &m.content {
+            Some(Content::Text(t)) if t.contains("\"skill\":\"visits\"") => Some(t.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(listed.len(), 1, "one entry for the skill: {listed:?}");
+    dispatched_tools(&mut agg, "call-2");
+    assert!(
+        agg.state
+            .llm_call("call-2")
+            .expect("the call")
+            .prompt
+            .is_empty(),
+        "an entry is written once"
+    );
+
+    call(&mut agg, "tc-1", "skill", r#"{"name":"visits"}"#);
+    let skill = agg.state.skill_call("tc-1").expect("a bundle answers it");
+    assert_eq!(skill.plugin_id, crate::plugins::SKILLS_BUNDLE);
+}
+
+#[test]
+fn searched_skills_are_found_beside_tools_and_not_listed() {
+    let mut config = skilled_config(crate::protocol::SkillSource::Bundle);
+    config.defer_tools = Some(crate::protocol::DeferTools {
+        skills: crate::protocol::SkillListing::Search,
+        ..Default::default()
+    });
+    let mut agg = create_session_with_config("sess-1", "tenant-a", "user-1", Some(config));
+    dispatched_tools(&mut agg, "call-1");
+    assert!(
+        agg.state
+            .llm_call("call-1")
+            .expect("the call")
+            .prompt
+            .is_empty(),
+        "no skill is listed in the prompt"
+    );
+
+    call(&mut agg, "tc-1", "tool_search", r#"{"query":"bookings"}"#);
+    let answer: serde_json::Value = serde_json::from_str(
+        &agg.state
+            .local_connector_answer("tc-1")
+            .expect("the engine answers a search")
+            .as_text(),
+    )
+    .expect("json");
+    assert_eq!(
+        answer["skills"][0]["name"], "visits",
+        "the skill matches on the tool it brings: {answer}"
+    );
+    assert_eq!(answer["load_with"], "skill");
+    assert!(
+        answer["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .all(|t| t["name"] != "find_bookings"),
+        "a locked tool isn't found: {answer}"
+    );
+
+    call(
+        &mut agg,
+        "tc-2",
+        "call_tool",
+        r#"{"name":"find_bookings","arguments":{}}"#,
+    );
+    let refused = agg
+        .state
+        .local_connector_answer("tc-2")
+        .expect("the engine answers it");
+    assert!(
+        refused.as_text().contains("comes with the skill `visits`"),
+        "call_tool refuses it the same way: {}",
+        refused.as_text()
+    );
+}
+
+#[test]
+fn call_tool_on_an_engine_tool_is_that_tools_call() {
+    let mut agg = searching_sentry();
+    call(
+        &mut agg,
+        "tc-1",
+        "call_tool",
+        r#"{"name":"tool_search","arguments":{"query":"issues"}}"#,
+    );
+    assert_eq!(
+        agg.state.tool_call("tc-1").map(|t| t.name.as_str()),
+        Some("tool_search"),
+        "recorded as the search it names"
+    );
+    let answer = agg
+        .state
+        .local_connector_answer("tc-1")
+        .expect("the engine answers it");
+    assert!(!answer.is_error, "{}", answer.as_text());
+    assert!(answer.as_text().contains("sentry__search_issues"));
+
+    call(
+        &mut agg,
+        "tc-2",
+        "call_tool",
+        r#"{"name":"call_tool","arguments":{}}"#,
+    );
+    let refused = agg
+        .state
+        .local_connector_answer("tc-2")
+        .expect("the engine answers it");
+    assert!(refused.as_text().contains("can't call itself"));
+}
+
+#[test]
+fn a_skill_loaded_through_call_tool_unlocks_its_tools() {
+    let mut config = skilled_config(crate::protocol::SkillSource::Worker);
+    config.defer_tools = Some(Default::default());
+    let mut agg = create_session_with_config("sess-1", "tenant-a", "user-1", Some(config));
+    call(
+        &mut agg,
+        "tc-1",
+        "call_tool",
+        r#"{"name":"skill","arguments":{"name":"visits"}}"#,
+    );
+    assert_eq!(
+        agg.state.tool_call("tc-1").map(|t| t.handler),
+        Some(ToolHandler::Worker),
+        "the worker answers its own skill, however it was called"
+    );
+    dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::ToolCall,
+            "tc-1".to_string(),
+            Some(0),
+            Outcome::Tool {
+                result: StoredResult::text("Bookings are by day.".to_string()),
+            },
+        ),
+        &machine(),
+    );
+    assert!(agg.state.at_head().locked_tools().is_empty());
 }

@@ -415,6 +415,9 @@ pub enum ConnectorTarget {
         skill: String,
     },
     Attachment,
+    /// A tool a skill holds back, called before that skill loaded. The engine
+    /// answers it with an error and runs nothing.
+    Locked,
 }
 
 impl ConnectorTarget {
@@ -425,6 +428,7 @@ impl ConnectorTarget {
             Self::Call => ConnectorToolKind::Call,
             Self::Skill { .. } => ConnectorToolKind::Skill,
             Self::Attachment => ConnectorToolKind::Attachment,
+            Self::Locked => ConnectorToolKind::Call,
         }
     }
 }

@@ -8,13 +8,13 @@ use crate::connectors::registry::{
     AuthKind, ConnectionDecl, ConnectionPath, ConnectionSpec, CredentialScope,
 };
 use crate::copy::declared;
-use crate::plugins::{BundleServer, PluginBundle};
+use crate::plugins::{BundleServer, PluginBundle, SKILLS_BUNDLE};
 use crate::protocol::ReasoningEffort;
 use crate::protocol::{
-    AgentConfig, AgentPlugin, AgentTool, Approve, ConnectorProtocol, ContextConfig, DeferTools,
-    Handler, LlmFormat, McpAnnounce, McpAuthFailure, McpServer, McpToolSyncFailure, McpTools,
-    RetryConfig, SpawnMode, Subagent, SubagentMode, SubagentTools, SubagentToolsStrategy, SUBAGENT,
-    SUBAGENT_WAIT,
+    AgentConfig, AgentPlugin, AgentSkill, AgentTool, Approve, ConnectorProtocol, ContextConfig,
+    DeferTools, Handler, LlmFormat, McpAnnounce, McpAuthFailure, McpServer, McpToolSyncFailure,
+    McpTools, RetryConfig, SkillMeta, SkillSource, SpawnMode, Subagent, SubagentMode,
+    SubagentTools, SubagentToolsStrategy, CALL_TOOL, SKILL, SUBAGENT, SUBAGENT_WAIT, TOOL_SEARCH,
 };
 use crate::runtime::events_url::EventsBlock;
 use crate::runtime::llm::{LlmBlock, LlmBlocks};
@@ -44,6 +44,8 @@ pub struct Manifest {
     pub mcp: BTreeMap<String, ConnectionDecl>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub plugin: BTreeMap<String, PluginSpec>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub skill: BTreeMap<String, SkillSpec>,
 }
 
 impl Manifest {
@@ -86,6 +88,10 @@ impl Manifest {
         }
         for (id, spec) in &self.plugin {
             check_plugin(id, spec).map_err(|e| anyhow::anyhow!("[plugin.{id}]: {e}"))?;
+        }
+        let bundled = self.plugin.contains_key(SKILLS_BUNDLE);
+        for (id, spec) in &self.skill {
+            check_skill(id, spec, bundled).map_err(|e| anyhow::anyhow!("[skill.{id}]: {e}"))?;
         }
         check_tool_prefixes(self)?;
         for (id, spec) in &self.llm {
@@ -148,6 +154,9 @@ impl Manifest {
         for spec in wire.mcp.values_mut() {
             spec.client_id_env = None;
             spec.client_secret_env = None;
+        }
+        for spec in wire.skill.values_mut() {
+            spec.path = None;
         }
         for spec in wire.plugin.values_mut() {
             spec.path = None;
@@ -212,8 +221,88 @@ impl Manifest {
                 resolved.pending.insert(id.clone(), loaded.pending);
             }
         }
+        self.resolve_skills(base, &mut resolved)?;
+        self.resolve_tool_schemas(base)?;
         self.validate()?;
         Ok(resolved)
+    }
+
+    fn resolve_skills(
+        &mut self,
+        base: &std::path::Path,
+        resolved: &mut ResolvedPlugins,
+    ) -> Result<()> {
+        if self
+            .plugin
+            .get(SKILLS_BUNDLE)
+            .is_some_and(|s| s.bundle.is_some())
+        {
+            return Ok(());
+        }
+        let mut dirs = Vec::new();
+        for (id, spec) in &self.skill {
+            if let (SkillSource::Bundle, Some(path)) = (spec.source, &spec.path) {
+                let dir =
+                    plugin_dir(base, path).map_err(|e| anyhow::anyhow!("[skill.{id}]: {e}"))?;
+                dirs.push((id.clone(), dir));
+            }
+        }
+        if dirs.is_empty() {
+            return Ok(());
+        }
+        let loaded = crate::plugins::load_skill_dirs(&dirs)?;
+        for skill in &loaded.bundle.skills {
+            if let Some(spec) = self.skill.get_mut(&skill.name) {
+                spec.description
+                    .get_or_insert_with(|| skill.description.clone());
+                spec.tools.get_or_insert_with(|| skill.tools.clone());
+            }
+        }
+        let hash = loaded.hash();
+        resolved
+            .notices
+            .extend(loaded.notices.into_iter().map(|n| format!("[skill]: {n}")));
+        if !loaded.pending.is_empty() {
+            resolved
+                .pending
+                .insert(SKILLS_BUNDLE.to_string(), loaded.pending);
+        }
+        self.plugin.insert(
+            SKILLS_BUNDLE.to_string(),
+            PluginSpec {
+                bundle: Some(loaded.bundle),
+                hash: Some(hash),
+                ..Default::default()
+            },
+        );
+        Ok(())
+    }
+
+    /// A tool's `input` or `output` may name a JSON Schema file instead of
+    /// writing the schema out.
+    fn resolve_tool_schemas(&mut self, base: &std::path::Path) -> Result<()> {
+        for (id, section) in &mut self.agent {
+            for tool in &mut section.tools {
+                for schema in [&mut tool.input, &mut tool.output] {
+                    let Some(serde_json::Value::String(path)) = schema else {
+                        continue;
+                    };
+                    let file = plugin_dir(base, path)?;
+                    let read = std::fs::read_to_string(&file)
+                        .map_err(anyhow::Error::from)
+                        .and_then(|text| Ok(serde_json::from_str(&text)?))
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "[agent.{id}]: tool `{}`: {}: {e}",
+                                tool.name,
+                                file.display()
+                            )
+                        })?;
+                    *schema = Some(read);
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn llm_blocks(&self) -> LlmBlocks {
@@ -448,6 +537,8 @@ pub struct AgentSection {
     pub mcp: Vec<McpRef>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub plugins: Vec<PluginRef>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<String>,
     #[serde(
         default,
         deserialize_with = "crate::protocol::de_defer_tools",
@@ -483,6 +574,7 @@ impl AgentSection {
             || !self.subagents.is_empty()
             || !self.mcp.is_empty()
             || !self.plugins.is_empty()
+            || !self.skills.is_empty()
     }
 
     pub fn to_agent_config(&self, manifest: &Manifest) -> Option<AgentConfig> {
@@ -509,8 +601,51 @@ impl AgentSection {
                 .iter()
                 .map(|p| p.to_wire(manifest, self.mcp_defaults()))
                 .collect(),
+            skills: self
+                .skills
+                .iter()
+                .filter_map(|id| {
+                    let spec = manifest.skill.get(id)?;
+                    Some(AgentSkill {
+                        name: id.clone(),
+                        description: spec.description.clone().unwrap_or_default(),
+                        source: spec.source,
+                        tools: spec.tools.clone().unwrap_or_default(),
+                    })
+                })
+                .collect(),
             context: self.context.clone(),
         })
+    }
+
+    /// What in this section the worker answers, if anything.
+    fn worker_answered(&self, manifest: &Manifest) -> Option<String> {
+        let tool = self
+            .tools
+            .iter()
+            .find(|t| t.handler.is_none_or(|h| h == Handler::Worker))
+            .map(|t| format!("tool `{}`", t.name));
+        let skill = self
+            .skills
+            .iter()
+            .find(|id| {
+                manifest
+                    .skill
+                    .get(*id)
+                    .is_some_and(|s| s.source == SkillSource::Worker)
+            })
+            .map(|id| format!("skill `{id}`"));
+        let plugin = self
+            .plugins
+            .iter()
+            .find(|p| {
+                manifest
+                    .plugin
+                    .get(p.id())
+                    .is_some_and(|s| s.source == SkillSource::Worker)
+            })
+            .map(|p| format!("plugin `{}`", p.id()));
+        tool.or(skill).or(plugin)
     }
 
     fn mcp_defaults(&self) -> McpDefaults {
@@ -573,6 +708,29 @@ pub struct PluginSpec {
     pub auth: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
+    /// `worker` lists the skills here and has the worker answer them.
+    #[serde(skip_serializing_if = "SkillSource::is_bundle")]
+    pub source: SkillSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<SkillMeta>,
+}
+
+/// A skill of the project's own: a directory at `path`, or, with
+/// `source = "worker"`, one the worker answers. `description` and `tools`
+/// override the SKILL.md front matter.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SkillSpec {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "SkillSource::is_bundle")]
+    pub source: SkillSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
 }
 
 fn saw_auth_map<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
@@ -618,6 +776,25 @@ impl PluginServerSpec {
 
 fn check_plugin(id: &str, spec: &PluginSpec) -> Result<()> {
     check_id(id)?;
+    if id.starts_with('_') && (id != SKILLS_BUNDLE || spec.path.is_some()) {
+        bail!("an id that starts with `_` is the engine's. Rename the plugin.");
+    }
+    if spec.source == SkillSource::Worker {
+        if spec.path.is_some() || !spec.mcp.is_empty() {
+            bail!("a worker plugin has no `path` and no servers: the worker answers its skills");
+        }
+        for skill in &spec.skills {
+            check_skill_tools(&skill.tools)
+                .map_err(|e| anyhow::anyhow!("skill `{}`: {e}", skill.name))?;
+        }
+        return Ok(());
+    }
+    if spec.description.is_some() || !spec.skills.is_empty() {
+        bail!(
+            "`description` and `skills` come from the plugin's directory. Set \
+             `source = \"worker\"` to list them here."
+        );
+    }
     if spec.path.is_none() && spec.bundle.is_none() && spec.hash.is_none() {
         bail!("declares nothing. Set `path` to the plugin's directory.");
     }
@@ -645,6 +822,32 @@ fn check_plugin(id: &str, spec: &PluginSpec) -> Result<()> {
     }
     Ok(())
 }
+
+fn check_skill(id: &str, spec: &SkillSpec, bundled: bool) -> Result<()> {
+    check_id(id)?;
+    match spec.source {
+        SkillSource::Worker if spec.path.is_some() => {
+            bail!("a worker skill has no `path`: the worker answers it")
+        }
+        SkillSource::Worker if spec.description.as_deref().unwrap_or_default().is_empty() => {
+            bail!("needs a `description`: it is all the model knows of the skill before loading it")
+        }
+        SkillSource::Bundle if spec.path.is_none() && !bundled => bail!(
+            "declares nothing. Set `path` to the skill's directory, or `source = \"worker\"`."
+        ),
+        _ => {}
+    }
+    check_skill_tools(spec.tools.as_deref().unwrap_or_default())
+}
+
+fn check_skill_tools(tools: &[String]) -> Result<()> {
+    match tools.iter().find(|t| ENGINE_TOOLS.contains(&t.as_str())) {
+        Some(tool) => bail!("`tools` names `{tool}`, which is the engine's and always there"),
+        None => Ok(()),
+    }
+}
+
+const ENGINE_TOOLS: [&str; 3] = [TOOL_SEARCH, CALL_TOOL, SKILL];
 
 fn check_tool_prefixes(manifest: &Manifest) -> Result<()> {
     let paths = manifest.connection_paths();
@@ -877,7 +1080,7 @@ impl Ref<PluginEntry> {
             ),
             None => (String::new(), Vec::new(), Vec::new()),
         };
-        AgentPlugin {
+        let plugin = AgentPlugin {
             id: id.to_string(),
             description,
             skills,
@@ -893,6 +1096,15 @@ impl Ref<PluginEntry> {
                 .unwrap_or(defaults.tool_sync_failure),
             approve: entry.and_then(|e| e.approve).unwrap_or_default(),
             source: Default::default(),
+        };
+        match manifest.plugin.get(id) {
+            Some(spec) if spec.source == SkillSource::Worker => AgentPlugin {
+                description: spec.description.clone().unwrap_or_default(),
+                skills: spec.skills.clone(),
+                source: SkillSource::Worker,
+                ..plugin
+            },
+            _ => plugin,
         }
     }
 }
@@ -1078,6 +1290,21 @@ pub fn check_agent(id: &str, section: &AgentSection, manifest: &Manifest) -> Res
         }
     }
 
+    for id in &section.skills {
+        if !manifest.skill.contains_key(id) {
+            bail!(
+                "`skills` names no [skill.{id}]. Declared: {}",
+                declared(manifest.skill.keys())
+            );
+        }
+    }
+
+    if let Some(answered) = section.worker_answered(manifest) {
+        if section.worker.is_none() {
+            bail!("the worker answers {answered}, so this agent needs a `worker`");
+        }
+    }
+
     for plugin in &section.plugins {
         let Some(spec) = manifest.plugin.get(plugin.id()) else {
             bail!(
@@ -1119,10 +1346,16 @@ pub fn check_agent(id: &str, section: &AgentSection, manifest: &Manifest) -> Res
     }
 
     for tool in &section.tools {
-        if tool.handler != Some(Handler::Client) {
+        if tool.handler == Some(Handler::Server) {
             bail!(
-                "tool `{}` needs `handler = \"client\"`: a file can only declare tools the \
-                 browser runs, and worker-run tools come from worker code",
+                "tool `{}` can't have `handler = \"server\"`: the engine runs only the tools of \
+                 connections. Leave `handler` out for the worker, or set it to \"client\".",
+                tool.name
+            );
+        }
+        if ENGINE_TOOLS.contains(&tool.name.as_str()) {
+            bail!(
+                "tool `{}` has the name of one of the engine's tools. Rename it.",
                 tool.name
             );
         }
@@ -2930,6 +3163,201 @@ defer_tools = { strategy = "sometimes" }
             "#,
         );
         assert_eq!(m.system1["cf"].account_env(), Some("CLOUDFLARE_ACCOUNT_ID"));
+    }
+
+    fn skill_dir(root: &std::path::Path, name: &str, front: &str) {
+        let dir = root.join("skills").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: Work on {name}\n{front}---\nDo it well.\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_projects_skills_travel_as_one_bundle_and_the_file_wins() {
+        let root = tempfile::tempdir().unwrap();
+        skill_dir(
+            root.path(),
+            "automations",
+            "tools: [create_automation, edit_automation]\n",
+        );
+        skill_dir(root.path(), "audiences", "tools:\n  - find_audiences\n");
+        let mut m = manifest(
+            r#"
+            [llm.claude]
+            type = "anthropic"
+
+            [worker.w]
+            url = "https://w.example.com/agent"
+
+            [skill.automations]
+            path = "./skills/automations"
+
+            [skill.audiences]
+            path = "./skills/audiences"
+            tools = ["get_audience"]
+
+            [skill.visits]
+            source = "worker"
+            description = "Who visited, and when"
+            tools = ["find_bookings"]
+
+            [agent.support]
+            llm = "claude"
+            model = "m"
+            worker = "w"
+            skills = ["automations", "audiences", "visits"]
+            "#,
+        );
+        m.resolve_plugins(root.path()).unwrap();
+
+        let bundle = m.plugin[SKILLS_BUNDLE]
+            .bundle
+            .as_ref()
+            .expect("the skills bundle");
+        assert_eq!(bundle.skills.len(), 2, "only skills with a path are in it");
+        assert!(
+            m.plugin[SKILLS_BUNDLE].hash.is_some(),
+            "apply sends it by hash"
+        );
+
+        let config = m.agent["support"].to_agent_config(&m).unwrap();
+        let by_name = |name: &str| config.skills.iter().find(|s| s.name == name).unwrap();
+        assert_eq!(
+            by_name("automations").tools,
+            ["create_automation", "edit_automation"],
+            "the front matter's tools"
+        );
+        assert_eq!(
+            by_name("audiences").tools,
+            ["get_audience"],
+            "subs.toml wins over the front matter"
+        );
+        assert_eq!(by_name("automations").description, "Work on automations");
+        assert_eq!(by_name("visits").source, SkillSource::Worker);
+
+        let wire = m.for_wire();
+        assert!(wire.skill.values().all(|s| s.path.is_none()));
+        wire.validate()
+            .expect("the deployment checks the same file without the paths");
+    }
+
+    #[test]
+    fn a_skill_section_is_named_after_its_skill() {
+        let root = tempfile::tempdir().unwrap();
+        skill_dir(root.path(), "automations", "");
+        let mut m = manifest(
+            r#"
+            [skill.flows]
+            path = "./skills/automations"
+            "#,
+        );
+        let err = m.resolve_plugins(root.path()).unwrap_err().to_string();
+        assert!(err.contains("Name the section after the skill"), "{err}");
+    }
+
+    #[test]
+    fn a_worker_plugin_is_listed_in_the_file() {
+        let m = manifest(
+            r#"
+            [llm.claude]
+            type = "anthropic"
+
+            [worker.w]
+            url = "https://w.example.com/agent"
+
+            [plugin.org]
+            source = "worker"
+            description = "The clinic's records."
+            skills = [{ name = "automations", description = "Each automation", tools = ["get_automation"] }]
+
+            [agent.support]
+            llm = "claude"
+            model = "m"
+            worker = "w"
+            plugins = ["org"]
+            "#,
+        );
+        m.validate().unwrap();
+        let config = m.agent["support"].to_agent_config(&m).unwrap();
+        let org = &config.plugins[0];
+        assert_eq!(org.source, SkillSource::Worker);
+        assert_eq!(org.description, "The clinic's records.");
+        assert_eq!(org.skills[0].tools, ["get_automation"]);
+    }
+
+    #[test]
+    fn what_the_worker_answers_needs_a_worker() {
+        for (declared, named) in [
+            ("[plugin.org]\nsource = \"worker\"\n", "plugins = [\"org\"]"),
+            (
+                "[skill.visits]\nsource = \"worker\"\ndescription = \"Visits\"\n",
+                "skills = [\"visits\"]",
+            ),
+            ("", "tools = [{ name = \"find_bookings\" }]"),
+        ] {
+            let m = manifest(&format!(
+                "[llm.claude]\ntype = \"anthropic\"\n{declared}\n\
+                 [agent.support]\nllm = \"claude\"\nmodel = \"m\"\n{named}\n"
+            ));
+            let err = m.validate().unwrap_err().to_string();
+            assert!(err.contains("needs a `worker`"), "{named}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_skill_declares_where_it_comes_from() {
+        let cases = [
+            ("[skill.a]\n", "declares nothing"),
+            (
+                "[skill.a]\nsource = \"worker\"\npath = \"./a\"\ndescription = \"A\"\n",
+                "has no `path`",
+            ),
+            ("[skill.a]\nsource = \"worker\"\n", "needs a `description`"),
+            (
+                "[skill.a]\nsource = \"worker\"\ndescription = \"A\"\ntools = [\"tool_search\"]\n",
+                "the engine's",
+            ),
+            ("[plugin._skills]\npath = \"./x\"\n", "is the engine's"),
+            (
+                "[plugin.org]\ndescription = \"Org\"\npath = \"./x\"\n",
+                "come from the plugin's directory",
+            ),
+        ];
+        for (toml, expected) in cases {
+            let err = manifest(toml).validate().unwrap_err().to_string();
+            assert!(err.contains(expected), "{toml}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_tool_can_read_its_schema_from_a_file() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("find.json"),
+            r#"{"type":"object","properties":{"day":{"type":"string"}}}"#,
+        )
+        .unwrap();
+        let mut m = manifest(
+            r#"
+            [llm.claude]
+            type = "anthropic"
+
+            [worker.w]
+            url = "https://w.example.com/agent"
+
+            [agent.support]
+            llm = "claude"
+            model = "m"
+            worker = "w"
+            tools = [{ name = "find_bookings", input = "./find.json" }]
+            "#,
+        );
+        m.resolve_plugins(root.path()).unwrap();
+        let input = m.agent["support"].tools[0].input.as_ref().unwrap();
+        assert_eq!(input["properties"]["day"]["type"], "string");
     }
 }
 
