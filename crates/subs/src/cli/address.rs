@@ -2,6 +2,7 @@ use crate::connectors::registry::ConnectionPath;
 
 pub enum Address {
     Llm(String),
+    System1(String),
     Worker(String),
     Events(String),
     SlackApp(String),
@@ -18,6 +19,9 @@ impl Address {
         }
         if let Some(id) = written.strip_prefix("llm.") {
             return flat(id).map(|i| Self::Llm(i.to_string()));
+        }
+        if let Some(id) = written.strip_prefix("system1.") {
+            return flat(id).map(|i| Self::System1(i.to_string()));
         }
         if let Some(id) = written.strip_prefix("worker.") {
             return flat(id).map(|i| Self::Worker(i.to_string()));
@@ -43,6 +47,7 @@ mod tests {
             matches!(Address::parse("llm.openrouter"), Some(Address::Llm(b)) if b == "openrouter")
         );
         assert!(matches!(Address::parse("worker.main"), Some(Address::Worker(w)) if w == "main"));
+        assert!(matches!(Address::parse("system1.cf"), Some(Address::System1(b)) if b == "cf"));
         assert!(matches!(Address::parse("events.app"), Some(Address::Events(c)) if c == "app"));
         assert!(
             matches!(Address::parse("agent.support.slack"), Some(Address::SlackApp(a)) if a == "support")

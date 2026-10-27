@@ -259,6 +259,10 @@ async fn engine_with(
                 db.clone(),
                 Duration::from_secs(60),
             )),
+            system1: Arc::new(substructure_host::runtime::system1::System1Registry::default()),
+            system1_task_queue: Arc::new(SqliteQueue::<
+                substructure_host::runtime::system1::System1Task,
+            >::new(db.clone(), Duration::from_secs(60))),
             subagent_task_queue: Arc::new(SqliteQueue::<SubagentTask>::new(
                 db.clone(),
                 Duration::from_secs(60),

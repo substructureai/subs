@@ -6,7 +6,7 @@ use tokio::net::TcpListener;
 use crate::cli::auth::AuthWiring;
 use crate::cli::cloud::project_config::{self, ProjectConfig};
 use crate::cli::cloud::{credentials, print};
-use crate::cli::env::{EnvVars, ProviderEnv, ProviderKind};
+use crate::cli::env::{EnvVars, ProviderEnv, ProviderKind, System1Env};
 use crate::cli::DEFAULT_TENANT;
 use crate::connectors::credential::StoredCredentials;
 use crate::connectors::registry::{ConnectionPath, Connections, CredentialScope, LocalRegistry};
@@ -19,10 +19,12 @@ use crate::providers::sqlite::{
     SqliteAlarms, SqliteAuthFlows, SqliteBlobStore, SqliteCredentialStore, SqliteDb, SqliteQueue,
     SqliteSecretStore, SqliteSessionIndexStore, SqliteSessionStores,
 };
+use crate::providers::system1::{System1Client, System1Config};
 use crate::runtime::blob::{BlobResolvingLlm, BlobStore};
 use crate::runtime::connector::ConnectorTask;
 use crate::runtime::queue::Queue;
 use crate::runtime::secret::SecretCipher;
+use crate::runtime::system1::{System1Callable, System1Registry, System1Task};
 use crate::subagent::SubagentTask;
 use crate::transport::admin_http::{self, AdminHttpState};
 use crate::transport::ag_ui::channel::AgUiChannel;
@@ -102,7 +104,11 @@ async fn start_server(args: ServeArgs) -> anyhow::Result<()> {
     let db_path = args.db.unwrap_or_else(|| cfg.db_path());
     let authenticate = !args.no_auth && cfg.serve_auth();
 
-    let env = match EnvVars::load(cfg.provider_bindings(), authenticate) {
+    let env = match EnvVars::load(
+        cfg.provider_bindings(),
+        cfg.system1_bindings(),
+        authenticate,
+    ) {
         Some(e) => e,
         None => std::process::exit(2),
     };
@@ -134,6 +140,7 @@ async fn start_server(args: ServeArgs) -> anyhow::Result<()> {
         }),
         blobs.clone(),
         env.providers,
+        env.system1,
         &cfg,
     )
     .await?;
@@ -230,6 +237,7 @@ pub(crate) async fn start_engine(
     slack: Option<Arc<dyn crate::runtime::sessions::Reader>>,
     blobs: Arc<dyn BlobStore>,
     providers: Vec<ProviderEnv>,
+    system1: Vec<System1Env>,
     cfg: &ProjectConfig,
 ) -> anyhow::Result<(Arc<Runtime>, Arc<PushAdapter>, Option<Arc<McpAuthDeps>>)> {
     let (manifest, mut resolved) = cfg.resolved_manifest()?;
@@ -324,6 +332,14 @@ pub(crate) async fn start_engine(
         Arc::new(SqliteQueue::new(db.clone(), TASK_LEASE));
     let connector_task_queue: Arc<dyn Queue<ConnectorTask>> =
         Arc::new(SqliteQueue::new(db.clone(), TASK_LEASE));
+    let system1_task_queue: Arc<dyn Queue<System1Task>> =
+        Arc::new(SqliteQueue::new(db.clone(), TASK_LEASE));
+    let system1 = Arc::new(System1Registry::new(
+        system1
+            .into_iter()
+            .map(|b| (b.name.clone(), system1_client(b)))
+            .collect(),
+    ));
 
     let connections = Some(connectors.clone())
         .filter(|c| !c.is_empty())
@@ -376,7 +392,8 @@ pub(crate) async fn start_engine(
             cfg.llm_blocks(),
         )
         .with_workers(manifest.worker.clone(), manifest.default_worker.clone())
-        .with_events(manifest.events.clone()),
+        .with_events(manifest.events.clone())
+        .with_system1(manifest.system1_blocks()),
     );
 
     let token_delta_transport = Arc::new(crate::llm::InMemoryTokenDeltaTransport::new());
@@ -388,6 +405,8 @@ pub(crate) async fn start_engine(
             agents: agents.clone(),
             llm: llm_providers,
             llm_task_queue,
+            system1,
+            system1_task_queue,
             subagent_task_queue,
             connections,
             plugins,
@@ -407,6 +426,17 @@ pub(crate) async fn start_engine(
     adapter.start().await;
 
     Ok((rt, adapter, mcp_auth))
+}
+
+fn system1_client(b: System1Env) -> Arc<dyn System1Callable> {
+    Arc::new(System1Client::new(System1Config {
+        kind: b.spec.kind,
+        api_key: b.api_key,
+        base_url: b.spec.base_url,
+        url: b.spec.url,
+        account_id: b.account_id,
+        price_input: b.spec.price.map(|p| p.input),
+    }))
 }
 
 fn client(p: ProviderEnv) -> Option<Arc<dyn LlmProviderTrait>> {

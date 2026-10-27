@@ -183,6 +183,7 @@ What fires, what the engine proposes, and what you return.
 | `llm.execute` | The agent's LLM block is `type = "worker"`. | Empty. | `llm.result` or `llm.error`, or a stream. |
 | `llm.finished` | A model call ended. | Record the reply, then start its tool calls or end the turn. A failed, truncated, or refused call fails the turn. | `proposed` |
 | `subagent.finished` | A child session's turn ended. | Record the child's result as the tool result, then call the model. | `proposed` |
+| `system1.finished` | A `system1.call` ended, after retries. | Empty. | Your own actions. |
 | `interrupt.resumed` | Someone resumed a paused branch. | Call the model again over the transcript. | `proposed` |
 | `turn.finished` | A turn completed. Carries its cost and output. If your answer starts work, the turn ends when that work ends. | `done`. | `proposed` |
 
@@ -254,6 +255,16 @@ type Trigger =
           result?: string
           error?: ErrorInfo
       }
+    | {
+          type: "system1.finished"
+          id: string                // the system1.call
+          ok: boolean
+          model?: string            // the model that answered
+          answers?: Record<string, Answer>  // by question name
+          usage?: Usage
+          cost?: string
+          error?: ErrorInfo
+      }
     | { type: "interrupt.resumed"; interrupt_id: string; payload?: unknown }
     | {
           type: "turn.finished"
@@ -287,6 +298,7 @@ type ClientContext = {
 | `llm.result` | End a model call your worker made. | `llm.execute` |
 | `llm.error` | End a model call with a failure. | `llm.execute` |
 | `subagent.spawn` | Start a child session. | Any trigger. |
+| `system1.call` | Ask a `[system1.*]` block typed questions. | Any trigger. |
 | `message.send` | Write a message into a session. | Any trigger. |
 | `interrupt` | Pause the active branch. | Any trigger. |
 | `interrupt.resolve` | Clear an open interrupt and resume. | Any trigger. |
@@ -358,6 +370,16 @@ type Action =
           message?: DraftMessage  // the child's first message
           retry?: RetryOverride
       }
+    | {
+          type: "system1.call"
+          id?: string             // omitted: the engine creates one
+          system1?: string        // omitted: the only block declared
+          model?: string          // omitted: the block's model
+          state?: unknown         // omitted: the conversation as roles and text
+          questions: Record<string, Question>
+          assets?: Record<string, { type: "image"; uri: string }>  // blob:// or data:
+          retry?: RetryOverride
+      }
     | { type: "message.send"; session_id: string; message: DraftMessage }
     | {
           type: "interrupt"
@@ -381,6 +403,33 @@ over the current conversation.
 
 `llm.call` takes an `llm` to send one call to another block. The config stays as
 it is. See [LLMs](./70-llms.md).
+
+`system1.call` runs on a `[system1.*]` block. Its answers come back as
+`system1.finished`. See [System One models](./75-system1.md).
+
+```typescript
+type Question =
+    | { type: "noul"; instructions?: unknown; criteria?: { true?: unknown; false?: unknown } }
+    | { type: "choice"; instructions?: unknown; criteria: Record<string, unknown> }
+    | { type: "score"; instructions?: unknown; criteria: unknown[] }  // levels, from 0
+    | { type: "box"; instructions?: unknown }                        // needs an image asset
+
+type Answer =  // every answer keeps the fields the provider adds
+    | { type: "noul"; noul: number }
+    | { type: "choice"; choice: string; confidence: number; probabilities: Record<string, number> }
+    | {
+          type: "score"
+          score: number
+          confidence: number
+          legend: Record<string, unknown>
+          probabilities: Record<string, number>
+      }
+    | {
+          type: "box"
+          box: { top: number; left: number; bottom: number; right: number }
+          confidence: number | null
+      }
+```
 
 `connector.sync` names a connection that the current config already names. Use
 it after a person corrects a credential. The fetch runs again with a full retry
@@ -542,6 +591,7 @@ type RetryConfig = {            // one override per kind. they stack
     tool?: RetryOverride
     subagent?: RetryOverride
     connector?: RetryOverride
+    system1?: RetryOverride
 }
 ```
 

@@ -6,6 +6,7 @@ use crate::protocol::{
 use crate::runtime::events_url::EventsBlock;
 use crate::runtime::llm::LlmBlocks;
 use crate::runtime::session::command::CommandPayload;
+use crate::runtime::system1::System1Blocks;
 use crate::runtime::worker::WorkerDecisionRequest;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +42,7 @@ pub struct TenantDirectory {
     pub events: BTreeMap<String, EventsBlock>,
     pub default_worker: Option<String>,
     pub llm: LlmBlocks,
+    pub system1: System1Blocks,
 }
 
 impl TenantDirectory {
@@ -188,6 +190,11 @@ impl StaticAgentDirectory {
 
     pub fn with_events(mut self, events: BTreeMap<String, EventsBlock>) -> Self {
         self.directory.events = events;
+        self
+    }
+
+    pub fn with_system1(mut self, system1: System1Blocks) -> Self {
+        self.directory.system1 = system1;
         self
     }
 }

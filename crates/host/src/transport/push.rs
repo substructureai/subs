@@ -270,6 +270,7 @@ async fn submit(
         decision.agent.as_ref(),
         Some(&decision.trigger),
         &runtime.llm_blocks(tenant_id).await,
+        &runtime.system1_blocks(tenant_id).await,
         runtime.blob_store(),
         tenant_id,
     )

@@ -10,6 +10,7 @@ use crate::runtime::span::SpanContext;
 pub const LLM: &str = "llm";
 pub const CONNECTOR: &str = "connector";
 pub const SUBAGENT: &str = "subagent";
+pub const SYSTEM1: &str = "system1";
 
 pub fn decisions(tenant_id: &str) -> String {
     format!("decisions:{tenant_id}")

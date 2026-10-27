@@ -4,6 +4,7 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
 pub use substructure_host::manifest::ProviderKind;
+use substructure_host::manifest::System1Spec;
 
 /// How `subs run` renders a turn.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
@@ -42,6 +43,18 @@ pub struct ProviderBinding {
     pub cache_ttl: Option<String>,
 }
 
+pub struct System1Binding {
+    pub name: String,
+    pub spec: System1Spec,
+}
+
+pub struct System1Env {
+    pub name: String,
+    pub spec: System1Spec,
+    pub api_key: Option<String>,
+    pub account_id: Option<String>,
+}
+
 pub struct AuthEnvVars {
     pub client_token_issuer: String,
     pub client_token_audience: String,
@@ -51,11 +64,16 @@ pub struct AuthEnvVars {
 
 pub struct EnvVars {
     pub providers: Vec<ProviderEnv>,
+    pub system1: Vec<System1Env>,
     pub auth: Option<AuthEnvVars>,
 }
 
 impl EnvVars {
-    pub fn load(bindings: Vec<ProviderBinding>, authenticate: bool) -> Option<Self> {
+    pub fn load(
+        bindings: Vec<ProviderBinding>,
+        system1: Vec<System1Binding>,
+        authenticate: bool,
+    ) -> Option<Self> {
         let provider_specs: Vec<(String, String)> = bindings
             .iter()
             .map(|b| {
@@ -98,6 +116,45 @@ impl EnvVars {
                 Err(_) => missing.push((name.clone(), desc.clone())),
             }
         }
+        let mut read = |name: &str, desc: String| match std::env::var(name) {
+            Ok(v) => Some(v),
+            Err(_) => {
+                missing.push((name.to_string(), desc));
+                None
+            }
+        };
+        let system1: Vec<System1Env> = system1
+            .into_iter()
+            .map(|b| {
+                let kind = b.spec.kind;
+                let console = kind
+                    .console_url()
+                    .map(|u| format!(" ({u})"))
+                    .unwrap_or_default();
+                let api_key = b.spec.api_key_env().and_then(|var| {
+                    let what = format!(
+                        "API key for [system1.{}], a {} block{console}",
+                        b.name,
+                        kind.as_str()
+                    );
+                    read(&var, what)
+                });
+                let account_id = b.spec.account_id.clone().or_else(|| {
+                    let var = b.spec.account_env()?;
+                    read(
+                        var,
+                        format!("Cloudflare account id for [system1.{}]", b.name),
+                    )
+                });
+                System1Env {
+                    name: b.name,
+                    spec: b.spec,
+                    api_key,
+                    account_id,
+                }
+            })
+            .collect();
+
         if authenticate {
             for (name, desc) in auth_specs {
                 match std::env::var(name) {
@@ -143,6 +200,10 @@ impl EnvVars {
             })
         };
 
-        Some(Self { providers, auth })
+        Some(Self {
+            providers,
+            system1,
+            auth,
+        })
     }
 }

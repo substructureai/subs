@@ -7,9 +7,11 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use toml_edit::{DocumentMut, Item, Table, Value};
 
-use crate::cli::env::{ProviderBinding, ProviderKind};
+use crate::cli::env::{ProviderBinding, ProviderKind, System1Binding};
 use crate::connectors::registry::{ConnectionDecl, ConnectionPath, ConnectionSpec};
-use crate::manifest::{AgentSection, Manifest, PluginSpec, ProviderSpec, ResolvedPlugins};
+use crate::manifest::{
+    AgentSection, Manifest, PluginSpec, ProviderSpec, ResolvedPlugins, System1Spec,
+};
 use crate::runtime::llm::LlmBlocks;
 use crate::runtime::worker::AgentEntry;
 
@@ -40,6 +42,9 @@ pub struct ProjectConfig {
 
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub llm: BTreeMap<String, ProviderSpec>,
+
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub system1: BTreeMap<String, System1Spec>,
 
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub worker: BTreeMap<String, crate::worker::WorkerBlock>,
@@ -102,6 +107,7 @@ impl ProjectConfig {
             default_worker: self.default_worker.clone(),
             max_subagent_depth: self.max_subagent_depth,
             llm: self.llm.clone(),
+            system1: self.system1.clone(),
             agent: self.agent.clone(),
             mcp: self.mcp.clone(),
             plugin: self.plugin.clone(),
@@ -150,6 +156,16 @@ impl ProjectConfig {
                     base_url: spec.base_url.clone(),
                     cache_ttl: spec.cache_ttl.clone(),
                 })
+            })
+            .collect()
+    }
+
+    pub fn system1_bindings(&self) -> Vec<System1Binding> {
+        self.system1
+            .iter()
+            .map(|(name, spec)| System1Binding {
+                name: name.clone(),
+                spec: spec.clone(),
             })
             .collect()
     }

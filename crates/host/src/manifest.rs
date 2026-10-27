@@ -18,6 +18,7 @@ use crate::protocol::{
 };
 use crate::runtime::events_url::EventsBlock;
 use crate::runtime::llm::{LlmBlock, LlmBlocks};
+use crate::runtime::system1::{System1Block, System1Blocks, System1Kind};
 use crate::runtime::worker::{AgentEntry, Hosting, WorkerBlock};
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -31,6 +32,8 @@ pub struct Manifest {
     pub default_worker: Option<String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub llm: BTreeMap<String, ProviderSpec>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub system1: BTreeMap<String, System1Spec>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub worker: BTreeMap<String, WorkerBlock>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -88,6 +91,9 @@ impl Manifest {
         for (id, spec) in &self.llm {
             check_llm(id, spec).map_err(|e| anyhow::anyhow!("[llm.{id}]: {e}"))?;
         }
+        for (id, spec) in &self.system1 {
+            check_system1(id, spec).map_err(|e| anyhow::anyhow!("[system1.{id}]: {e}"))?;
+        }
         for (id, section) in &self.agent {
             check_agent(id, section, self).map_err(|e| anyhow::anyhow!("[agent.{id}]: {e}"))?;
         }
@@ -99,7 +105,13 @@ impl Manifest {
             .llm
             .iter()
             .filter(|(_, s)| s.api_key_env.is_some())
-            .map(|(id, _)| format!("[llm.{id}].api_key_env"));
+            .map(|(id, _)| format!("[llm.{id}].api_key_env"))
+            .chain(
+                self.system1
+                    .iter()
+                    .filter(|(_, s)| s.api_key_env.is_some())
+                    .map(|(id, _)| format!("[system1.{id}].api_key_env")),
+            );
         let mcp = self.mcp.iter().flat_map(|(id, s)| {
             s.client_id_env
                 .iter()
@@ -128,6 +140,9 @@ impl Manifest {
     pub fn for_wire(&self) -> Self {
         let mut wire = self.clone();
         for spec in wire.llm.values_mut() {
+            spec.api_key_env = None;
+        }
+        for spec in wire.system1.values_mut() {
             spec.api_key_env = None;
         }
         for spec in wire.mcp.values_mut() {
@@ -203,6 +218,13 @@ impl Manifest {
 
     pub fn llm_blocks(&self) -> LlmBlocks {
         self.llm
+            .iter()
+            .map(|(name, spec)| (name.clone(), spec.block()))
+            .collect()
+    }
+
+    pub fn system1_blocks(&self) -> System1Blocks {
+        self.system1
             .iter()
             .map(|(name, spec)| (name.clone(), spec.block()))
             .collect()
@@ -307,6 +329,94 @@ impl ProviderSpec {
             .clone()
             .or_else(|| self.kind.default_api_key_env().map(str::to_string))
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct System1Spec {
+    #[serde(rename = "type")]
+    pub kind: System1Kind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub questions: Option<Vec<crate::protocol::QuestionKind>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price: Option<System1Price>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct System1Price {
+    pub input: rust_decimal::Decimal,
+}
+
+pub const CLOUDFLARE_ACCOUNT_ENV: &str = "CLOUDFLARE_ACCOUNT_ID";
+
+impl System1Spec {
+    pub fn block(&self) -> System1Block {
+        System1Block {
+            kind: self.kind,
+            model: self.model.clone(),
+            questions: self.questions.clone(),
+        }
+    }
+
+    pub fn api_key_env(&self) -> Option<String> {
+        self.api_key_env
+            .clone()
+            .or_else(|| self.kind.default_api_key_env().map(str::to_string))
+    }
+
+    pub fn account_env(&self) -> Option<&'static str> {
+        (self.kind == System1Kind::WorkersAi && self.account_id.is_none())
+            .then_some(CLOUDFLARE_ACCOUNT_ENV)
+    }
+}
+
+pub fn check_system1(id: &str, spec: &System1Spec) -> Result<()> {
+    check_id(id)?;
+    let kind = spec.kind.as_str();
+    match spec.kind {
+        System1Kind::Http => {
+            let Some(url) = &spec.url else {
+                bail!("an `http` block needs a `url` to send calls to");
+            };
+            check_url(url)?;
+            if spec.base_url.is_some() || spec.account_id.is_some() {
+                bail!("an `http` block takes `url`, not `base_url` or `account_id`");
+            }
+        }
+        System1Kind::Typesafe | System1Kind::WorkersAi => {
+            if spec.url.is_some() {
+                bail!("a `{kind}` block knows its address. Use `base_url` to change it.");
+            }
+            if let Some(url) = &spec.base_url {
+                check_url(url)?;
+            }
+            if spec.kind == System1Kind::Typesafe && spec.account_id.is_some() {
+                bail!("`account_id` only applies to `type = \"workers-ai\"`");
+            }
+        }
+    }
+    if spec.questions.as_ref().is_some_and(Vec::is_empty) {
+        bail!("`questions` names no question types");
+    }
+    if spec
+        .price
+        .as_ref()
+        .is_some_and(|p| p.input.is_sign_negative())
+    {
+        bail!("`price.input` cannot be negative");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -2759,6 +2869,66 @@ defer_tools = { strategy = "sometimes" }
         assert_eq!(dir("$HOME/plugins/pdf"), home.join("plugins/pdf"));
         let err = plugin_dir(base, "$SUBS_NO_SUCH_VAR/pdf").unwrap_err();
         assert!(err.to_string().contains("path ="), "{err}");
+    }
+
+    #[test]
+    fn a_system1_block_reads_its_model_and_price() {
+        let m = manifest(
+            r#"
+            [system1.cf]
+            type = "workers-ai"
+            model = "clef-flash"
+            account_id = "acc"
+            price = { input = "0.24" }
+            "#,
+        );
+        m.validate().unwrap();
+        let spec = &m.system1["cf"];
+        assert_eq!(spec.api_key_env().as_deref(), Some("CLOUDFLARE_API_TOKEN"));
+        assert_eq!(spec.account_env(), None);
+        assert_eq!(
+            spec.price.as_ref().map(|p| p.input),
+            Some(rust_decimal::Decimal::new(24, 2))
+        );
+        assert_eq!(
+            m.system1_blocks().get("cf").and_then(|b| b.model.clone()),
+            Some("clef-flash".to_string())
+        );
+        assert!(m.for_wire().system1["cf"].api_key_env.is_none());
+    }
+
+    #[test]
+    fn a_system1_block_refuses_the_wrong_address() {
+        let err = manifest(
+            r#"
+            [system1.local]
+            type = "http"
+            "#,
+        )
+        .validate()
+        .unwrap_err();
+        assert!(err.to_string().contains("needs a `url`"), "{err}");
+        let err = manifest(
+            r#"
+            [system1.ts]
+            type = "typesafe"
+            url = "https://example.com"
+            "#,
+        )
+        .validate()
+        .unwrap_err();
+        assert!(err.to_string().contains("knows its address"), "{err}");
+    }
+
+    #[test]
+    fn a_workers_ai_block_without_an_account_reads_the_environment() {
+        let m = manifest(
+            r#"
+            [system1.cf]
+            type = "workers-ai"
+            "#,
+        );
+        assert_eq!(m.system1["cf"].account_env(), Some("CLOUDFLARE_ACCOUNT_ID"));
     }
 }
 

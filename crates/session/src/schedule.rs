@@ -155,8 +155,9 @@ fn first_due(
     })
 }
 
-const SWEEP_ORDER: [EffectKind; 5] = [
+const SWEEP_ORDER: [EffectKind; 6] = [
     EffectKind::LlmCall,
+    EffectKind::System1Call,
     EffectKind::ToolCall,
     EffectKind::ConnectorSync,
     EffectKind::Subagent,

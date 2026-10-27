@@ -12,13 +12,21 @@ The `@substructure.ai/cli` package and the `subs`, `substructure-host` and
 ### Added
 
 - A machine submit can change the agent config when it creates the session.
-- `turn.completed` has `turn_calls` and `turn_started_at`. `turn_calls` gives the count, the errors, the cost and the tokens of the model, tool and subagent calls of the turn.
+- `turn.completed` has `turn_calls` and `turn_started_at`. `turn_calls` gives the count, the errors, the cost and the tokens of the model, tool, subagent and System One calls of the turn.
+- Add `[system1.<id>]` blocks for System One models. The types are `typesafe`, `workers-ai` and `http`.
+- A worker can send a `system1.call` action. The answers come back in a `system1.finished` decision.
+- `[agent.<id>.retry]` takes a `system1` override.
 
 ### Changed
 
 - The `agent` of an admin run changes the config from the file. Fields that it does not set keep their values, and unknown fields are refused.
 - `SessionSeed.agent` is now an `AgentConfigPatch`, and `create_session_command` returns a `Result`.
 - `RuntimeError` has an `Invalid` variant. The HTTP APIs answer it with `400`.
+- `RuntimeDeps` must now have `system1` and `system1_task_queue`, and `resolve_response` takes the `[system1.*]` blocks.
+
+### Fixed
+
+- A worker can now set `temperature` on an `llm.call`. A call with a `temperature` now reads back from the log and the snapshot.
 
 ## [0.10.1] - 2026-10-26
 

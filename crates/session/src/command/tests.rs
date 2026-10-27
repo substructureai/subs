@@ -12369,3 +12369,283 @@ fn a_subagent_retry_is_a_new_attempt_and_a_stale_answer_is_ignored() {
         "the old attempt's answer is ignored: {stale:?}"
     );
 }
+
+fn system1_call(id: &str) -> Action {
+    Action::CallSystem1 {
+        id: id.to_string(),
+        system1: "cf".to_string(),
+        request: crate::system1::System1Request {
+            model: "clef".to_string(),
+            state: None,
+            questions: std::collections::BTreeMap::from([(
+                "spam".to_string(),
+                crate::system1::Question::Noul {
+                    instructions: Some(serde_json::json!("Is this spam?")),
+                    criteria: None,
+                },
+            )]),
+            assets: Default::default(),
+        },
+        retry: RetryPolicy::no_retry(),
+    }
+}
+
+fn system1_finished(events: &[EventPayload]) -> Option<&Trigger> {
+    events.iter().find_map(|e| match e {
+        EventPayload::DecisionQueued(q) if matches!(q.trigger, Trigger::System1Finished { .. }) => {
+            Some(&q.trigger)
+        }
+        _ => None,
+    })
+}
+
+fn decide_recording(agg: &mut Session, actions: Vec<Action>) -> Vec<EventPayload> {
+    let id = agg
+        .state
+        .effects_of(EffectKind::Decision)
+        .find(|d| d.tracking.status() == EffectStatus::Pending)
+        .map(|d| d.id.clone())
+        .expect("a live decision");
+    dispatch(
+        agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: id,
+            transcript: vec![node_msg("", Role::User, "hi")],
+            actions,
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    )
+}
+
+#[test]
+fn a_system1_call_reads_the_conversation_and_answers_in_a_decision() {
+    let mut agg = session_mid_turn();
+    let events = decide_recording(&mut agg, vec![system1_call("s1-1")]);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::System1CallDispatched(d) if d.id == "s1-1")),
+        "got {events:?}"
+    );
+    let work = agg
+        .open_work()
+        .into_iter()
+        .find_map(|w| match w {
+            crate::Work::CallSystem1 { call, .. } => Some(call),
+            _ => None,
+        })
+        .expect("the call is open work");
+    assert_eq!(
+        work.request.state,
+        Some(serde_json::json!([{ "role": "user", "content": "hi" }]))
+    );
+
+    let response = crate::system1::System1Response {
+        model: "clef".to_string(),
+        answers: std::collections::BTreeMap::from([(
+            "spam".to_string(),
+            serde_json::json!({ "type": "noul", "noul": 0.03 }),
+        )]),
+        usage: Usage::new(120, 0, 0, 12),
+        cost: Some(rust_decimal::Decimal::new(3, 5)),
+    };
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::System1Call,
+            "s1-1",
+            Some(0),
+            Outcome::System1(Box::new(response)),
+        ),
+        &system(),
+    );
+    match system1_finished(&events) {
+        Some(Trigger::System1Finished {
+            id, ok, answers, ..
+        }) => {
+            assert_eq!(id, "s1-1");
+            assert!(ok);
+            assert_eq!(answers["spam"]["noul"], serde_json::json!(0.03));
+        }
+        other => panic!("expected system1.finished, got {other:?}"),
+    }
+    assert_eq!(agg.state.turn_cost, rust_decimal::Decimal::new(3, 5));
+    let calls = &agg.state.turn_calls.system1;
+    assert_eq!((calls.count, calls.errors), (1, 0));
+    assert_eq!(calls.cost, rust_decimal::Decimal::new(3, 5));
+    assert_eq!(calls.tokens.input, 120);
+    assert_eq!(agg.state.turn_token_usage.input, 120);
+}
+
+#[test]
+fn a_failed_system1_call_answers_not_ok() {
+    let mut agg = session_mid_turn();
+    decide(&mut agg, vec![system1_call("s1-1")]);
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::System1Call,
+            "s1-1",
+            Some(0),
+            Outcome::from(SettleError::new(
+                ErrorInfo::new(crate::protocol::ErrorCode::ProviderError, "boom"),
+                false,
+            )),
+        ),
+        &system(),
+    );
+    match system1_finished(&events) {
+        Some(Trigger::System1Finished { ok, error, .. }) => {
+            assert!(!ok);
+            assert_eq!(error.as_ref().map(|e| e.message.as_str()), Some("boom"));
+        }
+        other => panic!("expected system1.finished, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_open_system1_call_holds_the_turn_until_done_voids_it() {
+    let mut agg = session_mid_turn();
+    let events = decide(
+        &mut agg,
+        vec![
+            system1_call("s1-1"),
+            Action::CallLlm {
+                id: "llm-1".to_string(),
+                llm: "claude".to_string(),
+                request: request_with(vec![]),
+                stream: false,
+                retry: RetryPolicy::no_retry(),
+                handler: LlmHandler::Server,
+                format: None,
+            },
+        ],
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, EventPayload::TurnCompleted(_))),
+        "the open call holds the turn; got {events:?}"
+    );
+    dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::LlmCall,
+            "llm-1",
+            Some(0),
+            Outcome::Llm(Box::new(LlmResponse {
+                model: "m".to_string(),
+                content: Some("hello".to_string()),
+                tool_calls: vec![],
+                finish_reason: None,
+                usage: None,
+                cost: None,
+                images: vec![],
+                reasoning: None,
+            })),
+        ),
+        &system(),
+    );
+    assert_eq!(agg.state.phase.turn_id(), Some("turn-1"));
+
+    let events = decide(
+        &mut agg,
+        vec![Action::Done {
+            data: serde_json::Value::Null,
+        }],
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            EventPayload::CallVoided(v) if v.kind == EffectKind::System1Call && v.id == "s1-1"
+        )),
+        "got {events:?}"
+    );
+}
+
+#[test]
+fn cancelling_voids_an_open_system1_call() {
+    let mut agg = session_mid_turn();
+    decide(&mut agg, vec![system1_call("s1-1")]);
+    let events = dispatch(&mut agg, CommandPayload::CancelSession, &system());
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            EventPayload::CallVoided(v) if v.kind == EffectKind::System1Call
+        )),
+        "got {events:?}"
+    );
+}
+
+#[test]
+fn only_the_engine_settles_a_system1_call() {
+    let mut agg = session_mid_turn();
+    decide(&mut agg, vec![system1_call("s1-1")]);
+    let err = agg
+        .try_handle(
+            CommandPayload::settle(
+                EffectKind::System1Call,
+                "s1-1",
+                Some(0),
+                Outcome::from(SettleError::new(
+                    ErrorInfo::new(crate::protocol::ErrorCode::ProviderError, "x"),
+                    false,
+                )),
+            ),
+            &machine(),
+        )
+        .expect_err("a worker cannot answer for the provider");
+    assert!(
+        matches!(
+            err,
+            SessionError::SessionAccessDenied | SessionError::EffectWrongHandler
+        ),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn a_call_with_a_temperature_reads_back_from_the_log_and_the_snapshot() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::RequestLlmCall {
+            llm: "claude".to_string(),
+            call_id: "llm-1".to_string(),
+            request: LlmRequest {
+                temperature: Some(0.2),
+                ..request_with(vec![])
+            },
+            stream: false,
+            retry: RetryPolicy::no_retry(),
+            handler: LlmHandler::Server,
+            format: None,
+        },
+        &system(),
+    );
+    for event in &events {
+        let text = serde_json::to_string(event).unwrap();
+        serde_json::from_str::<EventPayload>(&text).expect("the event reads back");
+    }
+    let snapshot = agg.to_json().unwrap();
+    let back = Session::from_json(&snapshot).expect("the snapshot reads back");
+    assert_eq!(
+        back.state
+            .llm_call("llm-1")
+            .and_then(|c| c.spec.temperature),
+        Some(0.2)
+    );
+}
+
+#[test]
+fn a_worker_can_set_a_temperature() {
+    let body = br#"{"actions":[{"type":"llm.call","temperature":0.7}]}"#;
+    let response: crate::protocol::DecisionResponse =
+        crate::json::from_slice("decision response", body).expect("the response parses");
+    assert!(matches!(
+        response.actions.as_slice(),
+        [crate::protocol::DecisionAction::CallLlm { temperature: Some(t), .. }] if *t == 0.7
+    ));
+}

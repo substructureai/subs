@@ -11,6 +11,7 @@ use crate::protocol::{
 };
 use crate::retry::RetryTarget;
 use crate::state::TurnPhase;
+use crate::system1::{System1Request, System1Response};
 
 impl Handler {
     pub fn as_str(self) -> &'static str {
@@ -202,6 +203,21 @@ pub enum Trigger {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<ErrorInfo>,
     },
+    #[serde(rename = "system1.finished")]
+    System1Finished {
+        id: String,
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        answers: BTreeMap<String, serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<Usage>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost: Option<Decimal>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<ErrorInfo>,
+    },
     #[serde(rename = "interrupt.resumed")]
     InterruptResumed {
         interrupt_id: String,
@@ -305,6 +321,30 @@ impl Trigger {
         }
     }
 
+    pub fn system1_ok(id: String, response: System1Response) -> Self {
+        Trigger::System1Finished {
+            id,
+            ok: true,
+            model: Some(response.model),
+            answers: response.answers,
+            usage: Some(response.usage),
+            cost: response.cost,
+            error: None,
+        }
+    }
+
+    pub fn system1_err(id: String, error: ErrorInfo) -> Self {
+        Trigger::System1Finished {
+            id,
+            ok: false,
+            model: None,
+            answers: BTreeMap::new(),
+            usage: None,
+            cost: None,
+            error: Some(error),
+        }
+    }
+
     pub fn turn_finished(
         turn_id: String,
         data: serde_json::Value,
@@ -400,6 +440,14 @@ pub enum Action {
         retry: RetryPolicy,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mode: Option<SpawnMode>,
+    },
+    #[serde(rename = "system1.call")]
+    CallSystem1 {
+        id: String,
+        system1: String,
+        request: System1Request,
+        #[serde(default = "RetryPolicy::no_retry")]
+        retry: RetryPolicy,
     },
     #[serde(rename = "message.send")]
     SendMessage {

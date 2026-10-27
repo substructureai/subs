@@ -29,6 +29,7 @@ use session::{execute, ExecuteError, ExecuteInput, Session, SessionEvent};
 use span::SpanContext;
 use subagent::{spawn_subagent_task_executor, SubagentTask};
 use substructure_session::delivery::Restart;
+use system1::{spawn_system1_task_executor, System1Blocks, System1Resolver, System1Task};
 use wake::{spawn_wake_dispatcher, Alarms};
 use worker::{AgentDirectory, FailDecision, SessionSeed, SubmitDecision, WorkerDecisionRequest};
 
@@ -49,6 +50,7 @@ pub mod session;
 pub mod sessions;
 pub use substructure_session::span;
 pub mod subagent;
+pub mod system1;
 pub mod wake;
 pub mod worker;
 
@@ -56,6 +58,7 @@ pub use caller::Caller;
 
 pub struct RuntimeConfig {
     pub llm_executor_workers: usize,
+    pub system1_executor_workers: usize,
     pub subagent_executor_workers: usize,
     pub connector_executor_workers: usize,
     pub executor_concurrency: usize,
@@ -70,6 +73,7 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             llm_executor_workers: 32,
+            system1_executor_workers: 16,
             subagent_executor_workers: 32,
             connector_executor_workers: 64,
             executor_concurrency: 32,
@@ -648,6 +652,10 @@ impl Runtime {
         self.agents.tenant(tenant_id).await.llm
     }
 
+    pub async fn system1_blocks(&self, tenant_id: &str) -> System1Blocks {
+        self.agents.tenant(tenant_id).await.system1
+    }
+
     pub fn reader(&self) -> SessionReader {
         SessionReader::new(self.sessions.clone(), self.session_index.clone())
     }
@@ -878,6 +886,8 @@ pub struct RuntimeDeps {
 
     pub llm: Arc<dyn LlmResolver>,
     pub llm_task_queue: Arc<dyn Queue<LlmTask>>,
+    pub system1: Arc<dyn System1Resolver>,
+    pub system1_task_queue: Arc<dyn Queue<System1Task>>,
     pub subagent_task_queue: Arc<dyn Queue<SubagentTask>>,
     pub connections: Option<Arc<Connections>>,
 
@@ -899,6 +909,8 @@ pub async fn start(deps: RuntimeDeps, config: RuntimeConfig) -> Arc<Runtime> {
         agents,
         llm,
         llm_task_queue,
+        system1,
+        system1_task_queue,
         subagent_task_queue,
         connections,
         plugins,
@@ -916,6 +928,7 @@ pub async fn start(deps: RuntimeDeps, config: RuntimeConfig) -> Arc<Runtime> {
 
     let work = Arc::new(consumers::WorkRouter {
         llm: (!llm.is_empty()).then(|| llm_task_queue.clone()),
+        system1: (!system1.is_empty()).then(|| system1_task_queue.clone()),
         connector: connector_task_queue.clone(),
         subagent: subagent_task_queue.clone(),
         decisions: worker_queue.clone(),
@@ -957,6 +970,16 @@ pub async fn start(deps: RuntimeDeps, config: RuntimeConfig) -> Arc<Runtime> {
             token_delta_transport.clone(),
             blobs.clone(),
             config.pool(config.llm_executor_workers),
+            cancel.clone(),
+        ));
+    }
+    if !system1.is_empty() {
+        handles.extend(spawn_system1_task_executor(
+            sessions.clone(),
+            system1,
+            system1_task_queue,
+            blobs.clone(),
+            config.pool(config.system1_executor_workers),
             cancel.clone(),
         ));
     }
@@ -1015,6 +1038,7 @@ mod tests {
         let config = RuntimeConfig::default();
         for workers in [
             config.llm_executor_workers,
+            config.system1_executor_workers,
             config.subagent_executor_workers,
             config.connector_executor_workers,
         ] {

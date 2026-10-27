@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::attachments::{Attachment, Attachments};
+pub use crate::system1::{Answer, Asset, Edges, NoulCriteria, Question, QuestionKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -777,6 +778,8 @@ pub struct RetryConfig {
     pub subagent: Option<RetryOverride>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connector: Option<RetryOverride>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system1: Option<RetryOverride>,
 }
 
 /// Where a person's name comes from: `app`, `cli`, or another source a
@@ -1745,7 +1748,11 @@ pub struct LlmRequest {
     pub messages: Vec<DraftMessage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<LlmTool>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::json::option_f64"
+    )]
     pub temperature: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_completion_tokens: Option<u64>,
@@ -2084,6 +2091,8 @@ pub enum EffectKind {
     /// The turn's completion, which waits for the `turn.finished` decision to
     /// settle. Carries the turn id. Never swept, because it has no deadline.
     TurnEnd,
+    /// A call to a `[system1.*]` block.
+    System1Call,
 }
 
 impl EffectKind {
@@ -2095,6 +2104,7 @@ impl EffectKind {
             EffectKind::ConnectorSync => "connector_sync",
             EffectKind::Decision => "decision",
             EffectKind::TurnEnd => "turn_end",
+            EffectKind::System1Call => "system1_call",
         }
     }
 }
@@ -2575,6 +2585,24 @@ pub enum DecisionTrigger {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<ErrorInfo>,
     },
+    #[serde(rename = "system1.finished")]
+    System1Finished {
+        id: String,
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// One answer for each question, by the question's name.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        #[schemars(with = "BTreeMap<String, Answer>")]
+        answers: BTreeMap<String, Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<Usage>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(schema_with = "decimal_string_schema")]
+        cost: Option<Decimal>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<ErrorInfo>,
+    },
     #[serde(rename = "interrupt.resumed")]
     InterruptResumed {
         #[serde(flatten)]
@@ -2607,6 +2635,7 @@ impl DecisionTrigger {
             Self::LlmExecute { .. } => "llm.execute",
             Self::LlmFinished { .. } => "llm.finished",
             Self::SubagentFinished { .. } => "subagent.finished",
+            Self::System1Finished { .. } => "system1.finished",
             Self::InterruptResumed { .. } => "interrupt.resumed",
             Self::TurnFinished { .. } => "turn.finished",
         }
@@ -2640,7 +2669,11 @@ pub enum DecisionAction {
         messages: Option<Vec<DraftMessage>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tools: Option<Vec<LlmTool>>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "crate::json::option_f64"
+        )]
         temperature: Option<f64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_completion_tokens: Option<u64>,
@@ -2751,6 +2784,30 @@ pub enum DecisionAction {
     SendMessage {
         session_id: String,
         message: DraftMessage,
+    },
+    /// Ask a `[system1.*]` block typed questions about `state`. The answers
+    /// come back as `system1.finished`.
+    ///
+    /// Without `id`, the engine mints one. Without `system1`, the call runs on
+    /// the only block declared. Without `model`, it uses the block's. Without
+    /// `state`, the model reads the conversation.
+    #[serde(rename = "system1.call")]
+    CallSystem1 {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        system1: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<Value>,
+        questions: BTreeMap<String, Question>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        assets: BTreeMap<String, Asset>,
+        /// Layered over the agent config's `system1` policy, or over the
+        /// engine's default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry: Option<RetryOverride>,
     },
     /// Without `interrupt_id`, the engine mints one to match the later
     /// resume.

@@ -13,6 +13,7 @@ pub mod connector;
 pub mod decision;
 pub mod llm;
 pub mod subagent;
+pub mod system1;
 pub mod tool;
 pub mod turn_end;
 
@@ -20,6 +21,7 @@ pub mod turn_end;
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum Outcome {
     Llm(Box<LlmResponse>),
+    System1(Box<crate::system1::System1Response>),
     Tool {
         result: StoredResult,
     },
@@ -148,6 +150,7 @@ impl EffectKind {
             EffectKind::ConnectorSync => &connector::ConnectorSpec,
             EffectKind::Decision => &decision::DecisionSpec,
             EffectKind::TurnEnd => &turn_end::TurnEndSpec,
+            EffectKind::System1Call => &system1::System1Spec,
         }
     }
 }

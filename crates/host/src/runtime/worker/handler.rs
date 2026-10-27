@@ -371,6 +371,7 @@ mod tests {
                 request.agent.as_ref(),
                 Some(&request.trigger),
                 &blocks,
+                &Default::default(),
                 &crate::runtime::blob::NOWHERE,
                 "tenant-a",
             )

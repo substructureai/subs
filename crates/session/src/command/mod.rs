@@ -18,6 +18,7 @@ use crate::protocol::{
 };
 use crate::protocol::{ErrorInfo, HeldCall};
 use crate::retry::RetryTarget;
+use crate::system1::System1Request;
 use crate::Caller;
 
 pub use super::effects::{Outcome, SettleError};
@@ -66,6 +67,12 @@ pub enum CommandPayload {
         id: String,
         attempt: Option<u32>,
         outcome: Outcome,
+    },
+    RequestSystem1Call {
+        call_id: String,
+        system1: String,
+        request: System1Request,
+        retry: RetryPolicy,
     },
     RequestToolCall {
         tool_call_id: String,
@@ -216,6 +223,17 @@ impl Action {
                 handler,
                 format,
             }),
+            Action::CallSystem1 {
+                id,
+                system1,
+                request,
+                retry,
+            } => Some(CommandPayload::RequestSystem1Call {
+                call_id: id,
+                system1,
+                request,
+                retry,
+            }),
             Action::CallTool {
                 id,
                 name,
@@ -318,7 +336,10 @@ impl SessionState {
             .filter(|e| {
                 matches!(
                     e.kind(),
-                    EffectKind::ToolCall | EffectKind::LlmCall | EffectKind::Subagent
+                    EffectKind::ToolCall
+                        | EffectKind::LlmCall
+                        | EffectKind::Subagent
+                        | EffectKind::System1Call
                 )
             })
             .filter(|e| stranded(e.kind(), &e.tracking, e.anchor.as_deref()))
@@ -1030,6 +1051,17 @@ impl Working {
                 attempt,
                 outcome,
             } => self.settle_effect(kind, id, attempt, outcome, caller),
+
+            CommandPayload::RequestSystem1Call {
+                call_id,
+                system1,
+                request,
+                retry,
+            } => self
+                .try_then(|s| {
+                    effects::system1::request(s, call_id, system1, request, retry, caller)
+                })
+                .map(|_| ()),
 
             CommandPayload::RequestToolCall {
                 tool_call_id,

@@ -88,6 +88,7 @@ The trigger says why the engine is asking.
 | `llm.execute` | Your worker makes this model call. |
 | `llm.finished` | A model call ended. |
 | `subagent.finished` | A child session completed. |
+| `system1.finished` | A `system1.call` ended. It carries the answers. |
 | `interrupt.resumed` | Someone resumed a paused branch. |
 | `turn.finished` | A turn completed. It carries the turn's cost and output. |
 
@@ -102,6 +103,7 @@ The actions in a decision tell the engine what to do.
 | `tool.result` / `tool.error` | End a tool call. |
 | `llm.result` / `llm.error` | End a model call the worker made. |
 | `subagent.spawn` | Start a child session. |
+| `system1.call` | Ask a System One model typed questions. |
 | `message.send` | Write a message into a session. |
 | `interrupt` | Pause the branch until someone resumes it. |
 | `interrupt.resolve` | Clear an open interrupt and resume. |

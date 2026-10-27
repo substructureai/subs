@@ -115,7 +115,7 @@ pub(crate) async fn open(cfg: &ProjectConfig, o: Open) -> Result<Box<dyn Turns>>
         }));
     }
 
-    let env = match EnvVars::load(cfg.provider_bindings(), false) {
+    let env = match EnvVars::load(cfg.provider_bindings(), cfg.system1_bindings(), false) {
         Some(e) => e,
         None => std::process::exit(2),
     };
@@ -125,7 +125,8 @@ pub(crate) async fn open(cfg: &ProjectConfig, o: Open) -> Result<Box<dyn Turns>>
 
     let db = SqliteDb::open(&db_path, std::time::Duration::from_secs(5))?;
     let blobs = Arc::new(SqliteBlobStore::new(db.clone()));
-    let (rt, adapter, mcp_auth) = local::start_engine(db, None, blobs, env.providers, cfg).await?;
+    let (rt, adapter, mcp_auth) =
+        local::start_engine(db, None, blobs, env.providers, env.system1, cfg).await?;
 
     Ok(Box::new(LocalTurns {
         ctx: ChannelContext::new(rt.clone(), CancellationToken::new()),

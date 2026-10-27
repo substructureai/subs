@@ -116,7 +116,10 @@ impl SessionState {
             .filter(|e| {
                 matches!(
                     e.kind(),
-                    EffectKind::ToolCall | EffectKind::Subagent | EffectKind::LlmCall
+                    EffectKind::ToolCall
+                        | EffectKind::Subagent
+                        | EffectKind::LlmCall
+                        | EffectKind::System1Call
                 )
             })
             .filter(|e| closed.contains(&e.id) || at.anchor_on_path(e.anchor.as_deref()))
@@ -136,6 +139,7 @@ impl SessionState {
                 Trigger::LlmExecute { id, .. } | Trigger::LlmFinished { id, .. } => {
                     gone(EffectKind::LlmCall, id)
                 }
+                Trigger::System1Finished { id, .. } => gone(EffectKind::System1Call, id),
                 _ => false,
             };
             if about
@@ -178,7 +182,10 @@ impl SessionState {
                 }
                 None => matches!(
                     e.kind(),
-                    EffectKind::ToolCall | EffectKind::LlmCall | EffectKind::Subagent
+                    EffectKind::ToolCall
+                        | EffectKind::LlmCall
+                        | EffectKind::Subagent
+                        | EffectKind::System1Call
                 ),
             })
             .filter(|e| e.tracking.is_unsettled())
@@ -194,7 +201,7 @@ impl SessionState {
                     data: f.data,
                     turn_cost: f.cost,
                     turn_token_usage: f.usage,
-                    turn_calls: self.turn_calls.clone(),
+                    turn_calls: Box::new(self.turn_calls.clone()),
                     turn_started_at: self.turn_started_at,
                     error: error.cloned(),
                 }),
@@ -242,7 +249,7 @@ impl SessionState {
                     data: serde_json::Value::Null,
                     turn_cost: self.turn_cost,
                     turn_token_usage: self.turn_token_usage.clone(),
-                    turn_calls: self.turn_calls.clone(),
+                    turn_calls: Box::new(self.turn_calls.clone()),
                     turn_started_at: self.turn_started_at,
                     error: Some(error),
                 }),
@@ -281,7 +288,7 @@ impl SessionState {
             data: serde_json::Value::Null,
             turn_cost: self.turn_cost,
             turn_token_usage: self.turn_token_usage.clone(),
-            turn_calls: self.turn_calls.clone(),
+            turn_calls: Box::new(self.turn_calls.clone()),
             turn_started_at: self.turn_started_at,
             error: Some(error.clone()),
         }));

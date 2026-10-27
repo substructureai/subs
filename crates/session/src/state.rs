@@ -13,6 +13,7 @@ use crate::protocol::{
     AgentTool, BoundServer, ConnectorTool, ConnectorToolKind, DeferToolsStrategy, Handler,
     McpServer, StoredResult, SubagentToolsStrategy,
 };
+use crate::system1::System1Request;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Source {
@@ -300,6 +301,7 @@ pub enum EffectPayload {
     Subagent(SubagentCallState),
     ConnectorSync(ConnectorSyncState),
     Decision(WorkerDecisionState),
+    System1Call(System1CallState),
 }
 
 impl EffectPayload {
@@ -310,6 +312,7 @@ impl EffectPayload {
             EffectPayload::Subagent(_) => EffectKind::Subagent,
             EffectPayload::ConnectorSync(_) => EffectKind::ConnectorSync,
             EffectPayload::Decision(_) => EffectKind::Decision,
+            EffectPayload::System1Call(_) => EffectKind::System1Call,
         }
     }
 }
@@ -361,6 +364,7 @@ payload_views! {
     subagent, subagent_mut => Subagent(SubagentCallState),
     connector, connector_mut => ConnectorSync(ConnectorSyncState),
     decision, decision_mut => Decision(WorkerDecisionState),
+    system1, system1_mut => System1Call(System1CallState),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -407,7 +411,11 @@ pub struct LlmCallSpec {
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<LlmTool>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::json::option_f64"
+    )]
     pub temperature: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_completion_tokens: Option<u64>,
@@ -472,6 +480,12 @@ pub struct SubagentCallState {
     pub is_error: bool,
     #[serde(default)]
     pub mode: SpawnMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct System1CallState {
+    pub system1: String,
+    pub request: System1Request,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1138,6 +1152,29 @@ impl SessionState {
         self.enqueue(ctx.sequence, EffectKind::ToolCall, &payload.id);
     }
 
+    fn apply_system1_requested(&mut self, p: &System1CallRequested, ctx: &ApplyContext) {
+        match self.effect_mut(EffectKind::System1Call, &p.id) {
+            Some(existing) => {
+                existing.tracking.requeue();
+                if let Some(call) = existing.system1_mut() {
+                    call.request = p.request.clone();
+                }
+            }
+            None => {
+                self.turn_calls.system1.count += 1;
+                self.insert_effect(
+                    &p.id,
+                    EffectTracking::new_queued(p.retry.clone()),
+                    EffectPayload::System1Call(System1CallState {
+                        system1: p.system1.clone(),
+                        request: p.request.clone(),
+                    }),
+                )
+            }
+        }
+        self.enqueue(ctx.sequence, EffectKind::System1Call, &p.id);
+    }
+
     fn apply_subagent_requested(&mut self, payload: &SubagentRequested, ctx: &ApplyContext) {
         if let Some(existing) = self.effect_mut(EffectKind::Subagent, &payload.id) {
             existing.tracking.requeue();
@@ -1303,6 +1340,33 @@ impl SessionState {
                 self.turn_calls.llm.errors += 1;
                 if let Some(e) = self.effect_mut(EffectKind::LlmCall, &payload.id) {
                     e.tracking.record_error(payload.retryable, now);
+                }
+            }
+            EventPayload::System1CallRequested(p) => self.apply_system1_requested(p, ctx),
+            EventPayload::System1CallDispatched(p) => {
+                if let Some(e) = self.effect_mut(EffectKind::System1Call, &p.id) {
+                    e.tracking.dispatch(now);
+                }
+                self.dequeue(EffectKind::System1Call, &p.id);
+            }
+            EventPayload::System1CallCompleted(p) => {
+                let usage = &p.response.usage;
+                self.token_usage.add(usage);
+                self.turn_token_usage.add(usage);
+                self.turn_calls.system1.tokens.add(usage);
+                if let Some(c) = p.response.cost {
+                    self.cost += c;
+                    self.turn_cost += c;
+                    self.turn_calls.system1.cost += c;
+                }
+                if let Some(e) = self.effect_mut(EffectKind::System1Call, &p.id) {
+                    e.tracking.complete();
+                }
+            }
+            EventPayload::System1CallErrored(p) => {
+                self.turn_calls.system1.errors += 1;
+                if let Some(e) = self.effect_mut(EffectKind::System1Call, &p.id) {
+                    e.tracking.record_error(p.retryable, now);
                 }
             }
             EventPayload::ToolCallRequested(payload) => self.apply_tool_requested(payload, ctx),
@@ -1705,6 +1769,7 @@ impl SessionState {
             Trigger::LlmFinished { id, .. } | Trigger::LlmExecute { id, .. } => {
                 self.effect(EffectKind::LlmCall, id)
             }
+            Trigger::System1Finished { id, .. } => self.effect(EffectKind::System1Call, id),
             _ => None,
         }
         .and_then(|e| e.anchor.as_deref())
@@ -2117,6 +2182,7 @@ impl SessionState {
                         wire.stream = Some(c.stream);
                     }
                     EffectPayload::ConnectorSync(_) => wire.name = Some(e.id.clone()),
+                    EffectPayload::System1Call(c) => wire.name = Some(c.system1.clone()),
                     EffectPayload::Decision(_) => return None,
                 }
                 Some(wire)

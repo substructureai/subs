@@ -314,6 +314,23 @@ pub fn wire_trigger(
             result,
             error,
         },
+        Trigger::System1Finished {
+            id,
+            ok,
+            model,
+            answers,
+            usage,
+            cost,
+            error,
+        } => DecisionTrigger::System1Finished {
+            id,
+            ok,
+            model,
+            answers,
+            usage,
+            cost,
+            error,
+        },
         Trigger::LlmFinished {
             id,
             ok,

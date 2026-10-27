@@ -32,9 +32,11 @@ use crate::protocol::{
     AgentConfig, DecisionAction, DecisionResponse, DecisionTrigger, DraftMessage, ErrorInfo,
     Handler, LlmFormat, LlmRequest, LlmResponse, RetryPolicy, WorkerState,
 };
-use crate::runtime::blob::{resolve, store, BlobStore};
+use crate::runtime::blob::{intern_uri, resolve, store, BlobStore};
 use crate::runtime::llm::LlmBlocks;
 use crate::runtime::retry::RetryTarget;
+use crate::runtime::system1::System1Blocks;
+use substructure_session::system1::System1Request;
 
 #[derive(Debug, Clone, Copy)]
 enum SettleKind {
@@ -72,6 +74,22 @@ pub enum ResolveError {
         message: String,
     },
     AmbiguousToolResult,
+    MissingSystem1 {
+        declared: String,
+    },
+    UnknownSystem1 {
+        name: String,
+        declared: String,
+    },
+    MissingSystem1Model {
+        block: String,
+    },
+    InvalidSystem1 {
+        message: String,
+    },
+    UnstoredAsset {
+        key: String,
+    },
 }
 
 impl ResolveError {
@@ -83,6 +101,12 @@ impl ResolveError {
             ResolveError::InvalidHandler { .. } => "handler".to_string(),
             ResolveError::InvalidLlmResponse { .. } => "response".to_string(),
             ResolveError::AmbiguousToolResult => "result".to_string(),
+            ResolveError::MissingSystem1 { .. } | ResolveError::UnknownSystem1 { .. } => {
+                "system1".to_string()
+            }
+            ResolveError::MissingSystem1Model { .. } => "model".to_string(),
+            ResolveError::InvalidSystem1 { .. } => "questions".to_string(),
+            ResolveError::UnstoredAsset { key } => format!("assets.{key}"),
         })
     }
 
@@ -106,6 +130,21 @@ impl ResolveError {
             }),
             ResolveError::InvalidLlmResponse { message } => {
                 serde_json::json!({ "reason": "invalid_llm_response", "message": message })
+            }
+            ResolveError::MissingSystem1 { declared } => {
+                serde_json::json!({ "reason": "missing_system1", "declared": declared })
+            }
+            ResolveError::UnknownSystem1 { name, declared } => serde_json::json!({
+                "reason": "unknown_system1", "name": name, "declared": declared,
+            }),
+            ResolveError::MissingSystem1Model { block } => {
+                serde_json::json!({ "reason": "missing_system1_model", "block": block })
+            }
+            ResolveError::InvalidSystem1 { message } => {
+                serde_json::json!({ "reason": "invalid_system1", "message": message })
+            }
+            ResolveError::UnstoredAsset { key } => {
+                serde_json::json!({ "reason": "unstored_asset", "key": key })
             }
         }
     }
@@ -139,6 +178,22 @@ impl std::fmt::Display for ResolveError {
             }
             ResolveError::InvalidLlmResponse { message } => {
                 write!(f, "llm.result response does not parse: {message}")
+            }
+            ResolveError::MissingSystem1 { declared } => write!(
+                f,
+                "system1.call names no block and more than one is declared — declared: {declared}"
+            ),
+            ResolveError::UnknownSystem1 { name, declared } => write!(
+                f,
+                "no system1 block `{name}` is declared — declared: {declared}"
+            ),
+            ResolveError::MissingSystem1Model { block } => write!(
+                f,
+                "system1.call omitted `model` and [system1.{block}] names none"
+            ),
+            ResolveError::InvalidSystem1 { message } => write!(f, "{message}"),
+            ResolveError::UnstoredAsset { key } => {
+                write!(f, "asset `{key}` could not be stored")
             }
         }
     }
@@ -211,6 +266,7 @@ pub async fn resolve_response(
     echoed_config: Option<&AgentConfig>,
     trigger: Option<&DecisionTrigger>,
     blocks: &LlmBlocks,
+    system1: &System1Blocks,
     blobs: &dyn BlobStore,
     tenant_id: &str,
 ) -> Result<ResolvedResponse, ResolveError> {
@@ -229,7 +285,7 @@ pub async fn resolve_response(
     }
     let merge_cfg = agent.as_ref().or(echoed_config);
     let resolved = lower_actions(
-        actions, &messages, merge_cfg, trigger, blocks, blobs, tenant_id,
+        actions, &messages, merge_cfg, trigger, blocks, system1, blobs, tenant_id,
     )
     .await?;
     Ok(ResolvedResponse {
@@ -247,6 +303,7 @@ async fn lower_actions(
     config: Option<&AgentConfig>,
     trigger: Option<&DecisionTrigger>,
     blocks: &LlmBlocks,
+    system1: &System1Blocks,
     blobs: &dyn BlobStore,
     tenant_id: &str,
 ) -> Result<Vec<Action>, ResolveError> {
@@ -303,6 +360,57 @@ async fn lower_actions(
                         retry,
                         handler: block.handler,
                         format: block.format,
+                    }
+                }
+                DecisionAction::CallSystem1 {
+                    id,
+                    system1: named,
+                    model,
+                    state,
+                    questions,
+                    assets,
+                    retry,
+                } => {
+                    let name = named
+                        .or_else(|| system1.only().map(str::to_string))
+                        .ok_or_else(|| ResolveError::MissingSystem1 {
+                            declared: system1.declared(),
+                        })?;
+                    let block = system1
+                        .get(&name)
+                        .ok_or_else(|| ResolveError::UnknownSystem1 {
+                            name: name.clone(),
+                            declared: system1.declared(),
+                        })?;
+                    let model = model.or_else(|| block.model.clone()).ok_or_else(|| {
+                        ResolveError::MissingSystem1Model {
+                            block: name.clone(),
+                        }
+                    })?;
+                    let mut request = System1Request {
+                        model,
+                        state,
+                        questions,
+                        assets,
+                    };
+                    let capability = block.capability(&request.model);
+                    crate::runtime::system1::check(&name, &request, capability.as_ref())
+                        .map_err(|message| ResolveError::InvalidSystem1 { message })?;
+                    for (key, asset) in request.assets.iter_mut() {
+                        let uri = intern_uri(asset.uri(), blobs, tenant_id)
+                            .await
+                            .ok_or_else(|| ResolveError::UnstoredAsset { key: key.clone() })?;
+                        *asset = asset.with_uri(uri);
+                    }
+                    Action::CallSystem1 {
+                        id: id.unwrap_or_else(new_call_id),
+                        system1: name,
+                        request,
+                        retry: RetryPolicy::resolve(
+                            retry.as_ref(),
+                            config_retry,
+                            RetryTarget::System1,
+                        ),
                     }
                 }
                 DecisionAction::CallTool {
@@ -512,6 +620,7 @@ mod tests {
             None,
             trigger,
             &blocks(),
+            &System1Blocks::default(),
             &crate::runtime::blob::NOWHERE,
             "t1",
         )
@@ -592,6 +701,7 @@ mod tests {
             None,
             None,
             &blocks(),
+            &System1Blocks::default(),
             &crate::runtime::blob::NOWHERE,
             "t1",
         )
@@ -971,6 +1081,7 @@ mod tests {
             echoed,
             None,
             &blocks(),
+            &System1Blocks::default(),
             &crate::runtime::blob::NOWHERE,
             "t1",
         )
@@ -997,6 +1108,7 @@ mod tests {
             Some(&config),
             None,
             &blocks(),
+            &System1Blocks::default(),
             &crate::runtime::blob::NOWHERE,
             "t1",
         )

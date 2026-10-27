@@ -16,6 +16,7 @@ use crate::protocol::{
 use crate::request::{PendingPrompt, WorkerDecisionRequest};
 use crate::session::{Session, SessionEvent};
 use crate::state::{title, EffectState, SessionStatus};
+use crate::system1::{transcript_state, System1Request};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct WorkId {
@@ -42,6 +43,7 @@ impl Work {
     pub fn id(&self) -> &WorkId {
         match self {
             Work::CallLlm { work, .. }
+            | Work::CallSystem1 { work, .. }
             | Work::CallTool { work, .. }
             | Work::ListTools { work, .. }
             | Work::AskWorker { work, .. }
@@ -71,6 +73,17 @@ pub struct LlmCall {
     pub agent_id: String,
     pub ancestry: Vec<String>,
     pub turn_id: Option<String>,
+    pub retry: RetryPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct System1Call {
+    pub call_id: String,
+    pub attempt: u32,
+    pub system1: String,
+    pub request: System1Request,
+    pub owner: SessionOwner,
+    pub agent_id: String,
     pub retry: RetryPolicy,
 }
 
@@ -136,6 +149,10 @@ pub enum Work {
     CallLlm {
         work: WorkId,
         call: Box<LlmCall>,
+    },
+    CallSystem1 {
+        work: WorkId,
+        call: Box<System1Call>,
     },
     CallTool {
         work: WorkId,
@@ -217,6 +234,7 @@ impl Session {
                 let attempt = effect.tracking.retry.attempts;
                 match kind {
                     EffectKind::LlmCall => self.llm(id, attempt),
+                    EffectKind::System1Call => self.system1(id, attempt),
                     EffectKind::ToolCall => self.tool(id, attempt),
                     EffectKind::Subagent if effect.tracking.status() == EffectStatus::Pending => {
                         self.subagent(id)
@@ -260,6 +278,9 @@ impl Session {
         let state = &self.state;
         match &event.payload {
             EventPayload::LlmCallDispatched(d) => self.llm(&d.id, d.attempt).into_iter().collect(),
+            EventPayload::System1CallDispatched(d) => {
+                self.system1(&d.id, d.attempt).into_iter().collect()
+            }
             EventPayload::ToolCallDispatched(d) => {
                 self.tool(&d.id, d.attempt).into_iter().collect()
             }
@@ -395,6 +416,29 @@ impl Session {
                 agent_id: state.agent_id.clone()?,
                 ancestry: state.ancestry.clone(),
                 turn_id: state.turn_id().map(str::to_string),
+                retry: effect.tracking.retry_policy.clone(),
+            }),
+        })
+    }
+
+    fn system1(&self, id: &str, attempt: u32) -> Option<Work> {
+        let state = &self.state;
+        let effect = self.open(EffectKind::System1Call, id, Some(attempt))?;
+        let call = effect.system1()?;
+        let mut request = call.request.clone();
+        if request.state.is_none() {
+            let transcript = state.at(effect.anchor.as_deref()).transcript();
+            request.state = Some(transcript_state(&transcript));
+        }
+        Some(Work::CallSystem1 {
+            work: WorkId::new(EffectKind::System1Call, id, Some(attempt)),
+            call: Box::new(System1Call {
+                call_id: id.to_string(),
+                attempt,
+                system1: call.system1.clone(),
+                request,
+                owner: state.owner.clone()?,
+                agent_id: state.agent_id.clone()?,
                 retry: effect.tracking.retry_policy.clone(),
             }),
         })

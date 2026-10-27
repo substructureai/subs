@@ -218,6 +218,122 @@
       "title": "AgentTool",
       "type": "object"
     },
+    "Answer": {
+      "description": "The answer to one question. A field the engine does not name stays on\nthe answer as the provider sent it.",
+      "oneOf": [
+        {
+          "additionalProperties": {},
+          "description": "`noul` is the probability of yes, from 0 to 1.",
+          "properties": {
+            "noul": {
+              "format": "double",
+              "type": "number"
+            },
+            "type": {
+              "const": "noul",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "noul"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": {},
+          "properties": {
+            "choice": {
+              "type": "string"
+            },
+            "confidence": {
+              "format": "double",
+              "type": "number"
+            },
+            "probabilities": {
+              "additionalProperties": {
+                "format": "double",
+                "type": "number"
+              },
+              "type": "object"
+            },
+            "type": {
+              "const": "choice",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "choice",
+            "confidence",
+            "probabilities"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": {},
+          "description": "`score` is the expected level. It can fall between two levels.",
+          "properties": {
+            "confidence": {
+              "format": "double",
+              "type": "number"
+            },
+            "legend": {
+              "additionalProperties": {},
+              "type": "object"
+            },
+            "probabilities": {
+              "additionalProperties": {
+                "format": "double",
+                "type": "number"
+              },
+              "type": "object"
+            },
+            "score": {
+              "format": "double",
+              "type": "number"
+            },
+            "type": {
+              "const": "score",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "score",
+            "confidence",
+            "probabilities"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": {},
+          "description": "The edges are fractions of the image's height and width.",
+          "properties": {
+            "box": {
+              "$ref": "#/$defs/Edges"
+            },
+            "confidence": {
+              "format": "double",
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "box",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "box"
+          ],
+          "type": "object"
+        }
+      ],
+      "title": "Answer"
+    },
     "Approve": {
       "description": "Which of a connection's calls stop for a person.",
       "oneOf": [
@@ -235,6 +351,30 @@
         }
       ],
       "title": "Approve"
+    },
+    "Asset": {
+      "description": "Media a question can refer to. Its key is a placeholder that stands for\nit in the state, the instructions or the criteria.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "`uri` is a `blob://` URI from a message, or a `data:` URI.",
+          "properties": {
+            "type": {
+              "const": "image",
+              "type": "string"
+            },
+            "uri": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "uri"
+          ],
+          "type": "object"
+        }
+      ],
+      "title": "Asset"
     },
     "Attachment": {
       "additionalProperties": false,
@@ -1303,6 +1443,63 @@
         },
         {
           "additionalProperties": false,
+          "description": "Ask a `[system1.*]` block typed questions about `state`. The answers\ncome back as `system1.finished`.\n\nWithout `id`, the engine mints one. Without `system1`, the call runs on\nthe only block declared. Without `model`, it uses the block's. Without\n`state`, the model reads the conversation.",
+          "properties": {
+            "assets": {
+              "additionalProperties": {
+                "$ref": "#/$defs/Asset"
+              },
+              "type": "object"
+            },
+            "id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "model": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "questions": {
+              "additionalProperties": {
+                "$ref": "#/$defs/Question"
+              },
+              "type": "object"
+            },
+            "retry": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/RetryOverride"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Layered over the agent config's `system1` policy, or over the\nengine's default."
+            },
+            "state": {},
+            "system1": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "system1.call",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "questions"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
           "description": "Without `interrupt_id`, the engine mints one to match the later\nresume.",
           "properties": {
             "interrupt_id": {
@@ -1942,6 +2139,67 @@
         },
         {
           "additionalProperties": false,
+          "properties": {
+            "answers": {
+              "additionalProperties": {
+                "$ref": "#/$defs/Answer"
+              },
+              "description": "One answer for each question, by the question's name.",
+              "type": "object"
+            },
+            "cost": {
+              "pattern": "^-?\\d+(\\.\\d+)?$",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "error": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ErrorInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "id": {
+              "type": "string"
+            },
+            "model": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "ok": {
+              "type": "boolean"
+            },
+            "type": {
+              "const": "system1.finished",
+              "type": "string"
+            },
+            "usage": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Usage"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "ok"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
           "description": "The body of an interrupt resume: which interrupt, and the payload delivered\nto the worker. Shared by the [`ClientInput::InterruptResume`] input and the\n[`DecisionTrigger::InterruptResumed`] trigger.",
           "properties": {
             "interrupt_id": {
@@ -2122,6 +2380,35 @@
       "title": "DraftMessage",
       "type": "object"
     },
+    "Edges": {
+      "additionalProperties": false,
+      "properties": {
+        "bottom": {
+          "format": "double",
+          "type": "number"
+        },
+        "left": {
+          "format": "double",
+          "type": "number"
+        },
+        "right": {
+          "format": "double",
+          "type": "number"
+        },
+        "top": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "top",
+        "left",
+        "bottom",
+        "right"
+      ],
+      "title": "Edges",
+      "type": "object"
+    },
     "Effect": {
       "additionalProperties": false,
       "description": "An effect still running, shown on each worker decision. A flat envelope\nplus the fields of its kind. A connector sync carries none. Its `id` is the\nconnection being fetched.",
@@ -2229,6 +2516,11 @@
         {
           "const": "turn_end",
           "description": "The turn's completion, which waits for the `turn.finished` decision to\nsettle. Carries the turn id. Never swept, because it has no deadline.",
+          "type": "string"
+        },
+        {
+          "const": "system1_call",
+          "description": "A call to a `[system1.*]` block.",
           "type": "string"
         }
       ],
@@ -2906,6 +3198,102 @@
       "title": "MessageTree",
       "type": "object"
     },
+    "NoulCriteria": {
+      "additionalProperties": false,
+      "description": "What counts as yes and what counts as no.",
+      "properties": {
+        "false": {},
+        "true": {}
+      },
+      "title": "NoulCriteria",
+      "type": "object"
+    },
+    "Question": {
+      "description": "A named question about a `system1.call`'s state. Its type sets the type\nof its answer.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Is it true? The answer is the probability of yes.",
+          "properties": {
+            "criteria": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/NoulCriteria"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "instructions": {},
+            "type": {
+              "const": "noul",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Which option? `criteria` names each option and says when it applies.",
+          "properties": {
+            "criteria": {
+              "additionalProperties": {},
+              "type": "object"
+            },
+            "instructions": {},
+            "type": {
+              "const": "choice",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "criteria"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Where on a scale? `criteria` lists the levels in order. The first is 0.",
+          "properties": {
+            "criteria": {
+              "items": {},
+              "type": "array"
+            },
+            "instructions": {},
+            "type": {
+              "const": "score",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "criteria"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Where in the image?",
+          "properties": {
+            "instructions": {},
+            "type": {
+              "const": "box",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ],
+      "title": "Question"
+    },
     "QueueMode": {
       "anyOf": [
         {
@@ -3095,6 +3483,16 @@
           ]
         },
         "subagent": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RetryOverride"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "system1": {
           "anyOf": [
             {
               "$ref": "#/$defs/RetryOverride"

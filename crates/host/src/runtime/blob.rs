@@ -103,6 +103,16 @@ async fn stash(
         .inspect_err(|e| tracing::warn!("storing inline content failed: {e}"))
 }
 
+pub async fn intern_uri(uri: &str, blobs: &dyn BlobStore, tenant_id: &str) -> Option<String> {
+    match parse_data_uri(uri) {
+        Some((mime, bytes)) => stash(bytes, mime, None, blobs, tenant_id)
+            .await
+            .ok()
+            .map(|r| r.uri()),
+        None => Some(uri.to_string()),
+    }
+}
+
 fn unkept(what: &str, mime: &str) -> StoredContent {
     StoredContent::Text {
         text: format!("[{what} {} content]", essence(mime)),

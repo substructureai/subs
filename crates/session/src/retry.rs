@@ -28,6 +28,7 @@ pub enum RetryTarget {
     ConnectorSync,
     Decision,
     Delivery,
+    System1,
 }
 
 impl RetryPolicy {
@@ -52,6 +53,7 @@ impl RetryPolicy {
             RetryTarget::ConnectorSync => (Some(10), Some(5), Some(30), 2, 2, 10),
             RetryTarget::Decision => (None, Some(20), Some(300), 10, 2, 60),
             RetryTarget::Delivery => (None, None, Some(259_200), u32::MAX, 2, 300),
+            RetryTarget::System1 => (Some(30), Some(30), Some(300), 3, 1, 10),
         };
         RetryPolicy {
             queue_timeout_secs: queue,
@@ -182,6 +184,7 @@ impl RetryConfig {
             }
             RetryTarget::Subagent => &self.subagent,
             RetryTarget::ConnectorSync => &self.connector,
+            RetryTarget::System1 => &self.system1,
             RetryTarget::Decision | RetryTarget::Delivery => return Vec::new(),
         };
         self.default.iter().chain(declared.iter()).collect()

@@ -14,6 +14,7 @@ use crate::protocol::{
     LlmResponse, Message, MessageTree, NewMessage, RetryPolicy, SessionOwner, SpawnMode,
     StoredResult, Usage, WorkerRef, WorkerState,
 };
+use crate::system1::{System1Request, System1Response};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -40,6 +41,14 @@ pub enum EventPayload {
     ToolCallCompleted(ToolCallCompleted),
     #[serde(rename = "tool.call.errored")]
     ToolCallErrored(ToolCallErrored),
+    #[serde(rename = "system1.call.requested")]
+    System1CallRequested(Box<System1CallRequested>),
+    #[serde(rename = "system1.call.dispatched")]
+    System1CallDispatched(System1CallDispatched),
+    #[serde(rename = "system1.call.completed")]
+    System1CallCompleted(Box<System1CallCompleted>),
+    #[serde(rename = "system1.call.errored")]
+    System1CallErrored(System1CallErrored),
     #[serde(rename = "connector.sync.requested")]
     ConnectorSyncRequested(ConnectorSyncRequested),
     #[serde(rename = "connector.sync.completed")]
@@ -297,6 +306,37 @@ pub struct LlmCallErrored {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct System1CallRequested {
+    pub id: String,
+    pub attempt: u32,
+    pub system1: String,
+    pub request: System1Request,
+    pub retry: RetryPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct System1CallDispatched {
+    pub id: String,
+    pub attempt: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct System1CallCompleted {
+    pub id: String,
+    pub attempt: u32,
+    pub response: System1Response,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct System1CallErrored {
+    pub id: String,
+    pub attempt: u32,
+    pub error: ErrorInfo,
+    #[serde(default = "default_true")]
+    pub retryable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectorSyncRequested {
     pub path: ConnectionPath,
     pub attempt: u32,
@@ -500,7 +540,7 @@ pub struct TurnCompleted {
     #[serde(default)]
     pub turn_token_usage: Usage,
     #[serde(default)]
-    pub turn_calls: TurnCalls,
+    pub turn_calls: Box<TurnCalls>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_started_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -514,6 +554,8 @@ pub struct TurnCalls {
     pub llm: CallTotals,
     pub tool: CallTotals,
     pub subagent: CallTotals,
+    #[serde(default)]
+    pub system1: CallTotals,
 }
 
 /// A retry is not a new call, but each failed attempt is an error.
@@ -620,7 +662,7 @@ mod tests {
         let old = serde_json::json!({ "type": "turn.completed", "turn_id": "t1" });
         let payload: EventPayload = serde_json::from_value(old).unwrap();
         assert!(
-            matches!(payload, EventPayload::TurnCompleted(t) if t.turn_calls == TurnCalls::default())
+            matches!(payload, EventPayload::TurnCompleted(t) if *t.turn_calls == TurnCalls::default())
         );
     }
 }

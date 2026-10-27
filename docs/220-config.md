@@ -109,6 +109,31 @@ never leaves your worker.
 `api_key_env` names a variable on your machine. `subs apply` removes it. A
 deployment refuses a document that carries one.
 
+## `[system1.<id>]`
+
+Where a `system1.call` runs. A worker names a block by its ID.
+
+```toml
+[system1.cf]
+type = "workers-ai"
+model = "clef-flash"
+account_id = "0123abcd…"
+price = { input = "0.038" }
+```
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `type` | `typesafe`, `workers-ai`, `http` | required | Who answers the call. |
+| `model` | string | none | The model a call uses when it names none. |
+| `api_key_env` | string | `TYPESAFE_API_KEY`, `CLOUDFLARE_API_TOKEN`, none for `http` | The variable holding the key. For an engine you run. |
+| `base_url` | url | the vendor's own | Where to send the call. `typesafe` and `workers-ai` only. |
+| `url` | url | required for `http` | The endpoint. `http` only. |
+| `account_id` | string | `$CLOUDFLARE_ACCOUNT_ID` | The Cloudflare account. `workers-ai` only. |
+| `questions` | list of `noul`, `choice`, `score`, `box` | what the engine knows of the model | The question types the model answers. The engine refuses others before the call. |
+| `price` | `{ input = "<decimal>" }` | none | The price per million input tokens. It sets the call's cost. |
+
+See [System One models](./75-system1.md).
+
 ## `[agent.<id>]`
 
 An agent. The ID is what clients, channels, and parent agents route on.

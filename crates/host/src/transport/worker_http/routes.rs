@@ -37,11 +37,13 @@ pub async fn submit(
         .child("worker_submit");
 
     let blocks = state.runtime.llm_blocks(caller.tenant_id()).await;
+    let system1 = state.runtime.system1_blocks(caller.tenant_id()).await;
     let resolved = match resolve_response(
         req.decision,
         None,
         None,
         &blocks,
+        &system1,
         state.runtime.blob_store(),
         caller.tenant_id(),
     )

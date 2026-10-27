@@ -72,7 +72,8 @@ kind of call:
 {
   "llm":      { "count": 6,  "errors": 0, "cost": "0.0101", "tokens": { "input": 41000, "output": 900, "…": "…" } },
   "tool":     { "count": 14, "errors": 2 },
-  "subagent": { "count": 1,  "errors": 0, "cost": "0.0022", "tokens": { "…": "…" } }
+  "subagent": { "count": 1,  "errors": 0, "cost": "0.0022", "tokens": { "…": "…" } },
+  "system1":  { "count": 2,  "errors": 0, "cost": "0.00006", "tokens": { "input": 400, "output": 6, "…": "…" } }
 }
 ```
 

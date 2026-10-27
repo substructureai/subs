@@ -14,6 +14,7 @@ mod run_remote;
 pub mod secret;
 pub mod sessions;
 mod slack_app;
+mod system1;
 pub mod target;
 mod turns;
 

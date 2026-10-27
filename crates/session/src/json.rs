@@ -1,8 +1,39 @@
 use std::fmt;
 
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, Error as _};
+use serde::{Deserialize, Deserializer};
 
 const WINDOW: usize = 160;
+
+/// A float that reads inside a tagged enum. With `arbitrary_precision`, serde
+/// buffers a number there as a map that `f64` refuses.
+pub fn option_f64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
+    match Option::<serde_json::Value>::deserialize(d)? {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(v) => v
+            .as_f64()
+            .map(Some)
+            .ok_or_else(|| D::Error::custom(format!("invalid type: {v}, expected a number"))),
+    }
+}
+
+pub fn f64<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    option_f64(d)?.ok_or_else(|| D::Error::custom("invalid type: null, expected a number"))
+}
+
+pub fn f64_map<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<std::collections::BTreeMap<String, f64>, D::Error> {
+    std::collections::BTreeMap::<String, serde_json::Value>::deserialize(d)?
+        .into_iter()
+        .map(|(k, v)| match v.as_f64() {
+            Some(n) => Ok((k, n)),
+            None => Err(D::Error::custom(format!(
+                "invalid type: {v}, expected a number"
+            ))),
+        })
+        .collect()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JsonParseError {

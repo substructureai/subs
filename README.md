@@ -277,6 +277,16 @@ Docs: [LLMs](./docs/70-llms.md)
 
 Examples: [Anthropic](./examples/node-hono-anthropic), [OpenAI](./examples/node-hono-openai), [OpenRouter](./examples/node-hono-openrouter)
 
+### System One models
+
+Your worker asks a fast model typed questions, such as TypeSafe's Jev or
+Cloudflare's Clef, and gets answers with a confidence. Route, guard, or score
+in the middle of a turn. The engine holds the key and saves every call.
+
+Docs: [System One models](./docs/75-system1.md)
+
+Examples: [Node](./examples/node-no-deps-system1)
+
 ### Crash recovery
 
 Every step is saved before it runs. A run continues from where it stopped. The

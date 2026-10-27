@@ -31,6 +31,7 @@ pub mod size;
 pub mod span;
 pub mod state;
 pub mod store;
+pub mod system1;
 pub mod tool_contract;
 pub mod work;
 mod worker_state;
@@ -40,5 +41,7 @@ pub use entry::{Accepted, Command, CommandId, CommandResult, Entry, Handled, Rej
 pub use ids::Ids;
 pub use session::{CommitContext, Error, Ran, Seen, Session, SessionEvent, Settings};
 pub use store::{MemoryStore, Store, StoreError};
-pub use work::{settle, LlmCall, Mail, Subagent, Summary, ToolCall, ToolTarget, Work, WorkId};
+pub use work::{
+    settle, LlmCall, Mail, Subagent, Summary, System1Call, ToolCall, ToolTarget, Work, WorkId,
+};
 pub mod request;

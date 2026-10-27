@@ -3,6 +3,7 @@ pub mod format;
 pub mod openai;
 pub mod openrouter;
 pub mod sqlite;
+pub mod system1;
 
 pub(crate) fn http_client() -> reqwest::Client {
     reqwest::Client::builder()

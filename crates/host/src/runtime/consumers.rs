@@ -14,11 +14,13 @@ use crate::runtime::session::SessionEvent;
 use crate::runtime::sessions::{DeliveryError, Reader, Sessions, WorkSink};
 use crate::runtime::span::SpanContext;
 use crate::runtime::subagent::SubagentTask;
+use crate::runtime::system1::System1Task;
 use crate::runtime::worker::handler::Unready;
 use crate::runtime::worker::{handler, AgentDirectory, WorkerDecisionRequest};
 
 pub struct WorkRouter {
     pub llm: Option<Arc<dyn Queue<LlmTask>>>,
+    pub system1: Option<Arc<dyn Queue<System1Task>>>,
     pub connector: Arc<dyn Queue<ConnectorTask>>,
     pub subagent: Arc<dyn Queue<SubagentTask>>,
     pub decisions: Arc<dyn Queue<WorkerDecisionRequest>>,
@@ -84,6 +86,24 @@ impl WorkRouter {
                     retry: call.retry,
                 };
                 send(queue.as_ref(), queue::LLM, session_id, id, span, task).await
+            }
+            Work::CallSystem1 { call, .. } => {
+                let Some(queue) = &self.system1 else {
+                    return Ok(());
+                };
+                let call = *call;
+                let task = System1Task {
+                    session_id: session_id.clone(),
+                    tenant_id,
+                    agent_id: call.agent_id,
+                    call_id: call.call_id,
+                    attempt: call.attempt,
+                    system1: call.system1,
+                    request: call.request,
+                    owner: call.owner,
+                    retry: call.retry,
+                };
+                send(queue.as_ref(), queue::SYSTEM1, session_id, id, span, task).await
             }
             Work::CallTool { call, .. } => match call.target {
                 ToolTarget::Remote {

@@ -10,6 +10,7 @@ use crate::connectors::registry::{AuthKind, ConnectionSpec};
 enum Target {
     Connection(ConnectionSpec),
     Block(String),
+    System1(String),
     SlackApp(String),
 }
 
@@ -17,6 +18,7 @@ fn target(path: Option<String>, cfg: &ProjectConfig) -> Result<Target> {
     let parsed = match &path {
         Some(written) => match Address::parse(written) {
             Some(Address::Llm(block)) => return Ok(Target::Block(block)),
+            Some(Address::System1(block)) => return Ok(Target::System1(block)),
             Some(Address::SlackApp(agent)) => return Ok(Target::SlackApp(agent)),
             Some(Address::Worker(id)) => {
                 bail!("`worker.{id}` holds a minted secret, not a credential: `subs secret worker.{id}`")
@@ -81,6 +83,7 @@ pub async fn auth(cmd: AuthCommand) -> Result<()> {
             }
             return llm::set_key_at(block, scope).await;
         }
+        Target::System1(block) => return super::system1::key_at(&block, &scope, "set"),
         Target::SlackApp(agent) => {
             if no_browser {
                 bail!(
@@ -126,6 +129,7 @@ pub async fn revoke(cmd: RevokeCommand) -> Result<()> {
     let cfg = connections::environment(&scope.globals)?;
     let path = match target(path, &cfg)? {
         Target::Block(block) => return llm::delete_key_at(block, scope).await,
+        Target::System1(block) => return super::system1::key_at(&block, &scope, "delete"),
         Target::SlackApp(agent) => return slack_app::delete_credentials(agent, scope).await,
         Target::Connection(spec) => spec.path,
     };
@@ -145,11 +149,17 @@ pub async fn list(cmd: ListCommand) -> Result<()> {
         false => connections::list_remote(&scope, &cfg).await?,
     };
     rows.extend(llm::rows(&cfg, &scope, here).await?);
+    if here {
+        rows.extend(super::system1::rows(&cfg));
+    }
     rows.extend(slack_app::rows(&cfg, &scope, here).await?);
     rows.sort_by(|a, b| a.path.cmp(&b.path));
 
     if rows.is_empty() {
-        bail!("subs.toml declares no connections, no `[llm.*]` blocks and no Slack apps");
+        bail!(
+            "subs.toml declares no connections, no `[llm.*]` or `[system1.*]` blocks and no Slack \
+             apps"
+        );
     }
     if scope.globals.json {
         return print::json(&rows);

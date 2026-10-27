@@ -20,6 +20,7 @@ It stops when the attempts run out or when a failure cannot be retried.
 | Subagent start | 30s | 10s | 3600s | 3 |
 | Connector fetch | 10s | 5s | 30s | 2 |
 | Worker decision | none | 20s | 300s | 10 |
+| System One call | 30s | 30s | 300s | 3 |
 
 A worker tool has timeouts, and the engine never repeats it. The engine cannot
 know whether your tool is safe to run twice. You decide when to retry.
@@ -79,7 +80,8 @@ tool = { max_attempts = 3 }
 That worker tool now has three attempts. It keeps the 120s attempt timeout and
 the 600s total. An override names only the fields it changes.
 
-The keys are `default`, `llm`, `tool`, `subagent`, and `connector`. They stack.
+The keys are `default`, `llm`, `tool`, `subagent`, `connector`, and `system1`.
+They stack.
 `default` sets the base, and each kind changes it.
 
 ```toml
