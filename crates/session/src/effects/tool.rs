@@ -5,7 +5,7 @@ use crate::cx::Cx;
 use crate::decision::{ToolHandler, Trigger};
 use crate::events::*;
 use crate::ids::Ids;
-use crate::protocol::{ConnectorToolKind, ErrorCode, ErrorInfo, StoredResult};
+use crate::protocol::{ConnectorToolKind, ErrorCode, ErrorInfo, PluginSource, StoredResult};
 use crate::protocol::{RetryOverride, RetryPolicy};
 use crate::state::{inner_arguments, CallTarget, EffectKind, SessionState};
 use crate::tool_contract::{declared_tool, output_violation, DeclaredTool};
@@ -190,11 +190,15 @@ pub fn request(
         Some(tool) if tool.kind == ConnectorToolKind::Skill => {
             let named = argument(&arguments, "name").unwrap_or_default();
             let (plugin, skill) = crate::engine_tools::split_skill(&named);
-            let target = ConnectorTarget::Skill {
-                plugin: plugin.to_string(),
-                skill: skill.to_string(),
-            };
-            (name, arguments, ToolHandler::Server, Some(target))
+            if state.plugin_source(plugin) == Some(PluginSource::Worker) {
+                (name, arguments, ToolHandler::Worker, None)
+            } else {
+                let target = ConnectorTarget::Skill {
+                    plugin: plugin.to_string(),
+                    skill: skill.to_string(),
+                };
+                (name, arguments, ToolHandler::Server, Some(target))
+            }
         }
         Some(tool) => {
             let target = match tool.connector {

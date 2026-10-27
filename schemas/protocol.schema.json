@@ -161,6 +161,10 @@
           },
           "type": "array"
         },
+        "source": {
+          "$ref": "#/$defs/PluginSource",
+          "description": "Where its skills come from. Absent ⇒ its bundle."
+        },
         "tool_sync_failure": {
           "$ref": "#/$defs/McpToolSyncFailure"
         },
@@ -3207,6 +3211,15 @@
       },
       "title": "NoulCriteria",
       "type": "object"
+    },
+    "PluginSource": {
+      "description": "Where a plugin's skills come from: the bundle `subs apply` sent, or the\nworker, which lists them in the config it returns and answers each `skill`\ncall as a `tool.execute`, so a skill can say what is true now.",
+      "enum": [
+        "bundle",
+        "worker"
+      ],
+      "title": "PluginSource",
+      "type": "string"
     },
     "Question": {
       "description": "A named question about a `system1.call`'s state. Its type sets the type\nof its answer.",

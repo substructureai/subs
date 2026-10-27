@@ -1615,6 +1615,27 @@ pub struct AgentPlugin {
     pub tool_sync_failure: McpToolSyncFailure,
     #[serde(default, skip_serializing_if = "Approve::is_default")]
     pub approve: Approve,
+    /// Where its skills come from. Absent ⇒ its bundle.
+    #[serde(default, skip_serializing_if = "PluginSource::is_bundle")]
+    pub source: PluginSource,
+}
+
+/// Where a plugin's skills come from: the bundle `subs apply` sent, or the
+/// worker, which lists them in the config it returns and answers each `skill`
+/// call as a `tool.execute`, so a skill can say what is true now.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(title = "PluginSource")]
+pub enum PluginSource {
+    #[default]
+    Bundle,
+    Worker,
+}
+
+impl PluginSource {
+    pub fn is_bundle(&self) -> bool {
+        *self == PluginSource::Bundle
+    }
 }
 
 impl AgentPlugin {

@@ -12099,6 +12099,7 @@ fn plugin_config() -> AgentConfig {
             auth_failure: Default::default(),
             tool_sync_failure: Default::default(),
             approve: Default::default(),
+            source: Default::default(),
         }],
         ..agent_config("m1")
     }
@@ -12183,6 +12184,81 @@ fn using_a_skill_only_freezes_the_call() {
     assert!(
         agg.state.skill_call("tc-1").is_some(),
         "the call is frozen as a skill call for the executor"
+    );
+}
+
+#[test]
+fn a_worker_plugins_skill_is_asked_of_the_worker() {
+    let mut config = plugin_config();
+    config.plugins[0].source = crate::protocol::PluginSource::Worker;
+    config.plugins[0].servers = vec![];
+    let mut agg = create_session_with_config("sess-1", "tenant-a", "user-1", Some(config));
+    let opened = dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: node_msg("m1", Role::User, "fill the form"),
+                stream: false,
+            }),
+            turn: TurnTarget::Open("turn-1".to_string()),
+            queue: QueueMode::Refuse,
+            metadata: Default::default(),
+        },
+        &system(),
+    );
+    let decision_id = decision_with(&opened, |t| matches!(t, Trigger::ClientMessage { .. }))
+        .expect("the message's decision");
+
+    let asked = dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id,
+            transcript: vec![],
+            actions: vec![Action::CallTool {
+                id: "tc-1".to_string(),
+                name: "skill".to_string(),
+                arguments: r#"{"name":"pdf:form-filling"}"#.to_string(),
+                retry: None,
+            }],
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    );
+    assert!(
+        agg.state.skill_call("tc-1").is_none(),
+        "no bundle answers it"
+    );
+    let execute = decision_with(&asked, |t| {
+        matches!(t, Trigger::ToolExecute { name, arguments, .. }
+            if name == "skill" && arguments.contains("pdf:form-filling"))
+    })
+    .unwrap_or_else(|| panic!("the worker is asked for the skill, by the call it was: {asked:?}"));
+
+    let answered = dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: execute,
+            transcript: vec![],
+            actions: vec![Action::ToolResult {
+                id: "tc-1".to_string(),
+                attempt: Some(0),
+                result: StoredResult::text("Fill each field, then sign.".to_string()),
+            }],
+            state: None,
+            agent: None,
+        },
+        &machine(),
+    );
+    assert!(
+        answered
+            .iter()
+            .any(|e| matches!(e, EventPayload::ToolCallCompleted(_))),
+        "the worker's answer completes the call: {answered:?}"
+    );
+    assert_eq!(
+        agg.state.tool_call("tc-1").unwrap().result.as_deref(),
+        Some("Fill each field, then sign.")
     );
 }
 

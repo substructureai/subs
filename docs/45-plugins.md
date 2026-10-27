@@ -81,6 +81,30 @@ wrote it, without rewriting the cached prefix.
 
 The model does not enable plugins. `skill` reads a skill and nothing else.
 
+## A plugin the worker answers
+
+A plugin can also come from the worker. Its skills then say what is true now,
+such as an organization's records, which a directory cannot hold. The worker
+writes the plugin into the config that it returns, with `source: "worker"`, a
+description, and the name and the description of each skill.
+
+```json
+{
+  "id": "org",
+  "source": "worker",
+  "description": "Smith Clinic: timezone Asia/Bangkok.",
+  "skills": [
+    { "name": "automations", "description": "Each automation's name, status and trigger" }
+  ]
+}
+```
+
+The model sees it as it sees any plugin. When the model loads one of its
+skills, the engine sends the worker a `tool.execute` decision with the name
+`skill` and the call's arguments, such as `{"name": "org:automations"}`. The
+worker answers with a `tool.result`, and that is the skill. A worker plugin has
+no bundle and no servers.
+
 ## Servers and credentials
 
 A plugin's `mcp.json` servers join the connection registry, and a file names one

@@ -257,6 +257,7 @@ mod tests {
                         auth_failure: Default::default(),
                         tool_sync_failure: Default::default(),
                         approve: Default::default(),
+                        source: Default::default(),
                     }],
                     ..Default::default()
                 },

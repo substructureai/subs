@@ -892,6 +892,7 @@ impl Ref<PluginEntry> {
                 .and_then(|e| e.tool_sync_failure)
                 .unwrap_or(defaults.tool_sync_failure),
             approve: entry.and_then(|e| e.approve).unwrap_or_default(),
+            source: Default::default(),
         }
     }
 }

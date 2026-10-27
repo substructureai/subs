@@ -11,7 +11,7 @@ use crate::connectors::ConnectionPath;
 use crate::connectors::{filter, AuthNeed, RemoteTool};
 use crate::protocol::{
     AgentTool, BoundServer, ConnectorTool, ConnectorToolKind, DeferToolsStrategy, Handler,
-    McpServer, StoredResult, SubagentToolsStrategy,
+    McpServer, PluginSource, StoredResult, SubagentToolsStrategy,
 };
 use crate::system1::System1Request;
 
@@ -1911,6 +1911,17 @@ impl SessionState {
             cursor = node.parent_id.as_deref();
         }
         ids
+    }
+
+    /// Where the skills of the agent's plugin `id` come from; none for a
+    /// plugin the agent doesn't have.
+    pub fn plugin_source(&self, id: &str) -> Option<PluginSource> {
+        self.at_head()
+            .resolve_agent_for()?
+            .plugins
+            .into_iter()
+            .find(|plugin| plugin.id == id)
+            .map(|plugin| plugin.source)
     }
 
     pub fn tool_handler_for(&self, name: &str) -> ToolHandler {
