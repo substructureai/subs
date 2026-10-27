@@ -1,6 +1,6 @@
 [package]
 name = "subs"
-version = "0.10.1"
+version = "0.10.2"
 edition = "2021"
 description = "The Substructure command line"
 license = "MIT"
