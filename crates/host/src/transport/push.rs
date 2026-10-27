@@ -156,7 +156,7 @@ impl Router {
 
 fn saved(result: Result<(), RuntimeError>) -> Result<(), String> {
     match result {
-        Ok(()) | Err(RuntimeError::Session(_)) => Ok(()),
+        Ok(()) | Err(RuntimeError::Session(_) | RuntimeError::Invalid(_)) => Ok(()),
         Err(RuntimeError::Internal(error)) => Err(error),
     }
 }

@@ -2262,6 +2262,8 @@ mod tests {
             data: Value::Null,
             turn_cost: Default::default(),
             turn_token_usage: Default::default(),
+            turn_calls: Default::default(),
+            turn_started_at: None,
             error: Some(error),
         }
     }
@@ -2599,6 +2601,8 @@ mod tests {
             data: Value::String("the answer".into()),
             turn_cost: Default::default(),
             turn_token_usage: Default::default(),
+            turn_calls: Default::default(),
+            turn_started_at: None,
             error: None,
         };
         bot.complete_turn(&ws, &thread(), SESSION, &t, chrono::Utc::now(), 0)
@@ -2928,6 +2932,8 @@ mod tests {
             data: Value::Null,
             turn_cost: Default::default(),
             turn_token_usage: Default::default(),
+            turn_calls: Default::default(),
+            turn_started_at: None,
             error: None,
         });
         bot.apply(turn_event(done, None, None))
@@ -3009,6 +3015,8 @@ mod tests {
             data: Value::Null,
             turn_cost: Default::default(),
             turn_token_usage: Default::default(),
+            turn_calls: Default::default(),
+            turn_started_at: None,
             error: None,
         });
         bot.apply(turn_event(done, None, None))

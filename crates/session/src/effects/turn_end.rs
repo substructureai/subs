@@ -194,6 +194,8 @@ impl SessionState {
                     data: f.data,
                     turn_cost: f.cost,
                     turn_token_usage: f.usage,
+                    turn_calls: self.turn_calls.clone(),
+                    turn_started_at: self.turn_started_at,
                     error: error.cloned(),
                 }),
                 EventPayload::SessionDone(SessionDone {}),
@@ -240,6 +242,8 @@ impl SessionState {
                     data: serde_json::Value::Null,
                     turn_cost: self.turn_cost,
                     turn_token_usage: self.turn_token_usage.clone(),
+                    turn_calls: self.turn_calls.clone(),
+                    turn_started_at: self.turn_started_at,
                     error: Some(error),
                 }),
                 EventPayload::SessionDone(SessionDone {}),
@@ -277,6 +281,8 @@ impl SessionState {
             data: serde_json::Value::Null,
             turn_cost: self.turn_cost,
             turn_token_usage: self.turn_token_usage.clone(),
+            turn_calls: self.turn_calls.clone(),
+            turn_started_at: self.turn_started_at,
             error: Some(error.clone()),
         }));
         events.push(EventPayload::SessionDone(SessionDone {}));

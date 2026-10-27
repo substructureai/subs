@@ -266,6 +266,7 @@ pub(crate) fn runtime_error_status(err: &RuntimeError) -> (StatusCode, String) {
             | SessionError::TurnAlreadyActive { .. }
             | SessionError::TurnAlreadyCompleted { .. },
         ) => StatusCode::CONFLICT,
+        RuntimeError::Invalid(_) => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (status, err.to_string())
@@ -298,7 +299,7 @@ pub async fn submit_client_payload(
             caller,
             owner,
             agent_id: req.agent_id,
-            agent: None,
+            agent: req.agent,
             state: req.state,
             worker: None,
             payload: req.payload,

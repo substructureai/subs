@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 
-use crate::protocol::{AgentConfig, RetryPolicy, SessionOwner, WorkerRef, WorkerState};
+use crate::protocol::{
+    AgentConfig, AgentConfigPatch, RetryPolicy, SessionOwner, WorkerRef, WorkerState,
+};
 use crate::runtime::events_url::EventsBlock;
 use crate::runtime::llm::LlmBlocks;
 use crate::runtime::session::command::CommandPayload;
@@ -116,7 +118,7 @@ pub trait AgentDirectory: Send + Sync {
 
 #[derive(Debug, Clone, Default)]
 pub struct SessionSeed {
-    pub agent: Option<AgentConfig>,
+    pub agent: Option<AgentConfigPatch>,
     pub state: Option<WorkerState>,
     pub worker: Option<WorkerRef>,
     pub events: Option<String>,
@@ -129,9 +131,20 @@ pub async fn create_session_command(
     ancestry: Vec<String>,
     worker_retry: RetryPolicy,
     seed: SessionSeed,
-) -> CommandPayload {
+) -> Result<CommandPayload, String> {
     let directory = agents.tenant(&owner.tenant_id).await;
-    CommandPayload::CreateSession {
+    let declared = directory.agent(&agent_id).and_then(|e| e.config.clone());
+    let agent = match (seed.agent, declared) {
+        (None, _) => None,
+        (Some(patch), Some(base)) => Some(patch.apply(base)),
+        (Some(patch), None) if patch.model.is_some() => Some(patch.apply(AgentConfig::default())),
+        (Some(_), None) => {
+            return Err(format!(
+                "[agent.{agent_id}] has no config to change, so `agent` must name a `model`"
+            ))
+        }
+    };
+    Ok(CommandPayload::CreateSession {
         worker: directory.resolve_worker(&agent_id, seed.worker),
         events: directory
             .agent(&agent_id)
@@ -141,9 +154,9 @@ pub async fn create_session_command(
         owner,
         ancestry,
         worker_retry,
-        agent: seed.agent.map(Box::new),
+        agent: agent.map(Box::new),
         state: seed.state,
-    }
+    })
 }
 
 pub struct StaticAgentDirectory {
@@ -321,7 +334,7 @@ mod tests {
                 )
                 .await;
                 match created {
-                    CommandPayload::CreateSession { events, .. } => events,
+                    Ok(CommandPayload::CreateSession { events, .. }) => events,
                     _ => None,
                 }
             }
@@ -329,6 +342,62 @@ mod tests {
 
         assert_eq!(events_of("bodi").await.as_deref(), Some("app"));
         assert_eq!(events_of("helper").await.as_deref(), Some("parent-app"));
+    }
+
+    async fn created_with(agent_id: &str, patch: AgentConfigPatch) -> Result<AgentConfig, String> {
+        let created = create_session_command(
+            &directory(),
+            agent_id.to_string(),
+            SessionOwner {
+                tenant_id: "default".to_string(),
+                ..SessionOwner::default()
+            },
+            vec![],
+            RetryPolicy::no_retry(),
+            SessionSeed {
+                agent: Some(patch),
+                ..SessionSeed::default()
+            },
+        )
+        .await?;
+        match created {
+            CommandPayload::CreateSession {
+                agent: Some(agent), ..
+            } => Ok(*agent),
+            other => panic!("expected a session with a config; got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_config_changes_the_declared_one() {
+        let agent = created_with(
+            "assistant",
+            AgentConfigPatch {
+                model: Some("other-model".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the session opens");
+        assert_eq!(agent.model, "other-model");
+        assert_eq!(agent.llm.as_deref(), Some("claude"), "the rest is kept");
+    }
+
+    #[tokio::test]
+    async fn an_undeclared_agent_needs_a_model_in_the_session_config() {
+        assert!(created_with("ad-hoc", AgentConfigPatch::default())
+            .await
+            .is_err_and(|e| e.contains("must name a `model`")));
+        let agent = created_with(
+            "ad-hoc",
+            AgentConfigPatch {
+                model: Some("m".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the session opens");
+        assert_eq!(agent.model, "m");
     }
 
     #[tokio::test]

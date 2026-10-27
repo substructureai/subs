@@ -74,6 +74,7 @@ pub fn runtime_error_status(err: &RuntimeError) -> (StatusCode, String) {
             | SessionError::TurnAlreadyCompleted { .. }
             | SessionError::NoActiveTurn,
         ) => StatusCode::CONFLICT,
+        RuntimeError::Invalid(_) => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (status, err.to_string())

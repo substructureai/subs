@@ -2619,6 +2619,17 @@ fn fail_tool_call_emits_errored() {
     assert_eq!(tc.tracking.status(), EffectStatus::Failed);
     assert!(tc.tool().unwrap().is_error);
     assert_eq!(tc.tool().unwrap().result.as_deref(), Some("boom"));
+    assert_eq!(
+        agg.state.turn_calls,
+        crate::events::TurnCalls {
+            tool: crate::events::CallTotals {
+                count: 1,
+                errors: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    );
 }
 
 #[test]

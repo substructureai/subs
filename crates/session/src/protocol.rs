@@ -974,6 +974,136 @@ pub struct AgentConfig {
     pub context: Option<ContextConfig>,
 }
 
+/// Changes to an [`AgentConfig`]. A field left out keeps the base's value. A
+/// field set replaces it whole, a list or a table too. `null` clears a field
+/// the config may leave unset.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentConfigPatch {
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub llm: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub system: Option<Option<String>>,
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub effort: Option<Option<ReasoningEffort>>,
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub retry: Option<Option<Box<RetryConfig>>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<AgentTool>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagents: Option<Vec<Subagent>>,
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub subagent_tools: Option<Option<SubagentTools>>,
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_subagent_depth: Option<Option<u32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<Vec<McpServer>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugins: Option<Vec<AgentPlugin>>,
+    #[serde(
+        default,
+        deserialize_with = "present_defer_tools",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub defer_tools: Option<Option<DeferTools>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_announce: Option<McpAnnounce>,
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub attachments: Option<Option<Attachments>>,
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub context: Option<Option<ContextConfig>>,
+}
+
+impl AgentConfigPatch {
+    /// No `..base`: a field added to either type must be patched here.
+    pub fn apply(self, base: AgentConfig) -> AgentConfig {
+        let AgentConfigPatch {
+            llm,
+            model,
+            system,
+            effort,
+            retry,
+            tools,
+            subagents,
+            subagent_tools,
+            max_subagent_depth,
+            mcp,
+            plugins,
+            defer_tools,
+            mcp_announce,
+            attachments,
+            context,
+        } = self;
+        AgentConfig {
+            llm: llm.unwrap_or(base.llm),
+            model: model.unwrap_or(base.model),
+            system: system.unwrap_or(base.system),
+            effort: effort.unwrap_or(base.effort),
+            retry: retry.unwrap_or(base.retry),
+            tools: tools.unwrap_or(base.tools),
+            subagents: subagents.unwrap_or(base.subagents),
+            subagent_tools: subagent_tools.unwrap_or(base.subagent_tools),
+            max_subagent_depth: max_subagent_depth.unwrap_or(base.max_subagent_depth),
+            mcp: mcp.unwrap_or(base.mcp),
+            plugins: plugins.unwrap_or(base.plugins),
+            defer_tools: defer_tools.unwrap_or(base.defer_tools),
+            mcp_announce: mcp_announce.unwrap_or(base.mcp_announce),
+            attachments: attachments.unwrap_or(base.attachments),
+            context: context.unwrap_or(base.context),
+        }
+    }
+}
+
+// A field that is present, even as `null`, is `Some`; only an absent one is `None`.
+fn present<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(d).map(Some)
+}
+
+fn present_defer_tools<'de, D>(d: D) -> Result<Option<Option<DeferTools>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    de_defer_tools(d).map(Some)
+}
+
 /// How the agent makes room in what the model reads. Before each model call
 /// the engine tries the strategies in order. The first that applies proposes
 /// a plan on a `context.limit` decision, and the worker has the final say.
@@ -1741,6 +1871,10 @@ impl Usage {
         self.cache_write += other.cache_write;
         self.total += other.total;
         self.provider = None;
+    }
+
+    pub fn is_empty(&self) -> bool {
+        *self == Usage::default()
     }
 }
 
@@ -2803,6 +2937,50 @@ mod tests {
             r#"{"content":3}"#
         );
         assert_eq!(from_result(serde_json::json!(null)).as_text(), "");
+    }
+
+    fn patch(value: Value) -> Result<AgentConfigPatch, serde_json::Error> {
+        serde_json::from_value(value)
+    }
+
+    fn base() -> AgentConfig {
+        AgentConfig {
+            llm: Some("openrouter".into()),
+            model: "deepseek".into(),
+            system: Some("be brief".into()),
+            effort: Some(ReasoningEffort::Low),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_patch_changes_what_it_names_and_keeps_the_rest() {
+        let config = patch(serde_json::json!({ "model": "haiku", "effort": "high" }))
+            .unwrap()
+            .apply(base());
+        assert_eq!(config.model, "haiku");
+        assert_eq!(config.effort, Some(ReasoningEffort::High));
+        assert_eq!(config.llm.as_deref(), Some("openrouter"));
+        assert_eq!(config.system.as_deref(), Some("be brief"));
+    }
+
+    #[test]
+    fn a_null_clears_a_field_and_an_absent_one_keeps_it() {
+        let config = patch(serde_json::json!({ "effort": null }))
+            .unwrap()
+            .apply(base());
+        assert_eq!(config.effort, None);
+        assert_eq!(config.system.as_deref(), Some("be brief"));
+    }
+
+    #[test]
+    fn an_empty_patch_is_the_base() {
+        assert_eq!(patch(serde_json::json!({})).unwrap().apply(base()), base());
+    }
+
+    #[test]
+    fn a_patch_refuses_a_field_it_does_not_know() {
+        assert!(patch(serde_json::json!({ "modle": "haiku" })).is_err());
     }
 
     #[test]

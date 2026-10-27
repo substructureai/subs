@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::connectors::registry::Connections;
 use crate::protocol::{
-    AgentConfig, ClientAction, ClientAppend, ClientInput, ClientMessage, ClientMessages,
+    AgentConfigPatch, ClientAction, ClientAppend, ClientInput, ClientMessage, ClientMessages,
     ClientPayload, ErrorCode, ErrorInfo, InterruptResumption, QueueMode, SessionOwner, TokenDelta,
     WorkerRef, WorkerState,
 };
@@ -112,7 +112,7 @@ pub struct SubmitClientPayload {
     pub agent_id: String,
     pub payload: ClientPayload,
 
-    pub agent: Option<AgentConfig>,
+    pub agent: Option<AgentConfigPatch>,
 
     pub state: Option<WorkerState>,
 
@@ -139,7 +139,7 @@ pub struct HandleClientInput {
     pub caller: Caller,
     pub owner: SessionOwner,
     pub input: ClientInput,
-    pub agent: Option<AgentConfig>,
+    pub agent: Option<AgentConfigPatch>,
     pub worker: Option<WorkerRef>,
     pub span: SpanContext,
 }
@@ -194,6 +194,8 @@ pub struct ResumeInterruptInput {
 pub enum RuntimeError {
     #[error(transparent)]
     Session(#[from] SessionError),
+    #[error("{0}")]
+    Invalid(String),
     #[error("{0}")]
     Internal(String),
 }
@@ -274,7 +276,8 @@ impl Runtime {
                     worker_retry,
                     seed,
                 )
-                .await,
+                .await
+                .map_err(RuntimeError::Invalid)?,
                 span: SpanContext::root().child("create_session"),
             },
         )

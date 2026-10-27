@@ -499,8 +499,32 @@ pub struct TurnCompleted {
     pub turn_cost: Decimal,
     #[serde(default)]
     pub turn_token_usage: Usage,
+    #[serde(default)]
+    pub turn_calls: TurnCalls,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_started_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<ErrorInfo>,
+}
+
+/// The calls a turn made, by kind. A subagent call costs what its child spent
+/// answering it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TurnCalls {
+    pub llm: CallTotals,
+    pub tool: CallTotals,
+    pub subagent: CallTotals,
+}
+
+/// A retry is not a new call, but each failed attempt is an error.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CallTotals {
+    pub count: u32,
+    pub errors: u32,
+    #[serde(default, skip_serializing_if = "Decimal::is_zero")]
+    pub cost: Decimal,
+    #[serde(default, skip_serializing_if = "Usage::is_empty")]
+    pub tokens: Usage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -560,5 +584,43 @@ mod tests {
         let payload: EventPayload = serde_json::from_value(old.clone()).unwrap();
         assert!(matches!(payload, EventPayload::ChannelsUpdated(_)));
         assert_eq!(serde_json::to_value(&payload).unwrap(), old);
+    }
+
+    #[test]
+    fn a_kind_of_call_without_cost_or_tokens_writes_only_its_counts() {
+        let calls = TurnCalls {
+            llm: CallTotals {
+                count: 2,
+                cost: Decimal::new(5, 3),
+                tokens: Usage::new(10, 0, 0, 5),
+                ..Default::default()
+            },
+            tool: CallTotals {
+                count: 3,
+                errors: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let written = serde_json::to_value(&calls).unwrap();
+        assert_eq!(
+            written["tool"],
+            serde_json::json!({ "count": 3, "errors": 1 })
+        );
+        assert_eq!(
+            written["subagent"],
+            serde_json::json!({ "count": 0, "errors": 0 })
+        );
+        assert_eq!(written["llm"]["tokens"]["total"], 15);
+        assert_eq!(serde_json::from_value::<TurnCalls>(written).unwrap(), calls);
+    }
+
+    #[test]
+    fn a_turn_written_before_its_calls_were_counted_still_reads() {
+        let old = serde_json::json!({ "type": "turn.completed", "turn_id": "t1" });
+        let payload: EventPayload = serde_json::from_value(old).unwrap();
+        assert!(
+            matches!(payload, EventPayload::TurnCompleted(t) if t.turn_calls == TurnCalls::default())
+        );
     }
 }

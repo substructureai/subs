@@ -9,6 +9,17 @@ The `@substructure.ai/cli` package and the `subs`, `substructure-host` and
 
 ## [Unreleased]
 
+### Added
+
+- A machine submit can change the agent config when it creates the session.
+- `turn.completed` has `turn_calls` and `turn_started_at`. `turn_calls` gives the count, the errors, the cost and the tokens of the model, tool and subagent calls of the turn.
+
+### Changed
+
+- The `agent` of an admin run changes the config from the file. Fields that it does not set keep their values, and unknown fields are refused.
+- `SessionSeed.agent` is now an `AgentConfigPatch`, and `create_session_command` returns a `Result`.
+- `RuntimeError` has an `Invalid` variant. The HTTP APIs answer it with `400`.
+
 ## [0.10.1] - 2026-10-26
 
 ### Added

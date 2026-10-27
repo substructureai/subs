@@ -186,7 +186,7 @@ pub struct RunRequest {
     pub session_id: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent: Option<crate::protocol::AgentConfig>,
+    pub agent: Option<crate::protocol::AgentConfigPatch>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker: Option<crate::protocol::WorkerRef>,

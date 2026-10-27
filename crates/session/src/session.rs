@@ -538,6 +538,8 @@ mod ends_run_tests {
                 data: serde_json::Value::Null,
                 turn_cost: Default::default(),
                 turn_token_usage: Default::default(),
+                turn_calls: Default::default(),
+                turn_started_at: None,
                 error: None,
             }),
             vec![call("c", Handler::Client)],

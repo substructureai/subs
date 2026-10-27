@@ -174,7 +174,7 @@ What fires, what the engine proposes, and what you return.
 
 | Trigger | Fires when | `proposed` holds | Return |
 | --- | --- | --- | --- |
-| `session.start` | The session was created. | The config from the file. Empty when the section sets none. | An `agent` config. |
+| `session.start` | The session was created. | The config from the file, with the changes of the `agent` that opened the session. Empty when neither sets one. | An `agent` config. |
 | `client.messages` | A client sent or edited messages. | Record the view, then call the model. | `proposed` |
 | `client.action` | A client called a named action. It joins the running turn, or opens the turn that the submit named. While a turn ends, it waits. A submit that names a turn id in use is refused. When its own turn has no more work, that turn ends. | Empty. | Your own actions. |
 | `context.limit` | A model call waits for room. See [Make room](./120-conversations.md#make-room). | The plan of the strategy that applied. | `proposed`, `context.replace` and `call`, a summary `llm.call`, or `call` alone. |

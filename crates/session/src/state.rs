@@ -766,6 +766,12 @@ pub struct SessionState {
     #[serde(default)]
     pub turn_token_usage: Usage,
 
+    #[serde(default)]
+    pub turn_calls: TurnCalls,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_started_at: Option<DateTime<Utc>>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_turn_at: Option<DateTime<Utc>>,
 
@@ -867,6 +873,8 @@ impl SessionState {
             subagent_cost: Decimal::ZERO,
             turn_cost: Decimal::ZERO,
             turn_token_usage: Usage::default(),
+            turn_calls: TurnCalls::default(),
+            turn_started_at: None,
             last_turn_at: None,
             last_read: None,
             limited: None,
@@ -1051,6 +1059,7 @@ impl SessionState {
                 call.defer_tools_strategy = payload.defer_tools_strategy;
             }
         } else {
+            self.turn_calls.llm.count += 1;
             self.insert_effect(
                 &payload.id,
                 EffectTracking::new_queued(payload.retry.clone()),
@@ -1112,6 +1121,7 @@ impl SessionState {
                 tc.arguments = payload.arguments.clone();
             }
         } else {
+            self.turn_calls.tool.count += 1;
             self.insert_effect(
                 &payload.id,
                 EffectTracking::new_queued(payload.retry.clone()),
@@ -1132,6 +1142,7 @@ impl SessionState {
         if let Some(existing) = self.effect_mut(EffectKind::Subagent, &payload.id) {
             existing.tracking.requeue();
         } else {
+            self.turn_calls.subagent.count += 1;
             self.insert_effect(
                 &payload.id,
                 EffectTracking::new_queued(payload.retry.clone()),
@@ -1282,12 +1293,14 @@ impl SessionState {
                 if let Some(c) = payload.response.cost {
                     self.cost += c;
                     self.turn_cost += c;
+                    self.turn_calls.llm.cost += c;
                 }
                 if let Some(e) = self.effect_mut(EffectKind::LlmCall, &payload.id) {
                     e.tracking.complete();
                 }
             }
             EventPayload::LlmCallErrored(payload) => {
+                self.turn_calls.llm.errors += 1;
                 if let Some(e) = self.effect_mut(EffectKind::LlmCall, &payload.id) {
                     e.tracking.record_error(payload.retryable, now);
                 }
@@ -1309,6 +1322,7 @@ impl SessionState {
                 }
             }
             EventPayload::ToolCallErrored(payload) => {
+                self.turn_calls.tool.errors += 1;
                 if let Some(e) = self.effect_mut(EffectKind::ToolCall, &payload.id) {
                     e.tracking.record_error(payload.retryable, now);
                     let failed = e.tracking.status == EffectStatus::Failed;
@@ -1337,6 +1351,7 @@ impl SessionState {
                 }
             }
             EventPayload::SubagentErrored(payload) => {
+                self.turn_calls.subagent.errors += 1;
                 if let Some(e) = self.effect_mut(EffectKind::Subagent, &payload.id) {
                     e.tracking.record_error(payload.retryable, now);
                     let failed = e.tracking.status == EffectStatus::Failed;
@@ -1496,6 +1511,9 @@ impl SessionState {
                 self.turn_cost += payload.cost;
                 self.subagent_token_usage.add(&payload.token_usage);
                 self.turn_token_usage.add(&payload.token_usage);
+                self.turn_calls.subagent.cost += payload.cost;
+                self.turn_calls.subagent.tokens.add(&payload.token_usage);
+                self.turn_calls.subagent.errors += u32::from(payload.error.is_some());
                 if let Some(turn_id) = &payload.turn_id {
                     self.detached_turns.insert(turn_id.clone());
                 }
@@ -1531,6 +1549,8 @@ impl SessionState {
                 self.context_kept = false;
                 self.turn_cost = Decimal::ZERO;
                 self.turn_token_usage = Usage::default();
+                self.turn_calls = TurnCalls::default();
+                self.turn_started_at = Some(now);
             }
             EventPayload::TurnCompleted(payload) => {
                 self.completed_turn_ids.push(payload.turn_id.clone());
@@ -1541,6 +1561,8 @@ impl SessionState {
                 self.data = payload.data.clone();
                 self.turn_cost = Decimal::ZERO;
                 self.turn_token_usage = Usage::default();
+                self.turn_calls = TurnCalls::default();
+                self.turn_started_at = None;
                 self.phase = TurnPhase::Idle;
                 self.turn_started_seq = None;
                 self.limited = None;
@@ -2158,6 +2180,7 @@ impl SessionState {
     fn track_turn_usage(&mut self, usage: &Option<Usage>) {
         if let Some(u) = usage {
             self.turn_token_usage.add(u);
+            self.turn_calls.llm.tokens.add(u);
         }
     }
 }

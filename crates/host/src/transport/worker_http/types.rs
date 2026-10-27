@@ -115,6 +115,8 @@ pub struct SubmitClientPayloadRequest {
     #[serde(default)]
     pub state: Option<crate::protocol::WorkerState>,
     #[serde(default)]
+    pub agent: Option<crate::protocol::AgentConfigPatch>,
+    #[serde(default)]
     pub queue: crate::protocol::QueueMode,
     #[serde(default)]
     pub metadata: std::collections::BTreeMap<String, String>,
@@ -166,6 +168,20 @@ mod tests {
         let req: SubmitClientPayloadRequest =
             serde_json::from_str(body).expect("the submit deserializes");
         assert!(req.state.is_none(), "an absent seed stays absent");
+    }
+
+    #[test]
+    fn a_submit_carries_an_optional_agent_config_patch() {
+        let body = r#"{"agent_id":"a","identity":{"id":"u"},"agent":{"effort":"high"},
+            "payload":{"type":"client.message","message":{"role":"user","content":"hi"}}}"#;
+        let req: SubmitClientPayloadRequest =
+            serde_json::from_str(body).expect("the submit deserializes");
+        let agent = req.agent.expect("agent is read");
+        assert_eq!(
+            agent.effort,
+            Some(Some(crate::protocol::ReasoningEffort::High))
+        );
+        assert_eq!(agent.model, None, "a patch need not name a model");
     }
 
     #[test]

@@ -183,6 +183,8 @@ mod tests {
             data,
             turn_cost: Default::default(),
             turn_token_usage: Default::default(),
+            turn_calls: Default::default(),
+            turn_started_at: None,
             error: None,
         }
     }

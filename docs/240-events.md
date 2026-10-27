@@ -59,9 +59,33 @@ Render a chat from these.
 | `message.new` | A message joined the tree: `{ message, parent_id?, copied_from? }`. `copied_from` names the original of a copy. |
 | `head.moved` | The active leaf changed. A client branched or edited. |
 | `turn.started` | A turn began: `{ turn_id, metadata? }`. `metadata` is the `metadata` the turn was submitted with. For a merged turn, a later submit's key wins. |
-| `turn.completed` | A turn ended, with its cost and output. |
+| `turn.completed` | A turn ended: `{ turn_id, data?, turn_cost, turn_token_usage, turn_calls, turn_started_at?, error? }`. See [Turn calls](#turn-calls). |
 | `session.done` | The session finished its work. |
 | `session.cancelled` | The current run was cancelled. A `turn.completed` with the error code `cancelled` follows. The session stays usable. |
+
+### Turn calls
+
+`turn_calls` on `turn.completed` totals the calls that the turn made, for each
+kind of call:
+
+```json
+{
+  "llm":      { "count": 6,  "errors": 0, "cost": "0.0101", "tokens": { "input": 41000, "output": 900, "…": "…" } },
+  "tool":     { "count": 14, "errors": 2 },
+  "subagent": { "count": 1,  "errors": 0, "cost": "0.0022", "tokens": { "…": "…" } }
+}
+```
+
+- `count` is the number of calls. A retry is not a new call.
+- `errors` is the number of attempts that failed, including the ones that were
+  retried.
+- `cost` and `tokens` are present only when they are not zero.
+- A subagent call costs what its child spent to answer it. The child's own
+  calls are in the child's `turn.completed`. `subagent.started` gives the
+  child's session.
+
+`turn_cost` and `turn_token_usage` are the totals of all kinds.
+`turn_started_at` is when the turn started.
 
 ## Model calls
 

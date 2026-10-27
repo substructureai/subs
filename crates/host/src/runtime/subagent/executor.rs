@@ -127,35 +127,39 @@ async fn handle_task(
         retry,
         events,
     } = task;
-    let created = execute(
-        store,
-        ExecuteInput {
-            id: Some(format!("create:{child_session_id}").into()),
-            session_id: child_session_id.clone(),
-            caller: Caller::System {
-                tenant_id: tenant_id.clone(),
-            },
-            command: create_session_command(
-                agents,
-                agent_id,
-                owner,
-                ancestry,
-                retry,
-                SessionSeed {
-                    events,
-                    ..SessionSeed::default()
-                },
-            )
-            .await,
-            span: span.child("create_subagent"),
+    let command = create_session_command(
+        agents,
+        agent_id,
+        owner,
+        ancestry,
+        retry,
+        SessionSeed {
+            events,
+            ..SessionSeed::default()
         },
     )
-    .await
-    .map(|_| ())
-    .or_else(|created| match created {
-        ExecuteError::Command(SessionError::SessionAlreadyCreated) => Ok(()),
-        err => Err(err),
-    });
+    .await;
+    let created = match command {
+        Ok(command) => execute(
+            store,
+            ExecuteInput {
+                id: Some(format!("create:{child_session_id}").into()),
+                session_id: child_session_id.clone(),
+                caller: Caller::System {
+                    tenant_id: tenant_id.clone(),
+                },
+                command,
+                span: span.child("create_subagent"),
+            },
+        )
+        .await
+        .map(|_| ())
+        .or_else(|created| match created {
+            ExecuteError::Command(SessionError::SessionAlreadyCreated) => Ok(()),
+            err => Err(err.to_string()),
+        }),
+        Err(err) => Err(err),
+    };
     let outcome = match created {
         Ok(()) => {
             open(

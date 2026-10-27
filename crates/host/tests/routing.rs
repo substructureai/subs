@@ -8,9 +8,9 @@ use substructure_host::llm::{
     LlmProviderRegistry, LlmProviderTrait, LlmTask,
 };
 use substructure_host::protocol::{
-    AgentConfig, ClientInput, Content, DraftMessage, ErrorCode, LlmResponse, PromptContent,
-    PromptRequest, Role, SessionOwner, Subagent, SubagentTools, ToolCall, ToolCallFunction,
-    WorkerRef,
+    AgentConfig, AgentConfigPatch, ClientInput, Content, DraftMessage, ErrorCode, LlmResponse,
+    PromptContent, PromptRequest, Role, SessionOwner, Subagent, SubagentTools, ToolCall,
+    ToolCallFunction, WorkerRef,
 };
 use substructure_host::protocol::{Issuer, Requester, Subject};
 use substructure_host::providers::sqlite::{
@@ -458,12 +458,18 @@ async fn a_declared_agent_runs_a_turn_in_engine() {
     .await;
 
     let events = turn(&h, "assistant", "hi").await;
-    assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, EventPayload::TurnCompleted(_))),
-        "the turn completes: {events:#?}"
+    let completed = events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::TurnCompleted(t) => Some(t),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("the turn completes: {events:#?}"));
+    assert_eq!(
+        completed.turn_calls.llm.count, 1,
+        "the turn counts its model call"
     );
+    assert!(completed.turn_started_at.is_some());
 
     let seen = h.model.seen.lock().unwrap();
     assert_eq!(seen.len(), 1, "one model call");
@@ -622,7 +628,12 @@ async fn a_session_opened_with_its_own_config_runs_in_engine() {
             "ad-hoc".to_string(),
             owner,
             SessionSeed {
-                agent: Some(config("claude")),
+                agent: Some(AgentConfigPatch {
+                    llm: Some(Some("claude".to_string())),
+                    model: Some("stub-model".to_string()),
+                    system: Some(Some("Be brief.".to_string())),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         )
@@ -1041,11 +1052,17 @@ async fn a_subagent_call_opens_its_child_with_the_message() {
             .any(|e| matches!(e, EventPayload::SubagentStarted(_))),
         "the child session starts: {events:#?}"
     );
-    assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, EventPayload::TurnCompleted(_))),
-        "the subagent folds back and the turn completes: {events:#?}"
+    let completed = events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::TurnCompleted(t) => Some(t),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("the subagent folds back and the turn completes: {events:#?}"));
+    assert_eq!(completed.turn_calls.subagent.count, 1);
+    assert_eq!(
+        completed.turn_calls.llm.count, 2,
+        "the child's model call is the subagent's, not the turn's"
     );
     assert!(
         h.model
