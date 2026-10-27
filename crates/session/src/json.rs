@@ -147,9 +147,14 @@ pub fn error_message(bytes: &[u8]) -> Option<String> {
                 .map(str::to_string),
         }
     };
+    let first = |v: &serde_json::Value| -> Option<String> {
+        let e = v.get("errors")?.as_array()?.first()?;
+        e.get("message")?.as_str().map(str::to_string)
+    };
     field(&value, "error")
         .or_else(|| field(&value, "message"))
         .or_else(|| field(&value, "detail"))
+        .or_else(|| first(&value))
         .map(|m| one_line(&m, MAX_MESSAGE))
 }
 
@@ -258,6 +263,13 @@ mod tests {
         assert_eq!(
             error_message(br#"{"message":"Internal Server Error"}"#).as_deref(),
             Some("Internal Server Error")
+        );
+        assert_eq!(
+            error_message(
+                br#"{"result":null,"success":false,"errors":[{"code":10000,"message":"Authentication error"}]}"#
+            )
+            .as_deref(),
+            Some("Authentication error")
         );
         assert_eq!(error_message(b"<html>500</html>"), None);
         assert_eq!(error_message(br#"{"actions":[]}"#), None);
