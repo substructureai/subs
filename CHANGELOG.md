@@ -9,6 +9,8 @@ The `@substructure.ai/cli` package and the `subs`, `substructure-host` and
 
 ## [Unreleased]
 
+## [0.10.3] - 2026-10-27
+
 ### Added
 
 - A worker can give an agent a plugin with `source: "worker"`. The engine asks the worker for each of its skills as a `tool.execute` named `skill`.
@@ -355,7 +357,8 @@ The `@substructure.ai/cli` package and the `subs`, `substructure-host` and
 - The changelog starts again at this release. For the changes before it, refer
   to the git history.
 
-[Unreleased]: https://github.com/substructureai/substructure/compare/v0.10.2...HEAD
+[Unreleased]: https://github.com/substructureai/substructure/compare/v0.10.3...HEAD
+[0.10.3]: https://github.com/substructureai/substructure/compare/v0.10.2...v0.10.3
 [0.10.2]: https://github.com/substructureai/substructure/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/substructureai/substructure/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/substructureai/substructure/compare/v0.9.5...v0.10.0

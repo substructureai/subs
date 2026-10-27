@@ -1,6 +1,6 @@
 [package]
 name = "substructure-session"
-version = "0.10.2"
+version = "0.10.3"
 edition = "2021"
 description = "One Substructure agent session: its rules, state and data"
 license = "MIT"
