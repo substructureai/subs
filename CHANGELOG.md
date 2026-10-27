@@ -9,6 +9,10 @@ The `@substructure.ai/cli` package and the `subs`, `substructure-host` and
 
 ## [Unreleased]
 
+### Changed
+
+- `call_tool` now requires `arguments`. A call without them is refused with an error that says where they go.
+
 ## [0.10.2] - 2026-10-27
 
 ### Added

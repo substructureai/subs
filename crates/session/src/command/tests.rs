@@ -8792,8 +8792,8 @@ fn a_connection_overrides_the_agents_default() {
     );
 }
 
-#[test]
-fn call_tool_refuses_arguments_that_break_the_tools_own_schema() {
+// A session whose one searchable tool, sentry__search_issues, needs a query.
+fn searching_sentry() -> Session {
     let mut agg = create_session_with_config(
         "sess-1",
         "tenant-a",
@@ -8826,7 +8826,12 @@ fn call_tool_refuses_arguments_that_break_the_tools_own_schema() {
         ),
         &system(),
     );
+    agg
+}
 
+#[test]
+fn call_tool_refuses_arguments_that_break_the_tools_own_schema() {
+    let mut agg = searching_sentry();
     call(
         &mut agg,
         "tc-1",
@@ -8847,6 +8852,27 @@ fn call_tool_refuses_arguments_that_break_the_tools_own_schema() {
         agg.state.tool_call("tc-1").unwrap().target,
         Some(ConnectorTarget::Call),
         "the provider held no schema for the inner tool, so the engine stops the call"
+    );
+}
+
+#[test]
+fn call_tool_without_arguments_says_where_they_go() {
+    let mut agg = searching_sentry();
+    call(
+        &mut agg,
+        "tc-1",
+        "call_tool",
+        r#"{"name":"sentry__search_issues"}"#,
+    );
+    let settled = agg
+        .state
+        .local_connector_answer("tc-1")
+        .expect("the engine answers this one");
+    assert!(settled.is_error);
+    let message = settled.as_text();
+    assert!(
+        message.contains("pass them in `arguments`"),
+        "the message says where the arguments go: {message}"
     );
 }
 

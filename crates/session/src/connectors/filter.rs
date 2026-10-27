@@ -348,7 +348,7 @@ fn call_tool() -> ConnectorTool {
         CALL_TOOL,
         format!(
             "Run one tool this agent can reach. Take `name` from `{TOOL_SEARCH}` exactly as it \
-             was given, and pass that tool's own arguments."
+             was given, and pass that tool's own arguments in `arguments`."
         ),
         serde_json::json!({
             "type": "object",
@@ -359,10 +359,10 @@ fn call_tool() -> ConnectorTool {
                 },
                 "arguments": {
                     "type": "object",
-                    "description": "The arguments that tool's own input schema declares."
+                    "description": "The arguments that tool's own input schema declares; {} for one that takes none."
                 }
             },
-            "required": ["name"]
+            "required": ["name", "arguments"]
         }),
         ConnectorToolKind::Call,
     )
@@ -1145,7 +1145,7 @@ mod tests {
         let properties = call.input.as_ref().unwrap()["properties"].clone();
         assert_eq!(
             call.input.as_ref().unwrap()["required"],
-            serde_json::json!(["name"])
+            serde_json::json!(["name", "arguments"])
         );
         assert!(properties.get("name").is_some());
         assert!(properties.get("arguments").is_some());

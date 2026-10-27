@@ -2494,9 +2494,13 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
             return Some(crate::copy::no_such_tool(&named, &near, &unavailable));
         };
         let input = target.input();
+        let fault = match raw.get("arguments") {
+            Some(_) => crate::copy::bad_arguments,
+            None => crate::copy::no_arguments,
+        };
         classify_arguments(&inner_arguments(&raw), input.as_ref())
             .error()
-            .map(|e| crate::copy::bad_arguments(&named, e, input.as_ref()))
+            .map(|e| fault(&named, e, input.as_ref()))
     }
 
     pub fn unsynced_connectors(&self) -> Vec<ConnectionPath> {

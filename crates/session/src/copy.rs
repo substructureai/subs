@@ -59,6 +59,14 @@ pub fn bad_arguments(named: &str, error: &str, schema: Option<&serde_json::Value
     }
 }
 
+/// A `call_tool` that named a tool but passed none of its arguments.
+pub fn no_arguments(named: &str, error: &str, schema: Option<&serde_json::Value>) -> String {
+    format!(
+        "{} No arguments reached it: pass them in `arguments`, beside `name`.",
+        bad_arguments(named, error, schema)
+    )
+}
+
 pub fn unavailable_reason(auth: Option<AuthNeed>) -> &'static str {
     match auth {
         Some(_) => "needs_authorization",
