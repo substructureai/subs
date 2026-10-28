@@ -125,6 +125,16 @@ pub fn declares(
     !tool.defer && refusal(&tool.name, "{}", config, connector_tools).is_none()
 }
 
+/// The result bytes one script may read, over all its calls.
+pub const RESULTS: usize = 8 << 20;
+
+pub fn spent() -> String {
+    format!(
+        "The script's results passed {} MiB. Make fewer calls, or ask for less in each.",
+        RESULTS >> 20
+    )
+}
+
 /// The names a script may call, sorted.
 pub fn callable(config: Option<&AgentConfig>, connector_tools: &[ConnectorTool]) -> Vec<String> {
     let declared = config

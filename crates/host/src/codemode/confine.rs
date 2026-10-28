@@ -78,7 +78,7 @@ fn limits() -> io::Result<()> {
     limit(libc::RLIMIT_NOFILE as i64, 3)?;
     limit(libc::RLIMIT_CPU as i64, CPU_SECS)?;
     #[cfg(target_os = "linux")]
-    limit(libc::RLIMIT_DATA as i64, 256 << 20)?;
+    limit(libc::RLIMIT_DATA as i64, 128 << 20)?;
     Ok(())
 }
 

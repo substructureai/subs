@@ -126,13 +126,12 @@ impl WorkRouter {
                     let queue = self.connector.as_ref();
                     send(queue, queue::CONNECTOR, session_id, id, span, task).await
                 }
-                ToolTarget::Script(script) => {
+                ToolTarget::Script => {
                     let task = ConnectorTask::RunScript {
                         session_id: session_id.clone(),
                         tenant_id,
                         tool_call_id: call.tool_call_id,
                         attempt: call.attempt,
-                        script,
                         retry: call.retry,
                     };
                     let envelope = uuid::Uuid::now_v7().to_string();

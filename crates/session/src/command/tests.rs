@@ -13091,15 +13091,16 @@ fn settle_tool(agg: &mut Session, id: &str, result: &str) -> Vec<EventPayload> {
 }
 
 fn script_work(agg: &Session) -> Option<crate::work::Script> {
-    agg.open_work().into_iter().find_map(|w| match w {
-        crate::work::Work::CallTool { call, .. } if call.tool_call_id == "tc-1" => {
-            match call.target {
-                crate::work::ToolTarget::Script(script) => Some(*script),
-                _ => None,
-            }
-        }
-        _ => None,
-    })
+    let queued = agg.open_work().into_iter().any(|w| {
+        matches!(w, crate::work::Work::CallTool { call, .. }
+            if call.tool_call_id == "tc-1" && matches!(call.target, crate::work::ToolTarget::Script))
+    });
+    assert_eq!(
+        queued,
+        agg.script("tc-1").is_some(),
+        "work and script agree"
+    );
+    agg.script("tc-1")
 }
 
 fn script_call(agg: &Session, seq: u32) -> String {
@@ -13261,4 +13262,76 @@ fn the_same_script_step_twice_requests_its_calls_once() {
     script_step(&mut agg, 0, &[("weather", "{}")]);
     assert!(script_step(&mut agg, 0, &[("weather", "{}")]).is_empty());
     assert_eq!(agg.state.script_calls("tc-1").len(), 1);
+}
+
+#[test]
+fn a_script_reads_its_results_up_to_a_budget() {
+    let mut agg = coding_session();
+    run_code(&mut agg, "...");
+    script_step(&mut agg, 0, &[("weather", "{}"), ("weather", r#"{"x":1}"#)]);
+    let big = "x".repeat(crate::codemode::RESULTS / 2 + 1);
+    let (first, second) = (script_call(&agg, 1), script_call(&agg, 2));
+    settle_tool(&mut agg, &first, &big);
+    settle_tool(&mut agg, &second, &big);
+    let script = script_work(&agg).expect("the script runs again");
+    assert!(script.spent);
+    assert_eq!(script.calls[0].output, big, "the first result fits");
+    assert!(!script.calls[1].ok, "the second passes the budget");
+    assert_eq!(script.calls[1].output, crate::codemode::spent());
+}
+
+fn coding_turn(agg: &mut Session) -> String {
+    let decision = open_decision(agg, "go");
+    submit_state(
+        agg,
+        decision,
+        vec![
+            node_msg("u1", Role::User, "go"),
+            node_msg("a1", Role::Assistant, "on it"),
+        ],
+        None,
+    );
+    run_code(agg, "...");
+    let events = script_step(agg, 0, &[("weather", "{}")]);
+    let execute = decision_with(&events, |t| matches!(t, Trigger::ToolExecute { .. }))
+        .expect("the worker is asked to run the call");
+    submit_state(agg, execute, vec![], None);
+    script_call(agg, 1)
+}
+
+fn assert_script_gone(agg: &mut Session, events: &[EventPayload], child: &str) {
+    let voided = voided_ids(events);
+    assert!(voided.contains(&"tc-1"), "run_code is voided: {voided:?}");
+    assert!(voided.contains(&child), "its call is voided: {voided:?}");
+    assert!(
+        settle_tool(agg, child, "late").is_empty(),
+        "a late answer lands nowhere"
+    );
+    assert!(script_work(agg).is_none(), "the script does not run again");
+}
+
+#[test]
+fn cancelling_voids_a_script_and_its_calls() {
+    let mut agg = coding_session();
+    let child = coding_turn(&mut agg);
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::CancelSession,
+        &frontend_caller("tenant-a", "user-1"),
+    );
+    assert_script_gone(&mut agg, &events, &child);
+}
+
+#[test]
+fn leaving_a_branch_voids_a_script_and_its_calls() {
+    let mut agg = coding_session();
+    let child = coding_turn(&mut agg);
+    let regen = open_decision(&mut agg, "regen");
+    let events = submit_state(
+        &mut agg,
+        regen,
+        vec![node_msg("u1", Role::User, "go")],
+        None,
+    );
+    assert_script_gone(&mut agg, &events, &child);
 }

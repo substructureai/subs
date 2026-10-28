@@ -34,7 +34,6 @@ pub enum ConnectorTask {
         tenant_id: String,
         tool_call_id: String,
         attempt: u32,
-        script: Box<crate::codemode::Script>,
         retry: RetryPolicy,
     },
 }

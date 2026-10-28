@@ -97,8 +97,9 @@ pub enum ToolTarget {
         requester: Requester,
     },
     Local,
-    /// Run a `run_code` script past the calls it already made.
-    Script(Box<Script>),
+    /// Run a `run_code` script past the calls it already made. The runner
+    /// reads the script from the session with [`Session::script`].
+    Script,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,6 +108,9 @@ pub struct Script {
     /// The names `tools` lists. A script can still call any name.
     #[serde(default)]
     pub tools: Vec<String>,
+    /// The script's results reached their budget: it may make no new call.
+    #[serde(default)]
+    pub spent: bool,
     pub calls: Vec<ScriptRecord>,
     pub seed: u64,
     pub now_ms: i64,
@@ -485,7 +489,8 @@ impl Session {
                     .unwrap_or_else(|_| serde_json::json!({})),
                 requester: Requester::of_owner(state.owner.as_ref()),
             },
-            ConnectorTarget::Code => ToolTarget::Script(Box::new(self.script(id, effect)?)),
+            ConnectorTarget::Code if state.script_waits(id) => return None,
+            ConnectorTarget::Code => ToolTarget::Script,
             _ => ToolTarget::Local,
         };
         Some(Work::CallTool {
@@ -515,13 +520,18 @@ impl Session {
         self.tool(parent, attempt)
     }
 
-    fn script(&self, id: &str, effect: &EffectState) -> Option<Script> {
+    /// A `run_code` call's script and the calls it made, when it is ready to
+    /// run again.
+    pub fn script(&self, id: &str) -> Option<Script> {
         let state = &self.state;
-        if state.script_waits(id) {
+        let effect = self.open(EffectKind::ToolCall, id, None)?;
+        if effect.tool()?.target != Some(ConnectorTarget::Code) || state.script_waits(id) {
             return None;
         }
         let arguments: serde_json::Value =
             serde_json::from_str(&effect.tool()?.arguments).unwrap_or_default();
+        let mut read = 0;
+        let mut spent = false;
         let calls = state
             .script_calls(id)
             .into_iter()
@@ -531,11 +541,22 @@ impl Session {
                     Some(called) => (called.name.clone(), called.arguments.clone()),
                     None => (tc.name.clone(), tc.arguments.clone()),
                 };
-                Some(ScriptRecord {
-                    name,
-                    arguments,
-                    ok: !tc.is_error,
-                    output: tc.result.clone().unwrap_or_default(),
+                let output = tc.result.clone().unwrap_or_default();
+                read += output.len();
+                spent |= read > crate::codemode::RESULTS;
+                Some(match spent {
+                    true => ScriptRecord {
+                        name,
+                        arguments,
+                        ok: false,
+                        output: crate::codemode::spent(),
+                    },
+                    false => ScriptRecord {
+                        name,
+                        arguments,
+                        ok: !tc.is_error,
+                        output,
+                    },
                 })
             })
             .collect();
@@ -550,6 +571,7 @@ impl Session {
                 .unwrap_or_default()
                 .to_string(),
             calls,
+            spent,
             seed: xxhash_rust::xxh3::xxh3_64(id.as_bytes()),
             now_ms: effect
                 .tracking

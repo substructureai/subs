@@ -83,6 +83,7 @@ pub enum Step {
 #[derive(Default)]
 struct Run {
     records: Vec<ScriptRecord>,
+    spent: bool,
     seq: usize,
     calls: Vec<ScriptCall>,
     call_bytes: usize,
@@ -109,6 +110,9 @@ impl Run {
             ));
         }
         let Some(record) = self.records.get(self.seq - 1) else {
+            if self.spent {
+                return refuse(&substructure_session::codemode::spent());
+            }
             self.call_bytes += arguments.len();
             if self.call_bytes > ALL_ARGUMENTS {
                 return refuse(&format!(
@@ -218,6 +222,7 @@ pub fn settle(tool_call_id: String, attempt: u32, known: u32, step: Step) -> Com
 fn execute(script: &Script) -> rquickjs::Result<Step> {
     let run = Rc::new(RefCell::new(Run {
         records: script.calls.clone(),
+        spent: script.spent,
         ..Run::default()
     }));
     let rt = Runtime::new()?;
@@ -334,6 +339,7 @@ mod tests {
             calls,
             seed: 7,
             now_ms: 1_700_000_000_000,
+            spent: false,
             tools: vec!["weather".to_string(), "list-prs".to_string()],
         }
     }
@@ -516,6 +522,20 @@ mod tests {
         let code = "return [typeof fetch, typeof require, typeof setTimeout, typeof __call, typeof os, typeof std];";
         let step = run(&script(code, vec![]));
         assert_eq!(step, Step::Done(r#"{"result":["undefined","undefined","undefined","undefined","undefined","undefined"]}"#.into()));
+    }
+
+    #[test]
+    fn a_script_whose_results_are_spent_makes_no_new_call() {
+        let mut spent = script(
+            "await tools.a(); try { await tools.b(); } catch (e) { return e.message; }",
+            vec![record("a", "{}", true, "1")],
+        );
+        spent.spent = true;
+        let step = run(&spent);
+        assert!(
+            matches!(&step, Step::Done(t) if t.contains("MiB")),
+            "{step:?}"
+        );
     }
 
     #[test]

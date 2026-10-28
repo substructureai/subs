@@ -20,6 +20,7 @@ fn script(code: &str) -> Script {
         calls: vec![],
         seed: 1,
         now_ms: 0,
+        spent: false,
         tools: vec![],
     }
 }

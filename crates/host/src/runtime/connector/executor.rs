@@ -74,14 +74,16 @@ async fn handle_task(
             tenant_id,
             tool_call_id,
             attempt,
-            script,
             ..
         } => {
             let Some(sandbox) = sandbox else {
                 return Err("a script reached the connector executor".to_string());
             };
+            let Some(script) = store.script(&tenant_id, &session_id, &tool_call_id).await else {
+                return Ok(());
+            };
             let known = script.calls.len() as u32;
-            let step = sandbox.run(&tenant_id, *script).await;
+            let step = sandbox.run(&tenant_id, script).await;
             let command = crate::codemode::settle(tool_call_id, attempt, known, step);
             submit(store, &session_id, &tenant_id, command, span, "script").await
         }

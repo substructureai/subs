@@ -49,6 +49,14 @@ impl PushAdapter {
         }
     }
 
+    /// Stops taking decisions. Pushes already in flight run on.
+    pub fn stop(&self) {
+        let handles = self.handles.lock().unwrap_or_else(|e| e.into_inner());
+        for handle in handles.values() {
+            handle.abort();
+        }
+    }
+
     fn spawn_loop(&self, tenant_id: String) {
         let mut handles = self.handles.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(existing) = handles.get(&tenant_id) {

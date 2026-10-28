@@ -763,6 +763,16 @@ impl Inbox for Sessions {
         Sessions::is_open(self, tenant_id, session_id, work).await
     }
 
+    async fn script(
+        &self,
+        tenant_id: &str,
+        session_id: &str,
+        tool_call_id: &str,
+    ) -> Option<substructure_session::Script> {
+        let session = self.load(tenant_id, session_id).await.ok()??;
+        session.script(tool_call_id)
+    }
+
     async fn ended(&self, tenant_id: &str, session_id: &str, work: &WorkId) {
         let mut tap = self.subscribe();
         let mut recheck = tokio::time::interval(RECHECK);
