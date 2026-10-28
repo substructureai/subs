@@ -313,6 +313,7 @@ pub(in crate::transport::slack) mod tests {
                 handler: Default::default(),
                 target: None,
                 retry: retry(),
+                script: None,
             }),
         )
     }

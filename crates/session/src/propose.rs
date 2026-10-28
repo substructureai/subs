@@ -831,6 +831,7 @@ mod tests {
                 arguments: String::new(),
                 result: None,
                 is_error: false,
+                script: None,
             }),
         )
     }

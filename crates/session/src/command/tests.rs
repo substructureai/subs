@@ -7279,6 +7279,7 @@ fn agent_config(model: &str) -> AgentConfig {
         effort: None,
         attachments: None,
         context: None,
+        code_mode: false,
     }
 }
 
@@ -13028,4 +13029,225 @@ fn a_skill_loaded_through_call_tool_unlocks_its_tools() {
         &machine(),
     );
     assert!(agg.state.at_head().locked_tools().is_empty());
+}
+
+fn coding_session() -> Session {
+    let mut agent = agent_config("m1");
+    agent.code_mode = true;
+    agent.tools.push(worker_tool("weather"));
+    agent.tools.push(AgentTool {
+        handler: Some(Handler::Client),
+        ..worker_tool("ask")
+    });
+    create_session_with_config("sess-1", "tenant-a", "user-1", Some(agent))
+}
+
+fn run_code(agg: &mut Session, code: &str) -> Vec<EventPayload> {
+    dispatch(
+        agg,
+        CommandPayload::RequestToolCall {
+            tool_call_id: "tc-1".to_string(),
+            name: crate::protocol::RUN_CODE.to_string(),
+            arguments: json!({ "code": code }).to_string(),
+            retry: None,
+        },
+        &system(),
+    )
+}
+
+fn script_step(agg: &mut Session, known: u32, calls: &[(&str, &str)]) -> Vec<EventPayload> {
+    let calls = calls
+        .iter()
+        .map(|(name, arguments)| crate::events::ScriptCall {
+            name: name.to_string(),
+            arguments: arguments.to_string(),
+        })
+        .collect();
+    dispatch(
+        agg,
+        CommandPayload::settle(
+            EffectKind::ToolCall,
+            "tc-1",
+            Some(0),
+            Outcome::Script { known, calls },
+        ),
+        &system(),
+    )
+}
+
+fn settle_tool(agg: &mut Session, id: &str, result: &str) -> Vec<EventPayload> {
+    dispatch(
+        agg,
+        CommandPayload::settle(
+            EffectKind::ToolCall,
+            id,
+            Some(0),
+            Outcome::Tool {
+                result: StoredResult::text(result),
+            },
+        ),
+        &system(),
+    )
+}
+
+fn script_work(agg: &Session) -> Option<crate::work::Script> {
+    agg.open_work().into_iter().find_map(|w| match w {
+        crate::work::Work::CallTool { call, .. } if call.tool_call_id == "tc-1" => {
+            match call.target {
+                crate::work::ToolTarget::Script(script) => Some(*script),
+                _ => None,
+            }
+        }
+        _ => None,
+    })
+}
+
+fn tool_finished(events: &[EventPayload]) -> Vec<&str> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            EventPayload::DecisionQueued(DecisionQueued {
+                trigger: Trigger::ToolFinished { id, .. },
+                ..
+            }) => Some(id.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn run_code_runs_its_script_in_the_engine() {
+    let mut agg = coding_session();
+    let events = run_code(&mut agg, "return 1;");
+    let requested = events.iter().find_map(|e| match e {
+        EventPayload::ToolCallRequested(r) => Some(r),
+        _ => None,
+    });
+    let requested = requested.expect("run_code is requested");
+    assert_eq!(requested.target, Some(ConnectorTarget::Code));
+    assert_eq!(requested.handler, ToolHandler::Server);
+    let script = script_work(&agg).expect("the script is sent to run");
+    assert_eq!(script.code, "return 1;");
+    assert!(script.calls.is_empty());
+}
+
+#[test]
+fn a_scripts_calls_run_as_tool_calls_the_model_never_hears_of() {
+    let mut agg = coding_session();
+    run_code(&mut agg, "...");
+    let events = script_step(&mut agg, 0, &[("weather", r#"{"city":"Oslo"}"#)]);
+    let child = events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::ToolCallRequested(r) => Some(r),
+            _ => None,
+        })
+        .expect("the script's call is requested");
+    assert_eq!(child.id, "tc-1.1");
+    assert_eq!(child.handler, ToolHandler::Worker);
+    assert_eq!(
+        child.script.as_ref().map(|s| (s.parent.as_str(), s.seq)),
+        Some(("tc-1", 1))
+    );
+    assert!(script_work(&agg).is_none(), "the script waits on its call");
+
+    let events = settle_tool(&mut agg, "tc-1.1", r#"{"temp":3}"#);
+    assert!(tool_finished(&events).is_empty(), "the model hears nothing");
+    let script = script_work(&agg).expect("the script runs again");
+    assert_eq!(script.calls.len(), 1);
+    assert_eq!(script.calls[0].name, "weather");
+    assert_eq!(script.calls[0].arguments, r#"{"city":"Oslo"}"#);
+    assert!(script.calls[0].ok);
+    assert_eq!(script.calls[0].output, r#"{"temp":3}"#);
+
+    let events = settle_tool(&mut agg, "tc-1", r#"{"result":4}"#);
+    assert_eq!(tool_finished(&events), vec!["tc-1"]);
+}
+
+#[test]
+fn a_script_may_not_call_client_unknown_or_run_code_tools() {
+    let mut agg = coding_session();
+    run_code(&mut agg, "...");
+    let events = script_step(
+        &mut agg,
+        0,
+        &[("ask", "{}"), ("nope", "{}"), ("run_code", "{}")],
+    );
+    let errors: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            EventPayload::ToolCallErrored(e) => Some(e.error.message.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(errors.len(), 3, "{events:?}");
+    assert!(errors[0].contains("runs on the client"));
+    assert!(errors[1].contains("no tool named `nope`"));
+    assert!(errors[2].contains("cannot call itself"));
+    assert!(tool_finished(&events).is_empty());
+    let script = script_work(&agg).expect("the script runs again");
+    assert!(script.calls.iter().all(|c| !c.ok));
+}
+
+#[test]
+fn a_stale_script_step_changes_nothing() {
+    let mut agg = coding_session();
+    run_code(&mut agg, "...");
+    script_step(&mut agg, 0, &[("weather", "{}")]);
+    assert!(script_step(&mut agg, 0, &[("weather", "{}")]).is_empty());
+    settle_tool(&mut agg, "tc-1.1", "1");
+    assert!(script_step(&mut agg, 0, &[("weather", "{}")]).is_empty());
+}
+
+#[test]
+fn ending_run_code_voids_the_calls_its_script_left_open() {
+    let mut agg = coding_session();
+    run_code(&mut agg, "...");
+    script_step(&mut agg, 0, &[("weather", "{}")]);
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::ToolCall,
+            "tc-1",
+            Some(0),
+            SettleError::new(
+                ErrorInfo::new(crate::protocol::ErrorCode::HandlerError, "boom"),
+                false,
+            ),
+        ),
+        &system(),
+    );
+    assert!(events.iter().any(|e| matches!(
+        e,
+        EventPayload::CallVoided(v) if v.id == "tc-1.1"
+    )));
+    assert_eq!(tool_finished(&events), vec!["tc-1"]);
+}
+
+#[test]
+fn each_script_step_settles_under_its_own_command_id() {
+    let step = |known| {
+        CommandPayload::settle(
+            EffectKind::ToolCall,
+            "tc-1",
+            Some(0),
+            Outcome::Script {
+                known,
+                calls: vec![],
+            },
+        )
+        .natural_id()
+    };
+    let done = CommandPayload::settle(
+        EffectKind::ToolCall,
+        "tc-1",
+        Some(0),
+        Outcome::Tool {
+            result: StoredResult::text("1"),
+        },
+    )
+    .natural_id();
+    assert_ne!(step(0), step(2));
+    assert_eq!(step(2), step(2));
+    assert_ne!(step(0), done);
 }

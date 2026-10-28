@@ -3,6 +3,7 @@ pub mod attachments;
 pub mod blob;
 pub mod branch;
 pub mod caller;
+pub mod codemode;
 pub mod command;
 pub mod connectors;
 pub mod context;
@@ -42,6 +43,7 @@ pub use ids::Ids;
 pub use session::{CommitContext, Error, Ran, Seen, Session, SessionEvent, Settings};
 pub use store::{MemoryStore, Store, StoreError};
 pub use work::{
-    settle, LlmCall, Mail, Subagent, Summary, System1Call, ToolCall, ToolTarget, Work, WorkId,
+    settle, LlmCall, Mail, Script, ScriptRecord, Subagent, Summary, System1Call, ToolCall,
+    ToolTarget, Work, WorkId,
 };
 pub mod request;

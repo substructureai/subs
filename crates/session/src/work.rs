@@ -97,6 +97,28 @@ pub enum ToolTarget {
         requester: Requester,
     },
     Local,
+    /// Run a `run_code` script past the calls it already made.
+    Script(Box<Script>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Script {
+    pub code: String,
+    /// The names `tools` lists. A script can still call any name.
+    #[serde(default)]
+    pub tools: Vec<String>,
+    pub calls: Vec<ScriptRecord>,
+    pub seed: u64,
+    pub now_ms: i64,
+}
+
+/// A call a script made, as the script made it, and how it ended.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScriptRecord {
+    pub name: String,
+    pub arguments: String,
+    pub ok: bool,
+    pub output: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -268,9 +290,11 @@ impl Session {
     }
 
     pub fn work(&self, events: &[SessionEvent]) -> Vec<Work> {
+        let mut seen = std::collections::HashSet::new();
         events
             .iter()
             .flat_map(|event| self.work_for(event))
+            .filter(|work| seen.insert(work.id().clone()))
             .collect()
     }
 
@@ -284,6 +308,8 @@ impl Session {
             EventPayload::ToolCallDispatched(d) => {
                 self.tool(&d.id, d.attempt).into_iter().collect()
             }
+            EventPayload::ToolCallCompleted(c) => self.script_resumed(&c.id).into_iter().collect(),
+            EventPayload::ToolCallErrored(e) => self.script_resumed(&e.id).into_iter().collect(),
             EventPayload::ConnectorSyncRequested(req) => self
                 .open(
                     EffectKind::ConnectorSync,
@@ -459,6 +485,7 @@ impl Session {
                     .unwrap_or_else(|_| serde_json::json!({})),
                 requester: Requester::of_owner(state.owner.as_ref()),
             },
+            ConnectorTarget::Code => ToolTarget::Script(Box::new(self.script(id, effect)?)),
             _ => ToolTarget::Local,
         };
         Some(Work::CallTool {
@@ -469,6 +496,66 @@ impl Session {
                 target,
                 retry: effect.tracking.retry_policy.clone(),
             },
+        })
+    }
+
+    /// A script runs again once every call it made has settled.
+    fn script_resumed(&self, id: &str) -> Option<Work> {
+        let state = &self.state;
+        let effect = state.effect(EffectKind::ToolCall, id)?;
+        let parent = &effect.tool()?.script.as_ref()?.parent;
+        if effect.tracking.is_unsettled() {
+            return None;
+        }
+        let attempt = state
+            .effect(EffectKind::ToolCall, parent)?
+            .tracking
+            .retry
+            .attempts;
+        self.tool(parent, attempt)
+    }
+
+    fn script(&self, id: &str, effect: &EffectState) -> Option<Script> {
+        let state = &self.state;
+        if state.script_waits(id) {
+            return None;
+        }
+        let arguments: serde_json::Value =
+            serde_json::from_str(&effect.tool()?.arguments).unwrap_or_default();
+        let calls = state
+            .script_calls(id)
+            .into_iter()
+            .filter_map(|e| {
+                let tc = e.tool()?;
+                let (name, arguments) = match tc.script.as_ref()?.called.as_ref() {
+                    Some(called) => (called.name.clone(), called.arguments.clone()),
+                    None => (tc.name.clone(), tc.arguments.clone()),
+                };
+                Some(ScriptRecord {
+                    name,
+                    arguments,
+                    ok: !tc.is_error,
+                    output: tc.result.clone().unwrap_or_default(),
+                })
+            })
+            .collect();
+        let at = state.at(effect.anchor.as_deref());
+        let config = at.resolve_agent_for();
+        let tools = crate::codemode::callable(config.as_ref(), &at.connector_tools().tools);
+        Some(Script {
+            tools,
+            code: arguments
+                .get("code")
+                .and_then(|c| c.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            calls,
+            seed: xxhash_rust::xxh3::xxh3_64(id.as_bytes()),
+            now_ms: effect
+                .tracking
+                .started_at
+                .map(|t| t.timestamp_millis())
+                .unwrap_or_default(),
         })
     }
 

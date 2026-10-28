@@ -3,6 +3,7 @@ pub mod runtime;
 pub use substructure_session::size;
 
 pub mod api;
+pub mod codemode;
 pub mod connectors;
 pub use substructure_session::copy;
 pub mod manifest;

@@ -15,6 +15,7 @@ pub fn answer(
         ConnectorToolKind::Skill => None,
         ConnectorToolKind::Subagent => None,
         ConnectorToolKind::Attachment => None,
+        ConnectorToolKind::Code => None,
     }
 }
 

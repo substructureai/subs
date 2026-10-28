@@ -1,4 +1,5 @@
 use super::{decision_queued, fail, mismatched, void_events, KindSpec, Outcome, SettleError};
+use crate::codemode;
 use crate::command::SessionError;
 use crate::connectors::ConnectionPath;
 use crate::cx::Cx;
@@ -55,9 +56,10 @@ impl KindSpec for ToolSpec {
                             false,
                         ),
                     ),
-                    None => complete(state.ids(), id.to_string(), name, result),
+                    None => finished(state, id, name, result),
                 }
             }
+            Outcome::Script { known, calls } => script_step(state, id, known, calls),
             Outcome::Error(e) => fail(self, state, id, &e),
             other => mismatched(self.kind(), &other),
         }
@@ -73,16 +75,20 @@ impl KindSpec for ToolSpec {
     }
 
     fn terminal(&self, state: &Cx<'_>, id: &str, e: &SettleError) -> Vec<EventPayload> {
-        let mut events = vec![decision_queued(
-            state.ids(),
-            Trigger::ToolFinished {
-                id: id.to_string(),
-                ok: false,
-                name: name_of(state, id),
-                result: None,
-                error: Some(e.error.clone()),
-            },
-        )];
+        let mut events = Vec::new();
+        if !in_script(state, id) {
+            events.extend(void_script(state, id));
+            events.push(decision_queued(
+                state.ids(),
+                Trigger::ToolFinished {
+                    id: id.to_string(),
+                    ok: false,
+                    name: name_of(state, id),
+                    result: None,
+                    error: Some(e.error.clone()),
+                },
+            ));
+        }
         if let (Some(auth), Some(target)) = (e.auth, connector_target(state, id)) {
             events.push(EventPayload::ConnectorAuthFailed(ConnectorAuthFailed {
                 path: target,
@@ -129,8 +135,100 @@ impl KindSpec for ToolSpec {
             handler: tc.handler,
             target: tc.target.clone(),
             retry: t.retry_policy.clone(),
+            script: tc.script.clone(),
         })]
     }
+}
+
+fn in_script(state: &SessionState, id: &str) -> bool {
+    state.tool_call(id).is_some_and(|t| t.script.is_some())
+}
+
+/// A call its script made settles without the model hearing of it.
+fn finished(state: &Cx<'_>, id: &str, name: String, result: StoredResult) -> Vec<EventPayload> {
+    if in_script(state, id) {
+        return vec![EventPayload::ToolCallCompleted(ToolCallCompleted {
+            id: id.to_string(),
+            name,
+            result,
+        })];
+    }
+    let mut events = void_script(state, id);
+    events.extend(complete(state.ids(), id.to_string(), name, result));
+    events
+}
+
+/// A script's calls still open when its `run_code` call ends.
+fn void_script(state: &SessionState, parent: &str) -> Vec<EventPayload> {
+    state
+        .script_calls(parent)
+        .into_iter()
+        .filter(|e| e.tracking.is_unsettled())
+        .flat_map(|e| void_events(EffectKind::ToolCall, e.id.clone()))
+        .collect()
+}
+
+fn script_step(
+    state: &Cx<'_>,
+    parent: &str,
+    known: u32,
+    calls: Vec<ScriptCall>,
+) -> Vec<EventPayload> {
+    let made = state.script_calls(parent);
+    let stale = made.len() != known as usize || made.iter().any(|e| e.tracking.is_unsettled());
+    let is_script = state
+        .tool_call(parent)
+        .is_some_and(|t| t.target == Some(ConnectorTarget::Code));
+    if stale || !is_script {
+        return Vec::new();
+    }
+    calls
+        .into_iter()
+        .zip(known + 1..)
+        .map(|(call, seq)| {
+            let script = ScriptCaller {
+                parent: parent.to_string(),
+                seq,
+                called: None,
+            };
+            scripted(state, script, call.name, call.arguments)
+        })
+        .collect()
+}
+
+fn scripted(
+    state: &SessionState,
+    script: ScriptCaller,
+    name: String,
+    arguments: String,
+) -> EventPayload {
+    let id = codemode::child_id(&script.parent, script.seq);
+    let here = state.at_head();
+    let config = here.resolve_agent_for();
+    let tools = here.connector_tools().tools;
+    let refused = codemode::refusal(&name, &arguments, config.as_ref(), &tools);
+    let called = ScriptCall {
+        name: name.clone(),
+        arguments: arguments.clone(),
+    };
+    let mut call = requested(state, id, name, arguments, None, Some(script));
+    if let Some(script) = call.script.as_mut() {
+        script.called =
+            (call.name != called.name || call.arguments != called.arguments).then_some(called);
+    }
+    let reason = refused.or_else(|| match call.handler {
+        ToolHandler::Client => Some(format!(
+            "`{}` runs on the client. Call it directly, not from code.",
+            call.name
+        )),
+        _ => None,
+    });
+    if let Some(reason) = reason {
+        call.handler = ToolHandler::Server;
+        call.target = Some(ConnectorTarget::Refused { reason });
+        call.retry = RetryPolicy::no_retry();
+    }
+    EventPayload::ToolCallRequested(call)
 }
 
 fn name_of(state: &SessionState, id: &str) -> String {
@@ -179,6 +277,21 @@ pub fn request(
     caller: &Caller,
 ) -> Result<Vec<EventPayload>, SessionError> {
     SessionState::ensure_internal(caller)?;
+    if state.has_effect(EffectKind::ToolCall, &tool_call_id) {
+        return Ok(Vec::new());
+    }
+    let call = requested(state, tool_call_id, name, arguments, retry.as_ref(), None);
+    Ok(vec![EventPayload::ToolCallRequested(call)])
+}
+
+fn requested(
+    state: &SessionState,
+    id: String,
+    name: String,
+    arguments: String,
+    retry: Option<&RetryOverride>,
+    script: Option<ScriptCaller>,
+) -> ToolCallRequested {
     let (name, arguments) = engine_call(state, name, arguments);
     let engine_tool = state
         .connector_tool_for(&name)
@@ -192,6 +305,12 @@ pub fn request(
             Some(ConnectorTarget::Locked),
         ),
         Some(tool) if tool.kind == ConnectorToolKind::Call => unwrap_call(state, name, arguments),
+        Some(tool) if tool.kind == ConnectorToolKind::Code => (
+            name,
+            arguments,
+            ToolHandler::Server,
+            Some(ConnectorTarget::Code),
+        ),
         Some(tool) if tool.kind == ConnectorToolKind::Attachment => (
             name,
             arguments,
@@ -227,20 +346,20 @@ pub fn request(
         }
         None => (name.clone(), arguments, state.tool_handler_for(&name), None),
     };
-    let config = state.retry_config();
-    let retry = RetryPolicy::resolve(retry.as_ref(), config.as_ref(), handler.retry_target());
-    if state.has_effect(EffectKind::ToolCall, &tool_call_id) {
-        return Ok(Vec::new());
-    }
-    Ok(vec![EventPayload::ToolCallRequested(ToolCallRequested {
-        id: tool_call_id,
+    let retry = match target {
+        Some(ConnectorTarget::Code) => codemode::retry(),
+        _ => RetryPolicy::resolve(retry, state.retry_config().as_ref(), handler.retry_target()),
+    };
+    ToolCallRequested {
+        id,
         attempt: 0,
         name,
         arguments,
         handler,
         target,
         retry,
-    })])
+        script,
+    }
 }
 
 /// `call_tool` that names `tool_search` or `skill` is that tool's call, as it

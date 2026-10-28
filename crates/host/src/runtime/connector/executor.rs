@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::codemode::Sandbox;
 use crate::connectors::registry::Connections;
 use crate::connectors::ConnectorError;
 use crate::plugins::PluginResolver;
@@ -23,6 +24,7 @@ use crate::protocol::{ErrorCode, ErrorInfo};
 pub fn spawn_connector_task_executor(
     store: Arc<dyn Inbox>,
     connections: Option<Arc<Connections>>,
+    sandbox: Arc<Sandbox>,
     queue: Arc<dyn Queue<ConnectorTask>>,
     pool: ExecutorPool,
     cancel: CancellationToken,
@@ -31,7 +33,8 @@ pub fn spawn_connector_task_executor(
     spawn_bounded_executors(store, queue, CONNECTOR, pool, cancel, move |task, span| {
         let store = inner.clone();
         let connections = connections.clone();
-        async move { handle_task(store.as_ref(), connections.as_deref(), task, span).await }
+        let sandbox = sandbox.clone();
+        async move { handle_task(store.as_ref(), connections.as_deref(), &sandbox, task, span).await }
     })
 }
 
@@ -42,10 +45,24 @@ fn unreachable() -> ConnectorError {
 async fn handle_task(
     store: &dyn Inbox,
     connections: Option<&Connections>,
+    sandbox: &Arc<Sandbox>,
     task: ConnectorTask,
     span: SpanContext,
 ) -> Result<(), String> {
     match task {
+        ConnectorTask::RunScript {
+            session_id,
+            tenant_id,
+            tool_call_id,
+            attempt,
+            script,
+            ..
+        } => {
+            let known = script.calls.len() as u32;
+            let step = sandbox.run(&tenant_id, *script).await;
+            let command = crate::codemode::settle(tool_call_id, attempt, known, step);
+            submit(store, &session_id, &tenant_id, command, span, "script").await
+        }
         ConnectorTask::Sync {
             session_id,
             tenant_id,

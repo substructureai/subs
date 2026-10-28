@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 use super::term::{paint, BOLD, DIM};
 
 pub const RESULT_LINES: usize = 12;
+pub const SCRIPT_RESULT_LINES: usize = 3;
 const SLOW: Duration = Duration::from_millis(100);
 
 pub struct PendingTool {
@@ -12,6 +13,8 @@ pub struct PendingTool {
     pub args: String,
     pub started: Instant,
     pub attempt: u32,
+    /// The `run_code` call whose script made this call.
+    pub script: Option<String>,
 }
 
 impl PendingTool {
@@ -23,6 +26,7 @@ impl PendingTool {
             args: String::new(),
             started: Instant::now(),
             attempt: 0,
+            script: None,
         }
     }
 
@@ -52,7 +56,11 @@ pub fn head_of(tool: &PendingTool, is_error: bool, again: bool, color: bool) -> 
         (true, false) => "✗",
         (false, false) => "●",
     };
-    let mut head = paint(BOLD, glyph, color);
+    let mut head = match tool.script {
+        Some(_) => "  ↳ ".to_string(),
+        None => String::new(),
+    };
+    head.push_str(&paint(BOLD, glyph, color));
     head.push(' ');
     head.push_str(&tool.heading(color));
 
@@ -128,7 +136,16 @@ mod tests {
             args: args.into(),
             started: Instant::now(),
             attempt,
+            script: None,
         }
+    }
+
+    #[test]
+    fn a_call_from_a_script_is_set_under_it() {
+        let mut child = tool("weather", "", 1);
+        child.script = Some("tc-1".into());
+        assert!(head_of(&child, false, false, false).starts_with("  ↳ ●"));
+        assert!(head_of(&tool("weather", "", 1), false, false, false).starts_with("●"));
     }
 
     #[test]

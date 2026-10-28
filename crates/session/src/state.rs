@@ -11,7 +11,7 @@ use crate::connectors::ConnectionPath;
 use crate::connectors::{filter, AuthNeed, RemoteTool};
 use crate::protocol::{
     AgentTool, BoundServer, ConnectorTool, ConnectorToolKind, DeferToolsStrategy, Handler,
-    McpServer, StoredResult, SubagentToolsStrategy, CALL_TOOL, SKILL,
+    McpServer, StoredResult, SubagentToolsStrategy, CALL_TOOL, RUN_CODE, SKILL,
 };
 use crate::system1::System1Request;
 
@@ -465,6 +465,8 @@ pub struct ToolCallState {
     pub result: Option<String>,
     #[serde(default)]
     pub is_error: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script: Option<ScriptCaller>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -971,6 +973,25 @@ impl SessionState {
         self.effect(EffectKind::ToolCall, id).and_then(|e| e.tool())
     }
 
+    /// The calls a `run_code` call's script made, in order.
+    pub fn script_calls(&self, parent: &str) -> Vec<&EffectState> {
+        let mut calls: Vec<(u32, &EffectState)> = self
+            .effects_of(EffectKind::ToolCall)
+            .filter_map(|e| {
+                let script = e.tool()?.script.as_ref()?;
+                (script.parent == parent).then_some((script.seq, e))
+            })
+            .collect();
+        calls.sort_by_key(|(seq, _)| *seq);
+        calls.into_iter().map(|(_, e)| e).collect()
+    }
+
+    pub fn script_waits(&self, parent: &str) -> bool {
+        self.script_calls(parent)
+            .iter()
+            .any(|e| e.tracking.is_unsettled())
+    }
+
     pub fn subagent(&self, id: &str) -> Option<&SubagentCallState> {
         self.effect(EffectKind::Subagent, id)
             .and_then(|e| e.subagent())
@@ -1104,6 +1125,7 @@ impl SessionState {
         let at = self.at(node.as_deref());
         let connector_tools = at.connector_tools().tools;
         let locked = at.locked_tools();
+        let config = at.resolve_agent_for();
         let owed = prompt_context::owed(at, &payload.id);
         let system_open = at.system_prefix_open(&payload.id);
         if let Some(effect) = self.effect_mut(EffectKind::LlmCall, &payload.id) {
@@ -1111,7 +1133,7 @@ impl SessionState {
             if let Some(call) = effect.llm_mut() {
                 if !connector_tools.is_empty() {
                     let tools = call.spec.tools.get_or_insert_with(Vec::new);
-                    for tool in connector_tools {
+                    for tool in &connector_tools {
                         if !tools.iter().any(|t| t.name == tool.name) {
                             tools.push(tool.to_llm_tool());
                         }
@@ -1119,6 +1141,7 @@ impl SessionState {
                 }
                 if let Some(tools) = call.spec.tools.as_mut() {
                     tools.retain(|t| !locked.contains_key(&t.name));
+                    describe_run_code(tools, config.as_ref(), &connector_tools);
                 }
                 prompt_context::merge(
                     &mut call.prompt,
@@ -1150,8 +1173,17 @@ impl SessionState {
                     arguments: payload.arguments.clone(),
                     result: None,
                     is_error: false,
+                    script: payload.script.clone(),
                 }),
             );
+            if let Some(script) = &payload.script {
+                let anchor = self
+                    .effect(EffectKind::ToolCall, &script.parent)
+                    .and_then(|e| e.anchor.clone());
+                if let Some(e) = self.effect_mut(EffectKind::ToolCall, &payload.id) {
+                    e.anchor = anchor;
+                }
+            }
         }
         self.enqueue(ctx.sequence, EffectKind::ToolCall, &payload.id);
     }
@@ -1992,6 +2024,9 @@ impl SessionState {
                 crate::attachments::tools::definitions(attachments),
             ));
         }
+        if config.code_mode {
+            resolutions.push(filter::Resolution::of(vec![crate::codemode::tool()]));
+        }
         let taken: Vec<&str> = config.tools.iter().map(|t| t.name.as_str()).collect();
         filter::merge(resolutions, taken)
     }
@@ -2007,6 +2042,9 @@ impl SessionState {
                 at.locked_fault(&tc.name)
                     .unwrap_or_else(|| crate::copy::CALL_NOT_ROUTED.to_string()),
             ));
+        }
+        if let ConnectorTarget::Refused { reason } = target {
+            return Some(StoredResult::error(reason.clone()));
         }
         super::engine_tools::answer(at, target.kind(), &tc.arguments)
     }
@@ -3153,5 +3191,28 @@ mod summary_fold_tests {
         assert!(s.last_turn_failed);
         apply(&mut s, json!({"type": "turn.completed", "turn_id": "t2"}));
         assert!(!s.last_turn_failed);
+    }
+}
+
+fn describe_run_code(
+    tools: &mut [LlmTool],
+    config: Option<&AgentConfig>,
+    connector_tools: &[ConnectorTool],
+) {
+    let offered = connector_tools
+        .iter()
+        .any(|t| t.name == RUN_CODE && t.kind == ConnectorToolKind::Code);
+    if !offered {
+        return;
+    }
+    let description = {
+        let declared: Vec<&LlmTool> = tools
+            .iter()
+            .filter(|t| crate::codemode::declares(t, config, connector_tools))
+            .collect();
+        crate::codemode::describe(&declared)
+    };
+    if let Some(tool) = tools.iter_mut().find(|t| t.name == RUN_CODE) {
+        tool.description = description;
     }
 }

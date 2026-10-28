@@ -32,6 +32,12 @@ pub enum Outcome {
         tools: Vec<RemoteTool>,
         instructions: Option<String>,
     },
+    /// A `run_code` script ran past the `known` calls it was given and made
+    /// `calls`.
+    Script {
+        known: u32,
+        calls: Vec<crate::events::ScriptCall>,
+    },
     Error(SettleError),
 }
 

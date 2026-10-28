@@ -23,6 +23,7 @@ pub const CALL_TOOL: &str = "call_tool";
 pub const SKILL: &str = "skill";
 pub const SUBAGENT: &str = "subagent";
 pub const SUBAGENT_WAIT: &str = "subagent_wait";
+pub const RUN_CODE: &str = "run_code";
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ConnectionPath {
@@ -978,6 +979,10 @@ pub struct AgentConfig {
     pub attachments: Option<Attachments>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<ContextConfig>,
+    /// Offer `run_code`: the model writes JavaScript that calls the agent's
+    /// tools.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub code_mode: bool,
 }
 
 /// Changes to an [`AgentConfig`]. A field left out keeps the base's value. A
@@ -1054,6 +1059,8 @@ pub struct AgentConfigPatch {
         skip_serializing_if = "Option::is_none"
     )]
     pub context: Option<Option<ContextConfig>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_mode: Option<bool>,
 }
 
 impl AgentConfigPatch {
@@ -1076,6 +1083,7 @@ impl AgentConfigPatch {
             mcp_announce,
             attachments,
             context,
+            code_mode,
         } = self;
         AgentConfig {
             llm: llm.unwrap_or(base.llm),
@@ -1094,6 +1102,7 @@ impl AgentConfigPatch {
             mcp_announce: mcp_announce.unwrap_or(base.mcp_announce),
             attachments: attachments.unwrap_or(base.attachments),
             context: context.unwrap_or(base.context),
+            code_mode: code_mode.unwrap_or(base.code_mode),
         }
     }
 }
@@ -1475,6 +1484,8 @@ pub enum ConnectorToolKind {
     Skill,
     Subagent,
     Attachment,
+    /// Run the model's JavaScript, which calls other tools.
+    Code,
 }
 
 impl ConnectorToolKind {

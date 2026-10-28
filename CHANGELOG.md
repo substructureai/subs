@@ -9,6 +9,10 @@ The `@substructure.ai/cli` package and the `subs`, `substructure-host` and
 
 ## [Unreleased]
 
+### Added
+
+- An agent can have `code_mode`. The model gets `run_code`, which runs JavaScript that calls the agent's tools. Only the return value and the `console.log` output go back to the model.
+
 ## [0.10.3] - 2026-10-27
 
 ### Added

@@ -143,8 +143,19 @@ impl CommandPayload {
     pub fn natural_id(&self) -> Option<crate::entry::CommandId> {
         match self {
             Self::SettleEffect {
-                kind, id, attempt, ..
-            } => Some(crate::work::WorkId::new(*kind, id.clone(), *attempt).settle_id()),
+                kind,
+                id,
+                attempt,
+                outcome,
+            } => {
+                let settle = crate::work::WorkId::new(*kind, id.clone(), *attempt).settle_id();
+                Some(match outcome {
+                    Outcome::Script { known, .. } => {
+                        crate::entry::CommandId(format!("{}:script:{known}", settle.0))
+                    }
+                    _ => settle,
+                })
+            }
             _ => None,
         }
     }

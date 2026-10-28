@@ -126,6 +126,27 @@ impl WorkRouter {
                     let queue = self.connector.as_ref();
                     send(queue, queue::CONNECTOR, session_id, id, span, task).await
                 }
+                ToolTarget::Script(script) => {
+                    let envelope = format!("{id}:script:{}", script.calls.len());
+                    let task = ConnectorTask::RunScript {
+                        session_id: session_id.clone(),
+                        tenant_id,
+                        tool_call_id: call.tool_call_id,
+                        attempt: call.attempt,
+                        script,
+                        retry: call.retry,
+                    };
+                    self.connector
+                        .send(Envelope::new(
+                            queue::CONNECTOR,
+                            session_id,
+                            envelope,
+                            span,
+                            task,
+                        ))
+                        .await
+                        .map_err(|e| transient(e.to_string()))
+                }
                 ToolTarget::Local => {
                     let Some(answer) = answer_locally(
                         session,

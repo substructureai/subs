@@ -67,6 +67,7 @@ pub struct RuntimeConfig {
     pub worker_retry_resolver: Arc<dyn WorkerRetryResolver>,
     pub session: substructure_session::Settings,
     pub send_timeout: std::time::Duration,
+    pub sandbox: Arc<crate::codemode::Sandbox>,
 }
 
 impl Default for RuntimeConfig {
@@ -82,6 +83,7 @@ impl Default for RuntimeConfig {
             worker_retry_resolver: Arc::new(DefaultWorkerRetryResolver),
             session: substructure_session::Settings::default(),
             send_timeout: sessions::DEFAULT_SEND_TIMEOUT,
+            sandbox: Arc::default(),
         }
     }
 }
@@ -986,6 +988,7 @@ pub async fn start(deps: RuntimeDeps, config: RuntimeConfig) -> Arc<Runtime> {
     handles.extend(spawn_connector_task_executor(
         sessions.clone(),
         connections,
+        config.sandbox.clone(),
         connector_task_queue,
         config.pool(config.connector_executor_workers),
         cancel.clone(),

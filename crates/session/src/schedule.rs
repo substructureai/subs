@@ -328,6 +328,7 @@ mod tests {
                 arguments: "{}".to_string(),
                 result: None,
                 is_error: false,
+                script: None,
             }),
         ));
     }

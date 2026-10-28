@@ -1,6 +1,7 @@
 use clap::Parser;
 
 use subs::cli::{self, Command};
+use substructure_host::codemode::sandbox;
 
 #[derive(Parser)]
 #[command(name = "subs", version)]
@@ -9,8 +10,15 @@ struct Cli {
     command: Command,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    sandbox::dispatch();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let configured = cli::project_log_filter(cli.command.config_path());

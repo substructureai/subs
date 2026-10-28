@@ -203,9 +203,16 @@ impl AgUiTranslator {
                     });
                     closed
                 } else {
+                    let mut metadata = self.title_of(&t.name);
+                    if let Some(script) = &t.script {
+                        metadata
+                            .get_or_insert_with(|| serde_json::json!({}))
+                            .as_object_mut()
+                            .map(|m| m.insert("script".into(), script.parent.clone().into()));
+                    }
                     vec![
                         AgUiEvent::ToolCallStart {
-                            metadata: self.title_of(&t.name),
+                            metadata,
                             tool_call_id: t.id.clone(),
                             tool_call_name: t.name.clone(),
                             parent_message_id: self.current_call_id.clone(),
@@ -657,6 +664,25 @@ mod tests {
             "handler": handler,
             "retry": serde_json::from_str::<Value>(RETRY).unwrap(),
         }))
+    }
+
+    #[test]
+    fn a_scripts_calls_name_their_script() {
+        let mut t = AgUiTranslator::new("t1".into(), "r1".into());
+        let mut child = tool_requested("tc-1.1", "weather", "{}", "server");
+        if let EventPayload::ToolCallRequested(r) = &mut child {
+            r.script = Some(crate::session::events::ScriptCaller {
+                parent: "tc-1".into(),
+                seq: 1,
+                called: None,
+            });
+        }
+        let out = vals(t.on_event(child, false));
+        assert_eq!(
+            kinds(&out),
+            ["TOOL_CALL_START", "TOOL_CALL_ARGS", "TOOL_CALL_END"]
+        );
+        assert_eq!(out[0]["metadata"]["script"], "tc-1");
     }
 
     #[test]

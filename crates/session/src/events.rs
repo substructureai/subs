@@ -418,6 +418,12 @@ pub enum ConnectorTarget {
     /// A tool a skill holds back, called before that skill loaded. The engine
     /// answers it with an error and runs nothing.
     Locked,
+    /// `run_code`.
+    Code,
+    /// A call a script may not make. The engine answers it with `reason`.
+    Refused {
+        reason: String,
+    },
 }
 
 impl ConnectorTarget {
@@ -428,7 +434,8 @@ impl ConnectorTarget {
             Self::Call => ConnectorToolKind::Call,
             Self::Skill { .. } => ConnectorToolKind::Skill,
             Self::Attachment => ConnectorToolKind::Attachment,
-            Self::Locked => ConnectorToolKind::Call,
+            Self::Locked | Self::Refused { .. } => ConnectorToolKind::Call,
+            Self::Code => ConnectorToolKind::Code,
         }
     }
 }
@@ -444,6 +451,24 @@ pub struct ToolCallRequested {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<ConnectorTarget>,
     pub retry: RetryPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script: Option<ScriptCaller>,
+}
+
+/// The `run_code` call that made this call, and where in its script.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScriptCaller {
+    pub parent: String,
+    pub seq: u32,
+    /// What the script called, when routing renamed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub called: Option<ScriptCall>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScriptCall {
+    pub name: String,
+    pub arguments: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

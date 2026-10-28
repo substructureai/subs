@@ -14,6 +14,10 @@
             }
           ]
         },
+        "code_mode": {
+          "description": "Offer `run_code`: the model writes JavaScript that calls the agent's\ntools.",
+          "type": "boolean"
+        },
         "context": {
           "anyOf": [
             {

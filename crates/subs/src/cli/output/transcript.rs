@@ -5,7 +5,7 @@ use super::markdown::Markdown;
 use super::reasoning::Reasoning;
 use super::status::{Phase, Status};
 use super::term::{fold, held_lines, indent, BOLD, DIM, RESET};
-use super::tool::{format_result, head_of, PendingTool, RESULT_LINES};
+use super::tool::{format_result, head_of, PendingTool, RESULT_LINES, SCRIPT_RESULT_LINES};
 use crate::transport::ag_ui::events::{AgUiEvent, RunOutcome};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -101,10 +101,10 @@ impl PrettyPrinter {
                         .and_then(|m| m.get(key)?.as_str())
                         .map(str::to_string)
                 };
-                self.tools.insert(
-                    tool_call_id.clone(),
-                    PendingTool::new(tool_call_name.clone(), named("server"), named("title")),
-                );
+                let mut tool =
+                    PendingTool::new(tool_call_name.clone(), named("server"), named("title"));
+                tool.script = named("script");
+                self.tools.insert(tool_call_id.clone(), tool);
                 self.status.set(self.tool_phase());
             }
             AgUiEvent::ToolCallArgs {
@@ -126,6 +126,10 @@ impl PrettyPrinter {
                 self.break_line(w)?;
                 let again = *is_error && *retryable;
                 let color = self.color;
+                let nested = self
+                    .tools
+                    .get(tool_call_id)
+                    .is_some_and(|t| t.script.is_some());
                 let outcome = match again {
                     true => self.tools.get_mut(tool_call_id).map(|tool| {
                         tool.attempt += 1;
@@ -142,13 +146,18 @@ impl PrettyPrinter {
                     self.write_body(w, &head)?;
                     self.newline(w)?;
                 }
+                let (lines, depth) = match nested {
+                    true => (SCRIPT_RESULT_LINES, 3),
+                    false => (RESULT_LINES, 1),
+                };
+                let nest = |text: &str| (0..depth).fold(text.to_string(), |t, _| indent(&t));
                 self.open(w, DIM)?;
-                let (body, held) = fold(&format_result(content), RESULT_LINES);
-                self.write_body(w, &indent(&body))?;
+                let (body, held) = fold(&format_result(content), lines);
+                self.write_body(w, &nest(&body))?;
                 self.close(w)?;
                 self.break_line(w)?;
                 if held > 0 {
-                    self.write_styled(w, DIM, &indent(&held_lines(held)))?;
+                    self.write_styled(w, DIM, &nest(&held_lines(held)))?;
                     self.newline(w)?;
                 }
                 self.status.set(self.tool_phase());
