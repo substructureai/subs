@@ -14,11 +14,12 @@ use crate::protocol::{
     WorkerRef, WorkerState,
 };
 use crate::runtime::blob::BlobStore;
-use connector::{spawn_connector_task_executor, spawn_script_executor, ConnectorTask};
+use connector::{spawn_connector_task_executor, ConnectorTask};
 use event_store::Seq;
 use llm::{spawn_llm_task_executor, LlmBlocks, LlmResolver, LlmTask, TokenDeltaTransport};
 use queue::Queue;
 use retry::{DefaultWorkerRetryResolver, WorkerRetryResolver};
+use script::{spawn_script_executor, ScriptTask};
 use session::command::{CommandPayload, Outcome, SessionError, SettleError, TurnTarget};
 use session::decision::{EffectResultPayload, WorkKind};
 use session::index::{SessionFilter, SessionIndexStore, SessionPage, SessionTotals};
@@ -44,6 +45,7 @@ pub mod inbox;
 pub mod live;
 pub mod llm;
 pub mod queue;
+pub mod script;
 pub use substructure_session::retry;
 pub mod secret;
 pub mod session;
@@ -67,7 +69,10 @@ pub struct RuntimeConfig {
     pub worker_retry_resolver: Arc<dyn WorkerRetryResolver>,
     pub session: substructure_session::Settings,
     pub send_timeout: std::time::Duration,
-    pub sandbox: Arc<crate::codemode::Sandbox>,
+    /// Runs `run_code` scripts. A process of this binary by default.
+    pub script_runner: Arc<dyn crate::codemode::ScriptRunner>,
+    /// Scripts that run at once.
+    pub script_slots: usize,
 }
 
 impl Default for RuntimeConfig {
@@ -83,7 +88,8 @@ impl Default for RuntimeConfig {
             worker_retry_resolver: Arc::new(DefaultWorkerRetryResolver),
             session: substructure_session::Settings::default(),
             send_timeout: sessions::DEFAULT_SEND_TIMEOUT,
-            sandbox: Arc::default(),
+            script_runner: Arc::new(crate::codemode::ProcessRunner::current()),
+            script_slots: std::thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 8)),
         }
     }
 }
@@ -895,6 +901,7 @@ pub struct RuntimeDeps {
 
     pub plugins: Arc<dyn crate::plugins::PluginResolver>,
     pub connector_task_queue: Arc<dyn Queue<ConnectorTask>>,
+    pub script_task_queue: Arc<dyn Queue<ScriptTask>>,
     pub worker_queue: Arc<dyn Queue<WorkerDecisionRequest>>,
     pub session_index_store: Arc<dyn SessionIndexStore>,
     pub alarms: Arc<dyn Alarms>,
@@ -917,6 +924,7 @@ pub async fn start(deps: RuntimeDeps, config: RuntimeConfig) -> Arc<Runtime> {
         connections,
         plugins,
         connector_task_queue,
+        script_task_queue,
         worker_queue,
         session_index_store,
         alarms,
@@ -932,6 +940,7 @@ pub async fn start(deps: RuntimeDeps, config: RuntimeConfig) -> Arc<Runtime> {
         llm: (!llm.is_empty()).then(|| llm_task_queue.clone()),
         system1: (!system1.is_empty()).then(|| system1_task_queue.clone()),
         connector: connector_task_queue.clone(),
+        scripts: script_task_queue.clone(),
         subagent: subagent_task_queue.clone(),
         decisions: worker_queue.clone(),
         restart: Restart::ResendOpen,
@@ -987,8 +996,9 @@ pub async fn start(deps: RuntimeDeps, config: RuntimeConfig) -> Arc<Runtime> {
     }
     handles.extend(spawn_script_executor(
         sessions.clone(),
-        config.sandbox.clone(),
-        connector_task_queue.clone(),
+        config.script_runner.clone(),
+        Arc::new(crate::codemode::Admission::new(config.script_slots)),
+        script_task_queue,
         cancel.clone(),
     ));
     handles.extend(spawn_connector_task_executor(

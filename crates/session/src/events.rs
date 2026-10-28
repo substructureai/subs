@@ -465,11 +465,7 @@ pub struct ScriptCaller {
     pub called: Option<ScriptCall>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScriptCall {
-    pub name: String,
-    pub arguments: String,
-}
+pub use crate::codemode::ScriptCall;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallCompleted {

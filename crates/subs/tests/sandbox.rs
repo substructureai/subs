@@ -1,21 +1,22 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use subs::codemode::sandbox::{self, Sandbox};
-use subs::codemode::{Script, Step};
+use subs::codemode::{
+    ProcessRunner, RunError, Script, ScriptRunner, Step, ARG, PROBE, PROBE_LOCK, VERSION,
+};
 
 fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_subs"))
 }
 
-fn sandbox() -> Sandbox {
-    Sandbox::new(binary(), vec![sandbox::ARG.into()])
+fn runner() -> ProcessRunner {
+    ProcessRunner::new(binary(), vec![ARG.into()])
 }
 
 fn script(code: &str) -> Script {
     Script {
+        version: VERSION,
         code: code.to_string(),
         calls: vec![],
         seed: 1,
@@ -26,9 +27,9 @@ fn script(code: &str) -> Script {
 }
 
 async fn probe(mode: &str) -> serde_json::Value {
-    let args: Vec<OsString> = vec![sandbox::ARG.into(), mode.into()];
+    let args: Vec<OsString> = vec![ARG.into(), mode.into()];
     std::env::set_var("SUBS_SANDBOX_TEST_SECRET", "hunter2");
-    let output = Sandbox::new(binary(), args)
+    let output = ProcessRunner::new(binary(), args)
         .command()
         .output()
         .await
@@ -59,17 +60,17 @@ fn assert_sealed(report: &serde_json::Value) {
 
 #[tokio::test]
 async fn a_sandbox_process_reaches_nothing_of_the_host() {
-    assert_sealed(&probe(sandbox::PROBE).await);
+    assert_sealed(&probe(PROBE).await);
 }
 
 #[tokio::test]
 async fn the_os_lock_alone_reaches_nothing_of_the_host() {
-    assert_sealed(&probe(sandbox::PROBE_LOCK).await);
+    assert_sealed(&probe(PROBE_LOCK).await);
 }
 
 #[tokio::test]
 async fn a_sandbox_process_sees_none_of_the_hosts_environment() {
-    let report = probe(sandbox::PROBE).await;
+    let report = probe(PROBE).await;
     let names: Vec<&str> = report["env"]
         .as_array()
         .expect("env names")
@@ -82,95 +83,72 @@ async fn a_sandbox_process_sees_none_of_the_hosts_environment() {
 
 #[tokio::test]
 async fn a_sandbox_process_is_never_root() {
-    assert_ne!(probe(sandbox::PROBE).await["uid"], 0);
+    assert_ne!(probe(PROBE).await["uid"], 0);
 }
 
 #[tokio::test]
 async fn scripts_run_in_sandbox_processes() {
-    let sandbox = Arc::new(sandbox());
-    let step = sandbox
-        .run("t", script("return [1 + 1, typeof fetch];"))
-        .await;
-    assert_eq!(step, Step::Done(r#"{"result":[2,"undefined"]}"#.into()));
-    let step = sandbox.run("t", script("return 'again';")).await;
-    assert_eq!(step, Step::Done(r#"{"result":"again"}"#.into()));
+    let runner = runner();
+    let step = runner.run(script("return [1 + 1, typeof fetch];")).await;
+    assert_eq!(step, Ok(Step::Done(r#"{"result":[2,"undefined"]}"#.into())));
+    let step = runner.run(script("return 'again';")).await;
+    assert_eq!(step, Ok(Step::Done(r#"{"result":"again"}"#.into())));
 }
 
 #[tokio::test]
 async fn scripts_run_at_once() {
-    let sandbox = Arc::new(sandbox().with_slots(4));
+    let runner = std::sync::Arc::new(runner());
     let runs: Vec<_> = (0..20)
         .map(|i| {
-            let sandbox = sandbox.clone();
-            let tenant = format!("t{}", i % 5);
-            tokio::spawn(async move {
-                sandbox
-                    .run(&tenant, script(&format!("return {i} * 2;")))
-                    .await
-            })
+            let runner = runner.clone();
+            tokio::spawn(async move { runner.run(script(&format!("return {i} * 2;"))).await })
         })
         .collect();
     for (i, run) in runs.into_iter().enumerate() {
         let step = run.await.unwrap();
-        assert_eq!(step, Step::Done(format!(r#"{{"result":{}}}"#, i * 2)));
+        assert_eq!(step, Ok(Step::Done(format!(r#"{{"result":{}}}"#, i * 2))));
     }
 }
 
 #[tokio::test]
-async fn a_script_past_its_deadline_is_killed_and_the_next_runs() {
-    let mut sandbox = sandbox();
-    sandbox.deadline = Duration::from_millis(300);
-    let sandbox = Arc::new(sandbox);
-    let step = sandbox.run("t", script("while (true) {}")).await;
+async fn a_script_past_its_deadline_fails_and_the_next_runs() {
+    let runner = runner().with_deadline(Duration::from_millis(300));
+    let step = runner.run(script("while (true) {}")).await;
     assert!(
-        matches!(&step, Step::Failed(m) if m.contains("ran too long")),
+        matches!(&step, Ok(Step::Failed(m)) if m.contains("ran too long")),
         "{step:?}"
     );
-    let step = sandbox.run("t", script("return 'next';")).await;
-    assert_eq!(step, Step::Done(r#"{"result":"next"}"#.into()));
+    let step = runner.run(script("return 'next';")).await;
+    assert_eq!(step, Ok(Step::Done(r#"{"result":"next"}"#.into())));
 }
 
 #[tokio::test]
-async fn one_tenant_cannot_take_every_slot() {
-    let mut sandbox = sandbox().with_slots(2);
-    sandbox.deadline = Duration::from_secs(3);
-    let sandbox = Arc::new(sandbox);
-    let busy: Vec<_> = (0..3)
-        .map(|_| {
-            let sandbox = sandbox.clone();
-            tokio::spawn(async move { sandbox.run("greedy", script("while (true) {}")).await })
-        })
-        .collect();
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let started = Instant::now();
-    let step = sandbox.run("polite", script("return 1;")).await;
-    assert_eq!(step, Step::Done(r#"{"result":1}"#.into()));
+async fn a_script_of_a_version_the_runner_does_not_take_is_tried_again() {
+    let mut newer = script("return 1;");
+    newer.version = VERSION + 1;
+    let step = runner().run(newer).await;
     assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "waited {:?}",
-        started.elapsed()
-    );
-    for run in busy {
-        run.abort();
-    }
-}
-
-#[tokio::test]
-async fn a_program_that_cannot_start_fails_the_run() {
-    let sandbox = Arc::new(Sandbox::new(PathBuf::from("/nonexistent/subs"), vec![]));
-    let step = sandbox.run("t", script("return 1;")).await;
-    assert!(
-        matches!(&step, Step::Failed(m) if m.contains("could not start")),
+        matches!(&step, Err(RunError(m)) if m.contains("version")),
         "{step:?}"
     );
 }
 
 #[tokio::test]
-async fn a_program_that_does_not_dispatch_is_refused() {
-    let sandbox = Arc::new(Sandbox::new(PathBuf::from("/bin/echo"), vec!["hi".into()]));
-    let step = sandbox.run("t", script("return 1;")).await;
+async fn a_runner_that_cannot_start_now_is_tried_again() {
+    let runner = ProcessRunner::new(PathBuf::from("/nonexistent/subs"), vec![]);
+    let step = runner.run(script("return 1;")).await;
     assert!(
-        matches!(&step, Step::Failed(m) if m.contains("dispatch()")),
+        matches!(&step, Err(RunError(m)) if m.contains("did not start")),
+        "{step:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_program_that_is_not_a_runner_fails_the_script() {
+    let runner = ProcessRunner::new(PathBuf::from("/bin/echo"), vec!["hi".into()]);
+    let step = runner.run(script("return 1;")).await;
+    assert!(
+        matches!(&step, Ok(Step::Failed(m)) if m.contains("dispatch()")),
         "{step:?}"
     );
 }

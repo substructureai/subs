@@ -3,7 +3,6 @@ use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::codemode::Sandbox;
 use crate::connectors::registry::Connections;
 use crate::connectors::ConnectorError;
 use crate::plugins::PluginResolver;
@@ -11,7 +10,7 @@ use crate::protocol::StoredResult;
 use crate::runtime::blob::BlobStore;
 use crate::runtime::executor::{settled, spawn_bounded_executors, ExecutorPool};
 use crate::runtime::inbox::Inbox;
-use crate::runtime::queue::{Queue, CONNECTOR, SCRIPT};
+use crate::runtime::queue::{Queue, CONNECTOR};
 use crate::runtime::session::command::{CommandPayload, Outcome, SettleError};
 use crate::runtime::session::engine_tools;
 use crate::runtime::session::state::EffectKind;
@@ -32,28 +31,7 @@ pub fn spawn_connector_task_executor(
     spawn_bounded_executors(store, queue, CONNECTOR, pool, cancel, move |task, span| {
         let store = inner.clone();
         let connections = connections.clone();
-        async move { handle_task(store.as_ref(), connections.as_deref(), None, task, span).await }
-    })
-}
-
-const SCRIPTS_WAITING: usize = 64;
-
-/// Script steps wait for a sandbox slot here, apart from connector calls.
-pub fn spawn_script_executor(
-    store: Arc<dyn Inbox>,
-    sandbox: Arc<Sandbox>,
-    queue: Arc<dyn Queue<ConnectorTask>>,
-    cancel: CancellationToken,
-) -> Vec<JoinHandle<()>> {
-    let pool = ExecutorPool {
-        workers: 1,
-        concurrency: SCRIPTS_WAITING,
-    };
-    let inner = store.clone();
-    spawn_bounded_executors(store, queue, SCRIPT, pool, cancel, move |task, span| {
-        let store = inner.clone();
-        let sandbox = sandbox.clone();
-        async move { handle_task(store.as_ref(), None, Some(&sandbox), task, span).await }
+        async move { handle_task(store.as_ref(), connections.as_deref(), task, span).await }
     })
 }
 
@@ -64,29 +42,10 @@ fn unreachable() -> ConnectorError {
 async fn handle_task(
     store: &dyn Inbox,
     connections: Option<&Connections>,
-    sandbox: Option<&Arc<Sandbox>>,
     task: ConnectorTask,
     span: SpanContext,
 ) -> Result<(), String> {
     match task {
-        ConnectorTask::RunScript {
-            session_id,
-            tenant_id,
-            tool_call_id,
-            attempt,
-            ..
-        } => {
-            let Some(sandbox) = sandbox else {
-                return Err("a script reached the connector executor".to_string());
-            };
-            let Some(script) = store.script(&tenant_id, &session_id, &tool_call_id).await else {
-                return Ok(());
-            };
-            let known = script.calls.len() as u32;
-            let step = sandbox.run(&tenant_id, script).await;
-            let command = crate::codemode::settle(tool_call_id, attempt, known, step);
-            submit(store, &session_id, &tenant_id, command, span, "script").await
-        }
         ConnectorTask::Sync {
             session_id,
             tenant_id,

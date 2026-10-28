@@ -212,6 +212,9 @@ async fn engine(block: &'static str) -> Engine {
             connections: None,
             plugins: Arc::new(substructure_host::plugins::StaticPlugins::default()),
             connector_task_queue: Arc::new(SqliteQueue::<ConnectorTask>::new(db.clone(), lease)),
+            script_task_queue: Arc::new(SqliteQueue::<
+                substructure_host::runtime::script::ScriptTask,
+            >::new(db.clone(), lease)),
             worker_queue: Arc::new(SqliteQueue::new(db.clone(), lease)),
             session_index_store: Arc::new(SqliteSessionIndexStore::new(db.clone()).unwrap()),
             alarms: Arc::new(SqliteAlarms::new(db.clone())),

@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use substructure_host::codemode::{sandbox, Sandbox};
+use substructure_host::codemode::{ProcessRunner, RunError, Script, ScriptRunner, Step, ARG};
 use substructure_host::event_store::Seq;
 use substructure_host::llm::{
     CallContext, InMemoryTokenDeltaTransport, LlmBlock, LlmBlocks, LlmCallError, LlmCallable,
@@ -145,6 +145,17 @@ impl Engine {
         worker: Option<String>,
         seen: Arc<Mutex<Seen>>,
     ) -> Self {
+        Engine::with_runner(db, code, config, worker, seen, Arc::new(runner())).await
+    }
+
+    async fn with_runner(
+        db: &Path,
+        code: &'static str,
+        config: AgentConfig,
+        worker: Option<String>,
+        seen: Arc<Mutex<Seen>>,
+        runner: Arc<dyn ScriptRunner>,
+    ) -> Self {
         let db = SqliteDb::open(db.to_str().unwrap(), Duration::from_secs(5)).unwrap();
         let agent = AgentEntry {
             config: Some(config),
@@ -191,6 +202,9 @@ impl Engine {
                     db.clone(),
                     LEASE,
                 )),
+                script_task_queue: Arc::new(SqliteQueue::<
+                    substructure_host::runtime::script::ScriptTask,
+                >::new(db.clone(), LEASE)),
                 worker_queue: Arc::new(SqliteQueue::new(db.clone(), LEASE)),
                 session_index_store: Arc::new(SqliteSessionIndexStore::new(db.clone()).unwrap()),
                 alarms: Arc::new(SqliteAlarms::new(db.clone())),
@@ -199,10 +213,7 @@ impl Engine {
             RuntimeConfig {
                 wake_poll_interval: Duration::from_millis(100),
                 worker_retry_resolver: Arc::new(Retry),
-                sandbox: Arc::new(Sandbox::new(
-                    std::path::PathBuf::from(env!("CARGO_BIN_EXE_subs")),
-                    vec![sandbox::ARG.into()],
-                )),
+                script_runner: runner,
                 ..RuntimeConfig::default()
             },
         )
@@ -285,6 +296,29 @@ impl Engine {
     async fn crash(self) {
         self.adapter.stop();
         self.runtime.shutdown().await;
+    }
+}
+
+fn runner() -> ProcessRunner {
+    ProcessRunner::new(
+        std::path::PathBuf::from(env!("CARGO_BIN_EXE_subs")),
+        vec![ARG.into()],
+    )
+}
+
+/// Down for its first step, then a process runner.
+struct Flaky {
+    down: Mutex<bool>,
+    runner: ProcessRunner,
+}
+
+#[async_trait]
+impl ScriptRunner for Flaky {
+    async fn run(&self, script: Script) -> Result<Step, RunError> {
+        if std::mem::take(&mut *self.down.lock().unwrap()) {
+            return Err(RunError("the code machine is restarting".into()));
+        }
+        self.runner.run(script).await
     }
 }
 
@@ -463,4 +497,33 @@ async fn a_script_survives_the_engine_restarting_mid_run() {
         "the held call is sent again at most once: {calls:?}"
     );
     assert_eq!(second_call, 1, "the next call is made once: {calls:?}");
+}
+
+#[tokio::test]
+async fn a_step_the_runner_could_not_take_is_tried_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let flaky = Arc::new(Flaky {
+        down: Mutex::new(true),
+        runner: runner(),
+    });
+    let engine = Engine::with_runner(
+        &dir.path().join("subs.db"),
+        "return 6 * 7;",
+        agent(vec![], false),
+        None,
+        seen.clone(),
+        flaky.clone(),
+    )
+    .await;
+    let turn = engine.say().await;
+    engine.settled(turn).await;
+    assert!(!*flaky.down.lock().unwrap(), "the first try failed");
+    let result = seen
+        .lock()
+        .unwrap()
+        .result
+        .clone()
+        .expect("the model heard the result");
+    assert!(result.contains(r#"\"result\":42"#), "{result}");
 }

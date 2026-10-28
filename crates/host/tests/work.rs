@@ -273,6 +273,9 @@ async fn engine_with(
                 db.clone(),
                 Duration::from_secs(60),
             )),
+            script_task_queue: Arc::new(SqliteQueue::<
+                substructure_host::runtime::script::ScriptTask,
+            >::new(db.clone(), Duration::from_secs(60))),
             worker_queue: Arc::new(SqliteQueue::new(db.clone(), lease)),
             session_index_store: Arc::new(SqliteSessionIndexStore::new(db.clone()).unwrap()),
             alarms: Arc::new(SqliteAlarms::new(db.clone())),
@@ -392,6 +395,19 @@ impl Engine {
             .unwrap()
             .query_row("SELECT COUNT(*) FROM engine_queue", [], |row| row.get(0))
             .unwrap()
+    }
+
+    /// The queue once it drains. A decision is acked after its outcome is
+    /// committed, so the turn can end a moment before the queue empties.
+    async fn drained(&self) -> i64 {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let queued = self.queued();
+            if queued == 0 || tokio::time::Instant::now() >= deadline {
+                return queued;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 }
 
@@ -514,7 +530,7 @@ async fn a_decision_taken_by_a_crashed_engine_is_pushed_once_after_its_lease() {
 
     assert!(completed(&events), "the turn completes: {events:#?}");
     assert_eq!(worker.attempts_of(&decision), vec![attempts]);
-    assert_eq!(e.queued(), 0);
+    assert_eq!(e.drained().await, 0);
 }
 
 #[tokio::test]
@@ -550,7 +566,7 @@ async fn a_decision_no_longer_open_is_not_pushed() {
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     assert!(worker.seen().is_empty(), "pushed: {:?}", worker.seen());
-    assert_eq!(e.queued(), 0);
+    assert_eq!(e.drained().await, 0);
 }
 
 #[tokio::test]

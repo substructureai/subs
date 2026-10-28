@@ -102,28 +102,7 @@ pub enum ToolTarget {
     Script,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Script {
-    pub code: String,
-    /// The names `tools` lists. A script can still call any name.
-    #[serde(default)]
-    pub tools: Vec<String>,
-    /// The script's results reached their budget: it may make no new call.
-    #[serde(default)]
-    pub spent: bool,
-    pub calls: Vec<ScriptRecord>,
-    pub seed: u64,
-    pub now_ms: i64,
-}
-
-/// A call a script made, as the script made it, and how it ended.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScriptRecord {
-    pub name: String,
-    pub arguments: String,
-    pub ok: bool,
-    pub output: String,
-}
+pub use crate::codemode::{Script, ScriptRecord};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
@@ -564,6 +543,7 @@ impl Session {
         let config = at.resolve_agent_for();
         let tools = crate::codemode::callable(config.as_ref(), &at.connector_tools().tools);
         Some(Script {
+            version: crate::codemode::VERSION,
             tools,
             code: arguments
                 .get("code")

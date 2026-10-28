@@ -29,13 +29,6 @@ pub enum ConnectorTask {
         arguments: Value,
         retry: RetryPolicy,
     },
-    RunScript {
-        session_id: String,
-        tenant_id: String,
-        tool_call_id: String,
-        attempt: u32,
-        retry: RetryPolicy,
-    },
 }
 
 impl BoundedTask for ConnectorTask {
@@ -57,14 +50,6 @@ impl BoundedTask for ConnectorTask {
                 retry,
             ),
             ConnectorTask::CallTool {
-                tenant_id,
-                session_id,
-                tool_call_id,
-                attempt,
-                retry,
-                ..
-            }
-            | ConnectorTask::RunScript {
                 tenant_id,
                 session_id,
                 tool_call_id,

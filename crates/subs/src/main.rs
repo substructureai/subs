@@ -1,7 +1,7 @@
 use clap::Parser;
 
 use subs::cli::{self, Command};
-use substructure_host::codemode::sandbox;
+use substructure_host::codemode;
 
 #[derive(Parser)]
 #[command(name = "subs", version)]
@@ -11,7 +11,7 @@ struct Cli {
 }
 
 fn main() -> anyhow::Result<()> {
-    sandbox::dispatch();
+    codemode::dispatch();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?

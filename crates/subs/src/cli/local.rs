@@ -23,6 +23,7 @@ use crate::providers::system1::{System1Client, System1Config};
 use crate::runtime::blob::{BlobResolvingLlm, BlobStore};
 use crate::runtime::connector::ConnectorTask;
 use crate::runtime::queue::Queue;
+use crate::runtime::script::ScriptTask;
 use crate::runtime::secret::SecretCipher;
 use crate::runtime::system1::{System1Callable, System1Registry, System1Task};
 use crate::subagent::SubagentTask;
@@ -230,6 +231,8 @@ fn announce_agents(cfg: &ProjectConfig) {
     }
 }
 
+/// How many `run_code` scripts run at once.
+const SLOTS_VAR: &str = "SUBS_SANDBOX_SLOTS";
 const TASK_LEASE: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub(crate) async fn start_engine(
@@ -323,6 +326,9 @@ pub(crate) async fn start_engine(
     }
 
     let mut config = RuntimeConfig::default();
+    if let Some(slots) = std::env::var(SLOTS_VAR).ok().and_then(|s| s.parse().ok()) {
+        config.script_slots = slots;
+    }
     if let Some(secs) = cfg.send_timeout_secs {
         config.send_timeout = std::time::Duration::from_secs(secs.get());
     }
@@ -331,6 +337,8 @@ pub(crate) async fn start_engine(
     let subagent_task_queue: Arc<dyn Queue<SubagentTask>> =
         Arc::new(SqliteQueue::new(db.clone(), TASK_LEASE));
     let connector_task_queue: Arc<dyn Queue<ConnectorTask>> =
+        Arc::new(SqliteQueue::new(db.clone(), TASK_LEASE));
+    let script_task_queue: Arc<dyn Queue<ScriptTask>> =
         Arc::new(SqliteQueue::new(db.clone(), TASK_LEASE));
     let system1_task_queue: Arc<dyn Queue<System1Task>> =
         Arc::new(SqliteQueue::new(db.clone(), TASK_LEASE));
@@ -411,6 +419,7 @@ pub(crate) async fn start_engine(
             connections,
             plugins,
             connector_task_queue,
+            script_task_queue,
             worker_queue,
             session_index_store,
             alarms,

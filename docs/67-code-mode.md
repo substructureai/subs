@@ -78,12 +78,39 @@ and on Linux with a seccomp filter that has no call to open a file, open a
 socket or start a process. A process that cannot lock itself down does not run
 the script. The engine kills a process that runs past its deadline.
 
-`SUBS_SANDBOX_SLOTS` sets how many scripts run at once. The default is the
-number of CPUs, from 2 to 8. One tenant uses at most all slots but one.
+`SUBS_SANDBOX_SLOTS` sets how many scripts `subs` runs at once. The default is
+the number of CPUs, from 2 to 8. One tenant uses at most all slots but one.
+A script also reads at most 8 MiB of results in all; past that, its calls
+throw.
 
-A program that embeds the engine must call
-`substructure_host::codemode::sandbox::dispatch()` first in `main`, before it
-starts a thread. Without it, every script fails with an error that says so.
+## Run scripts somewhere else
+
+A program that embeds the engine chooses what runs scripts with
+`RuntimeConfig::script_runner`, an implementation of
+`substructure_host::codemode::ScriptRunner`. A runner takes one step of a
+script, a `Script`, and returns where it ended, a `Step`. It keeps nothing
+between steps, so it can be a process here, another machine, or a service. The
+engine still decides how many steps run at once, reads each step from the
+session, and checks every call a step asks for.
+
+A runner that cannot take a step now, because it is down, busy or of another
+version, returns a `RunError`. The engine puts the step back on its queue and
+tries it again a few seconds later, until the step's queue timeout. A script
+that fails is a `Step::Failed`, not an error.
+
+The default runner, `ProcessRunner`, starts this binary as a confined process
+for each step. That binary must call `substructure_host::codemode::dispatch()`
+first in `main`, before it starts a thread. Without it, every script fails
+with an error that says so.
+
+The process speaks JSON lines on stdin and stdout. It first writes
+`{"ready": true, "version": N, "oldest": M}`, then reads one `Script` and
+writes one `Step`. A runner on another machine can start the same binary with
+`__sandbox` the same way, behind its own endpoint, and needs no other code. A
+`Script` carries its version, and a runner takes every version from `OLDEST` to
+`VERSION`, so an engine and its runners can be deployed one before the other.
+
+Script steps wait on `RuntimeDeps::script_task_queue`.
 
 ## Limits
 

@@ -17,16 +17,6 @@ pub trait Inbox: Send + Sync {
 
     async fn is_open(&self, tenant_id: &str, session_id: &str, work: &WorkId) -> bool;
 
-    /// A `run_code` call's script, when it is ready to run again.
-    async fn script(
-        &self,
-        _tenant_id: &str,
-        _session_id: &str,
-        _tool_call_id: &str,
-    ) -> Option<substructure_session::Script> {
-        None
-    }
-
     async fn ended(&self, tenant_id: &str, session_id: &str, work: &WorkId) {
         loop {
             tokio::time::sleep(RECHECK).await;

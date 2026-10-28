@@ -9,6 +9,7 @@ use crate::runtime::blob::BlobStore;
 use crate::runtime::connector::{answer_locally, settle_call, ConnectorTask};
 use crate::runtime::llm::LlmTask;
 use crate::runtime::queue::{self, Envelope, Queue};
+use crate::runtime::script::ScriptTask;
 use crate::runtime::session::index::{SessionActivity, SessionIndexRecord, SessionIndexStore};
 use crate::runtime::session::SessionEvent;
 use crate::runtime::sessions::{DeliveryError, Reader, Sessions, WorkSink};
@@ -22,6 +23,7 @@ pub struct WorkRouter {
     pub llm: Option<Arc<dyn Queue<LlmTask>>>,
     pub system1: Option<Arc<dyn Queue<System1Task>>>,
     pub connector: Arc<dyn Queue<ConnectorTask>>,
+    pub scripts: Arc<dyn Queue<ScriptTask>>,
     pub subagent: Arc<dyn Queue<SubagentTask>>,
     pub decisions: Arc<dyn Queue<WorkerDecisionRequest>>,
     pub restart: Restart,
@@ -127,7 +129,7 @@ impl WorkRouter {
                     send(queue, queue::CONNECTOR, session_id, id, span, task).await
                 }
                 ToolTarget::Script => {
-                    let task = ConnectorTask::RunScript {
+                    let task = ScriptTask {
                         session_id: session_id.clone(),
                         tenant_id,
                         tool_call_id: call.tool_call_id,
@@ -135,7 +137,7 @@ impl WorkRouter {
                         retry: call.retry,
                     };
                     let envelope = uuid::Uuid::now_v7().to_string();
-                    self.connector
+                    self.scripts
                         .send(Envelope::new(
                             queue::SCRIPT,
                             session_id,

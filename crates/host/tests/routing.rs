@@ -329,6 +329,11 @@ async fn start_with(
                 db.clone(),
                 std::time::Duration::from_secs(60),
             )),
+            script_task_queue: Arc::new(SqliteQueue::<
+                substructure_host::runtime::script::ScriptTask,
+            >::new(
+                db.clone(), std::time::Duration::from_secs(60)
+            )),
             worker_queue: Arc::new(SqliteQueue::new(
                 db.clone(),
                 std::time::Duration::from_secs(300),
