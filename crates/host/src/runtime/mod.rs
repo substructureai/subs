@@ -14,7 +14,7 @@ use crate::protocol::{
     WorkerRef, WorkerState,
 };
 use crate::runtime::blob::BlobStore;
-use connector::{spawn_connector_task_executor, ConnectorTask};
+use connector::{spawn_connector_task_executor, spawn_script_executor, ConnectorTask};
 use event_store::Seq;
 use llm::{spawn_llm_task_executor, LlmBlocks, LlmResolver, LlmTask, TokenDeltaTransport};
 use queue::Queue;
@@ -985,10 +985,15 @@ pub async fn start(deps: RuntimeDeps, config: RuntimeConfig) -> Arc<Runtime> {
             cancel.clone(),
         ));
     }
+    handles.extend(spawn_script_executor(
+        sessions.clone(),
+        config.sandbox.clone(),
+        connector_task_queue.clone(),
+        cancel.clone(),
+    ));
     handles.extend(spawn_connector_task_executor(
         sessions.clone(),
         connections,
-        config.sandbox.clone(),
         connector_task_queue,
         config.pool(config.connector_executor_workers),
         cancel.clone(),

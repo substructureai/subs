@@ -191,18 +191,18 @@ fn script_step(
                 seq,
                 called: None,
             };
-            scripted(state, script, call.name, call.arguments)
+            scripted(state, state.ids().next(), script, call.name, call.arguments)
         })
         .collect()
 }
 
 fn scripted(
     state: &SessionState,
+    id: String,
     script: ScriptCaller,
     name: String,
     arguments: String,
 ) -> EventPayload {
-    let id = codemode::child_id(&script.parent, script.seq);
     let here = state.at_head();
     let config = here.resolve_agent_for();
     let tools = here.connector_tools().tools;

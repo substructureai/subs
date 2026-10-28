@@ -13102,6 +13102,19 @@ fn script_work(agg: &Session) -> Option<crate::work::Script> {
     })
 }
 
+fn script_call(agg: &Session, seq: u32) -> String {
+    agg.state
+        .script_calls("tc-1")
+        .into_iter()
+        .find(|e| {
+            e.tool()
+                .and_then(|t| t.script.as_ref())
+                .is_some_and(|s| s.seq == seq)
+        })
+        .map(|e| e.id.clone())
+        .expect("the script made the call")
+}
+
 fn tool_finished(events: &[EventPayload]) -> Vec<&str> {
     events
         .iter()
@@ -13143,7 +13156,7 @@ fn a_scripts_calls_run_as_tool_calls_the_model_never_hears_of() {
             _ => None,
         })
         .expect("the script's call is requested");
-    assert_eq!(child.id, "tc-1.1");
+    assert_ne!(child.id, "tc-1.1", "its id is the engine's, not derived");
     assert_eq!(child.handler, ToolHandler::Worker);
     assert_eq!(
         child.script.as_ref().map(|s| (s.parent.as_str(), s.seq)),
@@ -13151,7 +13164,8 @@ fn a_scripts_calls_run_as_tool_calls_the_model_never_hears_of() {
     );
     assert!(script_work(&agg).is_none(), "the script waits on its call");
 
-    let events = settle_tool(&mut agg, "tc-1.1", r#"{"temp":3}"#);
+    let child = script_call(&agg, 1);
+    let events = settle_tool(&mut agg, &child, r#"{"temp":3}"#);
     assert!(tool_finished(&events).is_empty(), "the model hears nothing");
     let script = script_work(&agg).expect("the script runs again");
     assert_eq!(script.calls.len(), 1);
@@ -13195,7 +13209,8 @@ fn a_stale_script_step_changes_nothing() {
     run_code(&mut agg, "...");
     script_step(&mut agg, 0, &[("weather", "{}")]);
     assert!(script_step(&mut agg, 0, &[("weather", "{}")]).is_empty());
-    settle_tool(&mut agg, "tc-1.1", "1");
+    let child = script_call(&agg, 1);
+    settle_tool(&mut agg, &child, "1");
     assert!(script_step(&mut agg, 0, &[("weather", "{}")]).is_empty());
 }
 
@@ -13204,6 +13219,7 @@ fn ending_run_code_voids_the_calls_its_script_left_open() {
     let mut agg = coding_session();
     run_code(&mut agg, "...");
     script_step(&mut agg, 0, &[("weather", "{}")]);
+    let child = script_call(&agg, 1);
     let events = dispatch(
         &mut agg,
         CommandPayload::settle(
@@ -13219,35 +13235,30 @@ fn ending_run_code_voids_the_calls_its_script_left_open() {
     );
     assert!(events.iter().any(|e| matches!(
         e,
-        EventPayload::CallVoided(v) if v.id == "tc-1.1"
+        EventPayload::CallVoided(v) if v.id == child
     )));
     assert_eq!(tool_finished(&events), vec!["tc-1"]);
 }
 
 #[test]
-fn each_script_step_settles_under_its_own_command_id() {
-    let step = |known| {
-        CommandPayload::settle(
-            EffectKind::ToolCall,
-            "tc-1",
-            Some(0),
-            Outcome::Script {
-                known,
-                calls: vec![],
-            },
-        )
-        .natural_id()
-    };
-    let done = CommandPayload::settle(
+fn a_script_step_has_no_natural_command_id() {
+    let step = CommandPayload::settle(
         EffectKind::ToolCall,
         "tc-1",
         Some(0),
-        Outcome::Tool {
-            result: StoredResult::text("1"),
+        Outcome::Script {
+            known: 0,
+            calls: vec![],
         },
-    )
-    .natural_id();
-    assert_ne!(step(0), step(2));
-    assert_eq!(step(2), step(2));
-    assert_ne!(step(0), done);
+    );
+    assert_eq!(step.natural_id(), None, "the session fences steps itself");
+}
+
+#[test]
+fn the_same_script_step_twice_requests_its_calls_once() {
+    let mut agg = coding_session();
+    run_code(&mut agg, "...");
+    script_step(&mut agg, 0, &[("weather", "{}")]);
+    assert!(script_step(&mut agg, 0, &[("weather", "{}")]).is_empty());
+    assert_eq!(agg.state.script_calls("tc-1").len(), 1);
 }

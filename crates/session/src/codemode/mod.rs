@@ -140,10 +140,6 @@ pub fn callable(config: Option<&AgentConfig>, connector_tools: &[ConnectorTool])
     names
 }
 
-pub fn child_id(parent: &str, seq: u32) -> String {
-    format!("{parent}.{seq}")
-}
-
 /// A script waits on its calls, so its own deadline is the run's whole life.
 pub fn retry() -> RetryPolicy {
     RetryPolicy {

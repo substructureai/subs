@@ -270,11 +270,13 @@ async fn a_script_calls_tools_and_only_its_result_reaches_the_model() {
     let children: Vec<(&str, u32)> = log
         .iter()
         .filter_map(|e| match e {
-            EventPayload::ToolCallRequested(r) => r.script.as_ref().map(|s| (r.id.as_str(), s.seq)),
+            EventPayload::ToolCallRequested(r) => {
+                r.script.as_ref().map(|s| (s.parent.as_str(), s.seq))
+            }
             _ => None,
         })
         .collect();
-    assert_eq!(children, vec![("tc-1.1", 1), ("tc-1.2", 2), ("tc-1.3", 3)]);
+    assert_eq!(children, vec![("tc-1", 1), ("tc-1", 2), ("tc-1", 3)]);
 
     let seen = seen.lock().unwrap();
     let description = seen.description.as_deref().expect("run_code was offered");

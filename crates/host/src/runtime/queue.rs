@@ -9,6 +9,7 @@ use crate::runtime::span::SpanContext;
 
 pub const LLM: &str = "llm";
 pub const CONNECTOR: &str = "connector";
+pub const SCRIPT: &str = "script";
 pub const SUBAGENT: &str = "subagent";
 pub const SYSTEM1: &str = "system1";
 
