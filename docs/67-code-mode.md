@@ -79,9 +79,8 @@ socket or start a process. A process that cannot lock itself down does not run
 the script. The engine kills a process that runs past its deadline.
 
 `SUBS_SANDBOX_SLOTS` sets how many scripts `subs` runs at once. The default is
-the number of CPUs, from 2 to 8. One tenant uses at most all slots but one.
-A script also reads at most 8 MiB of results in all; past that, its calls
-throw.
+the number of CPUs, from 2 to 8. A tenant may take every slot while no other
+tenant waits; while another does, it keeps at most all but one.
 
 ## Run scripts somewhere else
 
@@ -114,8 +113,27 @@ Script steps wait on `RuntimeDeps::script_task_queue`.
 
 ## Limits
 
-A script has no network, file system, timer or module. Each run has a memory
-limit, a stack limit and an instruction budget. A run that goes over a limit
-fails, and `run_code` returns the error. A script can make at most 1,000
-calls. A result over 32 KiB is replaced with a note, and `console.log` output
-over 16 KiB is cut.
+A script has no network, file system, timer or module. The engine sets these
+limits with `RuntimeConfig::script_limits`, and a runner holds each script to
+them. An error names the limit that was met and what to do.
+
+| Limit | Default | Applies to |
+|---|---|---|
+| `calls` | 1,000 | Calls over the whole script |
+| `results` | 16 MiB | Results the script reads, over all its calls |
+| `arguments` | 32 MiB | Arguments over the whole script, and 256 KiB in one call |
+| `returned` | 64 KiB | The value it returns; past it, the start is shown with a note |
+| `logs` | 16 KiB | `console.log` output |
+| `memory` | 128 MiB | JavaScript heap in one run |
+| `compute_ms` | 20,000 | CPU in one run; the process is stopped 10s after it |
+
+A script resumes from the start after its calls finish, so work done before a
+call counts against each run. `RuntimeConfig::script_wait`, 60 seconds by
+default, is how long a step may wait for a slot or for a runner to take it.
+`ProcessRunner::with_data_limit` caps a process's heap, records included; keep
+it above `memory`.
+
+Each step logs a `script step` line under the `codemode` target, with its
+tenant, the bytes of results it was given, its wait, its run time, its heap and
+CPU, and the limit it met, if any. A step that uses over half its memory or
+compute logs a warning.

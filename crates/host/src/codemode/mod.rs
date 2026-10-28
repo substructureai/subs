@@ -8,7 +8,8 @@ pub use admission::{Admission, Ticket};
 pub use child::{dispatch, ARG, PROBE, PROBE_LOCK};
 pub use process::{ProcessRunner, RunError, ScriptRunner};
 pub use substructure_session::codemode::{
-    spent, supports, Script, ScriptCall, ScriptRecord, Step, OLDEST, RESULTS, VERSION,
+    spent, supports, Limit, Limits, Ran, Script, ScriptCall, ScriptRecord, Stats, Step, OLDEST,
+    VERSION,
 };
 
 use substructure_session::command::{CommandPayload, Outcome, SettleError};

@@ -73,6 +73,10 @@ pub struct RuntimeConfig {
     pub script_runner: Arc<dyn crate::codemode::ScriptRunner>,
     /// Scripts that run at once.
     pub script_slots: usize,
+    /// What a script may use.
+    pub script_limits: crate::codemode::Limits,
+    /// How long a script step may wait for a slot, or for a runner to take it.
+    pub script_wait: std::time::Duration,
 }
 
 impl Default for RuntimeConfig {
@@ -90,6 +94,8 @@ impl Default for RuntimeConfig {
             send_timeout: sessions::DEFAULT_SEND_TIMEOUT,
             script_runner: Arc::new(crate::codemode::ProcessRunner::current()),
             script_slots: std::thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 8)),
+            script_limits: crate::codemode::Limits::default(),
+            script_wait: std::time::Duration::from_secs(60),
         }
     }
 }
@@ -996,8 +1002,12 @@ pub async fn start(deps: RuntimeDeps, config: RuntimeConfig) -> Arc<Runtime> {
     }
     handles.extend(spawn_script_executor(
         sessions.clone(),
-        config.script_runner.clone(),
-        Arc::new(crate::codemode::Admission::new(config.script_slots)),
+        Arc::new(script::Scripts {
+            runner: config.script_runner.clone(),
+            admission: Arc::new(crate::codemode::Admission::new(config.script_slots)),
+            limits: config.script_limits.clone(),
+            wait: config.script_wait,
+        }),
         script_task_queue,
         cancel.clone(),
     ));

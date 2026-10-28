@@ -13097,10 +13097,11 @@ fn script_work(agg: &Session) -> Option<crate::work::Script> {
     });
     assert_eq!(
         queued,
-        agg.script("tc-1").is_some(),
+        agg.script("tc-1", &crate::codemode::Limits::default())
+            .is_some(),
         "work and script agree"
     );
-    agg.script("tc-1")
+    agg.script("tc-1", &crate::codemode::Limits::default())
 }
 
 fn script_call(agg: &Session, seq: u32) -> String {
@@ -13143,6 +13144,7 @@ fn run_code_runs_its_script_in_the_engine() {
     let script = script_work(&agg).expect("the script is sent to run");
     assert_eq!(script.code, "return 1;");
     assert!(script.calls.is_empty());
+    assert_eq!(script.tools, ["weather"], "client tools are not listed");
 }
 
 #[test]
@@ -13269,7 +13271,7 @@ fn a_script_reads_its_results_up_to_a_budget() {
     let mut agg = coding_session();
     run_code(&mut agg, "...");
     script_step(&mut agg, 0, &[("weather", "{}"), ("weather", r#"{"x":1}"#)]);
-    let big = "x".repeat(crate::codemode::RESULTS / 2 + 1);
+    let big = "x".repeat(crate::codemode::Limits::default().results / 2 + 1);
     let (first, second) = (script_call(&agg, 1), script_call(&agg, 2));
     settle_tool(&mut agg, &first, &big);
     settle_tool(&mut agg, &second, &big);
@@ -13277,7 +13279,10 @@ fn a_script_reads_its_results_up_to_a_budget() {
     assert!(script.spent);
     assert_eq!(script.calls[0].output, big, "the first result fits");
     assert!(!script.calls[1].ok, "the second passes the budget");
-    assert_eq!(script.calls[1].output, crate::codemode::spent());
+    assert_eq!(
+        script.calls[1].output,
+        crate::codemode::spent(crate::codemode::Limits::default().results)
+    );
 }
 
 fn coding_turn(agg: &mut Session) -> String {

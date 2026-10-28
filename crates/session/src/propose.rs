@@ -832,6 +832,7 @@ mod tests {
                 result: None,
                 is_error: false,
                 script: None,
+                script_tools: Vec::new(),
             }),
         )
     }

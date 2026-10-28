@@ -17,11 +17,12 @@ pub enum Denial {
     Refuse,
 }
 
-pub fn confine(denial: Denial) -> io::Result<()> {
+/// `data` caps the process's heap, in bytes.
+pub fn confine(denial: Denial, data: u64) -> io::Result<()> {
     close_inherited();
     isolate();
     unprivileged()?;
-    limits()?;
+    limits(data)?;
     lock(denial)
 }
 
@@ -72,13 +73,14 @@ fn unprivileged() -> io::Result<()> {
     }
 }
 
-fn limits() -> io::Result<()> {
+fn limits(data: u64) -> io::Result<()> {
     limit(libc::RLIMIT_CORE as i64, 0)?;
     limit(libc::RLIMIT_FSIZE as i64, 0)?;
     limit(libc::RLIMIT_NOFILE as i64, 3)?;
     limit(libc::RLIMIT_CPU as i64, CPU_SECS)?;
     #[cfg(target_os = "linux")]
-    limit(libc::RLIMIT_DATA as i64, 128 << 20)?;
+    limit(libc::RLIMIT_DATA as i64, data)?;
+    let _ = data;
     Ok(())
 }
 

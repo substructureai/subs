@@ -15,10 +15,15 @@ once, or to filter a large result before you read it.
 - `code` is the body of an async function. `return` a value to get it back.
 - Call a tool with `await tools.<name>(args)`. Use `tools[\"<name>\"](args)` when the name is not \
 an identifier. A call returns the tool's result, parsed when it is JSON.
-- A call that fails throws an `Error` with the tool's message.
-- Run calls at once with `Promise.all`.
+- A call that fails throws an `Error` with the tool's message. For many calls at once, use \
+`Promise.allSettled`, so one failure does not lose the rest.
+- Tools that the worker runs answer one at a time. Other tools run at once.
 - `console.log` output comes back with the return value. Results you do not return or log stay \
 out of the conversation.
+- Return a summary, not raw results: what a script returns and logs is capped.
+- A script resumes from the start after its calls finish, so work done before a call is done \
+again each time. It has limits on its calls, on the results it reads, on memory and on compute; \
+an error names the limit and what to do.
 - There is no network, file system, timer or module. `Date` and `Math.random` stay the same \
 for the whole run.
 - Tools that need approval, run on the client, or start a subagent cannot be called from code.";

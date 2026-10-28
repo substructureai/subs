@@ -1,22 +1,18 @@
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
 
 use rquickjs::{Context, Function, Runtime};
 
-use super::{Script, ScriptCall, ScriptRecord, Step};
+use super::{Limit, Limits, Ran, Script, ScriptCall, ScriptRecord, Stats, Step};
 
-const MEMORY: usize = 64 << 20;
 const STACK: usize = 512 << 10;
-/// QuickJS calls the handler about every 10k instructions.
-const TICKS: u64 = 10_000;
-const WALL: Duration = Duration::from_secs(10);
+/// QuickJS calls the interrupt handler about every 10k instructions. A
+/// backstop to the CPU limit.
+const TICKS: u64 = 1_000_000;
 const JOBS: usize = 1_000_000;
-const CALLS: usize = 1_000;
 const ARGUMENTS: usize = 256 << 10;
-const ALL_ARGUMENTS: usize = 4 << 20;
-const LOGS: usize = 16 << 10;
-const RESULT: usize = 32 << 10;
+/// The start of an oversized result that is still shown.
+const PREVIEW: usize = 4 << 10;
 
 const PRELUDE: &str = r#"
 (() => {
@@ -65,43 +61,61 @@ const PRELUDE: &str = r#"
 
 #[derive(Default)]
 struct Run {
+    limits: Limits,
     records: Vec<ScriptRecord>,
     spent: bool,
     seq: usize,
     calls: Vec<ScriptCall>,
-    call_bytes: usize,
+    argument_bytes: usize,
     diverged: Option<String>,
     logs: Vec<String>,
     log_bytes: usize,
     logs_cut: bool,
     outcome: Option<Result<Option<String>, String>>,
-    stopped: Option<&'static str>,
+    stopped: Option<Limit>,
+    refused: Option<Limit>,
 }
 
 impl Run {
     fn call(&mut self, name: String, arguments: String) -> Option<String> {
         self.seq += 1;
-        let refuse =
-            |message: &str| Some(serde_json::json!({"ok": false, "output": message}).to_string());
-        if self.seq > CALLS {
-            return refuse(&format!("A script can make at most {CALLS} calls."));
+        self.argument_bytes += arguments.len();
+        let mut refuse = |limit: Limit, message: String| {
+            self.refused.get_or_insert(limit);
+            Some(serde_json::json!({"ok": false, "output": message}).to_string())
+        };
+        if self.seq > self.limits.calls as usize {
+            return refuse(
+                Limit::Calls,
+                format!(
+                    "A script can make at most {} calls. Make fewer, larger calls, or split the \
+                     work over several run_code calls.",
+                    self.limits.calls
+                ),
+            );
         }
         if arguments.len() > ARGUMENTS {
-            return refuse(&format!(
-                "Arguments to `{name}` are over {} KiB.",
-                ARGUMENTS >> 10
-            ));
+            return refuse(
+                Limit::Arguments,
+                format!(
+                    "Arguments to `{name}` are over {} KiB. Pass less in one call.",
+                    ARGUMENTS >> 10
+                ),
+            );
+        }
+        if self.argument_bytes > self.limits.arguments {
+            return refuse(
+                Limit::Arguments,
+                format!(
+                    "The script's arguments passed {} MiB in all. Pass less in each call.",
+                    self.limits.arguments >> 20
+                ),
+            );
         }
         let Some(record) = self.records.get(self.seq - 1) else {
             if self.spent {
-                return refuse(&super::spent());
-            }
-            self.call_bytes += arguments.len();
-            if self.call_bytes > ALL_ARGUMENTS {
-                return refuse(&format!(
-                    "Calls made at once can carry at most {} MiB of arguments.",
-                    ALL_ARGUMENTS >> 20
-                ));
+                let message = super::spent(self.limits.results);
+                return refuse(Limit::Results, message);
             }
             self.calls.push(ScriptCall { name, arguments });
             return None;
@@ -109,7 +123,8 @@ impl Run {
         if record.name != name || record.arguments != arguments {
             self.diverged.get_or_insert(format!(
                 "The script changed between runs. Call {} was `{}` and is now `{name}`. A \
-                 script must make the same calls each time it runs.",
+                 script must make the same calls each time it runs: do not branch on timing or \
+                 on anything outside its results.",
                 self.seq, record.name
             ));
             return None;
@@ -118,7 +133,7 @@ impl Run {
     }
 
     fn log(&mut self, line: String) {
-        if self.log_bytes + line.len() > LOGS {
+        if self.log_bytes + line.len() > self.limits.logs {
             self.logs_cut = true;
             return;
         }
@@ -129,40 +144,78 @@ impl Run {
     fn logs(&self) -> Vec<String> {
         let mut logs = self.logs.clone();
         if self.logs_cut {
-            logs.push(format!("[output over {} KiB was cut]", LOGS >> 10));
+            logs.push(format!(
+                "[output over {} KiB was cut; log less]",
+                self.limits.logs >> 10
+            ));
         }
         logs
     }
 
-    fn step(self) -> Step {
-        if let Some(reason) = self.stopped {
-            return Step::Failed(reason.to_string());
+    fn step(self) -> (Step, Option<Limit>) {
+        if let Some(limit) = self.stopped {
+            let message = match limit {
+                Limit::Compute => format!(
+                    "The script used its {}s of compute. Do less work in one run: work done \
+                     before a call is done again each time the script resumes.",
+                    self.limits.compute_ms / 1000
+                ),
+                _ => format!(
+                    "The script ran out of its {} MiB of memory. Keep less: take only the \
+                     fields you need from each result.",
+                    self.limits.memory >> 20
+                ),
+            };
+            return (Step::Failed(message), Some(limit));
         }
         if let Some(diverged) = &self.diverged {
-            return Step::Failed(diverged.clone());
+            return (Step::Failed(diverged.clone()), Some(Limit::Diverged));
         }
         let logs = self.logs();
+        let cut = self.logs_cut.then_some(Limit::Logs);
         match &self.outcome {
-            Some(Ok(value)) => Step::Done(rendered(value.as_deref(), &logs)),
-            Some(Err(error)) => Step::Failed(with_logs(error, &logs)),
-            None if !self.calls.is_empty() => Step::Calls(self.calls),
-            None => Step::Failed(with_logs(
-                "The script waits on a promise that never settles.",
-                &logs,
-            )),
+            Some(Ok(value)) => {
+                let (text, over) = rendered(value.as_deref(), &logs, self.limits.returned);
+                (Step::Done(text), over.or(self.refused).or(cut))
+            }
+            Some(Err(error)) => {
+                let limit = match error {
+                    e if e.contains("out of memory") => Some(Limit::Memory),
+                    e if e.contains("stack overflow") || e.contains("call stack") => {
+                        Some(Limit::Stack)
+                    }
+                    _ => self.refused,
+                };
+                (Step::Failed(with_logs(error, &logs)), limit)
+            }
+            None if !self.calls.is_empty() => (Step::Calls(self.calls), self.refused),
+            None => (
+                Step::Failed(with_logs(
+                    "The script waits on a promise that never settles. Await only tool calls \
+                     and promises built from them.",
+                    &logs,
+                )),
+                Some(Limit::NeverSettles),
+            ),
         }
     }
 }
 
-fn rendered(value: Option<&str>, logs: &[String]) -> String {
+fn rendered(value: Option<&str>, logs: &[String], returned: usize) -> (String, Option<Limit>) {
     let mut out = serde_json::Map::new();
+    let mut over = None;
     if let Some(value) = value {
-        let value = match value.len() > RESULT {
-            true => serde_json::Value::String(format!(
-                "[the result is {} KiB, over the {} KiB limit; return less]",
-                value.len() >> 10,
-                RESULT >> 10
-            )),
+        let value = match value.len() > returned {
+            true => {
+                over = Some(Limit::Returned);
+                let start: String = value.chars().take(PREVIEW).collect();
+                serde_json::Value::String(format!(
+                    "[the result is {} KiB, over the {} KiB limit; return a summary. It began: \
+                     {start}]",
+                    value.len() >> 10,
+                    returned >> 10
+                ))
+            }
             false => serde_json::from_str(value).unwrap_or(serde_json::Value::Null),
         };
         out.insert("result".to_string(), value);
@@ -170,7 +223,7 @@ fn rendered(value: Option<&str>, logs: &[String]) -> String {
     if !logs.is_empty() {
         out.insert("logs".to_string(), serde_json::json!(logs));
     }
-    serde_json::Value::Object(out).to_string()
+    (serde_json::Value::Object(out).to_string(), over)
 }
 
 fn with_logs(error: &str, logs: &[String]) -> String {
@@ -180,43 +233,71 @@ fn with_logs(error: &str, logs: &[String]) -> String {
     }
 }
 
+/// CPU this thread has used.
+fn cpu_ms() -> u64 {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) };
+    now.tv_sec as u64 * 1000 + now.tv_nsec as u64 / 1_000_000
+}
+
 /// Run `script` past the calls it already made. The same script and records
 /// always give the same step.
-pub fn run(script: &Script) -> Step {
+pub fn run(script: &Script) -> Ran {
     if !super::supports(script.version) {
-        return Step::Failed(format!(
+        let step = Step::Failed(format!(
             "The runner takes versions {} to {}, not {}.",
             super::OLDEST,
             super::VERSION,
             script.version
         ));
+        return Ran {
+            step,
+            stats: Stats::default(),
+        };
     }
-    match execute(script) {
-        Ok(step) => step,
-        Err(e) => Step::Failed(format!("The script could not run: {e}")),
+    let started = cpu_ms();
+    let (step, heap, limit) = match execute(script, started) {
+        Ok(ran) => ran,
+        Err(e) => (
+            Step::Failed(format!("The script could not run: {e}")),
+            0,
+            None,
+        ),
+    };
+    Ran {
+        step,
+        stats: Stats {
+            heap,
+            cpu_ms: cpu_ms().saturating_sub(started),
+            limit,
+            warm: false,
+        },
     }
 }
 
-fn execute(script: &Script) -> rquickjs::Result<Step> {
+fn execute(script: &Script, started: u64) -> rquickjs::Result<(Step, usize, Option<Limit>)> {
+    let limits = script.limits.clone();
     let run = Rc::new(RefCell::new(Run {
+        limits: limits.clone(),
         records: script.calls.clone(),
         spent: script.spent,
         ..Run::default()
     }));
     let rt = Runtime::new()?;
-    rt.set_memory_limit(MEMORY);
+    rt.set_memory_limit(limits.memory);
     rt.set_max_stack_size(STACK);
-    let started = Instant::now();
     let mut ticks = 0u64;
     let stop = run.clone();
+    let compute = limits.compute_ms;
     rt.set_interrupt_handler(Some(Box::new(move || {
         ticks += 1;
-        let reason = match () {
-            _ if ticks > TICKS => "The script ran too long.",
-            _ if started.elapsed() > WALL => "The script ran too long.",
-            _ => return false,
-        };
-        stop.borrow_mut().stopped.get_or_insert(reason);
+        if ticks <= TICKS && cpu_ms().saturating_sub(started) <= compute {
+            return false;
+        }
+        stop.borrow_mut().stopped.get_or_insert(Limit::Compute);
         true
     })));
     let ctx = Context::full(&rt)?;
@@ -274,21 +355,23 @@ fn execute(script: &Script) -> rquickjs::Result<Step> {
         }
     }
     if rt.is_job_pending() {
-        run.borrow_mut()
-            .stopped
-            .get_or_insert("The script ran too long.");
+        run.borrow_mut().stopped.get_or_insert(Limit::Compute);
     }
-    if rt.memory_usage().malloc_size as usize > MEMORY / 10 * 9 {
-        run.borrow_mut()
-            .stopped
-            .get_or_insert("The script ran out of memory.");
+    let heap = rt.memory_usage().malloc_size.max(0) as usize;
+    {
+        let mut run = run.borrow_mut();
+        let finished = matches!(run.outcome, Some(Ok(_)));
+        if !finished && run.calls.is_empty() && heap > limits.memory / 10 * 9 {
+            run.stopped.get_or_insert(Limit::Memory);
+        }
     }
     drop(ctx);
     rt.set_interrupt_handler(None);
     let run = Rc::try_unwrap(run)
         .map(RefCell::into_inner)
         .unwrap_or_else(|r| std::mem::take(&mut *r.borrow_mut()));
-    Ok(run.step())
+    let (step, limit) = run.step();
+    Ok((step, heap, limit))
 }
 
 fn exception(ctx: &rquickjs::Ctx<'_>) -> String {
@@ -311,8 +394,17 @@ fn exception(ctx: &rquickjs::Ctx<'_>) -> String {
 mod tests {
     use super::*;
 
+    fn run(script: &Script) -> Step {
+        super::run(script).step
+    }
+
     fn script(code: &str, calls: Vec<ScriptRecord>) -> Script {
         Script {
+            limits: Limits {
+                compute_ms: 1_000,
+                memory: 16 << 20,
+                ..Limits::default()
+            },
             code: code.to_string(),
             calls,
             seed: 7,
@@ -440,7 +532,10 @@ mod tests {
             "try { while (true) {} } catch (e) { return 'caught'; }",
             vec![],
         ));
-        assert_eq!(step, Step::Failed("The script ran too long.".into()));
+        assert!(
+            matches!(&step, Step::Failed(m) if m.contains("1s of compute")),
+            "{step:?}"
+        );
     }
 
     #[test]
@@ -450,7 +545,7 @@ mod tests {
             vec![],
         ));
         assert!(
-            matches!(&step, Step::Failed(m) if m.contains("too long") || m.contains("memory")),
+            matches!(&step, Step::Failed(m) if m.contains("compute") || m.contains("memory")),
             "{step:?}"
         );
     }
@@ -531,8 +626,54 @@ mod tests {
     fn an_oversized_result_is_replaced_with_a_note() {
         let step = run(&script("return 'x'.repeat(100000);", vec![]));
         assert!(
-            matches!(&step, Step::Done(t) if t.contains("over the 32 KiB limit")),
+            matches!(&step, Step::Done(t) if t.contains("over the 64 KiB limit") && t.contains("It began:")),
             "{step:?}"
         );
+    }
+
+    #[test]
+    fn a_script_that_finishes_is_not_failed_for_the_memory_it_still_holds() {
+        let code = "const kept = Array.from({ length: 40000 }, (_, i) => ({ i, s: 'x'.repeat(200) })); return kept.length;";
+        let step = run(&script(code, vec![]));
+        assert_eq!(step, Step::Done(r#"{"result":40000}"#.into()));
+    }
+
+    #[test]
+    fn calls_past_the_limit_throw_what_the_script_can_catch() {
+        let mut limited = script(
+            "await tools.a(); await tools.b(); try { await tools.c(); } catch (e) { return e.message; }",
+            vec![record("a", "{}", true, "1"), record("b", "{}", true, "2")],
+        );
+        limited.limits.calls = 2;
+        let ran = super::run(&limited);
+        assert!(
+            matches!(&ran.step, Step::Done(t) if t.contains("at most 2 calls")),
+            "{ran:?}"
+        );
+        assert_eq!(ran.stats.limit, Some(Limit::Calls));
+    }
+
+    #[test]
+    fn arguments_past_the_limit_throw() {
+        let mut limited = script(
+            "try { await tools.a({ s: 'x'.repeat(2000) }); } catch (e) { return e.message; }",
+            vec![],
+        );
+        limited.limits.arguments = 1000;
+        let step = run(&limited);
+        assert!(
+            matches!(&step, Step::Done(t) if t.contains("arguments passed")),
+            "{step:?}"
+        );
+    }
+
+    #[test]
+    fn a_run_says_which_limit_stopped_it() {
+        let ran = super::run(&script("while (true) {}", vec![]));
+        assert_eq!(ran.stats.limit, Some(Limit::Compute));
+        assert!(ran.stats.cpu_ms >= 1_000, "{:?}", ran.stats);
+        let ran = super::run(&script("return 1;", vec![]));
+        assert_eq!(ran.stats.limit, None);
+        assert!(ran.stats.heap > 0);
     }
 }

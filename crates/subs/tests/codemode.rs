@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use substructure_host::codemode::{ProcessRunner, RunError, Script, ScriptRunner, Step, ARG};
+use substructure_host::codemode::{ProcessRunner, Ran, RunError, Script, ScriptRunner, ARG};
 use substructure_host::event_store::Seq;
 use substructure_host::llm::{
     CallContext, InMemoryTokenDeltaTransport, LlmBlock, LlmBlocks, LlmCallError, LlmCallable,
@@ -30,6 +30,7 @@ use substructure_host::worker::{AgentEntry, Hosting, StaticAgentDirectory, Worke
 use substructure_host::{Caller, HandleClientInput, Runtime, RuntimeConfig, RuntimeDeps};
 
 const TENANT: &str = "default";
+const WAIT: Duration = Duration::from_secs(60);
 /// Short, so a restarted engine takes over what the crashed one held.
 const LEASE: Duration = Duration::from_secs(2);
 
@@ -145,7 +146,8 @@ impl Engine {
         worker: Option<String>,
         seen: Arc<Mutex<Seen>>,
     ) -> Self {
-        Engine::with_runner(db, code, config, worker, seen, Arc::new(runner())).await
+        let runner = Arc::new(runner());
+        Engine::with_runner(db, code, config, worker, seen, runner, WAIT).await
     }
 
     async fn with_runner(
@@ -155,6 +157,7 @@ impl Engine {
         worker: Option<String>,
         seen: Arc<Mutex<Seen>>,
         runner: Arc<dyn ScriptRunner>,
+        wait: Duration,
     ) -> Self {
         let db = SqliteDb::open(db.to_str().unwrap(), Duration::from_secs(5)).unwrap();
         let agent = AgentEntry {
@@ -214,6 +217,7 @@ impl Engine {
                 wake_poll_interval: Duration::from_millis(100),
                 worker_retry_resolver: Arc::new(Retry),
                 script_runner: runner,
+                script_wait: wait,
                 ..RuntimeConfig::default()
             },
         )
@@ -314,7 +318,7 @@ struct Flaky {
 
 #[async_trait]
 impl ScriptRunner for Flaky {
-    async fn run(&self, script: Script) -> Result<Step, RunError> {
+    async fn run(&self, script: Script) -> Result<Ran, RunError> {
         if std::mem::take(&mut *self.down.lock().unwrap()) {
             return Err(RunError("the code machine is restarting".into()));
         }
@@ -514,6 +518,7 @@ async fn a_step_the_runner_could_not_take_is_tried_again() {
         None,
         seen.clone(),
         flaky.clone(),
+        WAIT,
     )
     .await;
     let turn = engine.say().await;
@@ -526,4 +531,29 @@ async fn a_step_the_runner_could_not_take_is_tried_again() {
         .clone()
         .expect("the model heard the result");
     assert!(result.contains(r#"\"result\":42"#), "{result}");
+}
+
+#[tokio::test]
+async fn a_step_that_waits_too_long_fails_and_says_why() {
+    let dir = tempfile::tempdir().unwrap();
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let engine = Engine::with_runner(
+        &dir.path().join("subs.db"),
+        "return 1;",
+        agent(vec![], false),
+        None,
+        seen.clone(),
+        Arc::new(runner()),
+        Duration::ZERO,
+    )
+    .await;
+    let turn = engine.say().await;
+    engine.settled(turn).await;
+    let result = seen
+        .lock()
+        .unwrap()
+        .result
+        .clone()
+        .expect("the model heard");
+    assert!(result.contains("waited"), "{result}");
 }

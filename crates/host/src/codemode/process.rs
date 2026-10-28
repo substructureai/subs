@@ -12,7 +12,8 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
-use super::{Script, Step, ARG};
+use super::child::DATA;
+use super::{Ran, Script, Stats, Step, ARG};
 
 /// Runs one step of a script. A runner keeps nothing between steps, so any
 /// runner can take any step: a process here, a machine elsewhere, a service.
@@ -20,9 +21,10 @@ use super::{Script, Step, ARG};
 /// lying.
 #[async_trait]
 pub trait ScriptRunner: Send + Sync {
-    /// The step the script reached, or an error that a later try may not
-    /// meet. A failed script is a [`Step::Failed`], not an error.
-    async fn run(&self, script: Script) -> Result<Step, RunError>;
+    /// The step the script reached and what it took, or an error that a
+    /// later try may not meet. A failed script is a [`Step::Failed`], not an
+    /// error. A runner holds the script to its [`super::Limits`].
+    async fn run(&self, script: Script) -> Result<Ran, RunError>;
 }
 
 /// The runner could not take the step this time: it was down, busy, or of
@@ -39,7 +41,10 @@ impl fmt::Display for RunError {
 impl std::error::Error for RunError {}
 
 const READY: Duration = Duration::from_secs(10);
-const DEADLINE: Duration = Duration::from_secs(15);
+/// Past a script's compute limit, for loading it and for work QuickJS cannot
+/// interrupt.
+const SLACK: Duration = Duration::from_secs(10);
+const DATA_MIB: u64 = 256;
 const ANSWER: u64 = 64 << 20;
 
 /// Runs each step in a fresh confined process started from `program`, which
@@ -47,7 +52,8 @@ const ANSWER: u64 = 64 << 20;
 pub struct ProcessRunner {
     program: PathBuf,
     args: Vec<OsString>,
-    deadline: Duration,
+    deadline: Option<Duration>,
+    data_mib: u64,
     spare: Arc<Mutex<Option<Worker>>>,
     refilling: Arc<AtomicBool>,
 }
@@ -78,14 +84,29 @@ impl ProcessRunner {
         ProcessRunner {
             program,
             args,
-            deadline: DEADLINE,
+            deadline: None,
+            data_mib: DATA_MIB,
             spare: Default::default(),
             refilling: Default::default(),
         }
     }
 
+    /// A fixed deadline per step, in place of the script's compute limit
+    /// plus slack.
     pub fn with_deadline(self, deadline: Duration) -> Self {
-        ProcessRunner { deadline, ..self }
+        ProcessRunner {
+            deadline: Some(deadline),
+            ..self
+        }
+    }
+
+    /// The most heap a process may take, script and records together. Keep it
+    /// above the scripts' memory limit.
+    pub fn with_data_limit(self, mib: u64) -> Self {
+        ProcessRunner {
+            data_mib: mib,
+            ..self
+        }
     }
 
     /// The command that starts a runner: no environment, `/` as its
@@ -94,6 +115,7 @@ impl ProcessRunner {
         let mut command = Command::new(&self.program);
         command
             .args(&self.args)
+            .arg(format!("{DATA}{}", self.data_mib))
             .env_clear()
             .current_dir("/")
             .stdin(Stdio::piped())
@@ -172,12 +194,15 @@ impl ProcessRunner {
         }
     }
 
-    async fn exchange(&self, worker: &mut Worker, script: &Script) -> io::Result<Step> {
+    async fn exchange(&self, worker: &mut Worker, script: &Script) -> io::Result<Ran> {
         let mut request = serde_json::to_vec(script)?;
         request.push(b'\n');
         worker.stdin.write_all(&request).await?;
         worker.stdin.flush().await?;
-        let line = tokio::time::timeout(self.deadline, read_line(&mut worker.stdout))
+        let deadline = self
+            .deadline
+            .unwrap_or(Duration::from_millis(script.limits.compute_ms) + SLACK);
+        let line = tokio::time::timeout(deadline, read_line(&mut worker.stdout))
             .await
             .map_err(|_| io::Error::other("the script ran too long"))??;
         Ok(serde_json::from_slice(&line)?)
@@ -186,19 +211,32 @@ impl ProcessRunner {
 
 #[async_trait]
 impl ScriptRunner for ProcessRunner {
-    async fn run(&self, script: Script) -> Result<Step, RunError> {
-        let worker = match self.take_spare().await {
+    async fn run(&self, script: Script) -> Result<Ran, RunError> {
+        let spare = self.take_spare().await;
+        let warm = spare.is_some();
+        let worker = match spare {
             Some(worker) => Ok(worker),
             None => self.start().await,
         };
         self.refill();
+        let failed = |message: String, limit| Ran {
+            step: Step::Failed(message),
+            stats: Stats {
+                limit: Some(limit),
+                warm,
+                ..Stats::default()
+            },
+        };
         let mut worker = match worker {
             Ok(worker) => worker,
             Err(Start::Again(e)) => {
                 return Err(RunError(format!("the sandbox did not start: {e}")))
             }
             Err(Start::Never(e)) => {
-                return Ok(Step::Failed(format!("The sandbox could not start: {e}")))
+                return Ok(failed(
+                    format!("The sandbox could not start: {e}"),
+                    super::Limit::Start,
+                ))
             }
         };
         let (oldest, newest) = worker.versions;
@@ -211,7 +249,19 @@ impl ScriptRunner for ProcessRunner {
         }
         let answer = self.exchange(&mut worker, &script).await;
         let _ = worker.process.start_kill();
-        Ok(answer.unwrap_or_else(|e| Step::Failed(format!("The sandbox stopped: {e}"))))
+        Ok(match answer {
+            Ok(mut ran) => {
+                ran.stats.warm = warm;
+                ran
+            }
+            Err(e) => failed(
+                format!(
+                    "The script stopped: {e}. It may have looped inside one call, such as a \
+                     regular expression or a large JSON.parse, or run out of memory."
+                ),
+                super::Limit::Deadline,
+            ),
+        })
     }
 }
 

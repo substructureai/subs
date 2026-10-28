@@ -3,12 +3,36 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
-/// How many scripts run at once, and how many of them one tenant may hold.
+/// How many scripts run at once. A tenant may take every slot while no other
+/// tenant waits; while another does, it keeps at most all but one.
 pub struct Admission {
     slots: usize,
     permits: Arc<Semaphore>,
-    tenants: Mutex<HashMap<String, usize>>,
+    tenants: Mutex<Tenants>,
     turn: Notify,
+}
+
+#[derive(Default)]
+struct Tenants {
+    running: HashMap<String, usize>,
+    waiting: HashMap<String, usize>,
+}
+
+impl Tenants {
+    fn others_wait(&self, tenant: &str) -> bool {
+        self.waiting.keys().any(|t| t != tenant)
+    }
+
+    fn change(map: &mut HashMap<String, usize>, tenant: &str, up: bool) {
+        let count = map.entry(tenant.to_string()).or_default();
+        match up {
+            true => *count += 1,
+            false => *count = count.saturating_sub(1),
+        }
+        if *count == 0 {
+            map.remove(tenant);
+        }
+    }
 }
 
 /// A slot, held until dropped.
@@ -29,26 +53,29 @@ impl Admission {
         }
     }
 
-    /// A tenant takes all slots but one, so another tenant always gets a turn.
-    fn per_tenant(&self) -> usize {
-        self.slots.saturating_sub(1).max(1)
-    }
-
     pub async fn admit(self: &Arc<Self>, tenant: &str) -> Ticket {
+        let mut waiting: Option<Waiting> = None;
         loop {
             let notified = self.turn.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             let admitted = {
                 let mut tenants = self.tenants.lock().expect("tenants");
-                let running = tenants.entry(tenant.to_string()).or_default();
-                let admitted = *running < self.per_tenant();
+                let cap = match tenants.others_wait(tenant) {
+                    true => self.slots.saturating_sub(1).max(1),
+                    false => self.slots,
+                };
+                let running = tenants.running.get(tenant).copied().unwrap_or(0);
+                let admitted = running < cap && self.permits.available_permits() > 0;
                 if admitted {
-                    *running += 1;
+                    Tenants::change(&mut tenants.running, tenant, true);
+                } else if waiting.is_none() {
+                    Tenants::change(&mut tenants.waiting, tenant, true);
                 }
                 admitted
             };
             if admitted {
+                drop(waiting.take());
                 let permit = self.permits.clone().acquire_owned().await.expect("open");
                 return Ticket {
                     admission: self.clone(),
@@ -56,20 +83,32 @@ impl Admission {
                     _permit: permit,
                 };
             }
+            waiting.get_or_insert_with(|| Waiting {
+                admission: self.clone(),
+                tenant: tenant.to_string(),
+            });
             notified.await;
         }
+    }
+}
+
+/// A tenant waiting for a slot, until dropped.
+struct Waiting {
+    admission: Arc<Admission>,
+    tenant: String,
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        let mut tenants = self.admission.tenants.lock().expect("tenants");
+        Tenants::change(&mut tenants.waiting, &self.tenant, false);
     }
 }
 
 impl Drop for Ticket {
     fn drop(&mut self) {
         let mut tenants = self.admission.tenants.lock().expect("tenants");
-        if let Some(running) = tenants.get_mut(&self.tenant) {
-            *running -= 1;
-            if *running == 0 {
-                tenants.remove(&self.tenant);
-            }
-        }
+        Tenants::change(&mut tenants.running, &self.tenant, false);
         drop(tenants);
         self.admission.turn.notify_waiters();
     }
@@ -80,36 +119,67 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    #[tokio::test]
-    async fn one_tenant_cannot_take_every_slot() {
-        let admission = Arc::new(Admission::new(3));
-        let a = admission.admit("greedy").await;
-        let b = admission.admit("greedy").await;
-        let third = tokio::time::timeout(Duration::from_millis(50), admission.admit("greedy"));
-        assert!(
-            third.await.is_err(),
-            "the greedy tenant waits for its own slot"
-        );
-        let polite = tokio::time::timeout(Duration::from_millis(50), admission.admit("polite"));
-        assert!(polite.await.is_ok(), "another tenant gets the slot left");
-        drop((a, b));
+    async fn soon<T>(f: impl std::future::Future<Output = T>) -> Option<T> {
+        tokio::time::timeout(Duration::from_millis(50), f)
+            .await
+            .ok()
     }
 
     #[tokio::test]
-    async fn a_slot_is_freed_when_its_ticket_drops() {
-        let admission = Arc::new(Admission::new(1));
-        let held = admission.admit("t").await;
-        let next = {
+    async fn a_tenant_alone_takes_every_slot() {
+        let admission = Arc::new(Admission::new(3));
+        let a = admission.admit("t").await;
+        let b = admission.admit("t").await;
+        let c = soon(admission.admit("t")).await;
+        assert!(
+            c.is_some(),
+            "no one else waits, so the last slot is its too"
+        );
+        drop((a, b, c));
+    }
+
+    #[tokio::test]
+    async fn a_waiting_tenant_gets_the_next_slot() {
+        let admission = Arc::new(Admission::new(2));
+        let a = admission.admit("greedy").await;
+        let b = admission.admit("greedy").await;
+        let polite = {
             let admission = admission.clone();
-            tokio::spawn(async move { admission.admit("t").await })
+            tokio::spawn(async move { admission.admit("polite").await })
         };
         tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(!next.is_finished());
-        drop(held);
-        tokio::time::timeout(Duration::from_secs(1), next)
+        let greedy = {
+            let admission = admission.clone();
+            tokio::spawn(async move { admission.admit("greedy").await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(a);
+        let polite = tokio::time::timeout(Duration::from_secs(1), polite)
             .await
-            .expect("the waiting script is admitted")
+            .expect("the waiting tenant gets the freed slot")
             .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!greedy.is_finished(), "the greedy tenant keeps all but one");
+        drop((b, polite));
+        tokio::time::timeout(Duration::from_secs(1), greedy)
+            .await
+            .expect("and gets a slot once one is free")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_tenant_that_stops_waiting_is_no_longer_counted() {
+        let admission = Arc::new(Admission::new(2));
+        let a = admission.admit("greedy").await;
+        let b = admission.admit("greedy").await;
+        assert!(soon(admission.admit("gone")).await.is_none());
+        drop(a);
+        let c = soon(admission.admit("greedy")).await;
+        assert!(
+            c.is_some(),
+            "the tenant that gave up does not hold a slot back"
+        );
+        drop((b, c));
     }
 
     #[tokio::test]

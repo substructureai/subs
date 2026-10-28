@@ -501,7 +501,7 @@ impl Session {
 
     /// A `run_code` call's script and the calls it made, when it is ready to
     /// run again.
-    pub fn script(&self, id: &str) -> Option<Script> {
+    pub fn script(&self, id: &str, limits: &crate::codemode::Limits) -> Option<Script> {
         let state = &self.state;
         let effect = self.open(EffectKind::ToolCall, id, None)?;
         if effect.tool()?.target != Some(ConnectorTarget::Code) || state.script_waits(id) {
@@ -522,13 +522,13 @@ impl Session {
                 };
                 let output = tc.result.clone().unwrap_or_default();
                 read += output.len();
-                spent |= read > crate::codemode::RESULTS;
+                spent |= read > limits.results;
                 Some(match spent {
                     true => ScriptRecord {
                         name,
                         arguments,
                         ok: false,
-                        output: crate::codemode::spent(),
+                        output: crate::codemode::spent(limits.results),
                     },
                     false => ScriptRecord {
                         name,
@@ -539,9 +539,7 @@ impl Session {
                 })
             })
             .collect();
-        let at = state.at(effect.anchor.as_deref());
-        let config = at.resolve_agent_for();
-        let tools = crate::codemode::callable(config.as_ref(), &at.connector_tools().tools);
+        let tools = effect.tool()?.script_tools.clone();
         Some(Script {
             version: crate::codemode::VERSION,
             tools,
@@ -552,6 +550,7 @@ impl Session {
                 .to_string(),
             calls,
             spent,
+            limits: limits.clone(),
             seed: xxhash_rust::xxh3::xxh3_64(id.as_bytes()),
             now_ms: effect
                 .tracking

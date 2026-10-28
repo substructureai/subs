@@ -467,6 +467,10 @@ pub struct ToolCallState {
     pub is_error: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub script: Option<ScriptCaller>,
+    /// For `run_code`: the names its script's `tools` lists, as they were when
+    /// the call was made.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub script_tools: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1163,6 +1167,14 @@ impl SessionState {
             }
         } else {
             self.turn_calls.tool.count += 1;
+            let script_tools = match payload.target {
+                Some(ConnectorTarget::Code) => {
+                    let at = self.at_head();
+                    let config = at.resolve_agent_for();
+                    crate::codemode::callable(config.as_ref(), &at.connector_tools().tools)
+                }
+                _ => Vec::new(),
+            };
             self.insert_effect(
                 &payload.id,
                 EffectTracking::new_queued(payload.retry.clone()),
@@ -1174,6 +1186,7 @@ impl SessionState {
                     result: None,
                     is_error: false,
                     script: payload.script.clone(),
+                    script_tools,
                 }),
             );
             if let Some(script) = &payload.script {

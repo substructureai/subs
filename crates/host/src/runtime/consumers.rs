@@ -135,6 +135,7 @@ impl WorkRouter {
                         tool_call_id: call.tool_call_id,
                         attempt: call.attempt,
                         retry: call.retry,
+                        queued_at: chrono::Utc::now(),
                     };
                     let envelope = uuid::Uuid::now_v7().to_string();
                     self.scripts
