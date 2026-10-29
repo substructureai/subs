@@ -477,6 +477,10 @@ pub struct ToolCallState {
     /// For `run_code`: CPU its script's runs have used.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub script_cpu_ms: u64,
+    /// For `run_code`: calls its script asked for that no decision has
+    /// started or refused yet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub script_asked: Vec<ScriptAsk>,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -1010,9 +1014,27 @@ impl SessionState {
     }
 
     fn script_waits(&self, parent: &str) -> bool {
-        self.script_calls(parent)
-            .iter()
-            .any(|e| e.tracking.is_unsettled())
+        !self.script_asked(parent).is_empty()
+            || self
+                .script_calls(parent)
+                .iter()
+                .any(|e| e.tracking.is_unsettled())
+    }
+
+    /// The calls a `run_code` call's script asked for that no decision has
+    /// answered yet.
+    pub fn script_asked(&self, parent: &str) -> &[ScriptAsk] {
+        self.tool_call(parent)
+            .map(|t| t.script_asked.as_slice())
+            .unwrap_or_default()
+    }
+
+    /// The `run_code` call that asked for `id`, and the ask.
+    pub fn script_ask(&self, id: &str) -> Option<(&str, &ScriptAsk)> {
+        self.effects_of(EffectKind::ToolCall).find_map(|e| {
+            let ask = e.tool()?.script_asked.iter().find(|a| a.id == id)?;
+            Some((e.id.as_str(), ask))
+        })
     }
 
     pub fn subagent(&self, id: &str) -> Option<&SubagentCallState> {
@@ -1192,7 +1214,7 @@ impl SessionState {
                     let config = at.resolve_agent_for();
                     let tools =
                         crate::codemode::callable(config.as_ref(), &at.connector_tools().tools);
-                    (tools, config.and_then(|c| c.code_mode).unwrap_or_default())
+                    (tools, config.and_then(|c| c.codemode).unwrap_or_default())
                 }
                 _ => (Vec::new(), Default::default()),
             };
@@ -1210,9 +1232,16 @@ impl SessionState {
                     script_tools,
                     script_language,
                     script_cpu_ms: 0,
+                    script_asked: Vec::new(),
                 }),
             );
             if let Some(script) = &payload.script {
+                if let Some(parent) = self
+                    .effect_mut(EffectKind::ToolCall, &script.parent)
+                    .and_then(|e| e.tool_mut())
+                {
+                    parent.script_asked.retain(|a| a.id != payload.id);
+                }
                 let anchor = self
                     .effect(EffectKind::ToolCall, &script.parent)
                     .and_then(|e| e.anchor.clone());
@@ -1463,6 +1492,7 @@ impl SessionState {
                     .and_then(|e| e.tool_mut())
                 {
                     tc.script_cpu_ms += payload.cpu_ms;
+                    tc.script_asked.extend(payload.asked.iter().cloned());
                 }
             }
             EventPayload::ToolCallErrored(payload) => {
@@ -1842,9 +1872,9 @@ impl SessionState {
 
     pub fn trigger_anchor(&self, trigger: &Trigger) -> Option<&str> {
         match trigger {
-            Trigger::ToolFinished { id, .. } | Trigger::ToolExecute { id, .. } => {
-                self.effect(EffectKind::ToolCall, id)
-            }
+            Trigger::ToolFinished { id, .. }
+            | Trigger::ToolExecute { id, .. }
+            | Trigger::CodemodeCalls { id, .. } => self.effect(EffectKind::ToolCall, id),
             Trigger::SubagentFinished { id, .. } => self.effect(EffectKind::Subagent, id),
             Trigger::LlmFinished { id, .. } | Trigger::LlmExecute { id, .. } => {
                 self.effect(EffectKind::LlmCall, id)
@@ -2073,7 +2103,7 @@ impl SessionState {
                 crate::attachments::tools::definitions(attachments),
             ));
         }
-        if let Some(language) = config.code_mode {
+        if let Some(language) = config.codemode {
             resolutions.push(filter::Resolution::of(vec![crate::codemode::tool(
                 language,
             )]));
@@ -2515,7 +2545,7 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
             .chain(connector)
             .filter(|t| !locked.contains_key(&t.name))
             .filter(|t| {
-                let code = config.code_mode.is_some()
+                let code = config.codemode.is_some()
                     && crate::codemode::reach(&t.name, Some(&config), &connector_tools)
                         == crate::codemode::Reach::Code;
                 code == from_code
@@ -3290,7 +3320,7 @@ fn describe_run_code(
     let description = {
         let declared: Vec<&LlmTool> = tools.iter().filter(|t| !t.defer && in_code(t)).collect();
         crate::codemode::describe(
-            config.and_then(|c| c.code_mode).unwrap_or_default(),
+            config.and_then(|c| c.codemode).unwrap_or_default(),
             &declared,
         )
     };

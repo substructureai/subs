@@ -1,12 +1,14 @@
 use serde_json::Value;
 
 use super::InterruptKind;
+use crate::events::ScriptAsk;
 use crate::propose::{
-    asked_about, recorded, reissue, resumed, route_tool_call, settled, siblings_answered, Proposing,
+    asked_about, call_tool, recorded, reissue, resumed, route_tool_call, script_calls, settled,
+    siblings_answered, Proposing,
 };
 use crate::protocol::{
     ConnectorTool, ConnectorToolKind, Content, DecisionAction, DecisionResponse, DraftMessage,
-    Role, ToolCall,
+    Message, Role, ToolCall,
 };
 use crate::state::inner_arguments;
 
@@ -30,6 +32,16 @@ impl InterruptKind for Approval {
         let connector_tools = p.state.connector_tools().tools;
         let connector_tools = connector_tools.as_slice();
         let pending_calls = p.pending_calls;
+        if let Some((parent, _)) = p.state.state().script_ask(tail) {
+            let asked = p.state.state().script_asked(parent);
+            return Some(script_resumed(
+                tail,
+                approved(payload),
+                asked,
+                transcript,
+                connector_tools,
+            ));
+        }
         let Some((at, call)) = asked_about(tail, transcript, dispatched) else {
             return Some(match config {
                 Some(c) => resumed(transcript, c),
@@ -118,6 +130,40 @@ pub fn ask(held: &ToolCall, connector_tools: &[ConnectorTool], remaining: usize)
     }
 }
 
+/// The answer about one of a script's calls: run it or refuse it, then ask
+/// about the next that needs approval, or run the rest.
+fn script_resumed(
+    id: &str,
+    approved: bool,
+    asked: &[ScriptAsk],
+    transcript: &[Message],
+    connector_tools: &[ConnectorTool],
+) -> DecisionResponse {
+    let calls: Vec<ToolCall> = asked.iter().map(ScriptAsk::tool_call).collect();
+    let (this, waiting): (Vec<ToolCall>, Vec<ToolCall>) =
+        calls.into_iter().partition(|c| c.id == id);
+    let mut actions: Vec<DecisionAction> = match approved {
+        true => this.iter().map(call_tool).collect(),
+        false => this
+            .iter()
+            .map(|c| DecisionAction::ToolError {
+                id: Some(c.id.clone()),
+                attempt: None,
+                error: format!("A person declined `{}`.", c.function.name),
+                retryable: false,
+                code: None,
+                detail: None,
+            })
+            .collect(),
+    };
+    actions.extend(script_calls(&waiting, connector_tools));
+    DecisionResponse {
+        messages: recorded(transcript),
+        actions,
+        ..Default::default()
+    }
+}
+
 fn refusal(call: &ToolCall) -> DraftMessage {
     DraftMessage {
         id: None,
@@ -180,4 +226,89 @@ fn target_of<'a>(
     connector_tools
         .iter()
         .find(|t| t.name == inner && t.kind.is_remote())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connectors::filter;
+    use crate::propose::script_calls;
+
+    fn tool(name: &str, approve: bool) -> ConnectorTool {
+        ConnectorTool {
+            approve,
+            ..filter::engine_tool(
+                name,
+                String::new(),
+                serde_json::json!({}),
+                ConnectorToolKind::Remote,
+            )
+        }
+    }
+
+    fn ask(id: &str, name: &str, seq: u32) -> ScriptAsk {
+        ScriptAsk {
+            id: id.to_string(),
+            seq,
+            name: name.to_string(),
+            arguments: "{}".to_string(),
+        }
+    }
+
+    fn tools() -> Vec<ConnectorTool> {
+        vec![tool("sentry__search", false), tool("sentry__delete", true)]
+    }
+
+    fn named(actions: &[DecisionAction]) -> Vec<String> {
+        actions
+            .iter()
+            .map(|a| match a {
+                DecisionAction::CallTool { id: Some(id), .. } => format!("run {id}"),
+                DecisionAction::ToolError { id: Some(id), .. } => format!("refuse {id}"),
+                DecisionAction::Interrupt {
+                    interrupt_id: Some(id),
+                    ..
+                } => format!("ask {id}"),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_scripts_calls_run_unless_one_needs_approval() {
+        let asked = [
+            ask("c1", "sentry__search", 1),
+            ask("c2", "sentry__search", 2),
+        ];
+        let calls: Vec<ToolCall> = asked.iter().map(ScriptAsk::tool_call).collect();
+        assert_eq!(named(&script_calls(&calls, &tools())), ["run c1", "run c2"]);
+
+        let asked = [
+            ask("c1", "sentry__search", 1),
+            ask("c2", "sentry__delete", 2),
+        ];
+        let calls: Vec<ToolCall> = asked.iter().map(ScriptAsk::tool_call).collect();
+        assert_eq!(
+            named(&script_calls(&calls, &tools())),
+            ["ask mcp-approve:c2"],
+            "a person is asked first, and the rest wait"
+        );
+    }
+
+    #[test]
+    fn an_answer_about_a_scripts_call_runs_or_refuses_it_then_the_rest() {
+        let asked = [
+            ask("c1", "sentry__search", 1),
+            ask("c2", "sentry__delete", 2),
+            ask("c3", "sentry__delete", 3),
+        ];
+        let approved = script_resumed("c2", true, &asked, &[], &tools());
+        assert_eq!(named(&approved.actions), ["run c2", "ask mcp-approve:c3"]);
+
+        let declined = script_resumed("c3", false, &asked[2..], &[], &tools());
+        assert_eq!(named(&declined.actions), ["refuse c3"]);
+
+        let last = script_resumed("c2", true, &asked[..2], &[], &tools());
+        assert_eq!(named(&last.actions), ["run c2", "run c1"]);
+    }
 }

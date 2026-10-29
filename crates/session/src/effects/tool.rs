@@ -191,45 +191,109 @@ fn script_step(
     cpu_ms: u64,
 ) -> Vec<EventPayload> {
     let made = state.script_calls(parent);
-    let stale = made.len() != known as usize || made.iter().any(|e| e.tracking.is_unsettled());
+    let stale = made.len() != known as usize
+        || made.iter().any(|e| e.tracking.is_unsettled())
+        || !state.script_asked(parent).is_empty();
     let is_script = state
         .tool_call(parent)
         .is_some_and(|t| t.target == Some(ConnectorTarget::Code));
     if stale || !is_script {
         return Vec::new();
     }
-    let stepped = EventPayload::ToolCallStepped(ToolCallStepped {
+    let asked: Vec<ScriptAsk> = calls
+        .into_iter()
+        .zip(known + 1..)
+        .map(|(call, seq)| ScriptAsk {
+            id: state.ids().next(),
+            seq,
+            name: call.name,
+            arguments: call.arguments,
+        })
+        .collect();
+    let trigger = Trigger::CodemodeCalls {
         id: parent.to_string(),
-        cpu_ms,
-    });
-    std::iter::once(stepped)
-        .chain(calls.into_iter().zip(known + 1..).map(|(call, seq)| {
-            let script = ScriptCaller {
-                parent: parent.to_string(),
-                seq,
-                called: None,
-            };
-            scripted(state, state.ids().next(), script, call.name, call.arguments)
-        }))
+        tool_calls: asked.iter().map(ScriptAsk::tool_call).collect(),
+    };
+    vec![
+        EventPayload::ToolCallStepped(ToolCallStepped {
+            id: parent.to_string(),
+            cpu_ms,
+            asked,
+        }),
+        decision_queued(state.ids(), trigger),
+    ]
+}
+
+/// Starts a call a script asked for, as `run` names it or as asked. `refused`
+/// ends it with that reason instead, as a decision's `tool.error` does.
+pub fn answer_ask(
+    state: &SessionState,
+    id: &str,
+    run: Option<(String, String)>,
+    refused: Option<String>,
+) -> Vec<EventPayload> {
+    let Some((parent, ask)) = state.script_ask(id) else {
+        return Vec::new();
+    };
+    let script = ScriptCaller {
+        parent: parent.to_string(),
+        seq: ask.seq,
+        called: None,
+    };
+    let asked = ScriptCall {
+        name: ask.name.clone(),
+        arguments: ask.arguments.clone(),
+    };
+    let run = run.unwrap_or_else(|| (asked.name.clone(), asked.arguments.clone()));
+    vec![scripted(state, id.to_string(), script, asked, run, refused)]
+}
+
+/// Ends with an error each call a script asked for that nothing can answer
+/// any more: no decision about it waits, and no interrupt holds it.
+pub fn unanswered(state: &SessionState) -> Vec<EventPayload> {
+    let deciding: Vec<&str> = state
+        .effects_of(EffectKind::Decision)
+        .filter_map(|e| match &e.decision()?.trigger {
+            Trigger::CodemodeCalls { id, .. } => Some(id.as_str()),
+            Trigger::InterruptResumed { .. } => Some(""),
+            _ => None,
+        })
+        .collect();
+    if deciding.contains(&"") {
+        return Vec::new();
+    }
+    state
+        .effects_of(EffectKind::ToolCall)
+        .filter(|e| !deciding.contains(&e.id.as_str()))
+        .filter(|e| !state.anchor_parked(e.anchor.as_deref()))
+        .flat_map(|e| e.tool().map(|t| t.script_asked.clone()).unwrap_or_default())
+        .flat_map(|ask| {
+            answer_ask(
+                state,
+                &ask.id,
+                None,
+                Some(format!("The worker did not run `{}`.", ask.name)),
+            )
+        })
         .collect()
 }
 
+/// A call a script asked for, as `(name, arguments)` says to run it. The
+/// script's records keep what it `asked`, so a replay matches.
 fn scripted(
     state: &SessionState,
     id: String,
     script: ScriptCaller,
-    name: String,
-    arguments: String,
+    asked: ScriptCall,
+    (name, arguments): (String, String),
+    refused: Option<String>,
 ) -> EventPayload {
     let here = state.at_head();
     let config = here.resolve_agent_for();
     let tools = here.connector_tools().tools;
     let reach = codemode::reach(&name, config.as_ref(), &tools);
-    let refused = reach.refusal(&name);
-    let called = ScriptCall {
-        name: name.clone(),
-        arguments: arguments.clone(),
-    };
+    let refused = refused.or_else(|| reach.refusal(&name));
+    let called = asked;
     let mut call = requested(state, id, name, arguments, None, Some(script));
     if let Some(script) = call.script.as_mut() {
         script.called =
@@ -301,6 +365,14 @@ pub fn request(
     caller: &Caller,
 ) -> Result<Vec<EventPayload>, SessionError> {
     SessionState::ensure_internal(caller)?;
+    if state.script_ask(&tool_call_id).is_some() {
+        return Ok(answer_ask(
+            state,
+            &tool_call_id,
+            Some((name, arguments)),
+            None,
+        ));
+    }
     if state.has_effect(EffectKind::ToolCall, &tool_call_id) {
         return Ok(Vec::new());
     }

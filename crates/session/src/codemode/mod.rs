@@ -68,7 +68,6 @@ pub enum Reach {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direct {
     Itself,
-    Approval,
     Subagent,
     Client,
     Engine,
@@ -85,7 +84,6 @@ impl Reach {
                 ))
             }
             Reach::Direct(Direct::Itself) => return Some(format!("`{name}` cannot call itself.")),
-            Reach::Direct(Direct::Approval) => "needs approval",
             Reach::Direct(Direct::Subagent) => "starts a subagent",
             Reach::Direct(Direct::Client) => "runs on the client",
             Reach::Direct(Direct::Engine) => "is the engine's",
@@ -100,7 +98,6 @@ pub fn reach(name: &str, config: Option<&AgentConfig>, connector_tools: &[Connec
     }
     if let Some(tool) = connector_tools.iter().find(|t| t.name == name) {
         return match tool.kind {
-            _ if tool.approve => Reach::Direct(Direct::Approval),
             ConnectorToolKind::Remote => Reach::Code,
             ConnectorToolKind::Subagent => Reach::Direct(Direct::Subagent),
             ConnectorToolKind::Code => Reach::Direct(Direct::Itself),

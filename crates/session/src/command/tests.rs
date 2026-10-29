@@ -7279,7 +7279,7 @@ fn agent_config(model: &str) -> AgentConfig {
         effort: None,
         attachments: None,
         context: None,
-        code_mode: None,
+        codemode: None,
     }
 }
 
@@ -13033,7 +13033,7 @@ fn a_skill_loaded_through_call_tool_unlocks_its_tools() {
 
 fn coding_session() -> Session {
     let mut agent = agent_config("m1");
-    agent.code_mode = Some(crate::codemode::Language::Javascript);
+    agent.codemode = Some(crate::codemode::Language::Javascript);
     agent.tools.push(worker_tool("weather"));
     agent.tools.push(AgentTool {
         handler: Some(Handler::Client),
@@ -13055,7 +13055,27 @@ fn run_code(agg: &mut Session, code: &str) -> Vec<EventPayload> {
     )
 }
 
+/// A script step that asks for `calls`, answered as the engine proposes:
+/// each call runs.
 fn script_step(agg: &mut Session, known: u32, calls: &[(&str, &str)]) -> Vec<EventPayload> {
+    let mut events = step_asks(agg, known, calls);
+    if let Some((decision, asked)) = codemode_calls(&events) {
+        let run = asked
+            .iter()
+            .map(|c| Action::CallTool {
+                id: c.id.clone(),
+                name: c.function.name.clone(),
+                arguments: c.function.arguments.clone(),
+                retry: None,
+            })
+            .collect();
+        events.extend(submit_decision(agg, decision, vec![], run));
+    }
+    events
+}
+
+/// A script step that asks for `calls`, leaving the decision about them open.
+fn step_asks(agg: &mut Session, known: u32, calls: &[(&str, &str)]) -> Vec<EventPayload> {
     let calls = calls
         .iter()
         .map(|(name, arguments)| crate::events::ScriptCall {
@@ -13077,6 +13097,17 @@ fn script_step(agg: &mut Session, known: u32, calls: &[(&str, &str)]) -> Vec<Eve
         ),
         &system(),
     )
+}
+
+/// The `codemode.calls` decision a step queued, and the calls it asks about.
+fn codemode_calls(events: &[EventPayload]) -> Option<(String, Vec<crate::protocol::ToolCall>)> {
+    events.iter().find_map(|e| match e {
+        EventPayload::DecisionQueued(DecisionQueued {
+            id,
+            trigger: Trigger::CodemodeCalls { tool_calls, .. },
+        }) => Some((id.clone(), tool_calls.clone())),
+        _ => None,
+    })
 }
 
 fn settle_tool(agg: &mut Session, id: &str, result: &str) -> Vec<EventPayload> {
@@ -13292,14 +13323,42 @@ fn an_interrupt_holds_a_script_and_takes_the_results_of_its_calls() {
     assert!(script_work(&agg).is_none(), "the script does not run");
     assert!(work_from(&agg, events).is_empty());
 
-    let events = script_step(&mut agg, 1, &[("weather", r#"{"city":"Rome"}"#)]);
+    let events = step_asks(&mut agg, 1, &[("weather", r#"{"city":"Rome"}"#)]);
+    let (decision, asked) = codemode_calls(&events).expect("the step asks about its calls");
     assert!(
-        dispatched_calls(&events).is_empty(),
-        "a call the script asks for waits: {events:?}"
+        !events
+            .iter()
+            .any(|e| matches!(e, EventPayload::DecisionDispatched(_))),
+        "the decision about the calls waits: {events:?}"
     );
 
     let events = resume(&mut agg, "int-1");
-    assert_eq!(dispatched_calls(&events).len(), 1, "the held call goes out");
+    let resumed = events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionDispatched(d) => Some(d.id.clone()),
+            _ => None,
+        })
+        .expect("the worker hears of the resume first");
+    let events = submit_decision(&mut agg, resumed, vec![], vec![]);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::DecisionDispatched(d) if d.id == decision)),
+        "then the worker is asked about the calls: {events:?}"
+    );
+    let events = submit_decision(
+        &mut agg,
+        decision,
+        vec![],
+        vec![Action::CallTool {
+            id: asked[0].id.clone(),
+            name: "weather".to_string(),
+            arguments: asked[0].function.arguments.clone(),
+            retry: None,
+        }],
+    );
+    assert_eq!(dispatched_calls(&events).len(), 1, "the call goes out");
 }
 
 #[test]
@@ -13342,6 +13401,55 @@ fn run_code_outlives_a_long_interrupt() {
             .map(|e| e.tracking.status()),
         Some(EffectStatus::Failed)
     );
+}
+
+#[test]
+fn the_engine_proposes_running_a_scripts_calls() {
+    let mut agg = coding_session();
+    run_code(&mut agg, "...");
+    let events = step_asks(&mut agg, 0, &[("weather", r#"{"city":"Oslo"}"#)]);
+    let (decision, asked) = codemode_calls(&events).expect("the step asks about its calls");
+    assert!(
+        agg.state.tool_call(&asked[0].id).is_none(),
+        "no call starts before the decision"
+    );
+    let proposed = agg
+        .open_work()
+        .into_iter()
+        .find_map(|w| match w {
+            crate::Work::AskWorker { work, request, .. } if work.id == decision => {
+                Some(request.proposed.clone())
+            }
+            _ => None,
+        })
+        .expect("the worker is asked");
+    assert!(
+        matches!(&proposed.actions[..],
+            [crate::protocol::DecisionAction::CallTool { id: Some(id), .. }] if *id == asked[0].id),
+        "{proposed:?}"
+    );
+}
+
+#[test]
+fn a_worker_can_refuse_a_scripts_call_and_one_it_skips_fails() {
+    let mut agg = coding_session();
+    run_code(&mut agg, "...");
+    let events = step_asks(&mut agg, 0, &[("weather", "{}"), ("weather", r#"{"x":1}"#)]);
+    let (decision, asked) = codemode_calls(&events).expect("the step asks about its calls");
+    submit_decision(
+        &mut agg,
+        decision,
+        vec![],
+        vec![Action::ToolError {
+            id: asked[0].id.clone(),
+            attempt: None,
+            error: ErrorInfo::new(crate::protocol::ErrorCode::HandlerError, "not today"),
+            retryable: false,
+        }],
+    );
+    let script = script_work(&agg).expect("both calls ended");
+    assert!(!script.calls[0].ok && script.calls[0].output.contains("not today"));
+    assert!(!script.calls[1].ok && script.calls[1].output.contains("did not run"));
 }
 
 #[test]

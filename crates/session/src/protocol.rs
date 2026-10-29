@@ -982,7 +982,7 @@ pub struct AgentConfig {
     /// Offer `run_code`: the model writes a script in this language that
     /// calls the agent's tools.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub code_mode: Option<crate::codemode::Language>,
+    pub codemode: Option<crate::codemode::Language>,
 }
 
 /// Changes to an [`AgentConfig`]. A field left out keeps the base's value. A
@@ -1064,7 +1064,7 @@ pub struct AgentConfigPatch {
         deserialize_with = "present",
         skip_serializing_if = "Option::is_none"
     )]
-    pub code_mode: Option<Option<crate::codemode::Language>>,
+    pub codemode: Option<Option<crate::codemode::Language>>,
 }
 
 impl AgentConfigPatch {
@@ -1087,7 +1087,7 @@ impl AgentConfigPatch {
             mcp_announce,
             attachments,
             context,
-            code_mode,
+            codemode,
         } = self;
         AgentConfig {
             llm: llm.unwrap_or(base.llm),
@@ -1106,7 +1106,7 @@ impl AgentConfigPatch {
             mcp_announce: mcp_announce.unwrap_or(base.mcp_announce),
             attachments: attachments.unwrap_or(base.attachments),
             context: context.unwrap_or(base.context),
-            code_mode: code_mode.unwrap_or(base.code_mode),
+            codemode: codemode.unwrap_or(base.codemode),
         }
     }
 }
@@ -2604,6 +2604,14 @@ pub enum DecisionTrigger {
         window: Option<u64>,
         call: HeldCall,
     },
+    /// A `run_code` call's script paused on these calls. `id` is the
+    /// `run_code` call. Answer each by its `id`: `tool.call` runs it,
+    /// `tool.error` refuses it.
+    #[serde(rename = "codemode.calls")]
+    CodemodeCalls {
+        id: String,
+        tool_calls: Vec<ToolCall>,
+    },
     /// Answer with `tool.result`/`tool.error`.
     #[serde(rename = "tool.execute")]
     ToolExecute {
@@ -2716,6 +2724,7 @@ impl DecisionTrigger {
             Self::ClientTranscript { .. } => "client.messages",
             Self::ClientAction { .. } => "client.action",
             Self::ContextLimit { .. } => "context.limit",
+            Self::CodemodeCalls { .. } => "codemode.calls",
             Self::ToolExecute { .. } => "tool.execute",
             Self::ToolFinished { .. } => "tool.finished",
             Self::LlmExecute { .. } => "llm.execute",

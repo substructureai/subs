@@ -15,7 +15,7 @@
               }
             ]
           },
-          "code_mode": {
+          "codemode": {
             "anyOf": [
               {
                 "$ref": "#/components/schemas/CodeLanguage"
@@ -1610,6 +1610,31 @@
               "reason",
               "tokens",
               "call"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "A `run_code` call's script paused on these calls. `id` is the\n`run_code` call. Answer each by its `id`: `tool.call` runs it,\n`tool.error` refuses it.",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "tool_calls": {
+                "items": {
+                  "$ref": "#/components/schemas/ToolCall"
+                },
+                "type": "array"
+              },
+              "type": {
+                "const": "codemode.calls",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "id",
+              "tool_calls"
             ],
             "type": "object"
           },

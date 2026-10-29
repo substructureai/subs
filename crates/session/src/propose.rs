@@ -137,6 +137,11 @@ fn derive(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionRespon
     let connector_tools = connector_tools.as_slice();
     let pending_calls = p.pending_calls;
     match trigger {
+        DecisionTrigger::CodemodeCalls { tool_calls, .. } => Some(DecisionResponse {
+            messages: recorded(transcript),
+            actions: script_calls(tool_calls, connector_tools),
+            ..Default::default()
+        }),
         DecisionTrigger::ClientTranscript {
             messages, client, ..
         } => Some(match config {
@@ -267,6 +272,30 @@ fn llm_finished(
         messages: appended(transcript, message.clone()),
         actions,
         ..Default::default()
+    }
+}
+
+/// A script's calls: each runs, unless one needs approval. Then a person is
+/// asked about the first, and the rest wait.
+pub(super) fn script_calls(
+    tool_calls: &[ToolCall],
+    connector_tools: &[ConnectorTool],
+) -> Vec<DecisionAction> {
+    let mut held = tool_calls
+        .iter()
+        .filter(|call| approval::needed(call, connector_tools));
+    match held.next() {
+        Some(first) => vec![approval::ask(first, connector_tools, held.count())],
+        None => tool_calls.iter().map(call_tool).collect(),
+    }
+}
+
+pub(super) fn call_tool(call: &ToolCall) -> DecisionAction {
+    DecisionAction::CallTool {
+        id: Some(call.id.clone()),
+        name: call.function.name.clone(),
+        arguments: serde_json::Value::String(call.function.arguments.clone()),
+        retry: None,
     }
 }
 
@@ -835,6 +864,7 @@ mod tests {
                 script_tools: Vec::new(),
                 script_language: Default::default(),
                 script_cpu_ms: 0,
+                script_asked: Vec::new(),
             }),
         )
     }

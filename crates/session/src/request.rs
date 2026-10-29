@@ -239,6 +239,9 @@ pub fn wire_trigger(
             window,
             call,
         },
+        Trigger::CodemodeCalls { id, tool_calls } => {
+            DecisionTrigger::CodemodeCalls { id, tool_calls }
+        }
         Trigger::ToolExecute {
             id,
             name,

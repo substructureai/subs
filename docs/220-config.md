@@ -173,7 +173,7 @@ tool = { max_attempts = 3 }
 | `tools` | list | none | Tools the worker or the browser runs: `name`, `description`, `input`, `output`, `handler` and `defer`. Leave out `handler` for the worker, or set `handler = "client"`. `input` and `output` are a JSON Schema, or the path of a file that holds one. |
 | `attachments` | table | none | How files reach the model. See [`[agent.<id>.attachments]`](#agentidattachments). |
 | `context` | table | none | How the agent makes room when the model reads too much. See [`[agent.<id>.context]`](#agentidcontext). |
-| `code_mode` | `javascript` | none | Offers `run_code`, which runs a script in this language that calls the agent's tools. See [Code mode](./67-code-mode.md). |
+| `codemode` | `javascript` | none | Offers `run_code`, which runs a script in this language that calls the agent's tools. See [Code mode](./67-code-mode.md). |
 | `worker` | url | none | Where decisions go. Leave it off and the engine decides. |
 | `events` | string | none | The `[events.<id>]` block that gets this agent's events. See [Events URL](./55-events-url.md). |
 | `signing_secret_env` | string | none | The variable holding the signing secret. For an engine you run. |

@@ -178,6 +178,7 @@ What fires, what the engine proposes, and what you return.
 | `client.messages` | A client sent or edited messages. | Record the view, then call the model. | `proposed` |
 | `client.action` | A client called a named action. It joins the running turn, or opens the turn that the submit named. While a turn ends, it waits. A submit that names a turn id in use is refused. When its own turn has no more work, that turn ends. | Empty. | Your own actions. |
 | `context.limit` | A model call waits for room. See [Make room](./120-conversations.md#make-room). | The plan of the strategy that applied. | `proposed`, `context.replace` and `call`, a summary `llm.call`, or `call` alone. |
+| `codemode.calls` | A [code mode](./67-code-mode.md) script stopped on calls. `id` is the `run_code` call. | Run each call with `tool.call`. When one needs approval, an interrupt that asks about it first. | `proposed`, or `tool.call` or `tool.error` for each call, by `id`. |
 | `tool.execute` | The model called your tool. | Empty. A `tool.error` when the arguments failed validation or the tool is undeclared. | `tool.result` or `tool.error`. |
 | `tool.finished` | A tool call ended, after retries. | Record the result, then call the model. Waits when other calls are in flight. | `proposed` |
 | `llm.execute` | The agent's LLM block is `type = "worker"`. | Empty. | `llm.result` or `llm.error`, or a stream. |
@@ -209,6 +210,11 @@ type Trigger =
               request: LlmRequest
               stream: boolean
           }
+      }
+    | {
+          type: "codemode.calls"
+          id: string                // the run_code call
+          tool_calls: ToolCall[]    // answer each by its id
       }
     | {
           type: "tool.execute"
@@ -488,7 +494,7 @@ type AgentConfig = {
         window?: number
         strategy?: ContextStrategy[]
     }
-    code_mode?: "javascript"    // offer run_code, scripts in this language. omitted: off
+    codemode?: "javascript"    // offer run_code, scripts in this language. omitted: off
 }
 
 type Attachments = {

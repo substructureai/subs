@@ -16,10 +16,10 @@ costs no model turn, and its result stays out of the conversation.
 ```toml title="subs.toml"
 [agent.assistant]
 model = "claude-sonnet-5"
-code_mode = "javascript"
+codemode = "javascript"
 ```
 
-A worker sets `code_mode: "javascript"` on the agent config. JavaScript is the
+A worker sets `codemode: "javascript"` on the agent config. JavaScript is the
 only language so far.
 
 ## What the model writes
@@ -51,9 +51,9 @@ throws an `Error` with the tool's message.
 ## What a script can call
 
 A script can call the agent's worker tools and connector tools, and
-`tool_search`. It cannot call:
+`tool_search`. A call that needs approval waits for a person, as a direct call
+does. A script cannot call:
 
-- a tool that needs approval,
 - a client tool,
 - a subagent,
 - `skill`, `call_tool` or another engine tool,
@@ -62,6 +62,25 @@ A script can call the agent's worker tools and connector tools, and
 A call to one of these throws, and the script can catch it.
 
 ## How a run works
+
+When a script stops on calls, the engine asks your worker about them with a
+`codemode.calls` trigger, as it asks about the model's calls on `llm.finished`.
+
+```jsonc
+{ "type": "codemode.calls",
+  "id": "<run_code call id>",
+  "tool_calls": [
+    { "id": "call_s1", "type": "function",
+      "function": { "name": "weather", "arguments": "{\"city\":\"Oslo\"}" } }
+  ] }
+```
+
+`proposed` runs each call with `tool.call`. When a call needs approval, it asks
+a person about that call first, and the rest wait. Return `proposed`, or answer
+each call by its `id`: `tool.call` runs it, and `tool.error` refuses it with
+your message. A call that no answer runs or refuses fails, and the script can
+catch the error. A worker that returns `proposed` for triggers it does not know
+needs no change.
 
 Each call a script makes is a tool call in the session log, under the
 `run_code` call. It runs as a direct call does, with the same retries,
@@ -133,7 +152,7 @@ Script steps wait on `RuntimeDeps::script_task_queue`.
 
 Nothing outside three places knows which language a script is in:
 
-- `CodeLanguage`, the enum `code_mode` takes, in `session::codemode`.
+- `CodeLanguage`, the enum `codemode` takes, in `session::codemode`.
 - A dialect in `session::codemode`, which tells the model how to write
   `run_code` in that language and declares each tool in its types.
   `javascript.rs` declares tools in TypeScript.

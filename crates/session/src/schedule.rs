@@ -332,6 +332,7 @@ mod tests {
                 script_tools: Vec::new(),
                 script_language: Default::default(),
                 script_cpu_ms: 0,
+                script_asked: Vec::new(),
             }),
         ));
     }

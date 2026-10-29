@@ -132,9 +132,9 @@ impl SessionState {
         for e in self.effects_of(EffectKind::Decision) {
             let Some(d) = e.decision() else { continue };
             let about = match &d.trigger {
-                Trigger::ToolExecute { id, .. } | Trigger::ToolFinished { id, .. } => {
-                    gone(EffectKind::ToolCall, id)
-                }
+                Trigger::ToolExecute { id, .. }
+                | Trigger::ToolFinished { id, .. }
+                | Trigger::CodemodeCalls { id, .. } => gone(EffectKind::ToolCall, id),
                 Trigger::SubagentFinished { id, .. } => gone(EffectKind::Subagent, id),
                 Trigger::LlmExecute { id, .. } | Trigger::LlmFinished { id, .. } => {
                     gone(EffectKind::LlmCall, id)

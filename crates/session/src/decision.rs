@@ -142,6 +142,12 @@ pub enum Trigger {
         sessions: Vec<String>,
         turn_id: String,
     },
+    /// A script paused on these calls.
+    #[serde(rename = "codemode.calls")]
+    CodemodeCalls {
+        id: String,
+        tool_calls: Vec<crate::protocol::ToolCall>,
+    },
     #[serde(rename = "tool.execute")]
     ToolExecute {
         id: String,

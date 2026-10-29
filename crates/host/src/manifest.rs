@@ -552,7 +552,7 @@ pub struct AgentSection {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<ContextConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub code_mode: Option<crate::codemode::Language>,
+    pub codemode: Option<crate::codemode::Language>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp_auth_failure: Option<McpAuthFailure>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -617,7 +617,7 @@ impl AgentSection {
                 })
                 .collect(),
             context: self.context.clone(),
-            code_mode: self.code_mode,
+            codemode: self.codemode,
         })
     }
 

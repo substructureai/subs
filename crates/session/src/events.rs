@@ -459,11 +459,35 @@ pub struct ToolCallRequested {
     pub script: Option<ScriptCaller>,
 }
 
-/// A `run_code` call's script ran a step.
+/// A `run_code` call's script ran a step, and asked for these calls.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallStepped {
     pub id: String,
     pub cpu_ms: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub asked: Vec<ScriptAsk>,
+}
+
+/// A call a script asked for, before a decision starts it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScriptAsk {
+    pub id: String,
+    pub seq: u32,
+    pub name: String,
+    pub arguments: String,
+}
+
+impl ScriptAsk {
+    pub fn tool_call(&self) -> crate::protocol::ToolCall {
+        crate::protocol::ToolCall {
+            id: self.id.clone(),
+            call_type: "function".to_string(),
+            function: crate::protocol::ToolCallFunction {
+                name: self.name.clone(),
+                arguments: self.arguments.clone(),
+            },
+        }
+    }
 }
 
 /// The `run_code` call that made this call, and where in its script.

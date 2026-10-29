@@ -338,7 +338,7 @@ fn agent(tools: Vec<AgentTool>, defer: bool) -> AgentConfig {
         model: "stub".to_string(),
         tools,
         defer_tools: defer.then(DeferTools::default),
-        code_mode: Some(substructure_host::codemode::Language::Javascript),
+        codemode: Some(substructure_host::codemode::Language::Javascript),
         ..Default::default()
     }
 }

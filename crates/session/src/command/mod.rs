@@ -888,6 +888,10 @@ impl Working {
                     self.then(|s| s.fail_run(&error));
                     Ok(())
                 }
+                Action::ToolError { id, error, .. } if self.script_ask(&id).is_some() => {
+                    self.then(|s| effects::tool::answer_ask(s, &id, None, Some(error.message)));
+                    Ok(())
+                }
                 other => match other.into_command(decision_id) {
                     Some(cmd) => self.run_active(cmd, &system),
                     None => Ok(()),
@@ -1262,6 +1266,7 @@ impl Working {
                 .then(|s| s.agent_config_events(agent));
 
                 self.apply_actions(actions, &decision_id, answered);
+                self.then(|s| effects::tool::unanswered(s));
                 Ok(())
             }
 
