@@ -33,22 +33,30 @@ const reviews = await Promise.all(stale.map((pr) => tools.github__get_reviews({ 
 return stale.map((pr, i) => ({ number: pr.number, reviews: reviews[i].length }));
 ```
 
+The model sees each tool once. A tool a script can call is offered only
+through `run_code`, not as a tool of its own. The other tools stay direct.
+
 The description of `run_code` declares each tool the script can call, with its
-input type and, when the tool declares an output schema, its result type. A
-deferred tool is not declared. The script finds it with `tools.tool_search` and
-calls it with `tools.call_tool`.
+input type and, when the tool declares an output schema, its result type. The
+declarations stop at 12 KiB. Past that, tools are listed by name, up to 4 KiB.
+A deferred tool is neither declared nor listed.
+
+A script finds tools with `tools.tool_search({ query })`, which answers with
+each match's declaration, and then calls them by name. It works whether or not
+the agent defers tools.
 
 A call returns the tool's result, parsed when it is JSON. A call that fails
 throws an `Error` with the tool's message.
 
 ## What a script can call
 
-A script can call the agent's worker tools and connector tools, `tool_search`,
-`call_tool` and `skill`. It cannot call:
+A script can call the agent's worker tools and connector tools, and
+`tool_search`. It cannot call:
 
 - a tool that needs approval,
 - a client tool,
 - a subagent,
+- `skill`, `call_tool` or another engine tool,
 - `run_code`.
 
 A call to one of these throws, and the script can catch it.

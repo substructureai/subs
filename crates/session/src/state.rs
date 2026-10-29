@@ -2083,6 +2083,19 @@ impl SessionState {
         if let ConnectorTarget::Refused { reason } = target {
             return Some(StoredResult::error(reason.clone()));
         }
+        if *target == ConnectorTarget::ScriptSearch {
+            let language = tc
+                .script
+                .as_ref()
+                .and_then(|s| self.tool_call(&s.parent))
+                .map(|parent| parent.script_language)
+                .unwrap_or_default();
+            return Some(super::engine_tools::script_find(
+                at,
+                language,
+                &tc.arguments,
+            ));
+        }
         super::engine_tools::answer(at, target.kind(), &tc.arguments)
     }
 
@@ -2453,20 +2466,29 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
             .collect()
     }
 
+    /// The tools `tool_search` reaches. With code mode, it leaves out those
+    /// reached only from code.
     pub fn searchable_tools(&self) -> Vec<LlmTool> {
+        self.searchable(false)
+    }
+
+    /// The tools a script's `tool_search` reaches: those a script can call.
+    pub fn script_searchable_tools(&self) -> Vec<LlmTool> {
+        self.searchable(true)
+    }
+
+    fn searchable(&self, from_code: bool) -> Vec<LlmTool> {
         let Some(config) = self.resolve_agent_for() else {
             return Vec::new();
         };
         let locked = config.locked_tools(&self.loaded_skills());
+        let connector_tools = self.state.connector_tools_for_config(&config).tools;
         let declared = config
             .tools
             .iter()
             .map(|t| t.to_llm_tool(config.defers_tools()));
-        let connector = self
-            .state
-            .connector_tools_for_config(&config)
-            .tools
-            .into_iter()
+        let connector = connector_tools
+            .iter()
             .filter(|t| {
                 matches!(
                     t.kind,
@@ -2478,6 +2500,12 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
         declared
             .chain(connector)
             .filter(|t| !locked.contains_key(&t.name))
+            .filter(|t| {
+                let code = config.code_mode.is_some()
+                    && crate::codemode::reach(&t.name, Some(&config), &connector_tools)
+                        == crate::codemode::Reach::Code;
+                code == from_code
+            })
             .collect()
     }
 
@@ -3232,7 +3260,7 @@ mod summary_fold_tests {
 }
 
 fn describe_run_code(
-    tools: &mut [LlmTool],
+    tools: &mut Vec<LlmTool>,
     config: Option<&AgentConfig>,
     connector_tools: &[ConnectorTool],
 ) {
@@ -3242,16 +3270,17 @@ fn describe_run_code(
     if !offered {
         return;
     }
+    let in_code = |t: &LlmTool| {
+        crate::codemode::reach(&t.name, config, connector_tools) == crate::codemode::Reach::Code
+    };
     let description = {
-        let declared: Vec<&LlmTool> = tools
-            .iter()
-            .filter(|t| crate::codemode::declares(t, config, connector_tools))
-            .collect();
+        let declared: Vec<&LlmTool> = tools.iter().filter(|t| !t.defer && in_code(t)).collect();
         crate::codemode::describe(
             config.and_then(|c| c.code_mode).unwrap_or_default(),
             &declared,
         )
     };
+    tools.retain(|t| !in_code(t));
     if let Some(tool) = tools.iter_mut().find(|t| t.name == RUN_CODE) {
         tool.description = description;
     }

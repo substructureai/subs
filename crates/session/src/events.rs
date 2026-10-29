@@ -426,13 +426,15 @@ pub enum ConnectorTarget {
     Refused {
         reason: String,
     },
+    /// A script's `tool_search`, over the tools a script can call.
+    ScriptSearch,
 }
 
 impl ConnectorTarget {
     pub fn kind(&self) -> ConnectorToolKind {
         match self {
             Self::Remote { .. } => ConnectorToolKind::Remote,
-            Self::Find => ConnectorToolKind::Find,
+            Self::Find | Self::ScriptSearch => ConnectorToolKind::Find,
             Self::Call => ConnectorToolKind::Call,
             Self::Skill { .. } => ConnectorToolKind::Skill,
             Self::Attachment => ConnectorToolKind::Attachment,

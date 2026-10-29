@@ -213,7 +213,8 @@ fn scripted(
     let here = state.at_head();
     let config = here.resolve_agent_for();
     let tools = here.connector_tools().tools;
-    let refused = codemode::refusal(&name, &arguments, config.as_ref(), &tools);
+    let reach = codemode::reach(&name, config.as_ref(), &tools);
+    let refused = reach.refusal(&name);
     let called = ScriptCall {
         name: name.clone(),
         arguments: arguments.clone(),
@@ -230,9 +231,14 @@ fn scripted(
         )),
         _ => None,
     });
-    if let Some(reason) = reason {
+    let target = match reason {
+        Some(reason) => Some(ConnectorTarget::Refused { reason }),
+        None if reach == codemode::Reach::Search => Some(ConnectorTarget::ScriptSearch),
+        None => None,
+    };
+    if let Some(target) = target {
         call.handler = ToolHandler::Server;
-        call.target = Some(ConnectorTarget::Refused { reason });
+        call.target = Some(target);
         call.retry = RetryPolicy::no_retry();
     }
     EventPayload::ToolCallRequested(call)

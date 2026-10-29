@@ -378,7 +378,10 @@ async fn a_script_calls_tools_and_only_its_result_reaches_the_model() {
     let seen = seen.lock().unwrap();
     let description = seen.description.as_deref().expect("run_code was offered");
     assert!(description.contains("declare const tools"), "{description}");
-    assert!(description.contains("tool_search(args:"), "{description}");
+    assert!(
+        description.contains("tools.tool_search({ query })"),
+        "{description}"
+    );
     assert!(
         !description.contains("weather(args:"),
         "deferred tools are not declared"

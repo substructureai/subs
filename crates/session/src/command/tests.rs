@@ -13148,7 +13148,11 @@ fn run_code_runs_its_script_in_the_engine() {
     let script = script_work(&agg).expect("the script is sent to run");
     assert_eq!(script.code, "return 1;");
     assert!(script.calls.is_empty());
-    assert_eq!(script.tools, ["weather"], "client tools are not listed");
+    assert_eq!(
+        script.tools,
+        ["tool_search", "weather"],
+        "client tools are not listed"
+    );
 }
 
 #[test]
@@ -13173,6 +13177,125 @@ fn run_code_without_code_is_refused() {
         "{target:?}"
     );
     assert!(script_work(&agg).is_none());
+}
+
+#[test]
+fn tools_a_script_can_call_reach_the_model_only_through_run_code() {
+    let mut agg = coding_session();
+    let tools = dispatched_tools(&mut agg, "llm-1");
+    assert!(tools.contains(&"run_code".to_string()), "{tools:?}");
+    assert!(
+        tools.contains(&"ask".to_string()),
+        "client tools stay direct"
+    );
+    assert!(!tools.contains(&"weather".to_string()), "{tools:?}");
+    let call = agg.state.llm_call("llm-1").expect("the call");
+    let run_code = call
+        .spec
+        .tools
+        .iter()
+        .flatten()
+        .find(|t| t.name == "run_code")
+        .expect("run_code");
+    assert!(run_code.description.contains("  weather(args:"));
+    assert!(!run_code.description.contains("  ask(args:"));
+}
+
+#[test]
+fn a_direct_search_leaves_out_tools_reached_from_code() {
+    let agg = coding_session();
+    let names = |tools: Vec<LlmTool>| tools.into_iter().map(|t| t.name).collect::<Vec<_>>();
+    let at = agg.state.at_head();
+    assert_eq!(names(at.searchable_tools()), ["ask"]);
+    assert_eq!(names(at.script_searchable_tools()), ["weather"]);
+}
+
+#[test]
+fn a_script_searches_its_tools_without_tool_search() {
+    let mut agg = coding_session();
+    run_code(&mut agg, "...");
+    script_step(&mut agg, 0, &[("tool_search", r#"{"query":"weather"}"#)]);
+    let script = script_work(&agg).expect("the search is answered at once");
+    let found = &script.calls[0];
+    assert!(found.ok, "{found:?}");
+    let answer: serde_json::Value = serde_json::from_str(&found.output).unwrap();
+    assert_eq!(answer["tools"][0]["name"], "weather", "{answer}");
+    assert!(answer["tools"][0]["declaration"]
+        .as_str()
+        .is_some_and(|d| d.starts_with("weather(args:")));
+    assert!(
+        !found.output.contains("\"ask\""),
+        "client tools are not found"
+    );
+}
+
+fn tool_executes(events: &[EventPayload]) -> Vec<(String, String)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            EventPayload::DecisionQueued(DecisionQueued {
+                id,
+                trigger: Trigger::ToolExecute { id: call, .. },
+            }) => Some((id.clone(), call.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_worker_interrupt_holds_a_script_until_resumed() {
+    let mut agg = coding_session();
+    run_code(&mut agg, "...");
+    let events = script_step(
+        &mut agg,
+        0,
+        &[
+            ("weather", r#"{"city":"Oslo"}"#),
+            ("weather", r#"{"city":"Rome"}"#),
+        ],
+    );
+    let executes = tool_executes(&events);
+    let [(first, oslo), (second, rome)] = [executes[0].clone(), executes[1].clone()];
+    submit_decision(
+        &mut agg,
+        first,
+        vec![],
+        vec![Action::Interrupt {
+            interrupt_id: "int-1".to_string(),
+            reason: "confirm".to_string(),
+            payload: serde_json::json!({}),
+        }],
+    );
+    assert!(
+        agg.state.worker_decision(&second).is_some(),
+        "the other call still waits its turn"
+    );
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::ResumeInterrupt {
+            interrupt_id: "int-1".to_string(),
+            payload: serde_json::json!({"approved": true}),
+        },
+        &frontend_caller("tenant-a", "user-1"),
+    );
+    let resumed = events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionDispatched(p) => Some(p.id.clone()),
+            _ => None,
+        })
+        .expect("the worker hears of the resume first");
+    let answer = |id: &str, text: &str| Action::ToolResult {
+        id: id.to_string(),
+        attempt: None,
+        result: StoredResult::text(text),
+    };
+    submit_decision(&mut agg, resumed, vec![], vec![answer(&oslo, "sunny")]);
+    assert!(script_work(&agg).is_none(), "the script waits on Rome");
+    submit_decision(&mut agg, second, vec![], vec![answer(&rome, "rain")]);
+    let script = script_work(&agg).expect("the script runs again");
+    let outputs: Vec<&str> = script.calls.iter().map(|c| c.output.as_str()).collect();
+    assert_eq!(outputs, ["sunny", "rain"]);
 }
 
 #[test]

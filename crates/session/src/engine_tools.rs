@@ -42,6 +42,26 @@ fn find(at: SessionStateAtNode, arguments: &str) -> StoredResult {
     ))
 }
 
+/// A script's `tool_search`.
+pub fn script_find(
+    at: SessionStateAtNode,
+    language: crate::codemode::Language,
+    arguments: &str,
+) -> StoredResult {
+    let max = at
+        .resolve_agent_for()
+        .as_ref()
+        .map(AgentConfig::defer_settings)
+        .unwrap_or_default()
+        .max_matches;
+    StoredResult::text(crate::codemode::search(
+        language,
+        &at.script_searchable_tools(),
+        &argument(arguments, "query"),
+        max,
+    ))
+}
+
 fn call(at: SessionStateAtNode, arguments: &str) -> StoredResult {
     StoredResult::error(
         at.call_tool_fault(arguments)
