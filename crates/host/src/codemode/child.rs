@@ -147,6 +147,7 @@ fn main(args: Vec<OsString>) -> ! {
         Err(e) => Ran {
             step: Step::Failed(format!("The runner could not read the script: {e}")),
             stats: Default::default(),
+            shown: Vec::new(),
         },
     };
     let _ = writeln!(out, "{}", serde_json::to_string(&ran).unwrap_or_default());

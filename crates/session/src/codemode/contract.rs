@@ -50,6 +50,11 @@ pub struct Limits {
     pub total_file_bytes: u64,
     /// Files open at once.
     pub streams: u32,
+    /// Bytes of file text a script shows the model.
+    pub shown: usize,
+    /// Bytes of media files a script shows the model. Bytes stand in for the
+    /// tokens they cost: a PDF's pages and audio's length grow with them.
+    pub shown_media: u64,
 }
 
 impl Default for Limits {
@@ -66,6 +71,8 @@ impl Default for Limits {
             file_bytes: 64 << 20,
             total_file_bytes: 512 << 20,
             streams: 4,
+            shown: 64 << 10,
+            shown_media: 2 << 20,
         }
     }
 }
@@ -176,6 +183,19 @@ pub struct Ran {
     pub step: Step,
     #[serde(default)]
     pub stats: Stats,
+    /// What a script that returned put in front of the model, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shown: Vec<Shown>,
+}
+
+/// Something a script shows the model, apart from what it returns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Shown {
+    /// A text file's text.
+    Text { file: String, text: String },
+    /// A file the model reads as media, by its id.
+    File { file: String },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

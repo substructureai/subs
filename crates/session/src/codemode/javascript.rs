@@ -37,6 +37,10 @@ an error names the limit and what to do.
 files.csv(id))`, `files.lines(id)`, `files.jsonl(id)` or `files.chunks(id)`. Each takes \
 `{ limit }`. `files.list()` lists them. Read files before you call tools: a script resumes from \
 the start after its calls, and reads them again.
+- `files.show(id)` puts a file in front of you when the script ends: an image, PDF, audio or video \
+as itself, any other file as its text. Print anything else with `console.log`.
+- Load a skill with `await tools.skill({ name })`. Its instructions reach you when the script \
+ends, and its tools can then be called.
 - There is no network, file system, timer or module. `Date` and `Math.random` stay the same \
 for the whole run.
 - A call that needs approval waits for a person, and a client tool waits for the client. A \

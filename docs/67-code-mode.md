@@ -33,8 +33,9 @@ const reviews = await Promise.all(stale.map((pr) => tools.github__get_reviews({ 
 return stale.map((pr, i) => ({ number: pr.number, reviews: reviews[i].length }));
 ```
 
-The model sees each tool once. A tool a script can call is offered only
-through `run_code`, not as a tool of its own. The other tools stay direct.
+Code mode is all or nothing. The model gets one tool, `run_code`, and reaches
+every other tool from a script: there is no direct `tool_search`, `call_tool`,
+`skill` or attachment tool.
 
 The description of `run_code` declares each tool the script can call, with its
 input type and, when the tool declares an output schema, its result type. The
@@ -51,14 +52,26 @@ throws an `Error` with the tool's message.
 ## What a script can call
 
 A script can call the agent's worker tools, connector tools, client tools,
-subagents, and `tool_search`. A call that needs approval waits for a person, and
-a client tool waits for the client, as a direct call does. A subagent call
-returns the subagent's answer. A script cannot call:
+subagents, `skill` and `tool_search`. A call that needs approval waits for a
+person, and a client tool waits for the client, as a direct call does. A
+subagent call returns the subagent's answer. A script cannot call `call_tool`,
+the attachment tools, or `run_code`: it calls tools by name, and reads files
+with `files`. A call to one of these throws, and the script can catch it.
 
-- `skill`, `call_tool` or another engine tool,
-- `run_code`.
+`await tools.skill({ name })` loads a skill as a direct call does: its tools
+unlock. The model reads its instructions in the `run_code` result, whether or
+not the script returns them. When the agent searches its skills,
+`tools.tool_search` finds them too.
 
-A call to one of these throws, and the script can catch it.
+## What reaches the model
+
+The `run_code` result is what the script returns and prints, then each file it
+showed, then the instructions of each skill it loaded.
+
+`files.show(id)` puts a file in front of the model: an image, PDF, audio or
+video as itself, and any other file as its text. A script shows at most 4
+files, 64 KiB of file text and 2 MiB of media, which bounds what a file can
+cost in context. Text the script makes is printed with `console.log`.
 
 ## How a run works
 
@@ -123,6 +136,7 @@ return totals;
 |---|---|
 | `files.list()`, `files.stat(id)` | `{ id, mime, size }` of each file, or of one |
 | `await files.text(id)` | The whole file as text, up to an eighth of `memory` |
+| `files.show(id)` | Nothing; the model sees the file when the script ends |
 | `files.csv(id, { header, delimiter })` | Rows: objects keyed by the header, or arrays with `header: false` |
 | `files.lines(id)` | Lines, without their line ends |
 | `files.jsonl(id)` | One JSON value per line |
@@ -230,6 +244,8 @@ them. An error names the limit that was met and what to do.
 | `file_bytes` | 64 MiB | File bytes one run reads |
 | `total_file_bytes` | 512 MiB | File bytes over all of a script's runs |
 | `streams` | 4 | Files open at once |
+| `shown` | 64 KiB | File text the script shows the model |
+| `shown_media` | 2 MiB | Media files the script shows the model |
 
 A run reads the script, the results its calls already returned, and the files
 it asks for, and stops at the first call with no result. Time spent waiting on

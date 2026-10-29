@@ -170,8 +170,34 @@ fn finished(state: &Cx<'_>, id: &str, name: String, result: StoredResult) -> Vec
         })];
     }
     let mut events = void_script(state, id);
+    let result = with_skills(state, id, result);
     events.extend(complete(state.ids(), id.to_string(), name, result));
     events
+}
+
+/// A `run_code` result, with the instructions of each skill its script
+/// loaded: they are for the model, whatever the script did with them.
+fn with_skills(state: &SessionState, id: &str, mut result: StoredResult) -> StoredResult {
+    for call in state.script_calls(id) {
+        let Some(tc) = call.tool().filter(|t| t.name == SKILL && !t.is_error) else {
+            continue;
+        };
+        let Some(text) = &tc.result else { continue };
+        let quoted = serde_json::to_string(text).unwrap_or_default();
+        let quoted = quoted.trim_matches('"');
+        let said = result.content.iter().any(|c| {
+            matches!(c, crate::protocol::StoredContent::Text { text: t }
+                if t.contains(text.as_str()) || t.contains(quoted))
+        });
+        if said {
+            continue;
+        }
+        let named = argument(&tc.arguments, "name").unwrap_or_default();
+        result.content.push(crate::protocol::StoredContent::Text {
+            text: format!("[skill {named}]\n{text}"),
+        });
+    }
+    result
 }
 
 /// A script's calls still open when its `run_code` call ends.

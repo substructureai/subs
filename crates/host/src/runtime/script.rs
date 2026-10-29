@@ -88,9 +88,10 @@ async fn step(
     let Some(script) = session.script(&task.tool_call_id, &scripts.limits) else {
         return Ok(());
     };
+    let blobs = session.script_blobs(&task.tool_call_id);
     let files = ScriptFiles {
         tenant_id: task.tenant_id.clone(),
-        blobs: session.script_blobs(&task.tool_call_id),
+        blobs: blobs.clone(),
         store: scripts.blobs.clone(),
     };
     let known = script.calls.len() as u32;
@@ -116,7 +117,7 @@ async fn step(
         &ran,
         &scripts.limits,
     );
-    let command = settle(task.tool_call_id, task.attempt, known, ran);
+    let command = settle(task.tool_call_id, task.attempt, known, ran, &blobs);
     settled(
         sessions,
         &task.tenant_id,
@@ -144,6 +145,7 @@ fn late(waited: Duration, limit: Limit) -> Ran {
             limit: Some(limit),
             ..Stats::default()
         },
+        shown: Vec::new(),
     }
 }
 

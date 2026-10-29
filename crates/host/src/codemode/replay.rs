@@ -249,6 +249,7 @@ pub fn precheck(script: &Script) -> Option<Ran> {
             limit,
             ..Stats::default()
         },
+        shown: Vec::new(),
     })
 }
 

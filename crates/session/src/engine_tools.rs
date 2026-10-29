@@ -48,15 +48,21 @@ pub fn script_find(
     language: crate::codemode::Language,
     arguments: &str,
 ) -> StoredResult {
-    let max = at
-        .resolve_agent_for()
+    let config = at.resolve_agent_for();
+    let max = config
         .as_ref()
         .map(AgentConfig::defer_settings)
         .unwrap_or_default()
         .max_matches;
+    let skills = config
+        .as_ref()
+        .filter(|c| c.searches_skills())
+        .map(AgentConfig::named_skills)
+        .unwrap_or_default();
     StoredResult::text(crate::codemode::search(
         language,
         &at.script_searchable_tools(),
+        &skills,
         &argument(arguments, "query"),
         max,
     ))

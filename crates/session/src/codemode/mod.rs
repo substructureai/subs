@@ -7,6 +7,7 @@ pub use typescript::{is_identifier, render_json_schema_to_typescript};
 
 use std::num::NonZeroUsize;
 
+use crate::agent_config::NamedSkill;
 use crate::connectors::filter;
 use crate::protocol::{
     AgentConfig, ConnectorTool, ConnectorToolKind, LlmTool, RetryPolicy, RUN_CODE, TOOL_SEARCH,
@@ -68,22 +69,27 @@ pub enum Reach {
 pub enum Direct {
     Itself,
     Engine,
+    Files,
 }
 
 impl Reach {
     /// What a script that calls `name` is told, when it may not.
     pub fn refusal(self, name: &str) -> Option<String> {
-        let why = match self {
+        Some(match self {
             Reach::Code | Reach::Search => return None,
             Reach::Unknown => {
-                return Some(format!(
-                    "There is no tool named `{name}`. Find tools with `{TOOL_SEARCH}`."
-                ))
+                format!("There is no tool named `{name}`. Find tools with `{TOOL_SEARCH}`.")
             }
-            Reach::Direct(Direct::Itself) => return Some(format!("`{name}` cannot call itself.")),
-            Reach::Direct(Direct::Engine) => "is the engine's",
-        };
-        Some(format!("`{name}` {why}. Call it directly, not from code."))
+            Reach::Direct(Direct::Itself) => format!("`{name}` cannot call itself."),
+            Reach::Direct(Direct::Engine) => format!(
+                "`{name}` is not for code. Call tools by name, and find them with \
+                 `{TOOL_SEARCH}`."
+            ),
+            Reach::Direct(Direct::Files) => format!(
+                "`{name}` is not for code. Read files with `files`, and show one with \
+                 `files.show`."
+            ),
+        })
     }
 }
 
@@ -93,8 +99,11 @@ pub fn reach(name: &str, config: Option<&AgentConfig>, connector_tools: &[Connec
     }
     if let Some(tool) = connector_tools.iter().find(|t| t.name == name) {
         return match tool.kind {
-            ConnectorToolKind::Remote | ConnectorToolKind::Subagent => Reach::Code,
+            ConnectorToolKind::Remote | ConnectorToolKind::Subagent | ConnectorToolKind::Skill => {
+                Reach::Code
+            }
             ConnectorToolKind::Code => Reach::Direct(Direct::Itself),
+            ConnectorToolKind::Attachment => Reach::Direct(Direct::Files),
             _ => Reach::Direct(Direct::Engine),
         };
     }
@@ -122,8 +131,25 @@ pub fn callable(config: Option<&AgentConfig>, connector_tools: &[ConnectorTool])
 
 /// A script's `tool_search`: the tools that match `query`, best first, each
 /// with its declaration. A tool named exactly comes first.
-pub fn search(language: Language, tools: &[LlmTool], query: &str, max: NonZeroUsize) -> String {
-    let mut found = filter::find(tools, query);
+pub fn search(
+    language: Language,
+    tools: &[LlmTool],
+    skills: &[NamedSkill],
+    query: &str,
+    max: NonZeroUsize,
+) -> String {
+    let skill_tools: Vec<LlmTool> = skills
+        .iter()
+        .map(|s| LlmTool {
+            name: s.name.clone(),
+            description: format!("{} {}", s.description, s.tools.join(" ")),
+            input: None,
+            output: None,
+            defer: true,
+        })
+        .collect();
+    let corpus: Vec<LlmTool> = tools.iter().chain(&skill_tools).cloned().collect();
+    let mut found = filter::find(&corpus, query);
     if let Some(at) = found.iter().position(|t| t.name == query.trim()) {
         let named = found.remove(at);
         found.insert(0, named);
@@ -131,12 +157,17 @@ pub fn search(language: Language, tools: &[LlmTool], query: &str, max: NonZeroUs
     let shown: Vec<serde_json::Value> = found
         .iter()
         .take(max.get())
-        .map(|tool| {
-            serde_json::json!({
+        .map(|tool| match skills.iter().find(|s| s.name == tool.name) {
+            Some(skill) => serde_json::json!({
+                "skill": skill.name,
+                "description": skill.description,
+                "load": format!("await tools.skill({{ name: {:?} }})", skill.name),
+            }),
+            None => serde_json::json!({
                 "name": tool.name,
                 "description": tool.description,
                 "declaration": (dialect(language).declare)(tool),
-            })
+            }),
         })
         .collect();
     let mut answer = serde_json::json!({ "tools": shown, "matched": found.len() });

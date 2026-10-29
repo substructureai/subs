@@ -13211,9 +13211,7 @@ fn run_code_without_code_is_refused() {
 fn tools_a_script_can_call_reach_the_model_only_through_run_code() {
     let mut agg = coding_session();
     let tools = dispatched_tools(&mut agg, "llm-1");
-    assert!(tools.contains(&"run_code".to_string()), "{tools:?}");
-    assert!(!tools.contains(&"ask".to_string()), "{tools:?}");
-    assert!(!tools.contains(&"weather".to_string()), "{tools:?}");
+    assert_eq!(tools, ["run_code"], "code mode is all or nothing");
     let call = agg.state.llm_call("llm-1").expect("the call");
     let run_code = call
         .spec
@@ -13594,6 +13592,87 @@ fn a_script_may_read_the_files_on_its_branch() {
         "the script sees ids, not blobs"
     );
     assert_eq!(agg.script_blobs("tc-1").get("sales.csv"), Some(&blob));
+}
+
+#[test]
+fn a_script_loads_a_skill_and_the_model_reads_its_instructions() {
+    let mut config = skilled_config(crate::protocol::SkillSource::Worker);
+    config.codemode = Some(crate::codemode::Language::Javascript);
+    let mut agg = create_session_with_config("sess-1", "tenant-a", "user-1", Some(config));
+    assert!(agg
+        .state
+        .at_head()
+        .locked_tools()
+        .contains_key("find_bookings"));
+    run_code(&mut agg, "...");
+    let events = script_step(&mut agg, 0, &[("skill", r#"{"name":"visits"}"#)]);
+    let skill = events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::ToolCallRequested(r) if r.name == "skill" => Some(r.id.clone()),
+            _ => None,
+        })
+        .expect("the script loads the skill");
+    settle_tool(&mut agg, &skill, "Bookings are by day.");
+    assert!(
+        agg.state.at_head().locked_tools().is_empty(),
+        "the skill's tools unlock"
+    );
+    let events = settle_tool(&mut agg, "tc-1", r#"{"result":"loaded"}"#);
+    let texts: Vec<String> = events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::ToolCallCompleted(c) if c.id == "tc-1" => Some(
+                c.result
+                    .content
+                    .iter()
+                    .filter_map(|c| match c {
+                        crate::protocol::StoredContent::Text { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .expect("run_code completes");
+    assert_eq!(
+        texts,
+        [
+            r#"{"result":"loaded"}"#.to_string(),
+            "[skill visits]\nBookings are by day.".to_string()
+        ],
+        "the model reads the instructions though the script did not return them"
+    );
+}
+
+#[test]
+fn skill_instructions_the_script_printed_are_not_added_again() {
+    let mut config = skilled_config(crate::protocol::SkillSource::Worker);
+    config.codemode = Some(crate::codemode::Language::Javascript);
+    let mut agg = create_session_with_config("sess-1", "tenant-a", "user-1", Some(config));
+    run_code(&mut agg, "...");
+    let events = script_step(&mut agg, 0, &[("skill", r#"{"name":"visits"}"#)]);
+    let skill = events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::ToolCallRequested(r) if r.name == "skill" => Some(r.id.clone()),
+            _ => None,
+        })
+        .expect("the script loads the skill");
+    settle_tool(&mut agg, &skill, "Bookings are by day.\nAsk first.");
+    let events = settle_tool(
+        &mut agg,
+        "tc-1",
+        r#"{"logs":["Bookings are by day.\nAsk first."]}"#,
+    );
+    let blocks = events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::ToolCallCompleted(c) if c.id == "tc-1" => Some(c.result.content.len()),
+            _ => None,
+        })
+        .expect("run_code completes");
+    assert_eq!(blocks, 1, "the printed instructions are not repeated");
 }
 
 #[test]

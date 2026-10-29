@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::io::{self, BufRead, BufReader, Read};
 use std::rc::Rc;
 
-use super::{Limit, Script, ScriptFile};
+use super::{Limit, Script, ScriptFile, Shown};
 
 /// Bytes read from the runner at once.
 const CHUNK: u64 = 256 << 10;
@@ -14,6 +14,8 @@ const CHUNK: u64 = 256 << 10;
 const BATCH: usize = 512;
 /// Bytes of one line or row.
 const RECORD: usize = 4 << 20;
+/// Files a script shows the model.
+const SHOWN: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileError {
@@ -181,6 +183,9 @@ pub struct Files {
     max_streams: usize,
     next: u32,
     text_cap: u64,
+    shown: Vec<Shown>,
+    shown_left: u64,
+    media_left: u64,
 }
 
 impl Files {
@@ -197,6 +202,9 @@ impl Files {
             max_streams: script.limits.streams as usize,
             next: 1,
             text_cap: (script.limits.memory / 8) as u64,
+            shown: Vec::new(),
+            shown_left: script.limits.shown as u64,
+            media_left: script.limits.shown_media,
         }
     }
 
@@ -229,6 +237,59 @@ impl Files {
             buf: Vec::new(),
             at: 0,
         }
+    }
+
+    /// Puts `id` in front of the model: a media file as itself, any other
+    /// file as its text.
+    pub fn show(&mut self, id: &str) -> Result<(), String> {
+        let file = self.file(id)?.clone();
+        if self.shown.len() >= SHOWN {
+            return Err(format!("A script shows at most {SHOWN} files."));
+        }
+        let media = ["image/", "audio/", "video/"]
+            .iter()
+            .any(|kind| file.mime.starts_with(kind))
+            || file.mime == "application/pdf";
+        if media {
+            if file.size > self.media_left {
+                return Err(format!(
+                    "\"{id}\" is {} KiB, and the script may show {} KiB more of media. Show \
+                     fewer or smaller files.",
+                    file.size >> 10,
+                    self.media_left >> 10
+                ));
+            }
+            self.media_left -= file.size;
+            self.shown.push(Shown::File { file: file.id });
+            return Ok(());
+        }
+        if file.size > self.shown_left {
+            return Err(format!(
+                "\"{id}\" is {} KiB, and the script may show {} KiB more of file text. Read it \
+                 with `files.lines` or `files.csv`, and print what matters.",
+                file.size >> 10,
+                self.shown_left >> 10
+            ));
+        }
+        let mut bytes = Vec::new();
+        self.source(&file, 0)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        let text = String::from_utf8(bytes)
+            .ok()
+            .filter(|t| !t.contains('\0'))
+            .ok_or_else(|| format!("\"{id}\" is {}, not text or media.", file.mime))?;
+        self.shown_left -= text.len() as u64;
+        self.shown.push(Shown::Text {
+            file: file.id,
+            text,
+        });
+        Ok(())
+    }
+
+    /// What the script showed, in order.
+    pub fn take_shown(&mut self) -> Vec<Shown> {
+        std::mem::take(&mut self.shown)
     }
 
     /// The whole file as text, when it is small enough to hold.

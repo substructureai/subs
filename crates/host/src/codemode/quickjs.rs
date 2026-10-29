@@ -49,6 +49,10 @@ impl Engine for QuickJs {
             Step::Failed(_) => limit.or(files_limit),
             _ => limit,
         };
+        let shown = match step {
+            Step::Done(_) => files.borrow_mut().take_shown(),
+            _ => Vec::new(),
+        };
         Ran {
             step,
             stats: Stats {
@@ -58,6 +62,7 @@ impl Engine for QuickJs {
                 limit,
                 warm: false,
             },
+            shown,
         }
     }
 }
@@ -65,9 +70,9 @@ impl Engine for QuickJs {
 const PRELUDE: &str = r#"
 (() => {
   const { __call: call, __log: log, __done: done, __names: names, __now: NOW } = globalThis;
-  const { __files_list: listed, __files_text: ftext, __files_open: fopen, __files_next: fnext, __files_close: fclose } = globalThis;
+  const { __files_list: listed, __files_text: ftext, __files_open: fopen, __files_next: fnext, __files_close: fclose, __files_show: fshow } = globalThis;
   let seed = globalThis.__seed;
-  for (const k of ["__call", "__log", "__done", "__names", "__now", "__seed", "__files_list", "__files_text", "__files_open", "__files_next", "__files_close"]) delete globalThis[k];
+  for (const k of ["__call", "__log", "__done", "__names", "__now", "__seed", "__files_list", "__files_text", "__files_open", "__files_next", "__files_close", "__files_show"]) delete globalThis[k];
   const answered = (r) => { const a = JSON.parse(r); if ("error" in a) throw new Error(a.error); return a.value; };
   const known = JSON.parse(listed);
   async function* stream(id, format, options) {
@@ -88,6 +93,7 @@ const PRELUDE: &str = r#"
       return { ...f };
     },
     text: async (id) => answered(ftext(String(id))),
+    show: (id) => { answered(fshow(String(id))); },
     lines: (id, options) => stream(id, "lines", options),
     jsonl: (id, options) => stream(id, "jsonl", options),
     csv: (id, options) => stream(id, "csv", options),
@@ -318,6 +324,13 @@ fn execute(
         )?;
         let f = files.clone();
         globals.set(
+            "__files_show",
+            Function::new(ctx.clone(), move |id: String| {
+                answer(f.borrow_mut().show(&id).map(|()| "null".to_string()))
+            })?,
+        )?;
+        let f = files.clone();
+        globals.set(
             "__files_close",
             Function::new(ctx.clone(), move |stream: u32| f.borrow_mut().close(stream))?,
         )?;
@@ -472,6 +485,54 @@ mod tests {
         assert_eq!(
             ran.step,
             Step::Done(r#"{"result":[["line 0","line 1"],["line 0"],"hi",2]}"#.into())
+        );
+    }
+
+    #[test]
+    fn a_script_shows_files_by_kind_and_within_its_budget() {
+        let mut s = script(
+            "files.show('notes.txt'); files.show('shot.png');\n\
+             try { files.show('big.txt'); } catch (e) { console.log(e.message); }\n\
+             return 'ok';",
+            vec![],
+        );
+        let file = |id: &str, mime: &str, size: usize| crate::codemode::ScriptFile {
+            id: id.to_string(),
+            mime: mime.to_string(),
+            size: size as u64,
+        };
+        let big = "y".repeat(70 << 10);
+        s.files = vec![
+            file("notes.txt", "text/plain", 5),
+            file("shot.png", "image/png", 3),
+            file("big.txt", "text/plain", big.len()),
+        ];
+        let host = crate::codemode::files::MemoryFiles(
+            [
+                ("notes.txt", b"hello".to_vec()),
+                ("shot.png", vec![0x89, 0x50, 0x4e]),
+                ("big.txt", big.into_bytes()),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect(),
+        );
+        let ran = engine::run(&s, Box::new(host));
+        assert!(
+            matches!(&ran.step, Step::Done(t) if t.contains("may show")),
+            "{ran:?}"
+        );
+        assert_eq!(
+            ran.shown,
+            [
+                crate::codemode::Shown::Text {
+                    file: "notes.txt".into(),
+                    text: "hello".into()
+                },
+                crate::codemode::Shown::File {
+                    file: "shot.png".into()
+                },
+            ]
         );
     }
 

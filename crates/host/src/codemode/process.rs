@@ -322,6 +322,7 @@ impl ScriptRunner for ProcessRunner {
                 warm,
                 ..Stats::default()
             },
+            shown: Vec::new(),
         };
         let mut worker = match worker {
             Ok(worker) => worker,

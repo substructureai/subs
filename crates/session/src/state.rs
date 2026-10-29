@@ -3335,7 +3335,7 @@ fn describe_run_code(
             &declared,
         )
     };
-    tools.retain(|t| !in_code(t));
+    tools.retain(|t| t.name == RUN_CODE);
     if let Some(tool) = tools.iter_mut().find(|t| t.name == RUN_CODE) {
         tool.description = description;
     }

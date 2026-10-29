@@ -34,6 +34,7 @@ pub fn run(script: &Script, host: Box<dyn Host>) -> Ran {
                 script.language
             )),
             stats: Default::default(),
+            shown: Vec::new(),
         },
     }
 }
