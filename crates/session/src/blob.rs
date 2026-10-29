@@ -87,6 +87,18 @@ pub struct NewBlob {
 pub trait BlobStore: Send + Sync {
     async fn put(&self, blob: NewBlob) -> Result<BlobRef, BlobError>;
     async fn get(&self, r: &BlobRef) -> Result<Vec<u8>, BlobError>;
+
+    /// Bytes `range` of the blob, fewer at its end. A blob never changes, so
+    /// a read always gives the same bytes. Scripts stream files a range at a
+    /// time, so a store should fetch only the range.
+    async fn read(&self, r: &BlobRef, range: std::ops::Range<u64>) -> Result<Vec<u8>, BlobError>;
+}
+
+/// `range` of `bytes`, clamped to their end.
+pub fn slice(bytes: &[u8], range: std::ops::Range<u64>) -> Vec<u8> {
+    let end = (range.end as usize).min(bytes.len());
+    let start = (range.start as usize).min(end);
+    bytes[start..end].to_vec()
 }
 
 pub struct MemoryBlobStore(std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>);
@@ -127,6 +139,15 @@ impl BlobStore for MemoryBlobStore {
             .unwrap_or_else(|e| e.into_inner())
             .get(&r.id)
             .cloned()
+            .ok_or(BlobError::NotFound)
+    }
+
+    async fn read(&self, r: &BlobRef, range: std::ops::Range<u64>) -> Result<Vec<u8>, BlobError> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&r.id)
+            .map(|bytes| slice(bytes, range))
             .ok_or(BlobError::NotFound)
     }
 }

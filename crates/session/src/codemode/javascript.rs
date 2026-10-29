@@ -32,6 +32,11 @@ out of the conversation.
 - A script resumes from the start after its calls finish, so work done before a call is done \
 again each time. It has limits on its calls, on the results it reads, on memory and on compute; \
 an error names the limit and what to do.
+- Files in the conversation show as `[attachment <id> …]` lines. Read one by its id: \
+`await files.text(id)` for a small file, or stream it with `for await (const row of \
+files.csv(id))`, `files.lines(id)`, `files.jsonl(id)` or `files.chunks(id)`. Each takes \
+`{ limit }`. `files.list()` lists them. Read files before you call tools: a script resumes from \
+the start after its calls, and reads them again.
 - There is no network, file system, timer or module. `Date` and `Math.random` stay the same \
 for the whole run.
 - A call that needs approval waits for a person, and a client tool waits for the client. A \

@@ -12,8 +12,10 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
-use super::child::{Hello, DATA, DATA_MIB};
+use super::child::{Hello, Reply, Request, DATA, DATA_MIB};
 use super::{Ran, Script, Stats, Step, ARG};
+use std::collections::BTreeMap;
+use substructure_session::blob::{BlobError, BlobRef, BlobStore, MemoryBlobStore};
 
 /// Runs one step of a script. A runner keeps nothing between steps, so any
 /// runner can take any step: a process here, a machine elsewhere, a service.
@@ -23,8 +25,66 @@ use super::{Ran, Script, Stats, Step, ARG};
 pub trait ScriptRunner: Send + Sync {
     /// The step the script reached and what it took, or an error that a
     /// later try may not meet. A failed script is a [`Step::Failed`], not an
-    /// error. A runner holds the script to its [`super::Limits`].
-    async fn run(&self, script: Script) -> Result<Ran, RunError>;
+    /// error. A runner holds the script to its [`super::Limits`], and reads
+    /// its files from `files`.
+    async fn run(&self, script: Script, files: ScriptFiles) -> Result<Ran, RunError>;
+}
+
+/// The blobs behind a script's files, for its runner to read. The script sees
+/// only their ids.
+#[derive(Clone)]
+pub struct ScriptFiles {
+    pub tenant_id: String,
+    pub blobs: BTreeMap<String, BlobRef>,
+    pub store: Arc<dyn BlobStore>,
+}
+
+/// Why a file could not be read.
+pub enum ReadError {
+    /// The file is not there, or not this tenant's. The script hears of it.
+    Missing(String),
+    /// The store failed. The step is tried again.
+    Store(String),
+}
+
+impl ScriptFiles {
+    pub fn none() -> Self {
+        ScriptFiles {
+            tenant_id: String::new(),
+            blobs: BTreeMap::new(),
+            store: Arc::new(MemoryBlobStore::new()),
+        }
+    }
+
+    /// Bytes `offset..offset + len` of `file`, fewer at its end.
+    pub async fn read(&self, file: &str, offset: u64, len: u64) -> Result<Vec<u8>, ReadError> {
+        let missing = || ReadError::Missing(format!("There is no file \"{file}\"."));
+        let blob = self.blobs.get(file).ok_or_else(missing)?;
+        if blob.tenant_id != self.tenant_id {
+            return Err(missing());
+        }
+        let end = offset.saturating_add(len).min(blob.size);
+        if offset >= end {
+            return Ok(Vec::new());
+        }
+        self.store
+            .read(blob, offset..end)
+            .await
+            .map_err(|e| match e {
+                BlobError::NotFound => {
+                    ReadError::Missing(format!("\"{file}\" is no longer stored."))
+                }
+                other => ReadError::Store(other.to_string()),
+            })
+    }
+}
+
+/// Why a step ended without a `Ran`.
+enum Stop {
+    /// The script ran too long or its process died. The script fails.
+    Failed(String),
+    /// Its files could not be read. The step is tried again.
+    Store(String),
 }
 
 /// The runner could not take the step this time: it was down, busy, or of
@@ -45,6 +105,8 @@ const READY: Duration = Duration::from_secs(10);
 /// and work QuickJS cannot interrupt.
 const SLACK: Duration = Duration::from_secs(1);
 const ANSWER: u64 = 64 << 20;
+/// Time a run may wait on reading its files, apart from its own deadline.
+const READ_WAIT: Duration = Duration::from_secs(60);
 
 /// Runs each step in a fresh confined process started from `program`, which
 /// must call [`super::dispatch`] first in `main`.
@@ -189,24 +251,63 @@ impl ProcessRunner {
         }
     }
 
-    async fn exchange(&self, worker: &mut Worker, script: &Script) -> io::Result<Ran> {
-        let mut request = serde_json::to_vec(script)?;
+    /// Sends the script, answers its reads, and takes its `Ran`. Time spent
+    /// reading files does not count toward the run's deadline.
+    async fn exchange(
+        &self,
+        worker: &mut Worker,
+        script: &Script,
+        files: &ScriptFiles,
+    ) -> Result<Ran, Stop> {
+        let failed = |e: io::Error| Stop::Failed(e.to_string());
+        let mut request = serde_json::to_vec(script).map_err(|e| Stop::Failed(e.to_string()))?;
         request.push(b'\n');
-        worker.stdin.write_all(&request).await?;
-        worker.stdin.flush().await?;
-        let deadline = self
-            .deadline
-            .unwrap_or(Duration::from_millis(3 * script.compute_ms()) + SLACK);
-        let line = tokio::time::timeout(deadline, read_line(&mut worker.stdout))
-            .await
-            .map_err(|_| io::Error::other("the script ran too long"))??;
-        Ok(serde_json::from_slice(&line)?)
+        worker.stdin.write_all(&request).await.map_err(failed)?;
+        worker.stdin.flush().await.map_err(failed)?;
+        let mut deadline = tokio::time::Instant::now()
+            + self
+                .deadline
+                .unwrap_or(Duration::from_millis(3 * script.compute_ms()) + SLACK);
+        let (budget, mut served, mut waited) = (script.file_bytes(), 0u64, Duration::ZERO);
+        loop {
+            let line = tokio::time::timeout_at(deadline, read_line(&mut worker.stdout))
+                .await
+                .map_err(|_| Stop::Failed("the script ran too long".to_string()))?
+                .map_err(failed)?;
+            let Ok(Request::Read { file, offset, len }) = serde_json::from_slice(&line) else {
+                return serde_json::from_slice(&line).map_err(|e| Stop::Failed(e.to_string()));
+            };
+            let started = tokio::time::Instant::now();
+            let (reply, bytes) = match served.saturating_add(len) > budget {
+                true => (
+                    Reply::Refused("The script read its limit of file bytes.".to_string()),
+                    Vec::new(),
+                ),
+                false => match files.read(&file, offset, len).await {
+                    Ok(bytes) => (Reply::Bytes(bytes.len() as u64), bytes),
+                    Err(ReadError::Missing(m)) => (Reply::Missing(m), Vec::new()),
+                    Err(ReadError::Store(e)) => return Err(Stop::Store(e)),
+                },
+            };
+            served += bytes.len() as u64;
+            let mut head = serde_json::to_vec(&reply).map_err(|e| Stop::Failed(e.to_string()))?;
+            head.push(b'\n');
+            worker.stdin.write_all(&head).await.map_err(failed)?;
+            worker.stdin.write_all(&bytes).await.map_err(failed)?;
+            worker.stdin.flush().await.map_err(failed)?;
+            let spent = started.elapsed();
+            deadline += spent;
+            waited += spent;
+            if waited > READ_WAIT {
+                return Err(Stop::Store("reading its files took too long".to_string()));
+            }
+        }
     }
 }
 
 #[async_trait]
 impl ScriptRunner for ProcessRunner {
-    async fn run(&self, script: Script) -> Result<Ran, RunError> {
+    async fn run(&self, script: Script, files: ScriptFiles) -> Result<Ran, RunError> {
         let spare = self.take_spare().await;
         let warm = spare.is_some();
         let worker = match spare {
@@ -249,14 +350,19 @@ impl ScriptRunner for ProcessRunner {
                 script.version
             )));
         }
-        let answer = self.exchange(&mut worker, &script).await;
+        let answer = self.exchange(&mut worker, &script, &files).await;
         let _ = worker.process.start_kill();
         Ok(match answer {
             Ok(mut ran) => {
                 ran.stats.warm = warm;
                 ran
             }
-            Err(e) => failed(
+            Err(Stop::Store(e)) => {
+                return Err(RunError(format!(
+                    "the script's files could not be read: {e}"
+                )))
+            }
+            Err(Stop::Failed(e)) => failed(
                 format!(
                     "The script stopped: {e}. It may have run long inside one built-in \
                      operation, or run out of memory."

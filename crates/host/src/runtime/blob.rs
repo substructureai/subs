@@ -161,6 +161,9 @@ impl BlobStore for Nowhere {
     async fn get(&self, _: &BlobRef) -> Result<Vec<u8>, BlobError> {
         Err(BlobError::NotFound)
     }
+    async fn read(&self, _: &BlobRef, _: std::ops::Range<u64>) -> Result<Vec<u8>, BlobError> {
+        Err(BlobError::NotFound)
+    }
 }
 
 pub struct BlobResolvingLlm {
@@ -592,6 +595,13 @@ mod tests {
             async fn get(&self, _: &BlobRef) -> Result<Vec<u8>, BlobError> {
                 Err(BlobError::NotFound)
             }
+            async fn read(
+                &self,
+                _: &BlobRef,
+                _: std::ops::Range<u64>,
+            ) -> Result<Vec<u8>, BlobError> {
+                Err(BlobError::NotFound)
+            }
         }
 
         let result = ToolResult {
@@ -666,6 +676,14 @@ mod tests {
                 ID => Ok(vec![1, 2, 3, 4]),
                 _ => Err(BlobError::NotFound),
             }
+        }
+
+        async fn read(
+            &self,
+            r: &BlobRef,
+            range: std::ops::Range<u64>,
+        ) -> Result<Vec<u8>, BlobError> {
+            Ok(slice(&self.get(r).await?, range))
         }
     }
 

@@ -8,8 +8,9 @@ use rquickjs::convert::List;
 use rquickjs::{Context, Function, Runtime};
 
 use super::engine::{cpu_ms, Engine};
+use super::files::{Files, Host};
 use super::replay::{Answer, End, Replay};
-use super::{Language, Limit, Ran, Script, Stats};
+use super::{Language, Limit, Ran, Script, Stats, Step};
 
 const STACK: usize = 512 << 10;
 /// QuickJS calls the interrupt handler about every 10k instructions. A
@@ -24,10 +25,11 @@ impl Engine for QuickJs {
         Language::Javascript
     }
 
-    fn run(&self, script: &Script) -> Ran {
+    fn run(&self, script: &Script, host: Box<dyn Host>) -> Ran {
         let started = cpu_ms();
         let replay = Rc::new(RefCell::new(Replay::new(script)));
-        let heap = match execute(script, &replay, started) {
+        let files = Rc::new(RefCell::new(Files::new(script, host)));
+        let heap = match execute(script, &replay, &files, started) {
             Ok(heap) => heap,
             Err(e) => {
                 replay.borrow_mut().end(End::Raised {
@@ -42,11 +44,17 @@ impl Engine for QuickJs {
             .expect("the runtime is gone")
             .into_inner();
         let (step, limit) = replay.finish();
+        let (file_bytes, files_limit) = files.borrow().spent();
+        let limit = match step {
+            Step::Failed(_) => limit.or(files_limit),
+            _ => limit,
+        };
         Ran {
             step,
             stats: Stats {
                 heap,
                 cpu_ms: cpu_ms().saturating_sub(started),
+                file_bytes,
                 limit,
                 warm: false,
             },
@@ -57,8 +65,34 @@ impl Engine for QuickJs {
 const PRELUDE: &str = r#"
 (() => {
   const { __call: call, __log: log, __done: done, __names: names, __now: NOW } = globalThis;
+  const { __files_list: listed, __files_text: ftext, __files_open: fopen, __files_next: fnext, __files_close: fclose } = globalThis;
   let seed = globalThis.__seed;
-  for (const k of ["__call", "__log", "__done", "__names", "__now", "__seed"]) delete globalThis[k];
+  for (const k of ["__call", "__log", "__done", "__names", "__now", "__seed", "__files_list", "__files_text", "__files_open", "__files_next", "__files_close"]) delete globalThis[k];
+  const answered = (r) => { const a = JSON.parse(r); if ("error" in a) throw new Error(a.error); return a.value; };
+  const known = JSON.parse(listed);
+  async function* stream(id, format, options) {
+    const s = answered(fopen(String(id), JSON.stringify({ ...(options ?? {}), format })));
+    try {
+      for (;;) {
+        const batch = answered(fnext(s));
+        if (batch === null) return;
+        yield* batch;
+      }
+    } finally { fclose(s); }
+  }
+  globalThis.files = Object.freeze({
+    list: () => known.map((f) => ({ ...f })),
+    stat: (id) => {
+      const f = known.find((f) => f.id === id);
+      if (!f) throw new Error(`There is no file "${id}".`);
+      return { ...f };
+    },
+    text: async (id) => answered(ftext(String(id))),
+    lines: (id, options) => stream(id, "lines", options),
+    jsonl: (id, options) => stream(id, "jsonl", options),
+    csv: (id, options) => stream(id, "csv", options),
+    chunks: (id, options) => stream(id, "chunks", options),
+  });
   const parse = (s) => { try { return JSON.parse(s); } catch { return s; } };
   const invoke = (name, args) => {
     const json = JSON.stringify(args === undefined ? {} : args);
@@ -183,7 +217,12 @@ fn raised(message: String, range: Option<&str>) -> End {
 }
 
 /// Runs the script on QuickJS, and returns the most heap it held.
-fn execute(script: &Script, replay: &Rc<RefCell<Replay>>, started: u64) -> rquickjs::Result<usize> {
+fn execute(
+    script: &Script,
+    replay: &Rc<RefCell<Replay>>,
+    files: &Rc<RefCell<Files>>,
+    started: u64,
+) -> rquickjs::Result<usize> {
     let limits = replay.borrow().limits().clone();
     let peak = Rc::new(Cell::new(0));
     let refused = Rc::new(Cell::new(false));
@@ -242,6 +281,46 @@ fn execute(script: &Script, replay: &Rc<RefCell<Replay>>, started: u64) -> rquic
         globals.set("__names", script.tools.clone())?;
         globals.set("__now", script.now_ms as f64)?;
         globals.set("__seed", script.seed as u32 as i32)?;
+        let listed = serde_json::to_string(files.borrow().list()).unwrap_or_default();
+        globals.set("__files_list", listed)?;
+        let f = files.clone();
+        globals.set(
+            "__files_text",
+            Function::new(ctx.clone(), move |id: String| {
+                answer(
+                    f.borrow_mut()
+                        .text(&id)
+                        .map(|t| serde_json::Value::String(t).to_string()),
+                )
+            })?,
+        )?;
+        let f = files.clone();
+        globals.set(
+            "__files_open",
+            Function::new(ctx.clone(), move |id: String, options: String| {
+                answer(
+                    f.borrow_mut()
+                        .open_with(&id, &options)
+                        .map(|s| s.to_string()),
+                )
+            })?,
+        )?;
+        let f = files.clone();
+        globals.set(
+            "__files_next",
+            Function::new(ctx.clone(), move |stream: u32| {
+                answer(
+                    f.borrow_mut()
+                        .next(stream)
+                        .map(|b| b.unwrap_or_else(|| "null".to_string())),
+                )
+            })?,
+        )?;
+        let f = files.clone();
+        globals.set(
+            "__files_close",
+            Function::new(ctx.clone(), move |stream: u32| f.borrow_mut().close(stream))?,
+        )?;
         ctx.eval::<(), _>(PRELUDE)?;
         let source = format!("__run(async () => {{\n{}\n}});", script.code);
         match ctx.eval::<(), _>(source) {
@@ -275,6 +354,15 @@ fn execute(script: &Script, replay: &Rc<RefCell<Replay>>, started: u64) -> rquic
     Ok(peak.get())
 }
 
+/// A file call's answer for the prelude: `{"value": …}` with JSON, or
+/// `{"error": …}`.
+fn answer(result: Result<String, String>) -> String {
+    match result {
+        Ok(json) => format!("{{\"value\":{json}}}"),
+        Err(e) => serde_json::json!({ "error": e }).to_string(),
+    }
+}
+
 fn exception(ctx: &rquickjs::Ctx<'_>) -> End {
     let caught = ctx.catch();
     if let Some(e) = caught.as_exception() {
@@ -300,15 +388,18 @@ fn exception(ctx: &rquickjs::Ctx<'_>) -> End {
 mod tests {
     use super::*;
     use crate::codemode::engine;
+    use crate::codemode::files::NoFiles;
     use crate::codemode::{Limits, ScriptCall, ScriptRecord, Step};
 
     fn run(script: &Script) -> Step {
-        engine::run(script).step
+        engine::run(script, Box::new(NoFiles)).step
     }
 
     fn script(code: &str, calls: Vec<ScriptRecord>) -> Script {
         Script {
             cpu_used_ms: 0,
+            files: vec![],
+            file_bytes_used: 0,
             limits: Limits {
                 compute_ms: 1_000,
                 memory: 16 << 20,
@@ -323,6 +414,75 @@ mod tests {
             language: Default::default(),
             tools: vec!["weather".to_string(), "list-prs".to_string()],
         }
+    }
+
+    /// Runs `code` with `files` to read.
+    fn with_files(code: &str, files: &[(&str, &str)]) -> Ran {
+        let mut s = script(code, vec![]);
+        s.files = files
+            .iter()
+            .map(|(id, text)| crate::codemode::ScriptFile {
+                id: id.to_string(),
+                mime: "text/plain".to_string(),
+                size: text.len() as u64,
+            })
+            .collect();
+        let host = crate::codemode::files::MemoryFiles(
+            files
+                .iter()
+                .map(|(id, text)| (id.to_string(), text.as_bytes().to_vec()))
+                .collect(),
+        );
+        engine::run(&s, Box::new(host))
+    }
+
+    #[test]
+    fn a_script_streams_a_csv_and_sums_it() {
+        let mut csv = String::from("region,amount\n");
+        for i in 0..3_000 {
+            csv.push_str(&format!("{},{}\n", ["EU", "US", "APAC"][i % 3], i));
+        }
+        let code = "const t = {};\n\
+            for await (const r of files.csv('sales.csv')) t[r.region] = (t[r.region] ?? 0) + Number(r.amount);\n\
+            return [files.list().map(f => f.id), t];";
+        let ran = with_files(code, &[("sales.csv", &csv)]);
+        let sum = |k: usize| (0..3_000).filter(|i| i % 3 == k).sum::<usize>();
+        assert_eq!(
+            ran.step,
+            Step::Done(format!(
+                r#"{{"result":[["sales.csv"],{{"APAC":{},"EU":{},"US":{}}}]}}"#,
+                sum(2),
+                sum(0),
+                sum(1)
+            ))
+        );
+        assert_eq!(ran.stats.file_bytes, csv.len() as u64);
+    }
+
+    #[test]
+    fn a_script_reads_lines_text_and_stops_early() {
+        let log: String = (0..10_000).map(|i| format!("line {i}\n")).collect();
+        let code = "const first = [];\n\
+            for await (const l of files.lines('app.log')) { first.push(l); if (first.length === 2) break; }\n\
+            const few = [];\n\
+            for await (const l of files.lines('app.log', { limit: 1 })) few.push(l);\n\
+            const text = await files.text('note.txt');\n\
+            return [first, few, text, files.stat('note.txt').size];";
+        let ran = with_files(code, &[("app.log", &log), ("note.txt", "hi")]);
+        assert_eq!(
+            ran.step,
+            Step::Done(r#"{"result":[["line 0","line 1"],["line 0"],"hi",2]}"#.into())
+        );
+    }
+
+    #[test]
+    fn a_missing_file_throws_what_the_script_can_catch() {
+        let code = "try { await files.text('nope.csv'); } catch (e) { return e.message; }";
+        let ran = with_files(code, &[("sales.csv", "a")]);
+        assert!(
+            matches!(&ran.step, Step::Done(t) if t.contains("Files: sales.csv")),
+            "{ran:?}"
+        );
     }
 
     fn record(name: &str, arguments: &str, ok: bool, output: &str) -> ScriptRecord {
@@ -462,20 +622,23 @@ mod tests {
 
     #[test]
     fn runaway_memory_fails_the_run() {
-        let ran = engine::run(&script(
-            "const a = []; while (true) a.push('x'.repeat(1 << 20));",
-            vec![],
-        ));
+        let ran = engine::run(
+            &script(
+                "const a = []; while (true) a.push('x'.repeat(1 << 20));",
+                vec![],
+            ),
+            Box::new(NoFiles),
+        );
         assert_eq!(ran.stats.limit, Some(Limit::Memory), "{ran:?}");
     }
 
     #[test]
     fn a_tool_error_that_names_a_limit_is_not_that_limit() {
         for message in ["database out of memory", "Maximum call stack size exceeded"] {
-            let ran = engine::run(&script(
-                "await tools.a();",
-                vec![record("a", "{}", false, message)],
-            ));
+            let ran = engine::run(
+                &script("await tools.a();", vec![record("a", "{}", false, message)]),
+                Box::new(NoFiles),
+            );
             assert!(
                 matches!(&ran.step, Step::Failed(m) if m.contains(message)),
                 "{ran:?}"
@@ -486,10 +649,10 @@ mod tests {
 
     #[test]
     fn deep_recursion_fails_the_run() {
-        let ran = engine::run(&script(
-            "const f = (n) => f(n + 1) + 1; return f(0);",
-            vec![],
-        ));
+        let ran = engine::run(
+            &script("const f = (n) => f(n + 1) + 1; return f(0);", vec![]),
+            Box::new(NoFiles),
+        );
         assert_eq!(ran.stats.limit, Some(Limit::Stack), "{ran:?}");
         assert!(
             matches!(&ran.step, Step::Failed(m) if m.contains("call stack")),
@@ -571,7 +734,7 @@ mod tests {
             vec![record("a", "{}", true, "1"), record("b", "{}", true, "2")],
         );
         limited.limits.calls = 2;
-        let ran = engine::run(&limited);
+        let ran = engine::run(&limited, Box::new(NoFiles));
         assert!(
             matches!(&ran.step, Step::Done(t) if t.contains("at most 2 calls")),
             "{ran:?}"
@@ -595,10 +758,10 @@ mod tests {
 
     #[test]
     fn a_run_says_which_limit_stopped_it() {
-        let ran = engine::run(&script("while (true) {}", vec![]));
+        let ran = engine::run(&script("while (true) {}", vec![]), Box::new(NoFiles));
         assert_eq!(ran.stats.limit, Some(Limit::Compute));
         assert!(ran.stats.cpu_ms >= 1_000, "{:?}", ran.stats);
-        let ran = engine::run(&script("return 1;", vec![]));
+        let ran = engine::run(&script("return 1;", vec![]), Box::new(NoFiles));
         assert_eq!(ran.stats.limit, None);
         assert!(ran.stats.heap > 0);
     }
@@ -607,7 +770,7 @@ mod tests {
     fn a_run_gets_only_what_is_left_of_the_whole_budget() {
         let mut nearly = script("while (true) {}", vec![]);
         nearly.cpu_used_ms = nearly.limits.total_compute_ms - 50;
-        let ran = engine::run(&nearly);
+        let ran = engine::run(&nearly, Box::new(NoFiles));
         assert!(
             matches!(&ran.step, Step::Failed(m) if m.contains("over all its runs")),
             "{ran:?}"
@@ -623,7 +786,7 @@ mod tests {
     fn a_script_with_no_budget_left_does_not_run() {
         let mut spent = script("return 1;", vec![]);
         spent.cpu_used_ms = spent.limits.total_compute_ms;
-        let ran = engine::run(&spent);
+        let ran = engine::run(&spent, Box::new(NoFiles));
         assert!(
             matches!(&ran.step, Step::Failed(m) if m.contains("over all its runs")),
             "{ran:?}"

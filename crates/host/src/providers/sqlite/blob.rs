@@ -71,6 +71,34 @@ impl BlobStore for SqliteBlobStore {
         .await
         .map_err(io_err)?
     }
+
+    async fn read(&self, r: &BlobRef, range: std::ops::Range<u64>) -> Result<Vec<u8>, BlobError> {
+        let (tenant_id, id) = (r.tenant_id.clone(), r.id.clone());
+        let reader = self.db.reader.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = reader.open().map_err(io_err)?;
+            let row: i64 = conn
+                .query_row(
+                    "SELECT rowid FROM blobs WHERE tenant_id = ?1 AND id = ?2",
+                    rusqlite::params![tenant_id, id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(io_err)?
+                .ok_or(BlobError::NotFound)?;
+            let blob = conn
+                .blob_open(rusqlite::MAIN_DB, "blobs", "bytes", row, true)
+                .map_err(io_err)?;
+            let end = range.end.min(blob.len() as u64);
+            let start = range.start.min(end);
+            let mut bytes = vec![0; (end - start) as usize];
+            blob.read_at_exact(&mut bytes, start as usize)
+                .map_err(io_err)?;
+            Ok(bytes)
+        })
+        .await
+        .map_err(io_err)?
+    }
 }
 
 #[cfg(test)]
@@ -83,6 +111,38 @@ mod tests {
             std::env::temp_dir().join(format!("core-blobs-{name}-{}.db", uuid::Uuid::now_v7()));
         let db = SqliteDb::open(path.to_str().unwrap(), Duration::from_secs(5)).unwrap();
         SqliteBlobStore::new(db)
+    }
+
+    #[tokio::test]
+    async fn a_read_takes_only_its_range() {
+        let store = store("ranges");
+        let bytes: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        let r = store
+            .put(NewBlob {
+                tenant_id: "t1".into(),
+                mime: "text/plain".into(),
+                name: None,
+                bytes: bytes.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store.read(&r, 70_000..70_010).await.unwrap(),
+            bytes[70_000..70_010]
+        );
+        assert_eq!(
+            store.read(&r, 99_990..200_000).await.unwrap(),
+            bytes[99_990..]
+        );
+        assert!(store.read(&r, 200_000..200_010).await.unwrap().is_empty());
+        let gone = BlobRef {
+            id: uuid::Uuid::now_v7().to_string(),
+            ..r
+        };
+        assert!(matches!(
+            store.read(&gone, 0..1).await,
+            Err(BlobError::NotFound)
+        ));
     }
 
     #[tokio::test]

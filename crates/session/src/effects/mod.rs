@@ -39,6 +39,8 @@ pub enum Outcome {
         calls: Vec<crate::events::ScriptCall>,
         #[serde(default)]
         cpu_ms: u64,
+        #[serde(default)]
+        file_bytes: u64,
     },
     Error(SettleError),
 }

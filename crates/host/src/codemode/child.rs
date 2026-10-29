@@ -2,12 +2,13 @@
 //! from stdin, and writes its step to stdout, each as one line of JSON.
 
 use std::ffi::OsString;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 
 use serde::{Deserialize, Serialize};
 
 use super::confine::{self, Denial};
 use super::engine::{languages, run};
+use super::files::{FileError, Host};
 use super::{Language, Ran, Script, Step, OLDEST, VERSION};
 
 /// The argument that makes a binary a runner process.
@@ -31,6 +32,58 @@ pub enum Hello {
     Unconfined {
         error: String,
     },
+}
+
+/// What a runner process asks its runner during a run. Its last line is the
+/// `Ran` instead.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Request {
+    /// Bytes of a file. The answer is a `Reply`, then for `Bytes(n)`, `n` raw
+    /// bytes.
+    Read { file: String, offset: u64, len: u64 },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Reply {
+    Bytes(u64),
+    Missing(String),
+    Refused(String),
+}
+
+/// Reads a script's files by asking the runner over the pipes.
+struct PipeHost;
+
+impl Host for PipeHost {
+    fn read(&mut self, file: &str, offset: u64, len: u64) -> Result<Vec<u8>, FileError> {
+        let gone = || FileError::Missing("The runner did not answer.".to_string());
+        let request = Request::Read {
+            file: file.to_string(),
+            offset,
+            len,
+        };
+        let mut out = io::stdout().lock();
+        let line = serde_json::to_string(&request).map_err(|_| gone())?;
+        writeln!(out, "{line}")
+            .and_then(|_| out.flush())
+            .map_err(|_| gone())?;
+        let mut input = io::stdin().lock();
+        let mut line = String::new();
+        if input.read_line(&mut line).unwrap_or(0) == 0 {
+            return Err(gone());
+        }
+        match serde_json::from_str(&line).map_err(|_| gone())? {
+            Reply::Bytes(n) if n > len => Err(gone()),
+            Reply::Bytes(n) => {
+                let mut bytes = vec![0; n as usize];
+                input.read_exact(&mut bytes).map_err(|_| gone())?;
+                Ok(bytes)
+            }
+            Reply::Missing(m) => Err(FileError::Missing(m)),
+            Reply::Refused(m) => Err(FileError::Limit(m)),
+        }
+    }
 }
 
 /// Call first in `main`, before any thread starts. Becomes a runner process
@@ -89,7 +142,7 @@ fn main(args: Vec<OsString>) -> ! {
     let ran = match serde_json::from_str::<Script>(&line) {
         Ok(script) => {
             let _ = confine::limit_cpu(script.compute_ms());
-            run(&script)
+            run(&script, Box::new(PipeHost))
         }
         Err(e) => Ran {
             step: Step::Failed(format!("The runner could not read the script: {e}")),

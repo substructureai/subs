@@ -2,16 +2,17 @@ mod admission;
 mod child;
 mod confine;
 pub mod engine;
+pub mod files;
 mod process;
 mod quickjs;
 pub mod replay;
 
 pub use admission::{Admission, Ticket};
 pub use child::{dispatch, ARG, PROBE, PROBE_LOCK};
-pub use process::{ProcessRunner, RunError, ScriptRunner};
+pub use process::{ProcessRunner, ReadError, RunError, ScriptFiles, ScriptRunner};
 pub use substructure_session::codemode::{
-    spent, supports, Language, Limit, Limits, Ran, Script, ScriptCall, ScriptRecord, Stats, Step,
-    OLDEST, VERSION,
+    spent, supports, Language, Limit, Limits, Ran, Script, ScriptCall, ScriptFile, ScriptRecord,
+    Stats, Step, OLDEST, VERSION,
 };
 
 use substructure_session::command::{CommandPayload, Outcome, SettleError};
@@ -24,6 +25,7 @@ pub fn settle(tool_call_id: String, attempt: u32, known: u32, ran: Ran) -> Comma
             known,
             calls,
             cpu_ms: ran.stats.cpu_ms,
+            file_bytes: ran.stats.file_bytes,
         },
         Step::Done(text) => Outcome::Tool {
             result: StoredResult::text(text),

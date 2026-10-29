@@ -74,7 +74,8 @@ impl KindSpec for ToolSpec {
                 known,
                 calls,
                 cpu_ms,
-            } => script_step(state, id, known, calls, cpu_ms),
+                file_bytes,
+            } => script_step(state, id, known, calls, (cpu_ms, file_bytes)),
             Outcome::Error(e) => fail(self, state, id, &e),
             other => mismatched(self.kind(), &other),
         }
@@ -188,7 +189,7 @@ fn script_step(
     parent: &str,
     known: u32,
     calls: Vec<ScriptCall>,
-    cpu_ms: u64,
+    (cpu_ms, file_bytes): (u64, u64),
 ) -> Vec<EventPayload> {
     let made = state.script_calls(parent);
     let stale = made.len() != known as usize
@@ -218,6 +219,7 @@ fn script_step(
         EventPayload::ToolCallStepped(ToolCallStepped {
             id: parent.to_string(),
             cpu_ms,
+            file_bytes,
             asked,
         }),
         decision_queued(state.ids(), trigger),

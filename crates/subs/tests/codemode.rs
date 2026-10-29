@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use substructure_host::codemode::{ProcessRunner, Ran, RunError, Script, ScriptRunner, ARG};
+use substructure_host::codemode::{
+    ProcessRunner, Ran, RunError, Script, ScriptFiles, ScriptRunner, ARG,
+};
 use substructure_host::event_store::Seq;
 use substructure_host::llm::{
     CallContext, InMemoryTokenDeltaTransport, LlmBlock, LlmBlocks, LlmCallError, LlmCallable,
@@ -318,11 +320,11 @@ struct Flaky {
 
 #[async_trait]
 impl ScriptRunner for Flaky {
-    async fn run(&self, script: Script) -> Result<Ran, RunError> {
+    async fn run(&self, script: Script, files: ScriptFiles) -> Result<Ran, RunError> {
         if std::mem::take(&mut *self.down.lock().unwrap()) {
             return Err(RunError("the code machine is restarting".into()));
         }
-        self.runner.run(script).await
+        self.runner.run(script, files).await
     }
 }
 

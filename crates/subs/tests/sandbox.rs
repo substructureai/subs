@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use subs::codemode::{
-    ProcessRunner, RunError, Script, ScriptRunner, Step, ARG, PROBE, PROBE_LOCK, VERSION,
+    ProcessRunner, RunError, Script, ScriptFiles, ScriptRunner, Step, ARG, PROBE, PROBE_LOCK,
+    VERSION,
 };
 
 fn binary() -> PathBuf {
@@ -16,7 +17,9 @@ trait Steps {
 
 impl Steps for ProcessRunner {
     async fn step(&self, script: Script) -> Result<Step, RunError> {
-        self.run(script).await.map(|ran| ran.step)
+        self.run(script, ScriptFiles::none())
+            .await
+            .map(|ran| ran.step)
     }
 }
 
@@ -30,6 +33,8 @@ fn script(code: &str) -> Script {
         language: Default::default(),
         limits: Default::default(),
         cpu_used_ms: 0,
+        files: vec![],
+        file_bytes_used: 0,
         code: code.to_string(),
         calls: vec![],
         seed: 1,
@@ -164,4 +169,147 @@ async fn a_program_that_is_not_a_runner_fails_the_script() {
         matches!(&step, Ok(Step::Failed(m)) if m.contains("dispatch()")),
         "{step:?}"
     );
+}
+
+mod files {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use subs::codemode::ScriptFile;
+    use subs::runtime::blob::{BlobError, BlobRef, BlobStore, MemoryBlobStore, NewBlob};
+
+    async fn put(store: &MemoryBlobStore, tenant: &str, text: &str) -> BlobRef {
+        store
+            .put(NewBlob {
+                tenant_id: tenant.to_string(),
+                mime: "text/csv".to_string(),
+                name: None,
+                bytes: text.as_bytes().to_vec(),
+            })
+            .await
+            .unwrap()
+    }
+
+    fn reading(code: &str, files: &[(&str, &BlobRef)]) -> Script {
+        let mut s = script(code);
+        s.files = files
+            .iter()
+            .map(|(id, r)| ScriptFile {
+                id: id.to_string(),
+                mime: r.mime.clone(),
+                size: r.size,
+            })
+            .collect();
+        s
+    }
+
+    fn grant(store: Arc<dyn BlobStore>, files: &[(&str, &BlobRef)]) -> ScriptFiles {
+        ScriptFiles {
+            tenant_id: "t1".to_string(),
+            blobs: files
+                .iter()
+                .map(|(id, r)| (id.to_string(), (*r).clone()))
+                .collect::<BTreeMap<_, _>>(),
+            store,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sandboxed_script_streams_a_file_through_its_runner() {
+        let store = Arc::new(MemoryBlobStore::new());
+        let mut csv = String::from("region,amount\n");
+        for i in 0..20_000 {
+            csv.push_str(&format!("{},{i}\n", ["EU", "US"][i % 2]));
+        }
+        let sales = put(&store, "t1", &csv).await;
+        let code = "let n = 0, total = 0;\n\
+            for await (const r of files.csv('sales.csv')) { n++; total += Number(r.amount); }\n\
+            return [n, total];";
+        let ran = runner()
+            .run(
+                reading(code, &[("sales.csv", &sales)]),
+                grant(store, &[("sales.csv", &sales)]),
+            )
+            .await
+            .unwrap();
+        let total: u64 = (0..20_000).sum();
+        assert_eq!(
+            ran.step,
+            Step::Done(format!(r#"{{"result":[20000,{total}]}}"#))
+        );
+        assert_eq!(ran.stats.file_bytes, csv.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn a_script_reads_no_blob_of_another_tenant() {
+        let store = Arc::new(MemoryBlobStore::new());
+        let theirs = put(&store, "t2", "secret").await;
+        let code = "try { return await files.text('x.csv'); } catch (e) { return e.message; }";
+        let ran = runner()
+            .run(
+                reading(code, &[("x.csv", &theirs)]),
+                grant(store, &[("x.csv", &theirs)]),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&ran.step, Step::Done(t) if t.contains("There is no file") && !t.contains("secret")),
+            "{ran:?}"
+        );
+    }
+
+    struct Down;
+
+    #[async_trait::async_trait]
+    impl BlobStore for Down {
+        async fn put(&self, _: NewBlob) -> Result<BlobRef, BlobError> {
+            Err(BlobError::Io("down".into()))
+        }
+        async fn get(&self, _: &BlobRef) -> Result<Vec<u8>, BlobError> {
+            Err(BlobError::Io("down".into()))
+        }
+        async fn read(&self, _: &BlobRef, _: std::ops::Range<u64>) -> Result<Vec<u8>, BlobError> {
+            Err(BlobError::Io("down".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_store_that_is_down_tries_the_step_again() {
+        let store = MemoryBlobStore::new();
+        let sales = put(&store, "t1", "a,b\n1,2\n").await;
+        let result = runner()
+            .run(
+                reading(
+                    "return await files.text('sales.csv');",
+                    &[("sales.csv", &sales)],
+                ),
+                grant(Arc::new(Down), &[("sales.csv", &sales)]),
+            )
+            .await;
+        assert!(
+            matches!(&result, Err(RunError(m)) if m.contains("could not be read")),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_reads_no_more_than_its_budget() {
+        let store = Arc::new(MemoryBlobStore::new());
+        let line = format!("{}\n", "x".repeat(1023));
+        let big = put(&store, "t1", &line.repeat(2048)).await;
+        let mut s = reading(
+            "let n = 0; for await (const l of files.lines('big.txt')) n++; return n;",
+            &[("big.txt", &big)],
+        );
+        s.limits.file_bytes = 1 << 20;
+        let ran = runner()
+            .run(s, grant(store, &[("big.txt", &big)]))
+            .await
+            .unwrap();
+        assert!(
+            matches!(&ran.step, Step::Failed(m) if m.contains("limit of file bytes")),
+            "{ran:?}"
+        );
+        assert!(ran.stats.file_bytes <= 1 << 20);
+    }
 }

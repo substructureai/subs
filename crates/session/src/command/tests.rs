@@ -13093,6 +13093,7 @@ fn step_asks(agg: &mut Session, known: u32, calls: &[(&str, &str)]) -> Vec<Event
                 known,
                 calls,
                 cpu_ms: 7,
+                file_bytes: 0,
             },
         ),
         &system(),
@@ -13539,6 +13540,63 @@ fn a_script_starts_a_subagent_and_reads_its_answer() {
 }
 
 #[test]
+fn a_script_may_read_the_files_on_its_branch() {
+    let mut agg = coding_session();
+    let blob = crate::blob::BlobRef {
+        tenant_id: "tenant-a".to_string(),
+        id: uuid::Uuid::now_v7().to_string(),
+        mime: "text/csv".to_string(),
+        name: Some("sales.csv".to_string()),
+        size: 42,
+    };
+    let file = crate::attachments::Attachment {
+        id: "sales.csv".to_string(),
+        mime: "text/csv".to_string(),
+        size: 42,
+        uri: blob.uri(),
+    };
+    let message = DraftMessage {
+        content: Some(Content::Parts(vec![
+            crate::protocol::StoredContent::Attachment(file),
+        ])),
+        ..node_msg("u1", Role::User, "")
+    };
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: message.clone(),
+                stream: false,
+            }),
+            turn: TurnTarget::Detached,
+            queue: QueueMode::Refuse,
+            metadata: Default::default(),
+        },
+        &system(),
+    );
+    let decision = events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionDispatched(d) => Some(d.id.clone()),
+            _ => None,
+        })
+        .expect("the message goes to the worker");
+    submit_decision(&mut agg, decision, vec![message], vec![]);
+    run_code(&mut agg, "...");
+    let script = script_work(&agg).expect("the script runs");
+    assert_eq!(
+        script.files,
+        [crate::codemode::ScriptFile {
+            id: "sales.csv".to_string(),
+            mime: "text/csv".to_string(),
+            size: 42,
+        }],
+        "the script sees ids, not blobs"
+    );
+    assert_eq!(agg.script_blobs("tc-1").get("sales.csv"), Some(&blob));
+}
+
+#[test]
 fn a_worker_interrupt_holds_a_script_until_resumed() {
     let mut agg = coding_session();
     run_code(&mut agg, "...");
@@ -13731,6 +13789,7 @@ fn a_script_step_has_no_natural_command_id() {
             known: 0,
             calls: vec![],
             cpu_ms: 0,
+            file_bytes: 0,
         },
     );
     assert_eq!(step.natural_id(), None, "the session fences steps itself");

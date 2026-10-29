@@ -559,9 +559,33 @@ impl Session {
             spent,
             limits: limits.clone(),
             cpu_used_ms: effect.tool()?.script_cpu_ms,
+            files: crate::attachments::on_path(&state.message_tree(), effect.anchor.as_deref())
+                .into_iter()
+                .map(|a| crate::codemode::ScriptFile {
+                    id: a.id,
+                    mime: a.mime,
+                    size: a.size,
+                })
+                .collect(),
+            file_bytes_used: effect.tool()?.script_file_bytes,
             seed: xxhash_rust::xxh3::xxh3_64(id.as_bytes()),
             now_ms: effect.tracking.started_at?.timestamp_millis(),
         })
+    }
+
+    /// The blob behind each file a `run_code` call's script may read, by
+    /// file id. Only the runner sees these; the script sees the ids.
+    pub fn script_blobs(
+        &self,
+        id: &str,
+    ) -> std::collections::BTreeMap<String, crate::blob::BlobRef> {
+        let Some(effect) = self.state.effect(EffectKind::ToolCall, id) else {
+            return Default::default();
+        };
+        crate::attachments::on_path(&self.state.message_tree(), effect.anchor.as_deref())
+            .into_iter()
+            .filter_map(|a| Some((a.id, crate::blob::BlobRef::parse(&a.uri)?)))
+            .collect()
     }
 
     fn subagent(&self, id: &str) -> Option<Work> {

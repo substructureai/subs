@@ -12,7 +12,7 @@ pub enum Language {
 }
 
 /// The contract's version.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 /// The oldest version a runner still takes, so engines and runners can be
 /// deployed one before the other.
 pub const OLDEST: u32 = 1;
@@ -43,6 +43,13 @@ pub struct Limits {
     pub compute_ms: u64,
     /// Milliseconds of CPU over all of a script's runs.
     pub total_compute_ms: u64,
+    /// Bytes of files one run may read.
+    pub file_bytes: u64,
+    /// Bytes of files over all of a script's runs. Each run reads its files
+    /// again, so this pays for every pass.
+    pub total_file_bytes: u64,
+    /// Files open at once.
+    pub streams: u32,
 }
 
 impl Default for Limits {
@@ -56,6 +63,9 @@ impl Default for Limits {
             memory: 96 << 20,
             compute_ms: 500,
             total_compute_ms: 10_000,
+            file_bytes: 64 << 20,
+            total_file_bytes: 512 << 20,
+            streams: 4,
         }
     }
 }
@@ -70,6 +80,18 @@ pub fn spent(results: usize) -> String {
 
 fn version() -> u32 {
     VERSION
+}
+
+/// A file a script may read, by the id the model sees in its
+/// `[attachment …]` line.
+///
+/// A script reads files without recording them: a blob never changes, so
+/// every run reads the same bytes. Anything that makes a blob is a call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScriptFile {
+    pub id: String,
+    pub mime: String,
+    pub size: u64,
 }
 
 /// A script to run past the calls it already made.
@@ -94,6 +116,12 @@ pub struct Script {
     /// CPU the script's earlier runs used.
     #[serde(default)]
     pub cpu_used_ms: u64,
+    /// The files it may read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<ScriptFile>,
+    /// Bytes of files the script's earlier runs read.
+    #[serde(default)]
+    pub file_bytes_used: u64,
 }
 
 impl Script {
@@ -105,6 +133,15 @@ impl Script {
             .total_compute_ms
             .saturating_sub(self.cpu_used_ms);
         self.limits.compute_ms.min(left)
+    }
+
+    /// The bytes of files this run may read.
+    pub fn file_bytes(&self) -> u64 {
+        let left = self
+            .limits
+            .total_file_bytes
+            .saturating_sub(self.file_bytes_used);
+        self.limits.file_bytes.min(left)
     }
 }
 
@@ -147,6 +184,8 @@ pub struct Stats {
     /// The most heap the run held at once.
     pub heap: usize,
     pub cpu_ms: u64,
+    /// Bytes of files the run read.
+    pub file_bytes: u64,
     /// The limit the run met, if one stopped it.
     pub limit: Option<Limit>,
     /// The process was started before the step reached it.
@@ -169,4 +208,5 @@ pub enum Limit {
     Deadline,
     Wait,
     Start,
+    Files,
 }

@@ -35,6 +35,7 @@ use wake::{spawn_wake_dispatcher, Alarms};
 use worker::{AgentDirectory, FailDecision, SessionSeed, SubmitDecision, WorkerDecisionRequest};
 
 pub mod blob;
+pub mod blob_cache;
 pub mod events_url;
 pub use substructure_session::caller;
 pub mod connector;
@@ -1007,6 +1008,7 @@ pub async fn start(deps: RuntimeDeps, config: RuntimeConfig) -> Arc<Runtime> {
             admission: Arc::new(crate::codemode::Admission::new(config.script_slots)),
             limits: config.script_limits.clone(),
             wait: config.script_wait,
+            blobs: blobs.clone(),
         }),
         script_task_queue,
         cancel.clone(),

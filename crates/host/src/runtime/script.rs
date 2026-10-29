@@ -6,8 +6,11 @@ use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::codemode::{settle, Admission, Limit, Limits, Ran, ScriptRunner, Stats, Step};
+use crate::codemode::{
+    settle, Admission, Limit, Limits, Ran, ScriptFiles, ScriptRunner, Stats, Step,
+};
 use crate::protocol::RetryPolicy;
+use crate::runtime::blob::BlobStore;
 use crate::runtime::executor::{
     settled, spawn_bounded_executors, Bound, BoundedTask, ExecutorPool, RESULT_NOT_SAVED,
 };
@@ -46,6 +49,8 @@ pub struct Scripts {
     pub limits: Limits,
     /// How long a step may wait for a slot, or for a runner to take it.
     pub wait: Duration,
+    /// Where the scripts' files are.
+    pub blobs: Arc<dyn BlobStore>,
 }
 
 pub fn spawn_script_executor(
@@ -77,15 +82,23 @@ async fn step(
         .load(&task.tenant_id, &task.session_id)
         .await
         .map_err(|e| e.to_string())?;
-    let Some(script) = session.and_then(|s| s.script(&task.tool_call_id, &scripts.limits)) else {
+    let Some(session) = session else {
         return Ok(());
+    };
+    let Some(script) = session.script(&task.tool_call_id, &scripts.limits) else {
+        return Ok(());
+    };
+    let files = ScriptFiles {
+        tenant_id: task.tenant_id.clone(),
+        blobs: session.script_blobs(&task.tool_call_id),
+        store: scripts.blobs.clone(),
     };
     let known = script.calls.len() as u32;
     let records: usize = script.calls.iter().map(|c| c.output.len()).sum();
     let started = Instant::now();
     let ran = match waited > scripts.wait {
         true => late(waited, Limit::Wait),
-        false => match scripts.runner.run(script).await {
+        false => match scripts.runner.run(script, files).await {
             Ok(ran) => ran,
             Err(e) if waited + RESULT_NOT_SAVED > scripts.wait => {
                 tracing::warn!(tenant_id = %task.tenant_id, error = %e, "no runner took a script step");
@@ -165,6 +178,7 @@ fn report(
         warm = ran.stats.warm,
         heap = ran.stats.heap,
         cpu_ms = ran.stats.cpu_ms,
+        file_bytes = ran.stats.file_bytes,
         %outcome,
         %limit,
         "script step"

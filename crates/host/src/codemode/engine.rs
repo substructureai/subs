@@ -1,6 +1,7 @@
 //! The engines a runner process can run. Each interprets one language and
 //! answers its script's calls through [`super::replay::Replay`].
 
+use super::files::Host;
 use super::quickjs::QuickJs;
 use super::replay::precheck;
 use super::{Language, Ran, Script, Step};
@@ -10,8 +11,8 @@ pub trait Engine: Sync {
 
     /// One run of `script` from its start: answer each call from its records,
     /// and stop at the first call with none. The same script must always
-    /// end in the same step.
-    fn run(&self, script: &Script) -> Ran;
+    /// end in the same step. `host` reads the script's files.
+    fn run(&self, script: &Script, host: Box<dyn Host>) -> Ran;
 }
 
 static ENGINES: &[&dyn Engine] = &[&QuickJs];
@@ -21,12 +22,12 @@ pub fn languages() -> Vec<Language> {
     ENGINES.iter().map(|e| e.language()).collect()
 }
 
-pub fn run(script: &Script) -> Ran {
+pub fn run(script: &Script, host: Box<dyn Host>) -> Ran {
     if let Some(ran) = precheck(script) {
         return ran;
     }
     match ENGINES.iter().find(|e| e.language() == script.language) {
-        Some(engine) => engine.run(script),
+        Some(engine) => engine.run(script, host),
         None => Ran {
             step: Step::Failed(format!(
                 "This runner has no engine for {:?}.",

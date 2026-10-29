@@ -105,6 +105,41 @@ a script: no step runs, and no call it asks for goes out, until the resume.
 [limits](#limits) bound what it runs. An [interrupt](./100-interrupts.md) holds
 a script: no step runs, and no call it asks for goes out, until the resume.
 
+## Files
+
+A script reads the conversation's files by the id in their `[attachment …]`
+line. The bytes never enter the model's context: the script reads them, and
+only what it returns or prints goes back.
+
+```javascript
+const totals = {};
+for await (const row of files.csv("sales.csv")) {
+    totals[row.region] = (totals[row.region] ?? 0) + Number(row.amount);
+}
+return totals;
+```
+
+| Call | Gives |
+|---|---|
+| `files.list()`, `files.stat(id)` | `{ id, mime, size }` of each file, or of one |
+| `await files.text(id)` | The whole file as text, up to an eighth of `memory` |
+| `files.csv(id, { header, delimiter })` | Rows: objects keyed by the header, or arrays with `header: false` |
+| `files.lines(id)` | Lines, without their line ends |
+| `files.jsonl(id)` | One JSON value per line |
+| `files.chunks(id, { size, offset })` | Text in pieces of about `size` bytes, from byte `offset` |
+
+Each stream takes `{ limit }`, a count of records, and `break` ends it. The
+files are the attachments on the branch where `run_code` was called.
+
+The script's process decodes the files, so decoding counts toward its CPU and
+memory. Its runner reads the bytes: the process has no file system or network,
+and never sees where a file is stored. A file's bytes never change, so the log
+records no read: each run reads its files again. Read files before calling
+tools, so the reading happens once per run.
+
+A file that is gone throws in the script. A store that fails sends the step
+back to its queue, as a runner that is down does.
+
 ## Sandbox
 
 Each run of a script is a new process that the engine starts from its own
@@ -142,8 +177,17 @@ with an error that says so.
 The process speaks JSON lines on stdin and stdout. It first writes
 `{"ready": {"version": N, "oldest": M, "languages": [...]}}`, or
 `{"unconfined": {"error": "..."}}` when it could not confine itself. Then it
-reads one `Script` and writes one `Ran`. A runner on another machine can start the same binary with
-`__sandbox` the same way, behind its own endpoint, and needs no other code. A
+reads one `Script` and writes one `Ran`. While it runs, it may ask for file
+bytes with `{"read": {"file": "sales.csv", "offset": 0, "len": 262144}}`, and
+its runner answers `{"bytes": n}` followed by `n` raw bytes, or `{"missing":
+"…"}`. A runner reads a script's files from the `ScriptFiles` the engine passes it: each
+file's blob and the store to read it from.
+
+A runner on another machine can start the same binary with `__sandbox` the same
+way, behind its own endpoint. Scripts that read no files need nothing more. For
+files, the process that starts the binary answers its reads, so a runner on
+another machine needs the blobs too: it reads them from the store, or the
+engine answers the reads for it. The engine does not provide either yet. A
 `Script` carries its version, and a runner takes every version from `OLDEST` to
 `VERSION`, so an engine and its runners can be deployed one before the other.
 
@@ -183,9 +227,13 @@ them. An error names the limit that was met and what to do.
 | `memory` | 96 MiB | JavaScript heap in one run |
 | `compute_ms` | 500 | CPU in one run |
 | `total_compute_ms` | 10,000 | CPU over all of a script's runs |
+| `file_bytes` | 64 MiB | File bytes one run reads |
+| `total_file_bytes` | 512 MiB | File bytes over all of a script's runs |
+| `streams` | 4 | Files open at once |
 
-A run does no I/O: it reads the script and the results its calls already
-returned, and stops at the first call with no result. So a run is quick, and a
+A run reads the script, the results its calls already returned, and the files
+it asks for, and stops at the first call with no result. Time spent waiting on
+file reads does not count toward its deadline. So a run is quick, and a
 run that needs more than half a second of CPU is almost always a runaway. A
 script resumes from the start after its calls finish, so work done before a
 call counts against each run and against the whole budget. A run's process is

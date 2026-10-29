@@ -477,13 +477,16 @@ pub struct ToolCallState {
     /// For `run_code`: CPU its script's runs have used.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub script_cpu_ms: u64,
+    /// For `run_code`: bytes of files its script's runs have read.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub script_file_bytes: u64,
     /// For `run_code`: calls its script asked for that no decision has
     /// started or refused yet.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub script_asked: Vec<ScriptAsk>,
 }
 
-fn is_zero(n: &u64) -> bool {
+pub(crate) fn is_zero(n: &u64) -> bool {
     *n == 0
 }
 
@@ -1232,6 +1235,7 @@ impl SessionState {
                     script_tools,
                     script_language,
                     script_cpu_ms: 0,
+                    script_file_bytes: 0,
                     script_asked: Vec::new(),
                 }),
             );
@@ -1492,6 +1496,7 @@ impl SessionState {
                     .and_then(|e| e.tool_mut())
                 {
                     tc.script_cpu_ms += payload.cpu_ms;
+                    tc.script_file_bytes += payload.file_bytes;
                     tc.script_asked.extend(payload.asked.iter().cloned());
                 }
             }

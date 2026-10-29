@@ -318,6 +318,8 @@ mod tests {
             spent: false,
             limits: Limits::default(),
             cpu_used_ms: 0,
+            files: vec![],
+            file_bytes_used: 0,
         }
     }
 

@@ -468,6 +468,8 @@ pub struct ToolCallRequested {
 pub struct ToolCallStepped {
     pub id: String,
     pub cpu_ms: u64,
+    #[serde(default, skip_serializing_if = "crate::state::is_zero")]
+    pub file_bytes: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub asked: Vec<ScriptAsk>,
 }
