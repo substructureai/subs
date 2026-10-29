@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use std::io::{self, BufRead, Write};
 
 use super::confine::{self, Denial};
-use super::run::run;
+use super::engine::{languages, run};
 use super::{Ran, Script, Step, OLDEST, VERSION};
 
 /// The argument that makes a binary a runner process.
@@ -51,7 +51,12 @@ fn main(args: Vec<OsString>) -> ! {
         std::process::exit(0);
     }
     let hello = match &confined {
-        Ok(()) => serde_json::json!({ "ready": true, "version": VERSION, "oldest": OLDEST }),
+        Ok(()) => serde_json::json!({
+            "ready": true,
+            "version": VERSION,
+            "oldest": OLDEST,
+            "languages": languages(),
+        }),
         Err(e) => serde_json::json!({ "ready": false, "error": e.to_string() }),
     };
     let _ = writeln!(out, "{hello}");
@@ -64,7 +69,10 @@ fn main(args: Vec<OsString>) -> ! {
         std::process::exit(0);
     }
     let ran = match serde_json::from_str::<Script>(&line) {
-        Ok(script) => run(&script),
+        Ok(script) => {
+            let _ = confine::limit_cpu(script.compute_ms());
+            run(&script)
+        }
         Err(e) => Ran {
             step: Step::Failed(format!("The runner could not read the script: {e}")),
             stats: Default::default(),

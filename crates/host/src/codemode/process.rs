@@ -41,9 +41,9 @@ impl fmt::Display for RunError {
 impl std::error::Error for RunError {}
 
 const READY: Duration = Duration::from_secs(10);
-/// Past a script's compute limit, for loading it and for work QuickJS cannot
-/// interrupt.
-const SLACK: Duration = Duration::from_secs(10);
+/// Past three times a run's CPU, for a contended machine, loading the script,
+/// and work QuickJS cannot interrupt.
+const SLACK: Duration = Duration::from_secs(1);
 const DATA_MIB: u64 = 256;
 const ANSWER: u64 = 64 << 20;
 
@@ -63,6 +63,7 @@ struct Worker {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     versions: (u32, u32),
+    languages: Vec<super::Language>,
 }
 
 /// Why a process could not take a step.
@@ -185,11 +186,17 @@ impl ProcessRunner {
                 0 => newest,
                 oldest => oldest,
             };
+            let languages = hello
+                .get("languages")
+                .cloned()
+                .and_then(|l| serde_json::from_value(l).ok())
+                .unwrap_or_else(|| vec![super::Language::Javascript]);
             Ok(Worker {
                 process,
                 stdin,
                 stdout,
                 versions: (oldest, newest),
+                languages,
             })
         }
     }
@@ -201,7 +208,7 @@ impl ProcessRunner {
         worker.stdin.flush().await?;
         let deadline = self
             .deadline
-            .unwrap_or(Duration::from_millis(script.limits.compute_ms) + SLACK);
+            .unwrap_or(Duration::from_millis(3 * script.compute_ms()) + SLACK);
         let line = tokio::time::timeout(deadline, read_line(&mut worker.stdout))
             .await
             .map_err(|_| io::Error::other("the script ran too long"))??;
@@ -239,6 +246,13 @@ impl ScriptRunner for ProcessRunner {
                 ))
             }
         };
+        if !worker.languages.contains(&script.language) {
+            let _ = worker.process.start_kill();
+            return Err(RunError(format!(
+                "the sandbox runs no {:?}",
+                script.language
+            )));
+        }
         let (oldest, newest) = worker.versions;
         if !(oldest..=newest).contains(&script.version) {
             let _ = worker.process.start_kill();
@@ -256,8 +270,8 @@ impl ScriptRunner for ProcessRunner {
             }
             Err(e) => failed(
                 format!(
-                    "The script stopped: {e}. It may have looped inside one call, such as a \
-                     regular expression or a large JSON.parse, or run out of memory."
+                    "The script stopped: {e}. It may have run long inside one built-in \
+                     operation, or run out of memory."
                 ),
                 super::Limit::Deadline,
             ),

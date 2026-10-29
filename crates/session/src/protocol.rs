@@ -979,10 +979,10 @@ pub struct AgentConfig {
     pub attachments: Option<Attachments>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<ContextConfig>,
-    /// Offer `run_code`: the model writes JavaScript that calls the agent's
-    /// tools.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub code_mode: bool,
+    /// Offer `run_code`: the model writes a script in this language that
+    /// calls the agent's tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_mode: Option<crate::codemode::Language>,
 }
 
 /// Changes to an [`AgentConfig`]. A field left out keeps the base's value. A
@@ -1059,8 +1059,12 @@ pub struct AgentConfigPatch {
         skip_serializing_if = "Option::is_none"
     )]
     pub context: Option<Option<ContextConfig>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub code_mode: Option<bool>,
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub code_mode: Option<Option<crate::codemode::Language>>,
 }
 
 impl AgentConfigPatch {
@@ -1484,7 +1488,7 @@ pub enum ConnectorToolKind {
     Skill,
     Subagent,
     Attachment,
-    /// Run the model's JavaScript, which calls other tools.
+    /// Run the model's script, which calls other tools.
     Code,
 }
 

@@ -103,7 +103,7 @@ async fn step(
         &ran,
         &scripts.limits,
     );
-    let command = settle(task.tool_call_id, task.attempt, known, ran.step);
+    let command = settle(task.tool_call_id, task.attempt, known, ran);
     settled(
         sessions,
         &task.tenant_id,

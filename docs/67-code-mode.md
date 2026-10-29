@@ -16,10 +16,11 @@ costs no model turn, and its result stays out of the conversation.
 ```toml title="subs.toml"
 [agent.assistant]
 model = "claude-sonnet-5"
-code_mode = true
+code_mode = "javascript"
 ```
 
-A worker sets `code_mode: true` on the agent config.
+A worker sets `code_mode: "javascript"` on the agent config. JavaScript is the
+only language so far.
 
 ## What the model writes
 
@@ -111,6 +112,24 @@ writes one `Step`. A runner on another machine can start the same binary with
 
 Script steps wait on `RuntimeDeps::script_task_queue`.
 
+## Add a language
+
+Nothing outside three places knows which language a script is in:
+
+- `CodeLanguage`, the enum `code_mode` takes, in `session::codemode`.
+- A dialect in `session::codemode`, which tells the model how to write
+  `run_code` in that language and declares each tool in its types.
+  `javascript.rs` declares tools in TypeScript.
+- An engine in `host::codemode`, an implementation of `Engine`, listed in
+  `engine.rs`. It interprets the language and asks `Replay` for each call the
+  script makes. `Replay` answers from the script's records, holds it to its
+  limits, and turns how it ended into a step, so an engine only binds the
+  language: a call to a tool, printed output, the value returned, and an error
+  raised. `quickjs.rs` is the JavaScript engine.
+
+A runner process says which languages it runs when it starts, and a step in a
+language it does not run is tried again elsewhere.
+
 ## Limits
 
 A script has no network, file system, timer or module. The engine sets these
@@ -120,18 +139,25 @@ them. An error names the limit that was met and what to do.
 | Limit | Default | Applies to |
 |---|---|---|
 | `calls` | 1,000 | Calls over the whole script |
-| `results` | 16 MiB | Results the script reads, over all its calls |
+| `results` | 8 MiB | Results the script reads, over all its calls |
 | `arguments` | 32 MiB | Arguments over the whole script, and 256 KiB in one call |
 | `returned` | 64 KiB | The value it returns; past it, the start is shown with a note |
 | `logs` | 16 KiB | `console.log` output |
-| `memory` | 128 MiB | JavaScript heap in one run |
-| `compute_ms` | 20,000 | CPU in one run; the process is stopped 10s after it |
+| `memory` | 96 MiB | JavaScript heap in one run |
+| `compute_ms` | 500 | CPU in one run |
+| `total_compute_ms` | 10,000 | CPU over all of a script's runs |
 
-A script resumes from the start after its calls finish, so work done before a
-call counts against each run. `RuntimeConfig::script_wait`, 60 seconds by
+A run does no I/O: it reads the script and the results its calls already
+returned, and stops at the first call with no result. So a run is quick, and a
+run that needs more than half a second of CPU is almost always a runaway. A
+script resumes from the start after its calls finish, so work done before a
+call counts against each run and against the whole budget. A run's process is
+stopped three times its CPU allowance and one second after it starts, and the
+operating system stops it a second past its allowance. `RuntimeConfig::script_wait`, 60 seconds by
 default, is how long a step may wait for a slot or for a runner to take it.
 `ProcessRunner::with_data_limit` caps a process's heap, records included; keep
-it above `memory`.
+it above `memory`. Parsed JSON takes about seven times its size in heap, so keep
+`results` under an eighth of `memory`.
 
 Each step logs a `script step` line under the `codemode` target, with its
 tenant, the bytes of results it was given, its wait, its run time, its heap and

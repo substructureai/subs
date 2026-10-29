@@ -1,4 +1,15 @@
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+/// The language a script is written in. Each has a dialect that describes
+/// `run_code` to the model and an engine that runs it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(rename = "CodeLanguage")]
+pub enum Language {
+    #[default]
+    Javascript,
+}
 
 /// The contract's version.
 pub const VERSION: u32 = 1;
@@ -17,30 +28,34 @@ pub fn supports(version: u32) -> bool {
 pub struct Limits {
     /// Calls over the whole script.
     pub calls: u32,
-    /// Bytes of results the script may read, over all its calls.
+    /// Bytes of results the script may read, over all its calls. Parsed JSON
+    /// takes about seven times its size in heap, so keep it under `memory / 8`.
     pub results: usize,
     /// Bytes of arguments over the whole script.
     pub arguments: usize,
     /// Bytes of the value it returns.
     pub returned: usize,
-    /// Bytes of `console.log` output.
+    /// Bytes of output the script prints.
     pub logs: usize,
-    /// Bytes of JavaScript heap in one run.
+    /// Bytes of heap in one run.
     pub memory: usize,
     /// Milliseconds of CPU in one run.
     pub compute_ms: u64,
+    /// Milliseconds of CPU over all of a script's runs.
+    pub total_compute_ms: u64,
 }
 
 impl Default for Limits {
     fn default() -> Self {
         Limits {
             calls: 1_000,
-            results: 16 << 20,
+            results: 8 << 20,
             arguments: 32 << 20,
             returned: 64 << 10,
             logs: 16 << 10,
-            memory: 128 << 20,
-            compute_ms: 20_000,
+            memory: 96 << 20,
+            compute_ms: 500,
+            total_compute_ms: 10_000,
         }
     }
 }
@@ -62,6 +77,8 @@ fn version() -> u32 {
 pub struct Script {
     #[serde(default = "version")]
     pub version: u32,
+    #[serde(default)]
+    pub language: Language,
     pub code: String,
     pub calls: Vec<ScriptRecord>,
     pub seed: u64,
@@ -74,6 +91,21 @@ pub struct Script {
     pub spent: bool,
     #[serde(default)]
     pub limits: Limits,
+    /// CPU the script's earlier runs used.
+    #[serde(default)]
+    pub cpu_used_ms: u64,
+}
+
+impl Script {
+    /// The CPU this run may use: the per-run limit, or what is left of the
+    /// script's whole budget.
+    pub fn compute_ms(&self) -> u64 {
+        let left = self
+            .limits
+            .total_compute_ms
+            .saturating_sub(self.cpu_used_ms);
+        self.limits.compute_ms.min(left)
+    }
 }
 
 /// A call a script made, as the script made it, and how it ended.
@@ -112,7 +144,7 @@ pub struct Ran {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Stats {
-    /// JavaScript heap at the end of the run.
+    /// The most heap the run held at once.
     pub heap: usize,
     pub cpu_ms: u64,
     /// The limit the run met, if one stopped it.

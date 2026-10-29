@@ -542,6 +542,7 @@ impl Session {
         let tools = effect.tool()?.script_tools.clone();
         Some(Script {
             version: crate::codemode::VERSION,
+            language: effect.tool()?.script_language,
             tools,
             code: arguments
                 .get("code")
@@ -551,6 +552,7 @@ impl Session {
             calls,
             spent,
             limits: limits.clone(),
+            cpu_used_ms: effect.tool()?.script_cpu_ms,
             seed: xxhash_rust::xxh3::xxh3_64(id.as_bytes()),
             now_ms: effect
                 .tracking

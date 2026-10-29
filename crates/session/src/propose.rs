@@ -833,6 +833,8 @@ mod tests {
                 is_error: false,
                 script: None,
                 script_tools: Vec::new(),
+                script_language: Default::default(),
+                script_cpu_ms: 0,
             }),
         )
     }

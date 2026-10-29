@@ -37,6 +37,8 @@ pub enum Outcome {
     Script {
         known: u32,
         calls: Vec<crate::events::ScriptCall>,
+        #[serde(default)]
+        cpu_ms: u64,
     },
     Error(SettleError),
 }

@@ -1,18 +1,57 @@
-use std::cell::RefCell;
+//! JavaScript, run by QuickJS.
+
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use rquickjs::allocator::{Allocator, RustAllocator};
 use rquickjs::{Context, Function, Runtime};
 
-use super::{Limit, Limits, Ran, Script, ScriptCall, ScriptRecord, Stats, Step};
+use super::engine::{cpu_ms, Engine};
+use super::replay::{Answer, End, Replay};
+use super::{Language, Limit, Ran, Script, Stats};
 
 const STACK: usize = 512 << 10;
 /// QuickJS calls the interrupt handler about every 10k instructions. A
 /// backstop to the CPU limit.
 const TICKS: u64 = 1_000_000;
 const JOBS: usize = 1_000_000;
-const ARGUMENTS: usize = 256 << 10;
-/// The start of an oversized result that is still shown.
-const PREVIEW: usize = 4 << 10;
+
+pub struct QuickJs;
+
+impl Engine for QuickJs {
+    fn language(&self) -> Language {
+        Language::Javascript
+    }
+
+    fn run(&self, script: &Script) -> Ran {
+        let started = cpu_ms();
+        let replay = Rc::new(RefCell::new(Replay::new(script)));
+        let heap = match execute(script, &replay, started) {
+            Ok(heap) => heap,
+            Err(e) => {
+                replay.borrow_mut().end(End::Raised {
+                    message: format!("The script could not run: {e}"),
+                    limit: None,
+                });
+                0
+            }
+        };
+        let replay = Rc::try_unwrap(replay)
+            .ok()
+            .expect("the runtime is gone")
+            .into_inner();
+        let (step, limit) = replay.finish();
+        Ran {
+            step,
+            stats: Stats {
+                heap,
+                cpu_ms: cpu_ms().saturating_sub(started),
+                limit,
+                warm: false,
+            },
+        }
+    }
+}
 
 const PRELUDE: &str = r#"
 (() => {
@@ -59,269 +98,120 @@ const PRELUDE: &str = r#"
 })();
 "#;
 
-#[derive(Default)]
-struct Run {
-    limits: Limits,
-    records: Vec<ScriptRecord>,
-    spent: bool,
-    seq: usize,
-    calls: Vec<ScriptCall>,
-    argument_bytes: usize,
-    diverged: Option<String>,
-    logs: Vec<String>,
-    log_bytes: usize,
-    logs_cut: bool,
-    outcome: Option<Result<Option<String>, String>>,
-    stopped: Option<Limit>,
-    refused: Option<Limit>,
+/// QuickJS's allocator, keeping the most it held at once.
+struct Peak {
+    inner: RustAllocator,
+    now: usize,
+    peak: Rc<Cell<usize>>,
 }
 
-impl Run {
-    fn call(&mut self, name: String, arguments: String) -> Option<String> {
-        self.seq += 1;
-        self.argument_bytes += arguments.len();
-        let mut refuse = |limit: Limit, message: String| {
-            self.refused.get_or_insert(limit);
-            Some(serde_json::json!({"ok": false, "output": message}).to_string())
+impl Peak {
+    fn grew(&mut self, ptr: *mut u8) -> *mut u8 {
+        if !ptr.is_null() {
+            self.now += unsafe { RustAllocator::usable_size(ptr) };
+            self.peak.set(self.peak.get().max(self.now));
+        }
+        ptr
+    }
+}
+
+unsafe impl Allocator for Peak {
+    fn alloc(&mut self, size: usize) -> *mut u8 {
+        let ptr = self.inner.alloc(size);
+        self.grew(ptr)
+    }
+
+    fn calloc(&mut self, count: usize, size: usize) -> *mut u8 {
+        let ptr = self.inner.calloc(count, size);
+        self.grew(ptr)
+    }
+
+    unsafe fn dealloc(&mut self, ptr: *mut u8) {
+        if !ptr.is_null() {
+            self.now = self.now.saturating_sub(RustAllocator::usable_size(ptr));
+        }
+        self.inner.dealloc(ptr)
+    }
+
+    unsafe fn realloc(&mut self, ptr: *mut u8, new_size: usize) -> *mut u8 {
+        let old = match ptr.is_null() {
+            true => 0,
+            false => RustAllocator::usable_size(ptr),
         };
-        if self.seq > self.limits.calls as usize {
-            return refuse(
-                Limit::Calls,
-                format!(
-                    "A script can make at most {} calls. Make fewer, larger calls, or split the \
-                     work over several run_code calls.",
-                    self.limits.calls
-                ),
-            );
+        let moved = self.inner.realloc(ptr, new_size);
+        if !moved.is_null() || new_size == 0 {
+            self.now = self.now.saturating_sub(old);
         }
-        if arguments.len() > ARGUMENTS {
-            return refuse(
-                Limit::Arguments,
-                format!(
-                    "Arguments to `{name}` are over {} KiB. Pass less in one call.",
-                    ARGUMENTS >> 10
-                ),
-            );
-        }
-        if self.argument_bytes > self.limits.arguments {
-            return refuse(
-                Limit::Arguments,
-                format!(
-                    "The script's arguments passed {} MiB in all. Pass less in each call.",
-                    self.limits.arguments >> 20
-                ),
-            );
-        }
-        let Some(record) = self.records.get(self.seq - 1) else {
-            if self.spent {
-                let message = super::spent(self.limits.results);
-                return refuse(Limit::Results, message);
-            }
-            self.calls.push(ScriptCall { name, arguments });
-            return None;
-        };
-        if record.name != name || record.arguments != arguments {
-            self.diverged.get_or_insert(format!(
-                "The script changed between runs. Call {} was `{}` and is now `{name}`. A \
-                 script must make the same calls each time it runs: do not branch on timing or \
-                 on anything outside its results.",
-                self.seq, record.name
-            ));
-            return None;
-        }
-        Some(serde_json::json!({"ok": record.ok, "output": record.output}).to_string())
+        self.grew(moved)
     }
 
-    fn log(&mut self, line: String) {
-        if self.log_bytes + line.len() > self.limits.logs {
-            self.logs_cut = true;
-            return;
-        }
-        self.log_bytes += line.len();
-        self.logs.push(line);
-    }
-
-    fn logs(&self) -> Vec<String> {
-        let mut logs = self.logs.clone();
-        if self.logs_cut {
-            logs.push(format!(
-                "[output over {} KiB was cut; log less]",
-                self.limits.logs >> 10
-            ));
-        }
-        logs
-    }
-
-    fn step(self) -> (Step, Option<Limit>) {
-        if let Some(limit) = self.stopped {
-            let message = match limit {
-                Limit::Compute => format!(
-                    "The script used its {}s of compute. Do less work in one run: work done \
-                     before a call is done again each time the script resumes.",
-                    self.limits.compute_ms / 1000
-                ),
-                _ => format!(
-                    "The script ran out of its {} MiB of memory. Keep less: take only the \
-                     fields you need from each result.",
-                    self.limits.memory >> 20
-                ),
-            };
-            return (Step::Failed(message), Some(limit));
-        }
-        if let Some(diverged) = &self.diverged {
-            return (Step::Failed(diverged.clone()), Some(Limit::Diverged));
-        }
-        let logs = self.logs();
-        let cut = self.logs_cut.then_some(Limit::Logs);
-        match &self.outcome {
-            Some(Ok(value)) => {
-                let (text, over) = rendered(value.as_deref(), &logs, self.limits.returned);
-                (Step::Done(text), over.or(self.refused).or(cut))
-            }
-            Some(Err(error)) => {
-                let limit = match error {
-                    e if e.contains("out of memory") => Some(Limit::Memory),
-                    e if e.contains("stack overflow") || e.contains("call stack") => {
-                        Some(Limit::Stack)
-                    }
-                    _ => self.refused,
-                };
-                (Step::Failed(with_logs(error, &logs)), limit)
-            }
-            None if !self.calls.is_empty() => (Step::Calls(self.calls), self.refused),
-            None => (
-                Step::Failed(with_logs(
-                    "The script waits on a promise that never settles. Await only tool calls \
-                     and promises built from them.",
-                    &logs,
-                )),
-                Some(Limit::NeverSettles),
-            ),
-        }
+    unsafe fn usable_size(ptr: *mut u8) -> usize {
+        RustAllocator::usable_size(ptr)
     }
 }
 
-fn rendered(value: Option<&str>, logs: &[String], returned: usize) -> (String, Option<Limit>) {
-    let mut out = serde_json::Map::new();
-    let mut over = None;
-    if let Some(value) = value {
-        let value = match value.len() > returned {
-            true => {
-                over = Some(Limit::Returned);
-                let start: String = value.chars().take(PREVIEW).collect();
-                serde_json::Value::String(format!(
-                    "[the result is {} KiB, over the {} KiB limit; return a summary. It began: \
-                     {start}]",
-                    value.len() >> 10,
-                    returned >> 10
-                ))
-            }
-            false => serde_json::from_str(value).unwrap_or(serde_json::Value::Null),
-        };
-        out.insert("result".to_string(), value);
-    }
-    if !logs.is_empty() {
-        out.insert("logs".to_string(), serde_json::json!(logs));
-    }
-    (serde_json::Value::Object(out).to_string(), over)
-}
-
-fn with_logs(error: &str, logs: &[String]) -> String {
-    match logs.is_empty() {
-        true => error.to_string(),
-        false => format!("{error}\n\nconsole output:\n{}", logs.join("\n")),
-    }
-}
-
-/// CPU this thread has used.
-fn cpu_ms() -> u64 {
-    let mut now = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
+fn raised(message: String) -> End {
+    let limit = match &message {
+        m if m.contains("out of memory") => Some(Limit::Memory),
+        m if m.contains("stack overflow") || m.contains("call stack") => Some(Limit::Stack),
+        _ => None,
     };
-    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) };
-    now.tv_sec as u64 * 1000 + now.tv_nsec as u64 / 1_000_000
+    End::Raised { message, limit }
 }
 
-/// Run `script` past the calls it already made. The same script and records
-/// always give the same step.
-pub fn run(script: &Script) -> Ran {
-    if !super::supports(script.version) {
-        let step = Step::Failed(format!(
-            "The runner takes versions {} to {}, not {}.",
-            super::OLDEST,
-            super::VERSION,
-            script.version
-        ));
-        return Ran {
-            step,
-            stats: Stats::default(),
-        };
-    }
-    let started = cpu_ms();
-    let (step, heap, limit) = match execute(script, started) {
-        Ok(ran) => ran,
-        Err(e) => (
-            Step::Failed(format!("The script could not run: {e}")),
-            0,
-            None,
-        ),
-    };
-    Ran {
-        step,
-        stats: Stats {
-            heap,
-            cpu_ms: cpu_ms().saturating_sub(started),
-            limit,
-            warm: false,
-        },
-    }
-}
-
-fn execute(script: &Script, started: u64) -> rquickjs::Result<(Step, usize, Option<Limit>)> {
-    let limits = script.limits.clone();
-    let run = Rc::new(RefCell::new(Run {
-        limits: limits.clone(),
-        records: script.calls.clone(),
-        spent: script.spent,
-        ..Run::default()
-    }));
-    let rt = Runtime::new()?;
+/// Runs the script on QuickJS, and returns the most heap it held.
+fn execute(script: &Script, replay: &Rc<RefCell<Replay>>, started: u64) -> rquickjs::Result<usize> {
+    let limits = replay.borrow().limits().clone();
+    let peak = Rc::new(Cell::new(0));
+    let rt = Runtime::new_with_alloc(Peak {
+        inner: RustAllocator,
+        now: 0,
+        peak: peak.clone(),
+    })?;
     rt.set_memory_limit(limits.memory);
     rt.set_max_stack_size(STACK);
     let mut ticks = 0u64;
-    let stop = run.clone();
-    let compute = limits.compute_ms;
+    let stop = replay.clone();
+    let compute = script.compute_ms();
     rt.set_interrupt_handler(Some(Box::new(move || {
         ticks += 1;
         if ticks <= TICKS && cpu_ms().saturating_sub(started) <= compute {
             return false;
         }
-        stop.borrow_mut().stopped.get_or_insert(Limit::Compute);
+        stop.borrow_mut().stop(Limit::Compute);
         true
     })));
     let ctx = Context::full(&rt)?;
     let compiled = ctx.with(|ctx| -> rquickjs::Result<Option<String>> {
         let globals = ctx.globals();
-        let r = run.clone();
+        let r = replay.clone();
         globals.set(
             "__call",
-            Function::new(ctx.clone(), move |name: String, arguments: String| {
-                r.borrow_mut().call(name, arguments)
+            Function::new(ctx.clone(), move |name: String, arguments: String| match r
+                .borrow_mut()
+                .call(name, arguments)
+            {
+                Answer::Result { ok, output } => {
+                    Some(serde_json::json!({ "ok": ok, "output": output }).to_string())
+                }
+                Answer::Refused(message) => {
+                    Some(serde_json::json!({ "ok": false, "output": message }).to_string())
+                }
+                Answer::Pending => None,
             })?,
         )?;
-        let r = run.clone();
+        let r = replay.clone();
         globals.set(
             "__log",
             Function::new(ctx.clone(), move |line: String| r.borrow_mut().log(line))?,
         )?;
-        let r = run.clone();
+        let r = replay.clone();
         globals.set(
             "__done",
             Function::new(ctx.clone(), move |ok: bool, value: Option<String>| {
-                r.borrow_mut().outcome = Some(match ok {
-                    true => Ok(value),
-                    false => Err(value.unwrap_or_default()),
+                r.borrow_mut().end(match ok {
+                    true => End::Returned(value),
+                    false => raised(value.unwrap_or_default()),
                 });
             })?,
         )?;
@@ -341,7 +231,7 @@ fn execute(script: &Script, started: u64) -> rquickjs::Result<(Step, usize, Opti
         }
     })?;
     if let Some(error) = compiled {
-        run.borrow_mut().outcome.get_or_insert(Err(error));
+        replay.borrow_mut().end(raised(error));
     }
     for _ in 0..JOBS {
         match rt.execute_pending_job() {
@@ -349,29 +239,24 @@ fn execute(script: &Script, started: u64) -> rquickjs::Result<(Step, usize, Opti
             Ok(false) => break,
             Err(e) => {
                 let error = e.0.with(|ctx| exception(&ctx));
-                run.borrow_mut().outcome.get_or_insert(Err(error));
+                replay.borrow_mut().end(raised(error));
                 break;
             }
         }
     }
     if rt.is_job_pending() {
-        run.borrow_mut().stopped.get_or_insert(Limit::Compute);
+        replay.borrow_mut().stop(Limit::Compute);
     }
-    let heap = rt.memory_usage().malloc_size.max(0) as usize;
+    let held = rt.memory_usage().malloc_size.max(0) as usize;
     {
-        let mut run = run.borrow_mut();
-        let finished = matches!(run.outcome, Some(Ok(_)));
-        if !finished && run.calls.is_empty() && heap > limits.memory / 10 * 9 {
-            run.stopped.get_or_insert(Limit::Memory);
+        let mut replay = replay.borrow_mut();
+        if !replay.returned() && !replay.waits_on_calls() && held > limits.memory / 10 * 9 {
+            replay.stop(Limit::Memory);
         }
     }
     drop(ctx);
     rt.set_interrupt_handler(None);
-    let run = Rc::try_unwrap(run)
-        .map(RefCell::into_inner)
-        .unwrap_or_else(|r| std::mem::take(&mut *r.borrow_mut()));
-    let (step, limit) = run.step();
-    Ok((step, heap, limit))
+    Ok(peak.get())
 }
 
 fn exception(ctx: &rquickjs::Ctx<'_>) -> String {
@@ -393,13 +278,16 @@ fn exception(ctx: &rquickjs::Ctx<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codemode::engine;
+    use crate::codemode::{Limits, ScriptCall, ScriptRecord, Step};
 
     fn run(script: &Script) -> Step {
-        super::run(script).step
+        engine::run(script).step
     }
 
     fn script(code: &str, calls: Vec<ScriptRecord>) -> Script {
         Script {
+            cpu_used_ms: 0,
             limits: Limits {
                 compute_ms: 1_000,
                 memory: 16 << 20,
@@ -411,6 +299,7 @@ mod tests {
             now_ms: 1_700_000_000_000,
             spent: false,
             version: crate::codemode::VERSION,
+            language: Default::default(),
             tools: vec!["weather".to_string(), "list-prs".to_string()],
         }
     }
@@ -533,7 +422,7 @@ mod tests {
             vec![],
         ));
         assert!(
-            matches!(&step, Step::Failed(m) if m.contains("1s of compute")),
+            matches!(&step, Step::Failed(m) if m.contains("1000 ms of compute for one run")),
             "{step:?}"
         );
     }
@@ -575,7 +464,7 @@ mod tests {
     fn a_promise_that_never_settles_fails_the_run() {
         let step = run(&script("await new Promise(() => {});", vec![]));
         assert!(
-            matches!(&step, Step::Failed(m) if m.contains("never settles")),
+            matches!(&step, Step::Failed(m) if m.contains("never finishes")),
             "{step:?}"
         );
     }
@@ -645,7 +534,7 @@ mod tests {
             vec![record("a", "{}", true, "1"), record("b", "{}", true, "2")],
         );
         limited.limits.calls = 2;
-        let ran = super::run(&limited);
+        let ran = engine::run(&limited);
         assert!(
             matches!(&ran.step, Step::Done(t) if t.contains("at most 2 calls")),
             "{ran:?}"
@@ -669,11 +558,39 @@ mod tests {
 
     #[test]
     fn a_run_says_which_limit_stopped_it() {
-        let ran = super::run(&script("while (true) {}", vec![]));
+        let ran = engine::run(&script("while (true) {}", vec![]));
         assert_eq!(ran.stats.limit, Some(Limit::Compute));
         assert!(ran.stats.cpu_ms >= 1_000, "{:?}", ran.stats);
-        let ran = super::run(&script("return 1;", vec![]));
+        let ran = engine::run(&script("return 1;", vec![]));
         assert_eq!(ran.stats.limit, None);
         assert!(ran.stats.heap > 0);
+    }
+
+    #[test]
+    fn a_run_gets_only_what_is_left_of_the_whole_budget() {
+        let mut nearly = script("while (true) {}", vec![]);
+        nearly.cpu_used_ms = nearly.limits.total_compute_ms - 50;
+        let ran = engine::run(&nearly);
+        assert!(
+            matches!(&ran.step, Step::Failed(m) if m.contains("over all its runs")),
+            "{ran:?}"
+        );
+        assert!(
+            ran.stats.cpu_ms < 500,
+            "stopped near 50 ms: {:?}",
+            ran.stats
+        );
+    }
+
+    #[test]
+    fn a_script_with_no_budget_left_does_not_run() {
+        let mut spent = script("return 1;", vec![]);
+        spent.cpu_used_ms = spent.limits.total_compute_ms;
+        let ran = engine::run(&spent);
+        assert!(
+            matches!(&ran.step, Step::Failed(m) if m.contains("over all its runs")),
+            "{ran:?}"
+        );
+        assert_eq!(ran.stats.limit, Some(Limit::Compute));
     }
 }

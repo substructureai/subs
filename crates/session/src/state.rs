@@ -471,6 +471,16 @@ pub struct ToolCallState {
     /// the call was made.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub script_tools: Vec<String>,
+    /// For `run_code`: the language its script is in.
+    #[serde(default)]
+    pub script_language: crate::codemode::Language,
+    /// For `run_code`: CPU its script's runs have used.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub script_cpu_ms: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1167,13 +1177,15 @@ impl SessionState {
             }
         } else {
             self.turn_calls.tool.count += 1;
-            let script_tools = match payload.target {
+            let (script_tools, script_language) = match payload.target {
                 Some(ConnectorTarget::Code) => {
                     let at = self.at_head();
                     let config = at.resolve_agent_for();
-                    crate::codemode::callable(config.as_ref(), &at.connector_tools().tools)
+                    let tools =
+                        crate::codemode::callable(config.as_ref(), &at.connector_tools().tools);
+                    (tools, config.and_then(|c| c.code_mode).unwrap_or_default())
                 }
-                _ => Vec::new(),
+                _ => (Vec::new(), Default::default()),
             };
             self.insert_effect(
                 &payload.id,
@@ -1187,6 +1199,8 @@ impl SessionState {
                     is_error: false,
                     script: payload.script.clone(),
                     script_tools,
+                    script_language,
+                    script_cpu_ms: 0,
                 }),
             );
             if let Some(script) = &payload.script {
@@ -1432,6 +1446,14 @@ impl SessionState {
                         tc.result = Some(payload.result.rendered());
                         tc.is_error = false;
                     }
+                }
+            }
+            EventPayload::ToolCallStepped(payload) => {
+                if let Some(tc) = self
+                    .effect_mut(EffectKind::ToolCall, &payload.id)
+                    .and_then(|e| e.tool_mut())
+                {
+                    tc.script_cpu_ms += payload.cpu_ms;
                 }
             }
             EventPayload::ToolCallErrored(payload) => {
@@ -2037,8 +2059,10 @@ impl SessionState {
                 crate::attachments::tools::definitions(attachments),
             ));
         }
-        if config.code_mode {
-            resolutions.push(filter::Resolution::of(vec![crate::codemode::tool()]));
+        if let Some(language) = config.code_mode {
+            resolutions.push(filter::Resolution::of(vec![crate::codemode::tool(
+                language,
+            )]));
         }
         let taken: Vec<&str> = config.tools.iter().map(|t| t.name.as_str()).collect();
         filter::merge(resolutions, taken)
@@ -3223,7 +3247,10 @@ fn describe_run_code(
             .iter()
             .filter(|t| crate::codemode::declares(t, config, connector_tools))
             .collect();
-        crate::codemode::describe(&declared)
+        crate::codemode::describe(
+            config.and_then(|c| c.code_mode).unwrap_or_default(),
+            &declared,
+        )
     };
     if let Some(tool) = tools.iter_mut().find(|t| t.name == RUN_CODE) {
         tool.description = description;

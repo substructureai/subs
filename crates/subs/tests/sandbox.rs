@@ -27,7 +27,9 @@ fn runner() -> ProcessRunner {
 fn script(code: &str) -> Script {
     Script {
         version: VERSION,
+        language: Default::default(),
         limits: Default::default(),
+        cpu_used_ms: 0,
         code: code.to_string(),
         calls: vec![],
         seed: 1,

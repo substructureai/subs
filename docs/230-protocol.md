@@ -488,7 +488,7 @@ type AgentConfig = {
         window?: number
         strategy?: ContextStrategy[]
     }
-    code_mode?: boolean         // offer run_code. omitted: false
+    code_mode?: "javascript"    // offer run_code, scripts in this language. omitted: off
 }
 
 type Attachments = {

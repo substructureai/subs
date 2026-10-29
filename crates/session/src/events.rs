@@ -41,6 +41,8 @@ pub enum EventPayload {
     ToolCallCompleted(ToolCallCompleted),
     #[serde(rename = "tool.call.errored")]
     ToolCallErrored(ToolCallErrored),
+    #[serde(rename = "tool.call.stepped")]
+    ToolCallStepped(ToolCallStepped),
     #[serde(rename = "system1.call.requested")]
     System1CallRequested(Box<System1CallRequested>),
     #[serde(rename = "system1.call.dispatched")]
@@ -453,6 +455,13 @@ pub struct ToolCallRequested {
     pub retry: RetryPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub script: Option<ScriptCaller>,
+}
+
+/// A `run_code` call's script ran a step.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallStepped {
+    pub id: String,
+    pub cpu_ms: u64,
 }
 
 /// The `run_code` call that made this call, and where in its script.

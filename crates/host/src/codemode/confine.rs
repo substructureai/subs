@@ -84,6 +84,38 @@ fn limits(data: u64) -> io::Result<()> {
     Ok(())
 }
 
+/// Lowers the process's CPU limit to what it has used, `ms` more, and a second
+/// past that, so the OS stops a run the interpreter could not.
+pub fn limit_cpu(ms: u64) -> io::Result<()> {
+    let mut used = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut used) };
+    let used_ms = used.tv_sec as u64 * 1000 + used.tv_nsec as u64 / 1_000_000;
+    let secs = (used_ms + ms).div_ceil(1000) + 1;
+    let limit = libc::rlimit {
+        rlim_cur: secs as libc::rlim_t,
+        rlim_max: secs as libc::rlim_t,
+    };
+    #[cfg(target_os = "linux")]
+    let set = unsafe {
+        libc::syscall(
+            libc::SYS_prlimit64,
+            0,
+            libc::RLIMIT_CPU,
+            &limit as *const libc::rlimit,
+            std::ptr::null_mut::<libc::rlimit>(),
+        )
+    } as libc::c_int;
+    #[cfg(not(target_os = "linux"))]
+    let set = unsafe { libc::setrlimit(libc::RLIMIT_CPU, &limit) };
+    match set {
+        0 => Ok(()),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
 fn limit(resource: i64, value: u64) -> io::Result<()> {
     let limit = libc::rlimit {
         rlim_cur: value as libc::rlim_t,
@@ -177,6 +209,12 @@ fn lock(denial: Denial) -> io::Result<()> {
         allowed.iter().map(|&call| (call, Vec::new())).collect();
     rules.insert(libc::SYS_tkill, own(0)?);
     rules.insert(libc::SYS_tgkill, own(0)?);
+    let itself = SeccompCondition::new(0, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, 0)
+        .map_err(io::Error::other)?;
+    rules.insert(
+        libc::SYS_prlimit64,
+        vec![SeccompRule::new(vec![itself]).map_err(io::Error::other)?],
+    );
     let mismatch = match denial {
         Denial::Kill => SeccompAction::KillProcess,
         Denial::Refuse => SeccompAction::Errno(libc::EPERM as u32),

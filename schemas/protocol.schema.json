@@ -15,8 +15,15 @@
           ]
         },
         "code_mode": {
-          "description": "Offer `run_code`: the model writes JavaScript that calls the agent's\ntools.",
-          "type": "boolean"
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CodeLanguage"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Offer `run_code`: the model writes a script in this language that\ncalls the agent's tools."
         },
         "context": {
           "anyOf": [
@@ -854,6 +861,13 @@
         }
       ],
       "title": "ClientPayload"
+    },
+    "CodeLanguage": {
+      "description": "The language a script is written in. Each has a dialect that describes\n`run_code` to the model and an engine that runs it.",
+      "enum": [
+        "javascript"
+      ],
+      "type": "string"
     },
     "ConnectionPath": {
       "description": "Where a connection is declared: `mcp.<id>` or `plugin.<id>.mcp.<server>`",

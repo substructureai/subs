@@ -7279,7 +7279,7 @@ fn agent_config(model: &str) -> AgentConfig {
         effort: None,
         attachments: None,
         context: None,
-        code_mode: false,
+        code_mode: None,
     }
 }
 
@@ -13033,7 +13033,7 @@ fn a_skill_loaded_through_call_tool_unlocks_its_tools() {
 
 fn coding_session() -> Session {
     let mut agent = agent_config("m1");
-    agent.code_mode = true;
+    agent.code_mode = Some(crate::codemode::Language::Javascript);
     agent.tools.push(worker_tool("weather"));
     agent.tools.push(AgentTool {
         handler: Some(Handler::Client),
@@ -13069,7 +13069,11 @@ fn script_step(agg: &mut Session, known: u32, calls: &[(&str, &str)]) -> Vec<Eve
             EffectKind::ToolCall,
             "tc-1",
             Some(0),
-            Outcome::Script { known, calls },
+            Outcome::Script {
+                known,
+                calls,
+                cpu_ms: 7,
+            },
         ),
         &system(),
     )
@@ -13171,6 +13175,10 @@ fn a_scripts_calls_run_as_tool_calls_the_model_never_hears_of() {
     let events = settle_tool(&mut agg, &child, r#"{"temp":3}"#);
     assert!(tool_finished(&events).is_empty(), "the model hears nothing");
     let script = script_work(&agg).expect("the script runs again");
+    assert_eq!(
+        script.cpu_used_ms, 7,
+        "the step's CPU counts toward the script's budget"
+    );
     assert_eq!(script.calls.len(), 1);
     assert_eq!(script.calls[0].name, "weather");
     assert_eq!(script.calls[0].arguments, r#"{"city":"Oslo"}"#);
@@ -13252,6 +13260,7 @@ fn a_script_step_has_no_natural_command_id() {
         Outcome::Script {
             known: 0,
             calls: vec![],
+            cpu_ms: 0,
         },
     );
     assert_eq!(step.natural_id(), None, "the session fences steps itself");
