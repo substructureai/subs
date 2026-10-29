@@ -17,6 +17,8 @@ It stops when the attempts run out or when a failure cannot be retried.
 | Tool call (worker) | none | 120s | 600s | **1** |
 | Tool call (client) | none | none | none | 1 |
 | Tool call (connector) | 60s | 60s | 600s | 2 |
+| `run_code` | none | none | none | 1 |
+| `run_code` | none | none | none | 1 |
 | Subagent start | 30s | 10s | 3600s | 3 |
 | Connector fetch | 10s | 5s | 30s | 2 |
 | Worker decision | none | 20s | 300s | 10 |

@@ -13242,6 +13242,108 @@ fn tool_executes(events: &[EventPayload]) -> Vec<(String, String)> {
         .collect()
 }
 
+fn work_from(agg: &Session, events: Vec<EventPayload>) -> Vec<crate::Work> {
+    let at = Utc::now();
+    let events: Vec<crate::SessionEvent> = events
+        .into_iter()
+        .map(|payload| crate::SessionEvent {
+            id: uuid::Uuid::nil(),
+            tenant_id: "tenant-a".to_string(),
+            session_id: "sess-1".to_string(),
+            seq: 0,
+            span: SpanContext::root(),
+            occurred_at: at,
+            payload,
+            meta: serde_json::from_value(serde_json::json!({ "status": SessionStatus::Idle }))
+                .unwrap(),
+            start_time: at,
+            end_time: at,
+            command_id: None,
+        })
+        .collect();
+    agg.work(&events)
+}
+
+fn dispatched_calls(events: &[EventPayload]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            EventPayload::ToolCallDispatched(d) => Some(d.id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn an_interrupt_holds_a_script_and_takes_the_results_of_its_calls() {
+    let mut agg = coding_session();
+    run_code(&mut agg, "...");
+    let events = script_step(&mut agg, 0, &[("weather", r#"{"city":"Oslo"}"#)]);
+    let (_, oslo) = tool_executes(&events)[0].clone();
+    interrupt(&mut agg, "int-1");
+
+    let events = settle_tool(&mut agg, &oslo, "sunny");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::ToolCallCompleted(_))),
+        "a call already sent out still finishes"
+    );
+    assert!(script_work(&agg).is_none(), "the script does not run");
+    assert!(work_from(&agg, events).is_empty());
+
+    let events = script_step(&mut agg, 1, &[("weather", r#"{"city":"Rome"}"#)]);
+    assert!(
+        dispatched_calls(&events).is_empty(),
+        "a call the script asks for waits: {events:?}"
+    );
+
+    let events = resume(&mut agg, "int-1");
+    assert_eq!(dispatched_calls(&events).len(), 1, "the held call goes out");
+}
+
+#[test]
+fn a_resume_runs_the_script_it_held() {
+    let mut agg = coding_session();
+    run_code(&mut agg, "...");
+    let events = script_step(&mut agg, 0, &[("weather", r#"{"city":"Oslo"}"#)]);
+    let (_, oslo) = tool_executes(&events)[0].clone();
+    interrupt(&mut agg, "int-1");
+    settle_tool(&mut agg, &oslo, "sunny");
+    assert!(script_work(&agg).is_none());
+
+    let events = resume(&mut agg, "int-1");
+    assert!(script_work(&agg).is_some(), "the script runs again");
+    let work = work_from(&agg, events);
+    assert!(
+        work.iter().any(|w| matches!(w,
+            crate::Work::CallTool { call, .. } if call.tool_call_id == "tc-1")),
+        "the resume sends the script's step: {work:?}"
+    );
+}
+
+#[test]
+fn run_code_outlives_a_long_interrupt() {
+    let mut agg = coding_session();
+    run_code(&mut agg, "...");
+    script_step(&mut agg, 0, &[("weather", r#"{"city":"Oslo"}"#)]);
+    interrupt(&mut agg, "int-1");
+    dispatch(
+        &mut agg,
+        CommandPayload::Wake {
+            now: Utc::now() + chrono::Duration::days(2),
+        },
+        &system(),
+    );
+    resume(&mut agg, "int-1");
+    assert_ne!(
+        agg.state
+            .effect(EffectKind::ToolCall, "tc-1")
+            .map(|e| e.tracking.status()),
+        Some(EffectStatus::Failed)
+    );
+}
+
 #[test]
 fn a_worker_interrupt_holds_a_script_until_resumed() {
     let mut agg = coding_session();

@@ -11,6 +11,7 @@ use crate::protocol::{
     TOOL_SEARCH,
 };
 use crate::protocol::{RetryOverride, RetryPolicy};
+use crate::schedule::Dep;
 use crate::state::{inner_arguments, CallTarget, EffectKind, SessionState};
 use crate::tool_contract::{declared_tool, output_violation, DeclaredTool};
 use crate::Caller;
@@ -20,6 +21,16 @@ pub struct ToolSpec;
 impl KindSpec for ToolSpec {
     fn kind(&self) -> EffectKind {
         EffectKind::ToolCall
+    }
+
+    /// An interrupt holds the calls a script makes, as it holds decisions.
+    fn park(&self, state: &SessionState, id: &str) -> Option<Dep> {
+        let effect = state.effect(EffectKind::ToolCall, id)?;
+        effect.tool()?.script.as_ref()?;
+        let interrupt = state.anchor_interrupt(effect.anchor.as_deref())?;
+        Some(Dep::InterruptResumed {
+            interrupt_id: interrupt.interrupt_id.clone(),
+        })
     }
 
     fn authorize(

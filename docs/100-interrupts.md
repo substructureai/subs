@@ -13,20 +13,29 @@ the worker that person's answer.
 The worker pauses before a sensitive action, then acts on the answer.
 
 ```javascript title="server.mjs"
-function decide({ trigger, proposed }) {
+function decide({ trigger, proposed, state }) {
     if (trigger.type === "tool.execute" && trigger.name === "send_email") {
-        return { actions: [{ type: "interrupt", reason: "confirm", payload: { message: "Send the email?" } }] };
+        return {
+            actions: [{ type: "interrupt", interrupt_id: "confirm-email", reason: "confirm", payload: { message: "Send the email?" } }],
+            state: { ...state, confirming: trigger.id },
+        };
     }
 
-    if (trigger.type === "interrupt.resumed") {
-        return trigger.payload?.approved
-            ? { actions: [{ type: "tool.result", result: { content: [{ type: "text", text: "sent" }] } }] }
-            : { actions: [{ type: "tool.error", error: "declined" }] };
+    if (trigger.type === "interrupt.resumed" && trigger.interrupt_id === "confirm-email") {
+        const id = state.confirming;
+        const actions = trigger.payload?.approved
+            ? [{ type: "tool.result", id, result: { content: [{ type: "text", text: "sent" }] } }]
+            : [{ type: "tool.error", id, error: "declined" }];
+        return { actions, state: { ...state, confirming: null } };
     }
 
     return proposed;
 }
 ```
+
+The worker keeps the call's ID in its [state](./90-state.md). A result after a
+resume must carry that `id`, because the trigger is no longer the call's
+`tool.execute`.
 
 The engine raises an interrupt itself when a connection says to. See
 [Ask a person before a call runs](./40-connectors.md#ask-a-person-before-a-call-runs).
@@ -68,6 +77,24 @@ branch nobody uses sends nothing. An old or repeated ID does nothing.
 
 The engine refuses new messages on the paused branch. It still records work that
 ends an open call, and holds the next decision until the resume.
+
+Scripts wait too. While a branch is paused, no [code mode](./67-code-mode.md)
+script runs its next step, and no call that a script asks for goes out. After
+the resume, each script runs again with the results that arrived.
+
+## Calls keep their deadlines
+
+An interrupt does not stop a call's clock. A worker tool call has 120 seconds to
+run and 600 seconds in all. See [Retries](./210-retries.md).
+
+A call that waits on a person past its deadline fails with `deadline exceeded`.
+A later result for it is refused. For tools that wait on a person, raise the
+limits:
+
+```toml title="subs.toml"
+[agent.assistant.retry]
+tool = { run_timeout_secs = 86400, total_timeout_secs = 86400 }
+```
 
 A paused turn is still the same turn. A pause emits no `turn.completed`, and a
 resume starts no new turn. Events before and after the pause carry the same

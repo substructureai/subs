@@ -77,6 +77,14 @@ So a script must make the same calls each time it runs. `Date` and
 `Math.random` give the same values on every run. A run that makes a different
 call fails.
 
+`run_code` has no deadline of its own. Its calls keep theirs, and the script's
+[limits](#limits) bound what it runs. An [interrupt](./100-interrupts.md) holds
+a script: no step runs, and no call it asks for goes out, until the resume.
+
+`run_code` has no deadline of its own. Its calls keep theirs, and the script's
+[limits](#limits) bound what it runs. An [interrupt](./100-interrupts.md) holds
+a script: no step runs, and no call it asks for goes out, until the resume.
+
 ## Sandbox
 
 Each run of a script is a new process that the engine starts from its own

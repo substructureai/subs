@@ -1000,7 +1000,16 @@ impl SessionState {
         calls.into_iter().map(|(_, e)| e).collect()
     }
 
-    pub fn script_waits(&self, parent: &str) -> bool {
+    /// Whether a `run_code` call's script can take its next step: none of
+    /// its calls is open, and no interrupt holds it.
+    pub fn script_runs(&self, parent: &str) -> bool {
+        let anchor = self
+            .effect(EffectKind::ToolCall, parent)
+            .and_then(|e| e.anchor.as_deref());
+        !self.script_waits(parent) && !self.anchor_parked(anchor)
+    }
+
+    fn script_waits(&self, parent: &str) -> bool {
         self.script_calls(parent)
             .iter()
             .any(|e| e.tracking.is_unsettled())
@@ -1862,11 +1871,16 @@ impl SessionState {
     }
 
     pub fn anchor_parked(&self, anchor: Option<&str>) -> bool {
+        self.anchor_interrupt(anchor).is_some()
+    }
+
+    /// The interrupt that holds work anchored at `anchor`, if one does.
+    pub fn anchor_interrupt(&self, anchor: Option<&str>) -> Option<&OpenInterrupt> {
         match anchor {
             Some(a) if !self.at_head().anchor_on_path(Some(a)) => {
-                self.at(Some(a)).active_interrupt_for().is_some()
+                self.at(Some(a)).active_interrupt_for()
             }
-            _ => self.head_parked(),
+            _ => self.at_head().active_interrupt_for(),
         }
     }
 

@@ -158,13 +158,14 @@ pub fn search(language: Language, tools: &[LlmTool], query: &str, max: NonZeroUs
     answer.to_string()
 }
 
-/// A script waits on its calls, so its own deadline is the run's whole life.
-/// Each step's wait for a sandbox is the runtime's `script_wait`.
+/// A script waits on its calls, which keep their own clocks, and its budgets
+/// bound what it runs. So `run_code` has no deadline of its own. Each step's
+/// wait for a sandbox is the runtime's `script_wait`.
 pub fn retry() -> RetryPolicy {
     RetryPolicy {
         queue_timeout_secs: None,
         run_timeout_secs: None,
-        total_timeout_secs: Some(3600),
+        total_timeout_secs: None,
         max_attempts: 1,
         backoff_base_secs: 0,
         backoff_max_secs: 0,
