@@ -50,12 +50,11 @@ throws an `Error` with the tool's message.
 
 ## What a script can call
 
-A script can call the agent's worker tools and connector tools, and
-`tool_search`. A call that needs approval waits for a person, as a direct call
-does. A script cannot call:
+A script can call the agent's worker tools, connector tools, client tools,
+subagents, and `tool_search`. A call that needs approval waits for a person, and
+a client tool waits for the client, as a direct call does. A subagent call
+returns the subagent's answer. A script cannot call:
 
-- a client tool,
-- a subagent,
 - `skill`, `call_tool` or another engine tool,
 - `run_code`.
 
@@ -75,8 +74,10 @@ When a script stops on calls, the engine asks your worker about them with a
   ] }
 ```
 
-`proposed` runs each call with `tool.call`. When a call needs approval, it asks
-a person about that call first, and the rest wait. Return `proposed`, or answer
+`proposed` runs each call with `tool.call`, or starts a subagent with
+`subagent.spawn`. When a call needs approval, it asks a person about that call
+first, and the rest wait. When a subagent finishes, `subagent.finished`
+proposes its answer as the call's `tool.result`. Return `proposed`, or answer
 each call by its `id`: `tool.call` runs it, and `tool.error` refuses it with
 your message. A call that no answer runs or refuses fails, and the script can
 catch the error. A worker that returns `proposed` for triggers it does not know

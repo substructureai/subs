@@ -181,6 +181,29 @@ fn derive(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionRespon
         DecisionTrigger::SubagentFinished {
             id,
             ok,
+            session_id,
+            result,
+            error,
+            ..
+        } if p
+            .state
+            .state()
+            .tool_call(id)
+            .is_some_and(|t| t.script.is_some()) =>
+        {
+            Some(DecisionResponse {
+                messages: recorded(transcript),
+                actions: vec![answer_script_call(
+                    id,
+                    *ok,
+                    subagent_text(*ok, session_id, result, error),
+                )],
+                ..Default::default()
+            })
+        }
+        DecisionTrigger::SubagentFinished {
+            id,
+            ok,
             agent_id,
             session_id,
             result,
@@ -286,7 +309,32 @@ pub(super) fn script_calls(
         .filter(|call| approval::needed(call, connector_tools));
     match held.next() {
         Some(first) => vec![approval::ask(first, connector_tools, held.count())],
-        None => tool_calls.iter().map(call_tool).collect(),
+        None => tool_calls
+            .iter()
+            .flat_map(|call| route_tool_call(call, connector_tools))
+            .collect(),
+    }
+}
+
+/// A script's call answered with `text`: its result, or its error.
+fn answer_script_call(id: &str, ok: bool, text: String) -> DecisionAction {
+    match ok {
+        true => DecisionAction::ToolResult {
+            id: Some(id.to_string()),
+            attempt: None,
+            result: Some(serde_json::json!({ "content": [{ "type": "text", "text": text }] })),
+            content: None,
+            structured_content: None,
+            is_error: false,
+        },
+        false => DecisionAction::ToolError {
+            id: Some(id.to_string()),
+            attempt: None,
+            error: text,
+            retryable: false,
+            code: None,
+            detail: None,
+        },
     }
 }
 

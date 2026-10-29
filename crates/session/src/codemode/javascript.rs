@@ -34,8 +34,8 @@ again each time. It has limits on its calls, on the results it reads, on memory 
 an error names the limit and what to do.
 - There is no network, file system, timer or module. `Date` and `Math.random` stay the same \
 for the whole run.
-- A call that needs approval waits for a person. Tools that run on the client or start a \
-subagent cannot be called from code.";
+- A call that needs approval waits for a person, and a client tool waits for the client. A \
+subagent call returns the subagent's answer.";
 
 fn describe(tools: &[&LlmTool]) -> String {
     let budget = Budget::split(tools);

@@ -3236,8 +3236,14 @@ mod node_wire_compat_tests {
     }
 }
 
+/// Whether the only open calls wait on the client. A `run_code` call only
+/// waits on the calls its script made, so it does not count.
 pub fn waiting_on_client(calls: &[Effect]) -> bool {
-    !calls.is_empty() && calls.iter().all(|c| c.handler == Some(Handler::Client))
+    let mut open = calls
+        .iter()
+        .filter(|c| c.name.as_deref() != Some(RUN_CODE))
+        .peekable();
+    open.peek().is_some() && open.all(|c| c.handler == Some(Handler::Client))
 }
 
 const TITLE_CHARS: usize = 200;

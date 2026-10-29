@@ -428,6 +428,9 @@ pub enum ConnectorTarget {
     },
     /// A script's `tool_search`, over the tools a script can call.
     ScriptSearch,
+    /// A script's call that a subagent answers. The engine runs nothing for
+    /// it, and settles it when the child finishes.
+    Subagent,
 }
 
 impl ConnectorTarget {
@@ -435,6 +438,7 @@ impl ConnectorTarget {
         match self {
             Self::Remote { .. } => ConnectorToolKind::Remote,
             Self::Find | Self::ScriptSearch => ConnectorToolKind::Find,
+            Self::Subagent => ConnectorToolKind::Subagent,
             Self::Call => ConnectorToolKind::Call,
             Self::Skill { .. } => ConnectorToolKind::Skill,
             Self::Attachment => ConnectorToolKind::Attachment,

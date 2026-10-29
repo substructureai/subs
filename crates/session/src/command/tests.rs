@@ -13179,11 +13179,7 @@ fn run_code_runs_its_script_in_the_engine() {
     let script = script_work(&agg).expect("the script is sent to run");
     assert_eq!(script.code, "return 1;");
     assert!(script.calls.is_empty());
-    assert_eq!(
-        script.tools,
-        ["tool_search", "weather"],
-        "client tools are not listed"
-    );
+    assert_eq!(script.tools, ["ask", "tool_search", "weather"]);
 }
 
 #[test]
@@ -13215,10 +13211,7 @@ fn tools_a_script_can_call_reach_the_model_only_through_run_code() {
     let mut agg = coding_session();
     let tools = dispatched_tools(&mut agg, "llm-1");
     assert!(tools.contains(&"run_code".to_string()), "{tools:?}");
-    assert!(
-        tools.contains(&"ask".to_string()),
-        "client tools stay direct"
-    );
+    assert!(!tools.contains(&"ask".to_string()), "{tools:?}");
     assert!(!tools.contains(&"weather".to_string()), "{tools:?}");
     let call = agg.state.llm_call("llm-1").expect("the call");
     let run_code = call
@@ -13229,7 +13222,7 @@ fn tools_a_script_can_call_reach_the_model_only_through_run_code() {
         .find(|t| t.name == "run_code")
         .expect("run_code");
     assert!(run_code.description.contains("  weather(args:"));
-    assert!(!run_code.description.contains("  ask(args:"));
+    assert!(run_code.description.contains("  ask(args:"));
 }
 
 #[test]
@@ -13237,8 +13230,8 @@ fn a_direct_search_leaves_out_tools_reached_from_code() {
     let agg = coding_session();
     let names = |tools: Vec<LlmTool>| tools.into_iter().map(|t| t.name).collect::<Vec<_>>();
     let at = agg.state.at_head();
-    assert_eq!(names(at.searchable_tools()), ["ask"]);
-    assert_eq!(names(at.script_searchable_tools()), ["weather"]);
+    assert!(names(at.searchable_tools()).is_empty());
+    assert_eq!(names(at.script_searchable_tools()), ["weather", "ask"]);
 }
 
 #[test]
@@ -13452,6 +13445,99 @@ fn a_worker_can_refuse_a_scripts_call_and_one_it_skips_fails() {
     assert!(!script.calls[1].ok && script.calls[1].output.contains("did not run"));
 }
 
+fn proposed_for(agg: &Session, decision: &str) -> crate::protocol::DecisionResponse {
+    agg.open_work()
+        .into_iter()
+        .find_map(|w| match w {
+            crate::Work::AskWorker { work, request, .. } if work.id == decision => {
+                Some(request.proposed.clone())
+            }
+            _ => None,
+        })
+        .expect("the worker is asked")
+}
+
+#[test]
+fn a_script_starts_a_subagent_and_reads_its_answer() {
+    let mut agent = agent_config("m1");
+    agent.codemode = Some(crate::codemode::Language::Javascript);
+    agent.subagents = vec![crate::protocol::Subagent {
+        id: "agent-2".to_string(),
+        description: "Does the work.".to_string(),
+        defer: None,
+        prefix: None,
+        mode: None,
+    }];
+    let mut agg = create_session_with_config("sess-1", "tenant-a", "user-1", Some(agent));
+    run_code(&mut agg, "...");
+    let events = step_asks(
+        &mut agg,
+        0,
+        &[("agent-2", r#"{"message":"check the logs"}"#)],
+    );
+    let (decision, asked) = codemode_calls(&events).expect("the step asks about its call");
+    let call = asked[0].id.clone();
+    assert!(
+        matches!(&proposed_for(&agg, &decision).actions[..],
+            [crate::protocol::DecisionAction::SpawnSubagent { tool_call_id, agent_id, .. }]
+                if *tool_call_id == call && agent_id == "agent-2"),
+        "the engine proposes the spawn"
+    );
+    submit_decision(
+        &mut agg,
+        decision,
+        vec![],
+        vec![Action::SpawnSubagent {
+            session_id: None,
+            agent_id: "agent-2".to_string(),
+            tool_call_id: call.clone(),
+            message: Some(node_msg("m", Role::User, "check the logs")),
+            retry: RetryPolicy::no_retry(),
+            mode: None,
+        }],
+    );
+    assert!(script_work(&agg).is_none(), "the script waits on the child");
+
+    let child = child_of(&agg, &call);
+    let events = dispatch(
+        &mut agg,
+        answer(&child, "turn-x", rust_decimal::Decimal::ZERO),
+        &system(),
+    );
+    let finished = events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::DecisionDispatched(d) => Some(d.id.clone()),
+            _ => None,
+        })
+        .expect("the child's answer goes to the worker");
+    assert!(
+        matches!(&proposed_for(&agg, &finished).actions[..],
+            [crate::protocol::DecisionAction::ToolResult { id: Some(id), .. }] if *id == call),
+        "the engine proposes the answer as the script's result"
+    );
+    submit_decision(
+        &mut agg,
+        finished,
+        vec![],
+        vec![Action::ToolResult {
+            id: call.clone(),
+            attempt: None,
+            result: StoredResult::text("done"),
+        }],
+    );
+    let script = script_work(&agg).expect("the script runs again");
+    assert_eq!(script.calls[0].output, "done");
+    assert!(
+        agg.state
+            .at_head()
+            .transcript()
+            .iter()
+            .all(|m| m.tool_call_id.as_deref() != Some(call.as_str())),
+        "the model does not hear of it"
+    );
+}
+
 #[test]
 fn a_worker_interrupt_holds_a_script_until_resumed() {
     let mut agg = coding_session();
@@ -13547,14 +13633,10 @@ fn a_scripts_calls_run_as_tool_calls_the_model_never_hears_of() {
 }
 
 #[test]
-fn a_script_may_not_call_client_unknown_or_run_code_tools() {
+fn a_script_may_not_call_unknown_or_run_code_tools() {
     let mut agg = coding_session();
     run_code(&mut agg, "...");
-    let events = script_step(
-        &mut agg,
-        0,
-        &[("ask", "{}"), ("nope", "{}"), ("run_code", "{}")],
-    );
+    let events = script_step(&mut agg, 0, &[("nope", "{}"), ("run_code", "{}")]);
     let errors: Vec<&str> = events
         .iter()
         .filter_map(|e| match e {
@@ -13562,13 +13644,44 @@ fn a_script_may_not_call_client_unknown_or_run_code_tools() {
             _ => None,
         })
         .collect();
-    assert_eq!(errors.len(), 3, "{events:?}");
-    assert!(errors[0].contains("runs on the client"));
-    assert!(errors[1].contains("no tool named `nope`"));
-    assert!(errors[2].contains("cannot call itself"));
+    assert_eq!(errors.len(), 2, "{events:?}");
+    assert!(errors[0].contains("no tool named `nope`"));
+    assert!(errors[1].contains("cannot call itself"));
     assert!(tool_finished(&events).is_empty());
     let script = script_work(&agg).expect("the script runs again");
     assert!(script.calls.iter().all(|c| !c.ok));
+}
+
+#[test]
+fn a_script_calls_a_client_tool_and_waits_for_the_client() {
+    let mut agg = coding_session();
+    run_code(&mut agg, "...");
+    let events = script_step(&mut agg, 0, &[("ask", r#"{"q":"city?"}"#)]);
+    let call = events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::ToolCallRequested(r) if r.handler == ToolHandler::Client => {
+                Some(r.id.clone())
+            }
+            _ => None,
+        })
+        .expect("the call goes to the client");
+    assert!(agg.state.waiting_on_client(), "the run waits on the client");
+    assert!(script_work(&agg).is_none());
+    dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::ToolCall,
+            call,
+            None,
+            Outcome::Tool {
+                result: StoredResult::text("Lisbon"),
+            },
+        ),
+        &frontend_caller("tenant-a", "user-1"),
+    );
+    let script = script_work(&agg).expect("the client's answer runs the script again");
+    assert_eq!(script.calls[0].output, "Lisbon");
 }
 
 #[test]

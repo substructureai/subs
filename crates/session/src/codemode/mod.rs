@@ -9,8 +9,7 @@ use std::num::NonZeroUsize;
 
 use crate::connectors::filter;
 use crate::protocol::{
-    AgentConfig, ConnectorTool, ConnectorToolKind, Handler, LlmTool, RetryPolicy, RUN_CODE,
-    TOOL_SEARCH,
+    AgentConfig, ConnectorTool, ConnectorToolKind, LlmTool, RetryPolicy, RUN_CODE, TOOL_SEARCH,
 };
 
 pub fn tool(language: Language) -> ConnectorTool {
@@ -68,8 +67,6 @@ pub enum Reach {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direct {
     Itself,
-    Subagent,
-    Client,
     Engine,
 }
 
@@ -84,8 +81,6 @@ impl Reach {
                 ))
             }
             Reach::Direct(Direct::Itself) => return Some(format!("`{name}` cannot call itself.")),
-            Reach::Direct(Direct::Subagent) => "starts a subagent",
-            Reach::Direct(Direct::Client) => "runs on the client",
             Reach::Direct(Direct::Engine) => "is the engine's",
         };
         Some(format!("`{name}` {why}. Call it directly, not from code."))
@@ -98,14 +93,12 @@ pub fn reach(name: &str, config: Option<&AgentConfig>, connector_tools: &[Connec
     }
     if let Some(tool) = connector_tools.iter().find(|t| t.name == name) {
         return match tool.kind {
-            ConnectorToolKind::Remote => Reach::Code,
-            ConnectorToolKind::Subagent => Reach::Direct(Direct::Subagent),
+            ConnectorToolKind::Remote | ConnectorToolKind::Subagent => Reach::Code,
             ConnectorToolKind::Code => Reach::Direct(Direct::Itself),
             _ => Reach::Direct(Direct::Engine),
         };
     }
     match config.and_then(|c| c.tool(name)) {
-        Some(t) if t.handler == Some(Handler::Client) => Reach::Direct(Direct::Client),
         Some(_) => Reach::Code,
         None => Reach::Unknown,
     }

@@ -224,14 +224,17 @@ fn script_step(
     ]
 }
 
-/// Starts a call a script asked for, as `run` names it or as asked. `refused`
-/// ends it with that reason instead, as a decision's `tool.error` does.
-pub fn answer_ask(
-    state: &SessionState,
-    id: &str,
-    run: Option<(String, String)>,
-    refused: Option<String>,
-) -> Vec<EventPayload> {
+/// How a decision answers a call a script asked for.
+pub enum AskAnswer {
+    /// Run it, as named here or as asked.
+    Run(Option<(String, String)>),
+    /// End it with this reason, as `tool.error` does.
+    Refuse(String),
+    /// A subagent answers it.
+    Spawn,
+}
+
+pub fn answer_ask(state: &SessionState, id: &str, answer: AskAnswer) -> Vec<EventPayload> {
     let Some((parent, ask)) = state.script_ask(id) else {
         return Vec::new();
     };
@@ -244,8 +247,13 @@ pub fn answer_ask(
         name: ask.name.clone(),
         arguments: ask.arguments.clone(),
     };
+    let (run, target) = match answer {
+        AskAnswer::Run(run) => (run, None),
+        AskAnswer::Refuse(reason) => (None, Some(ConnectorTarget::Refused { reason })),
+        AskAnswer::Spawn => (None, Some(ConnectorTarget::Subagent)),
+    };
     let run = run.unwrap_or_else(|| (asked.name.clone(), asked.arguments.clone()));
-    vec![scripted(state, id.to_string(), script, asked, run, refused)]
+    vec![scripted(state, id.to_string(), script, asked, run, target)]
 }
 
 /// Ends with an error each call a script asked for that nothing can answer
@@ -271,8 +279,7 @@ pub fn unanswered(state: &SessionState) -> Vec<EventPayload> {
             answer_ask(
                 state,
                 &ask.id,
-                None,
-                Some(format!("The worker did not run `{}`.", ask.name)),
+                AskAnswer::Refuse(format!("The worker did not run `{}`.", ask.name)),
             )
         })
         .collect()
@@ -286,35 +293,36 @@ fn scripted(
     script: ScriptCaller,
     asked: ScriptCall,
     (name, arguments): (String, String),
-    refused: Option<String>,
+    target: Option<ConnectorTarget>,
 ) -> EventPayload {
     let here = state.at_head();
     let config = here.resolve_agent_for();
     let tools = here.connector_tools().tools;
     let reach = codemode::reach(&name, config.as_ref(), &tools);
-    let refused = refused.or_else(|| reach.refusal(&name));
+    let spawns = tools
+        .iter()
+        .any(|t| t.name == name && t.kind == ConnectorToolKind::Subagent);
+    let target = target.or_else(|| match reach.refusal(&name) {
+        Some(reason) => Some(ConnectorTarget::Refused { reason }),
+        None if reach == codemode::Reach::Search => Some(ConnectorTarget::ScriptSearch),
+        None if spawns => Some(ConnectorTarget::Refused {
+            reason: format!("`{name}` starts a subagent. Answer it with `subagent.spawn`."),
+        }),
+        None => None,
+    });
     let called = asked;
     let mut call = requested(state, id, name, arguments, None, Some(script));
     if let Some(script) = call.script.as_mut() {
         script.called =
             (call.name != called.name || call.arguments != called.arguments).then_some(called);
     }
-    let reason = refused.or_else(|| match call.handler {
-        ToolHandler::Client => Some(format!(
-            "`{}` runs on the client. Call it directly, not from code.",
-            call.name
-        )),
-        _ => None,
-    });
-    let target = match reason {
-        Some(reason) => Some(ConnectorTarget::Refused { reason }),
-        None if reach == codemode::Reach::Search => Some(ConnectorTarget::ScriptSearch),
-        None => None,
-    };
     if let Some(target) = target {
         call.handler = ToolHandler::Server;
+        call.retry = match target {
+            ConnectorTarget::Subagent => codemode::retry(),
+            _ => RetryPolicy::no_retry(),
+        };
         call.target = Some(target);
-        call.retry = RetryPolicy::no_retry();
     }
     EventPayload::ToolCallRequested(call)
 }
@@ -369,8 +377,7 @@ pub fn request(
         return Ok(answer_ask(
             state,
             &tool_call_id,
-            Some((name, arguments)),
-            None,
+            AskAnswer::Run(Some((name, arguments))),
         ));
     }
     if state.has_effect(EffectKind::ToolCall, &tool_call_id) {

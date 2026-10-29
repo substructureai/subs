@@ -797,6 +797,14 @@ impl Working {
     ) {
         let system = self.system();
         for action in actions {
+            if let Action::SpawnSubagent { tool_call_id, .. } = &action {
+                if self.script_ask(tool_call_id).is_some() {
+                    let id = tool_call_id.clone();
+                    self.then(|s| {
+                        effects::tool::answer_ask(s, &id, effects::tool::AskAnswer::Spawn)
+                    });
+                }
+            }
             let _ = match action {
                 Action::ReplaceContext { summary, messages } => {
                     self.replace_context(summary, messages);
@@ -889,7 +897,13 @@ impl Working {
                     Ok(())
                 }
                 Action::ToolError { id, error, .. } if self.script_ask(&id).is_some() => {
-                    self.then(|s| effects::tool::answer_ask(s, &id, None, Some(error.message)));
+                    self.then(|s| {
+                        effects::tool::answer_ask(
+                            s,
+                            &id,
+                            effects::tool::AskAnswer::Refuse(error.message),
+                        )
+                    });
                     Ok(())
                 }
                 other => match other.into_command(decision_id) {

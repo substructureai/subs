@@ -471,6 +471,7 @@ impl Session {
             },
             ConnectorTarget::Code if !state.script_runs(id) => return None,
             ConnectorTarget::Code => ToolTarget::Script,
+            ConnectorTarget::Subagent => return None,
             _ => ToolTarget::Local,
         };
         Some(Work::CallTool {
