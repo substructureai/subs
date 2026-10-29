@@ -9,7 +9,7 @@ pub mod replay;
 
 pub use admission::{Admission, Ticket};
 pub use child::{dispatch, ARG, PROBE, PROBE_LOCK};
-pub use process::{ProcessRunner, ReadError, RunError, ScriptFiles, ScriptRunner};
+pub use process::{FileSource, ProcessRunner, ReadError, RunError, ScriptFiles, ScriptRunner};
 pub use substructure_session::codemode::{
     spent, supports, Language, Limit, Limits, Ran, Script, ScriptCall, ScriptFile, ScriptRecord,
     Shown, Stats, Step, OLDEST, VERSION,
@@ -18,18 +18,19 @@ pub use substructure_session::codemode::{
 use std::collections::BTreeMap;
 use substructure_session::command::{CommandPayload, Outcome, SettleError};
 
-use substructure_session::blob::BlobRef;
 use substructure_session::protocol::{ErrorCode, ErrorInfo, StoredContent, StoredResult};
 use substructure_session::state::EffectKind;
 
 /// The command that records a step. A script that returned answers with its
-/// text, then each file it showed, found in `files` by id.
+/// text, then each file it showed, found in `files` by id. A step that made
+/// calls records the plugin bundles it read from, by hash, in `pins`.
 pub fn settle(
     tool_call_id: String,
     attempt: u32,
     known: u32,
     ran: Ran,
-    files: &BTreeMap<String, BlobRef>,
+    files: &BTreeMap<String, FileSource>,
+    pins: BTreeMap<String, String>,
 ) -> CommandPayload {
     let outcome = match ran.step {
         Step::Calls(calls) => Outcome::Script {
@@ -37,6 +38,7 @@ pub fn settle(
             calls,
             cpu_ms: ran.stats.cpu_ms,
             file_bytes: ran.stats.file_bytes,
+            pins,
         },
         Step::Done(text) => {
             let mut result = StoredResult::text(text);
@@ -46,13 +48,13 @@ pub fn settle(
                         text: format!("[file {file}]\n{text}"),
                     }],
                     Shown::File { file } => match files.get(&file) {
-                        Some(blob) => vec![
+                        Some(FileSource::Blob(blob)) => vec![
                             StoredContent::Text {
                                 text: format!("[file {file}]"),
                             },
                             StoredContent::Blob { uri: blob.uri() },
                         ],
-                        None => Vec::new(),
+                        _ => Vec::new(),
                     },
                 });
             }
@@ -68,6 +70,7 @@ pub fn settle(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use substructure_session::blob::BlobRef;
 
     #[test]
     fn a_result_holds_its_text_then_what_the_script_showed() {
@@ -94,8 +97,9 @@ mod tests {
                 },
             ],
         };
-        let files = BTreeMap::from([("shot.png".to_string(), blob.clone())]);
-        let CommandPayload::SettleEffect { outcome, .. } = settle("tc-1".into(), 0, 0, ran, &files)
+        let files = BTreeMap::from([("shot.png".to_string(), FileSource::Blob(blob.clone()))]);
+        let CommandPayload::SettleEffect { outcome, .. } =
+            settle("tc-1".into(), 0, 0, ran, &files, BTreeMap::new())
         else {
             panic!("a settle");
         };

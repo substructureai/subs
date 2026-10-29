@@ -13094,6 +13094,7 @@ fn step_asks(agg: &mut Session, known: u32, calls: &[(&str, &str)]) -> Vec<Event
                 calls,
                 cpu_ms: 7,
                 file_bytes: 0,
+                pins: Default::default(),
             },
         ),
         &system(),
@@ -13588,6 +13589,7 @@ fn a_script_may_read_the_files_on_its_branch() {
             id: "sales.csv".to_string(),
             mime: "text/csv".to_string(),
             size: 42,
+            skill: None,
         }],
         "the script sees ids, not blobs"
     );
@@ -13673,6 +13675,47 @@ fn skill_instructions_the_script_printed_are_not_added_again() {
         })
         .expect("run_code completes");
     assert_eq!(blocks, 1, "the printed instructions are not repeated");
+}
+
+#[test]
+fn a_script_keeps_the_plugin_bundles_of_its_first_step() {
+    let mut agg = coding_session();
+    run_code(&mut agg, "...");
+    let step = |known: u32, hash: &str| {
+        CommandPayload::settle(
+            EffectKind::ToolCall,
+            "tc-1",
+            Some(0),
+            Outcome::Script {
+                known,
+                calls: vec![crate::events::ScriptCall {
+                    name: "weather".to_string(),
+                    arguments: format!(r#"{{"n":{known}}}"#),
+                }],
+                cpu_ms: 1,
+                file_bytes: 0,
+                pins: [("runbooks".to_string(), hash.to_string())].into(),
+            },
+        )
+    };
+    let events = dispatch(&mut agg, step(0, "first"), &system());
+    let (decision, asked) = codemode_calls(&events).expect("the step asks");
+    submit_decision(
+        &mut agg,
+        decision,
+        vec![],
+        vec![Action::ToolError {
+            id: asked[0].id.clone(),
+            attempt: None,
+            error: ErrorInfo::new(crate::protocol::ErrorCode::HandlerError, "no"),
+            retryable: false,
+        }],
+    );
+    dispatch(&mut agg, step(1, "second"), &system());
+    assert_eq!(
+        agg.script_pins("tc-1"),
+        [("runbooks".to_string(), "first".to_string())].into()
+    );
 }
 
 #[test]
@@ -13869,6 +13912,7 @@ fn a_script_step_has_no_natural_command_id() {
             calls: vec![],
             cpu_ms: 0,
             file_bytes: 0,
+            pins: Default::default(),
         },
     );
     assert_eq!(step.natural_id(), None, "the session fences steps itself");

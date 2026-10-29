@@ -470,6 +470,9 @@ pub struct ToolCallStepped {
     pub cpu_ms: u64,
     #[serde(default, skip_serializing_if = "crate::state::is_zero")]
     pub file_bytes: u64,
+    /// The hash of each plugin bundle the script may read files of.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub pins: std::collections::BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub asked: Vec<ScriptAsk>,
 }

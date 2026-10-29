@@ -86,10 +86,13 @@ pub fn split_skill(named: &str) -> (&str, &str) {
     named.split_once(':').unwrap_or(("", named))
 }
 
+/// A skill's instructions, or one of its files. A script reads the files as
+/// files, `<skill>/<path>`, so `scripted` names them that way.
 pub fn skill_answer(
     at: SessionStateAtNode,
     bundle: Option<&PluginBundle>,
     arguments: &str,
+    scripted: bool,
 ) -> StoredResult {
     let named = argument(arguments, "name");
     let file = Some(argument(arguments, "file")).filter(|f| !f.is_empty());
@@ -111,7 +114,16 @@ pub fn skill_answer(
     };
 
     match file {
+        Some(path) if scripted => StoredResult::error(format!(
+            "Read a skill's files with `files.text`, by their path under its base directory: \
+             `files.text({:?})`.",
+            format!("{named}/{path}")
+        )),
         Some(path) => file_answer(skill, &named, &path),
+        None if scripted => StoredResult::text(format!(
+            "Base directory for this skill: {named}/\n\n{}",
+            skill.body
+        )),
         None => {
             let mut answer = format!("Skill {named} — {}\n\n{}", skill.description, skill.body);
             let listed = skill_files(skill);
@@ -259,11 +271,41 @@ mod tests {
     }
 
     #[test]
+    fn a_script_reads_a_skills_files_as_files() {
+        let answer = skill_answer(
+            state_with_plugin().at(None),
+            bundles().get("pdf"),
+            r#"{"name":"pdf:form-filling","file":"references/FORMS.md"}"#,
+            true,
+        );
+        assert!(answer.is_error);
+        assert!(
+            answer
+                .rendered()
+                .contains(r#"files.text("pdf:form-filling/references/FORMS.md")"#),
+            "{answer:?}"
+        );
+        let loaded = skill_answer(
+            state_with_plugin().at(None),
+            bundles().get("pdf"),
+            r#"{"name":"pdf:form-filling"}"#,
+            true,
+        );
+        assert!(
+            loaded
+                .rendered()
+                .starts_with("Base directory for this skill: pdf:form-filling/\n\n"),
+            "{loaded:?}"
+        );
+    }
+
+    #[test]
     fn a_skill_answers_with_its_body_and_file_listing() {
         let answer = skill_answer(
             state_with_plugin().at(None),
             bundles().get("pdf"),
             r#"{"name":"pdf:form-filling"}"#,
+            false,
         );
         assert!(!answer.is_error, "expected a result; got {answer:?}");
         let text = answer.as_text();
@@ -281,6 +323,7 @@ mod tests {
             state_with_plugin().at(None),
             bundles().get("pdf"),
             r#"{"name":"pdf:form-filling","file":"references/FORMS.md"}"#,
+            false,
         );
         assert_eq!(answer, StoredResult::text("field rules"));
     }
@@ -291,6 +334,7 @@ mod tests {
             state_with_plugin().at(None),
             bundles().get("pdf"),
             r#"{"name":"pdf:form-filling","file":"references/sample.pdf"}"#,
+            false,
         );
         assert_eq!(
             answer.content,
@@ -324,6 +368,7 @@ mod tests {
                 state_with_plugin().at(None),
                 bundles().get("pdf"),
                 arguments,
+                false,
             );
             assert!(
                 answer.is_error,

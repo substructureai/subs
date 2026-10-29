@@ -953,7 +953,7 @@ pub async fn start(deps: RuntimeDeps, config: RuntimeConfig) -> Arc<Runtime> {
         restart: Restart::ResendOpen,
         agents: agents.clone(),
         blobs: blobs.clone(),
-        plugins,
+        plugins: plugins.clone(),
     });
     let readers: Vec<Arc<dyn sessions::Reader>> = vec![
         Arc::new(consumers::IndexReader(session_index_store.clone())),
@@ -1009,6 +1009,7 @@ pub async fn start(deps: RuntimeDeps, config: RuntimeConfig) -> Arc<Runtime> {
             limits: config.script_limits.clone(),
             wait: config.script_wait,
             blobs: blobs.clone(),
+            plugins: plugins.clone(),
         }),
         script_task_queue,
         cancel.clone(),

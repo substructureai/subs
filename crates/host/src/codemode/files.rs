@@ -546,6 +546,7 @@ mod tests {
                     id: id.to_string(),
                     mime: "text/plain".to_string(),
                     size: text.len() as u64,
+                    skill: None,
                 })
                 .collect(),
             file_bytes_used: 0,

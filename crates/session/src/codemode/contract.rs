@@ -99,6 +99,9 @@ pub struct ScriptFile {
     pub id: String,
     pub mime: String,
     pub size: u64,
+    /// The skill whose file this is, at `<skill>/<path>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill: Option<String>,
 }
 
 /// A script to run past the calls it already made.

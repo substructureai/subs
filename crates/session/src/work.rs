@@ -565,12 +565,39 @@ impl Session {
                     id: a.id,
                     mime: a.mime,
                     size: a.size,
+                    skill: None,
                 })
                 .collect(),
             file_bytes_used: effect.tool()?.script_file_bytes,
             seed: xxhash_rust::xxh3::xxh3_64(id.as_bytes()),
             now_ms: effect.tracking.started_at?.timestamp_millis(),
         })
+    }
+
+    /// The bundle skills whose files a `run_code` call's script may read: each
+    /// one's name, its bundle, and its name in that bundle.
+    pub fn script_skills(&self, id: &str) -> Vec<(String, String, String)> {
+        let Some(effect) = self.state.effect(EffectKind::ToolCall, id) else {
+            return Vec::new();
+        };
+        let Some(config) = self.state.at(effect.anchor.as_deref()).resolve_agent_for() else {
+            return Vec::new();
+        };
+        config
+            .named_skills()
+            .into_iter()
+            .filter(|s| s.source == crate::protocol::SkillSource::Bundle)
+            .map(|s| (s.name, s.bundle.to_string(), s.skill.to_string()))
+            .collect()
+    }
+
+    /// The plugin bundles a `run_code` call's script reads from, by hash, as
+    /// they were at its first step.
+    pub fn script_pins(&self, id: &str) -> std::collections::BTreeMap<String, String> {
+        self.state
+            .tool_call(id)
+            .map(|t| t.script_pins.clone())
+            .unwrap_or_default()
     }
 
     /// The blob behind each file a `run_code` call's script may read, by

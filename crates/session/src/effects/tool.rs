@@ -75,7 +75,8 @@ impl KindSpec for ToolSpec {
                 calls,
                 cpu_ms,
                 file_bytes,
-            } => script_step(state, id, known, calls, (cpu_ms, file_bytes)),
+                pins,
+            } => script_step(state, id, known, calls, (cpu_ms, file_bytes), pins),
             Outcome::Error(e) => fail(self, state, id, &e),
             other => mismatched(self.kind(), &other),
         }
@@ -216,6 +217,7 @@ fn script_step(
     known: u32,
     calls: Vec<ScriptCall>,
     (cpu_ms, file_bytes): (u64, u64),
+    pins: std::collections::BTreeMap<String, String>,
 ) -> Vec<EventPayload> {
     let made = state.script_calls(parent);
     let stale = made.len() != known as usize
@@ -246,6 +248,7 @@ fn script_step(
             id: parent.to_string(),
             cpu_ms,
             file_bytes,
+            pins,
             asked,
         }),
         decision_queued(state.ids(), trigger),

@@ -913,6 +913,7 @@ mod tests {
                 script_language: Default::default(),
                 script_cpu_ms: 0,
                 script_file_bytes: 0,
+                script_pins: Default::default(),
                 script_asked: Vec::new(),
             }),
         )

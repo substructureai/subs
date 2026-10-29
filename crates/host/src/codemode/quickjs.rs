@@ -75,8 +75,9 @@ const PRELUDE: &str = r#"
   for (const k of ["__call", "__log", "__done", "__names", "__now", "__seed", "__files_list", "__files_text", "__files_open", "__files_next", "__files_close", "__files_show"]) delete globalThis[k];
   const answered = (r) => { const a = JSON.parse(r); if ("error" in a) throw new Error(a.error); return a.value; };
   const known = JSON.parse(listed);
+  const idOf = (file) => String(file !== null && typeof file === "object" ? file.id : file);
   async function* stream(id, format, options) {
-    const s = answered(fopen(String(id), JSON.stringify({ ...(options ?? {}), format })));
+    const s = answered(fopen(idOf(id), JSON.stringify({ ...(options ?? {}), format })));
     try {
       for (;;) {
         const batch = answered(fnext(s));
@@ -87,13 +88,14 @@ const PRELUDE: &str = r#"
   }
   globalThis.files = Object.freeze({
     list: () => known.map((f) => ({ ...f })),
-    stat: (id) => {
+    stat: (file) => {
+      const id = idOf(file);
       const f = known.find((f) => f.id === id);
       if (!f) throw new Error(`There is no file "${id}".`);
       return { ...f };
     },
-    text: async (id) => answered(ftext(String(id))),
-    show: (id) => { answered(fshow(String(id))); },
+    text: async (file) => answered(ftext(idOf(file))),
+    show: (file) => { answered(fshow(idOf(file))); },
     lines: (id, options) => stream(id, "lines", options),
     jsonl: (id, options) => stream(id, "jsonl", options),
     csv: (id, options) => stream(id, "csv", options),
@@ -438,6 +440,7 @@ mod tests {
                 id: id.to_string(),
                 mime: "text/plain".to_string(),
                 size: text.len() as u64,
+                skill: None,
             })
             .collect();
         let host = crate::codemode::files::MemoryFiles(
@@ -500,6 +503,7 @@ mod tests {
             id: id.to_string(),
             mime: mime.to_string(),
             size: size as u64,
+            skill: None,
         };
         let big = "y".repeat(70 << 10);
         s.files = vec![
@@ -533,6 +537,17 @@ mod tests {
                     file: "shot.png".into()
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn a_file_is_named_by_its_id_or_by_an_object_with_it() {
+        let code = "return [await files.text('a.txt'), await files.text({ id: 'a.txt' }), \
+                    await files.text(files.list()[0])];";
+        let ran = with_files(code, &[("a.txt", "hi")]);
+        assert_eq!(
+            ran.step,
+            Step::Done(r#"{"result":["hi","hi","hi"]}"#.into())
         );
     }
 

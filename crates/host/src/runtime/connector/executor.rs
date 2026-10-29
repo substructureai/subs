@@ -149,6 +149,7 @@ pub async fn answer_locally(
         state.at(call.node.as_deref()),
         bundle.as_ref(),
         &call.arguments,
+        call.scripted,
     ))
 }
 

@@ -59,6 +59,8 @@ pub struct SkillCall {
     pub node: Option<String>,
     pub plugin_id: String,
     pub arguments: String,
+    /// A script made the call.
+    pub scripted: bool,
 }
 use rust_decimal::Decimal;
 
@@ -480,6 +482,10 @@ pub struct ToolCallState {
     /// For `run_code`: bytes of files its script's runs have read.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub script_file_bytes: u64,
+    /// For `run_code`: the plugin bundles its script read from, by hash, as
+    /// they were at its first step.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub script_pins: BTreeMap<String, String>,
     /// For `run_code`: calls its script asked for that no decision has
     /// started or refused yet.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1236,6 +1242,7 @@ impl SessionState {
                     script_language,
                     script_cpu_ms: 0,
                     script_file_bytes: 0,
+                    script_pins: BTreeMap::new(),
                     script_asked: Vec::new(),
                 }),
             );
@@ -1497,6 +1504,9 @@ impl SessionState {
                 {
                     tc.script_cpu_ms += payload.cpu_ms;
                     tc.script_file_bytes += payload.file_bytes;
+                    if tc.script_pins.is_empty() {
+                        tc.script_pins = payload.pins.clone();
+                    }
                     tc.script_asked.extend(payload.asked.iter().cloned());
                 }
             }
@@ -2174,6 +2184,7 @@ impl SessionState {
             node: effect.anchor.clone(),
             plugin_id: plugin.clone(),
             arguments: tc.arguments.clone(),
+            scripted: tc.script.is_some(),
         })
     }
 
@@ -3314,6 +3325,21 @@ mod summary_fold_tests {
     }
 }
 
+/// A script reads a skill's files as files, so its `skill` takes no `file`.
+fn without_skill_file(mut tool: LlmTool) -> LlmTool {
+    if tool.name == SKILL {
+        if let Some(properties) = tool
+            .input
+            .as_mut()
+            .and_then(|i| i.get_mut("properties"))
+            .and_then(|p| p.as_object_mut())
+        {
+            properties.remove("file");
+        }
+    }
+    tool
+}
+
 fn describe_run_code(
     tools: &mut Vec<LlmTool>,
     config: Option<&AgentConfig>,
@@ -3329,10 +3355,15 @@ fn describe_run_code(
         crate::codemode::reach(&t.name, config, connector_tools) == crate::codemode::Reach::Code
     };
     let description = {
-        let declared: Vec<&LlmTool> = tools.iter().filter(|t| !t.defer && in_code(t)).collect();
+        let declared: Vec<LlmTool> = tools
+            .iter()
+            .filter(|t| !t.defer && in_code(t))
+            .cloned()
+            .map(without_skill_file)
+            .collect();
         crate::codemode::describe(
             config.and_then(|c| c.codemode).unwrap_or_default(),
-            &declared,
+            &declared.iter().collect::<Vec<_>>(),
         )
     };
     tools.retain(|t| t.name == RUN_CODE);

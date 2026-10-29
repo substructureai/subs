@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -7,10 +8,12 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::codemode::{
-    settle, Admission, Limit, Limits, Ran, ScriptFiles, ScriptRunner, Stats, Step,
+    settle, Admission, FileSource, Limit, Limits, Ran, Script, ScriptFile, ScriptFiles,
+    ScriptRunner, Stats, Step,
 };
+use crate::plugins::PluginResolver;
 use crate::protocol::RetryPolicy;
-use crate::runtime::blob::BlobStore;
+use crate::runtime::blob::{BlobRef, BlobStore};
 use crate::runtime::executor::{
     settled, spawn_bounded_executors, Bound, BoundedTask, ExecutorPool, RESULT_NOT_SAVED,
 };
@@ -18,6 +21,8 @@ use crate::runtime::inbox::Inbox;
 use crate::runtime::queue::{Queue, SCRIPT};
 use crate::runtime::sessions::Sessions;
 use crate::runtime::span::SpanContext;
+use substructure_session::plugins::PluginBundle;
+use substructure_session::Session;
 
 /// Run a `run_code` call's script again. The script and its calls are read
 /// from the session when the step runs.
@@ -51,6 +56,8 @@ pub struct Scripts {
     pub wait: Duration,
     /// Where the scripts' files are.
     pub blobs: Arc<dyn BlobStore>,
+    /// Where the skills' files are.
+    pub plugins: Arc<dyn PluginResolver>,
 }
 
 pub fn spawn_script_executor(
@@ -85,19 +92,31 @@ async fn step(
     let Some(session) = session else {
         return Ok(());
     };
-    let Some(script) = session.script(&task.tool_call_id, &scripts.limits) else {
+    let Some(mut script) = session.script(&task.tool_call_id, &scripts.limits) else {
         return Ok(());
     };
-    let blobs = session.script_blobs(&task.tool_call_id);
+    let mut sources: BTreeMap<String, FileSource> = session
+        .script_blobs(&task.tool_call_id)
+        .into_iter()
+        .map(|(id, blob)| (id, FileSource::Blob(blob)))
+        .collect();
+    let pins = skill_files(&session, &task, scripts, &mut script, &mut sources).await;
+    let changed: Vec<String> = session
+        .script_pins(&task.tool_call_id)
+        .into_iter()
+        .filter(|(bundle, hash)| pins.get(bundle) != Some(hash))
+        .map(|(bundle, _)| bundle)
+        .collect();
     let files = ScriptFiles {
         tenant_id: task.tenant_id.clone(),
-        blobs: blobs.clone(),
+        sources: sources.clone(),
         store: scripts.blobs.clone(),
     };
     let known = script.calls.len() as u32;
     let records: usize = script.calls.iter().map(|c| c.output.len()).sum();
     let started = Instant::now();
     let ran = match waited > scripts.wait {
+        _ if !changed.is_empty() => changed_plugins(&changed),
         true => late(waited, Limit::Wait),
         false => match scripts.runner.run(script, files).await {
             Ok(ran) => ran,
@@ -117,7 +136,7 @@ async fn step(
         &ran,
         &scripts.limits,
     );
-    let command = settle(task.tool_call_id, task.attempt, known, ran, &blobs);
+    let command = settle(task.tool_call_id, task.attempt, known, ran, &sources, pins);
     settled(
         sessions,
         &task.tenant_id,
@@ -126,6 +145,78 @@ async fn step(
         span.child("script"),
     )
     .await
+}
+
+/// Adds the files of the agent's bundle skills to `script`, as
+/// `<skill>/<path>`, and answers each bundle's hash.
+async fn skill_files(
+    session: &Session,
+    task: &ScriptTask,
+    scripts: &Scripts,
+    script: &mut Script,
+    sources: &mut BTreeMap<String, FileSource>,
+) -> BTreeMap<String, String> {
+    let mut bundles: BTreeMap<String, Option<PluginBundle>> = BTreeMap::new();
+    for (named, bundle, skill) in session.script_skills(&task.tool_call_id) {
+        if !bundles.contains_key(&bundle) {
+            let found = scripts.plugins.resolve(&task.tenant_id, &bundle).await;
+            bundles.insert(bundle.clone(), found);
+        }
+        let Some(skill) = bundles[&bundle].as_ref().and_then(|b| b.skill(&skill)) else {
+            continue;
+        };
+        for (path, text) in &skill.files {
+            let id = format!("{named}/{path}");
+            script.files.push(ScriptFile {
+                id: id.clone(),
+                mime: text_mime(path).to_string(),
+                size: text.len() as u64,
+                skill: Some(named.clone()),
+            });
+            sources.insert(id, FileSource::Text(Arc::from(text.as_str())));
+        }
+        for (path, binary) in &skill.binaries {
+            let Some(blob) = BlobRef::parse(&binary.uri) else {
+                continue;
+            };
+            let id = format!("{named}/{path}");
+            script.files.push(ScriptFile {
+                id: id.clone(),
+                mime: binary.mime.clone(),
+                size: binary.size,
+                skill: Some(named.clone()),
+            });
+            sources.insert(id, FileSource::Blob(blob));
+        }
+    }
+    bundles
+        .into_iter()
+        .filter_map(|(id, bundle)| Some((id, bundle?.hash())))
+        .collect()
+}
+
+fn text_mime(path: &str) -> &'static str {
+    match path.rsplit_once('.').map(|(_, ext)| ext) {
+        Some("md") => "text/markdown",
+        Some("json") => "application/json",
+        Some("csv") => "text/csv",
+        _ => "text/plain",
+    }
+}
+
+fn changed_plugins(changed: &[String]) -> Ran {
+    Ran {
+        step: Step::Failed(format!(
+            "A plugin changed while the script ran ({}), so its files may differ between \
+             runs. Run the script again.",
+            changed.join(", ")
+        )),
+        stats: Stats {
+            limit: Some(Limit::Diverged),
+            ..Stats::default()
+        },
+        shown: Vec::new(),
+    }
 }
 
 fn late(waited: Duration, limit: Limit) -> Ran {

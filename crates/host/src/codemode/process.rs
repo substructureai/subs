@@ -30,13 +30,23 @@ pub trait ScriptRunner: Send + Sync {
     async fn run(&self, script: Script, files: ScriptFiles) -> Result<Ran, RunError>;
 }
 
-/// The blobs behind a script's files, for its runner to read. The script sees
-/// only their ids.
+/// What is behind each of a script's files, for its runner to read. The
+/// script sees only their ids.
 #[derive(Clone)]
 pub struct ScriptFiles {
     pub tenant_id: String,
-    pub blobs: BTreeMap<String, BlobRef>,
+    pub sources: BTreeMap<String, FileSource>,
     pub store: Arc<dyn BlobStore>,
+}
+
+/// Where a file's bytes are. Neither changes, so a file reads the same on
+/// every run.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FileSource {
+    /// A stored blob, such as an attachment.
+    Blob(BlobRef),
+    /// Text held in a plugin bundle, such as a skill's reference file.
+    Text(Arc<str>),
 }
 
 /// Why a file could not be read.
@@ -51,7 +61,7 @@ impl ScriptFiles {
     pub fn none() -> Self {
         ScriptFiles {
             tenant_id: String::new(),
-            blobs: BTreeMap::new(),
+            sources: BTreeMap::new(),
             store: Arc::new(MemoryBlobStore::new()),
         }
     }
@@ -59,7 +69,15 @@ impl ScriptFiles {
     /// Bytes `offset..offset + len` of `file`, fewer at its end.
     pub async fn read(&self, file: &str, offset: u64, len: u64) -> Result<Vec<u8>, ReadError> {
         let missing = || ReadError::Missing(format!("There is no file \"{file}\"."));
-        let blob = self.blobs.get(file).ok_or_else(missing)?;
+        let blob = match self.sources.get(file).ok_or_else(missing)? {
+            FileSource::Text(text) => {
+                return Ok(substructure_session::blob::slice(
+                    text.as_bytes(),
+                    offset..offset.saturating_add(len),
+                ))
+            }
+            FileSource::Blob(blob) => blob,
+        };
         if blob.tenant_id != self.tenant_id {
             return Err(missing());
         }

@@ -63,6 +63,13 @@ unlock. The model reads its instructions in the `run_code` result, whether or
 not the script returns them. When the agent searches its skills,
 `tools.tool_search` finds them too.
 
+A skill's other files are files. A script reads them by `<skill>/<path>`, such
+as `files.text("runbooks:respond/references/escalation.md")`, and shows them
+with `files.show`. `files.list` lists them with the skill they belong to, as
+`skill`. A script reads the plugin as it
+was at its first step: a plugin that changes while the script runs fails it,
+and the model can run it again.
+
 ## What reaches the model
 
 The `run_code` result is what the script returns and prints, then each file it
@@ -134,7 +141,7 @@ return totals;
 
 | Call | Gives |
 |---|---|
-| `files.list()`, `files.stat(id)` | `{ id, mime, size }` of each file, or of one |
+| `files.list()`, `files.stat(id)` | `{ id, mime, size }` of each file, or of one, and `skill` for a skill's file |
 | `await files.text(id)` | The whole file as text, up to an eighth of `memory` |
 | `files.show(id)` | Nothing; the model sees the file when the script ends |
 | `files.csv(id, { header, delimiter })` | Rows: objects keyed by the header, or arrays with `header: false` |

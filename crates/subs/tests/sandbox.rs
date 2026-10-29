@@ -175,7 +175,7 @@ mod files {
     use super::*;
     use std::collections::BTreeMap;
     use std::sync::Arc;
-    use subs::codemode::ScriptFile;
+    use subs::codemode::{FileSource, ScriptFile};
     use subs::runtime::blob::{BlobError, BlobRef, BlobStore, MemoryBlobStore, NewBlob};
 
     async fn put(store: &MemoryBlobStore, tenant: &str, text: &str) -> BlobRef {
@@ -198,6 +198,7 @@ mod files {
                 id: id.to_string(),
                 mime: r.mime.clone(),
                 size: r.size,
+                skill: None,
             })
             .collect();
         s
@@ -206,9 +207,9 @@ mod files {
     fn grant(store: Arc<dyn BlobStore>, files: &[(&str, &BlobRef)]) -> ScriptFiles {
         ScriptFiles {
             tenant_id: "t1".to_string(),
-            blobs: files
+            sources: files
                 .iter()
-                .map(|(id, r)| (id.to_string(), (*r).clone()))
+                .map(|(id, r)| (id.to_string(), FileSource::Blob((*r).clone())))
                 .collect::<BTreeMap<_, _>>(),
             store,
         }
@@ -255,6 +256,34 @@ mod files {
         assert!(
             matches!(&ran.step, Step::Done(t) if t.contains("There is no file") && !t.contains("secret")),
             "{ran:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_script_reads_a_skills_file_by_its_path() {
+        let id = "runbooks:respond/references/escalation.md";
+        let mut s = script(
+            "return [files.list().map(f => f.skill), await files.text('runbooks:respond/references/escalation.md')];",
+        );
+        s.files = vec![ScriptFile {
+            id: id.to_string(),
+            mime: "text/markdown".to_string(),
+            size: 13,
+            skill: Some("runbooks:respond".to_string()),
+        }];
+        let files = ScriptFiles {
+            tenant_id: "t1".to_string(),
+            sources: BTreeMap::from([(
+                id.to_string(),
+                FileSource::Text(Arc::from("Page the lead")),
+            )]),
+            store: Arc::new(MemoryBlobStore::new()),
+        };
+        let ran = runner().run(s, files).await.unwrap();
+        assert_eq!(
+            ran.step,
+            Step::Done(r#"{"result":[["runbooks:respond"],"Page the lead"]}"#.into()),
+            "a skill's file is listed with its skill, and read by id"
         );
     }
 

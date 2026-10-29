@@ -41,6 +41,9 @@ pub enum Outcome {
         cpu_ms: u64,
         #[serde(default)]
         file_bytes: u64,
+        /// The hash of each plugin bundle whose files the script may read.
+        #[serde(default)]
+        pins: std::collections::BTreeMap<String, String>,
     },
     Error(SettleError),
 }
