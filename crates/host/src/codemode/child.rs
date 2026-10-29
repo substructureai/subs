@@ -4,9 +4,11 @@
 use std::ffi::OsString;
 use std::io::{self, BufRead, Write};
 
+use serde::{Deserialize, Serialize};
+
 use super::confine::{self, Denial};
 use super::engine::{languages, run};
-use super::{Ran, Script, Step, OLDEST, VERSION};
+use super::{Language, Ran, Script, Step, OLDEST, VERSION};
 
 /// The argument that makes a binary a runner process.
 pub const ARG: &str = "__sandbox";
@@ -15,7 +17,21 @@ pub const PROBE_LOCK: &str = "probe-lock";
 
 /// Sets the process's heap cap: `data=<MiB>`.
 pub const DATA: &str = "data=";
-const DEFAULT_DATA: u64 = 256 << 20;
+pub const DATA_MIB: u64 = 256;
+
+/// The first line a runner process writes.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Hello {
+    Ready {
+        version: u32,
+        oldest: u32,
+        languages: Vec<Language>,
+    },
+    Unconfined {
+        error: String,
+    },
+}
 
 /// Call first in `main`, before any thread starts. Becomes a runner process
 /// and never returns when the binary was started as one.
@@ -31,7 +47,8 @@ fn main(args: Vec<OsString>) -> ! {
     let data = args
         .iter()
         .find_map(|a| a.strip_prefix(DATA)?.parse::<u64>().ok())
-        .map_or(DEFAULT_DATA, |mib| mib << 20);
+        .unwrap_or(DATA_MIB)
+        << 20;
     let mode = args
         .iter()
         .copied()
@@ -51,15 +68,16 @@ fn main(args: Vec<OsString>) -> ! {
         std::process::exit(0);
     }
     let hello = match &confined {
-        Ok(()) => serde_json::json!({
-            "ready": true,
-            "version": VERSION,
-            "oldest": OLDEST,
-            "languages": languages(),
-        }),
-        Err(e) => serde_json::json!({ "ready": false, "error": e.to_string() }),
+        Ok(()) => Hello::Ready {
+            version: VERSION,
+            oldest: OLDEST,
+            languages: languages(),
+        },
+        Err(e) => Hello::Unconfined {
+            error: e.to_string(),
+        },
     };
-    let _ = writeln!(out, "{hello}");
+    let _ = writeln!(out, "{}", serde_json::to_string(&hello).unwrap_or_default());
     let _ = out.flush();
     if confined.is_err() {
         std::process::exit(70);

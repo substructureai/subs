@@ -312,12 +312,15 @@ fn requested(
             Some(ConnectorTarget::Locked),
         ),
         Some(tool) if tool.kind == ConnectorToolKind::Call => unwrap_call(state, name, arguments),
-        Some(tool) if tool.kind == ConnectorToolKind::Code => (
-            name,
-            arguments,
-            ToolHandler::Server,
-            Some(ConnectorTarget::Code),
-        ),
+        Some(tool) if tool.kind == ConnectorToolKind::Code => {
+            let target = match argument(&arguments, "code") {
+                Some(_) => ConnectorTarget::Code,
+                None => ConnectorTarget::Refused {
+                    reason: format!("`{name}` takes `code`, a string."),
+                },
+            };
+            (name, arguments, ToolHandler::Server, Some(target))
+        }
         Some(tool) if tool.kind == ConnectorToolKind::Attachment => (
             name,
             arguments,

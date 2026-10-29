@@ -13152,6 +13152,30 @@ fn run_code_runs_its_script_in_the_engine() {
 }
 
 #[test]
+fn run_code_without_code_is_refused() {
+    let mut agg = coding_session();
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::RequestToolCall {
+            tool_call_id: "tc-1".to_string(),
+            name: crate::protocol::RUN_CODE.to_string(),
+            arguments: "{}".to_string(),
+            retry: None,
+        },
+        &system(),
+    );
+    let target = events.iter().find_map(|e| match e {
+        EventPayload::ToolCallRequested(r) => r.target.clone(),
+        _ => None,
+    });
+    assert!(
+        matches!(&target, Some(ConnectorTarget::Refused { reason }) if reason.contains("`code`")),
+        "{target:?}"
+    );
+    assert!(script_work(&agg).is_none());
+}
+
+#[test]
 fn a_scripts_calls_run_as_tool_calls_the_model_never_hears_of() {
     let mut agg = coding_session();
     run_code(&mut agg, "...");

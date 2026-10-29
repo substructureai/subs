@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::codemode::{settle, Admission, Limit, Limits, Ran, ScriptRunner, Stats, Step};
 use crate::protocol::RetryPolicy;
 use crate::runtime::executor::{
-    settled, spawn_bounded_executors, Bound, BoundedTask, ExecutorPool,
+    settled, spawn_bounded_executors, Bound, BoundedTask, ExecutorPool, RESULT_NOT_SAVED,
 };
 use crate::runtime::inbox::Inbox;
 use crate::runtime::queue::{Queue, SCRIPT};
@@ -87,7 +87,7 @@ async fn step(
         true => late(waited, Limit::Wait),
         false => match scripts.runner.run(script).await {
             Ok(ran) => ran,
-            Err(e) if waited + RETRY > scripts.wait => {
+            Err(e) if waited + RESULT_NOT_SAVED > scripts.wait => {
                 tracing::warn!(tenant_id = %task.tenant_id, error = %e, "no runner took a script step");
                 late(waited, Limit::Start)
             }
@@ -113,9 +113,6 @@ async fn step(
     )
     .await
 }
-
-/// How soon the executor tries a step again after a runner could not take it.
-const RETRY: Duration = Duration::from_secs(5);
 
 fn late(waited: Duration, limit: Limit) -> Ran {
     let message = match limit {

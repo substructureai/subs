@@ -12,7 +12,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
-use super::child::DATA;
+use super::child::{Hello, DATA, DATA_MIB};
 use super::{Ran, Script, Stats, Step, ARG};
 
 /// Runs one step of a script. A runner keeps nothing between steps, so any
@@ -44,7 +44,6 @@ const READY: Duration = Duration::from_secs(10);
 /// Past three times a run's CPU, for a contended machine, loading the script,
 /// and work QuickJS cannot interrupt.
 const SLACK: Duration = Duration::from_secs(1);
-const DATA_MIB: u64 = 256;
 const ANSWER: u64 = 64 << 20;
 
 /// Runs each step in a fresh confined process started from `program`, which
@@ -164,40 +163,29 @@ impl ProcessRunner {
                 .await
                 .map_err(|_| Start::Again("it did not start in time".to_string()))?
                 .map_err(|e| Start::Again(e.to_string()))?;
-            let hello: serde_json::Value = serde_json::from_slice(&line).map_err(|_| {
+            let hello = serde_json::from_slice(&line).map_err(|_| {
                 Start::Never(format!(
                     "`{}` did not answer as a runner. Its `main` must call \
                      `codemode::dispatch()` first",
                     program.display()
                 ))
             })?;
-            if hello.get("ready").and_then(|r| r.as_bool()) != Some(true) {
-                return Err(Start::Never(format!(
-                    "it could not confine itself: {}",
-                    hello
-                        .get("error")
-                        .and_then(|e| e.as_str())
-                        .unwrap_or("no reason")
-                )));
+            match hello {
+                Hello::Ready {
+                    version,
+                    oldest,
+                    languages,
+                } => Ok(Worker {
+                    process,
+                    stdin,
+                    stdout,
+                    versions: (oldest, version),
+                    languages,
+                }),
+                Hello::Unconfined { error } => Err(Start::Never(format!(
+                    "it could not confine itself: {error}"
+                ))),
             }
-            let version = |key| hello.get(key).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            let newest = version("version");
-            let oldest = match version("oldest") {
-                0 => newest,
-                oldest => oldest,
-            };
-            let languages = hello
-                .get("languages")
-                .cloned()
-                .and_then(|l| serde_json::from_value(l).ok())
-                .unwrap_or_else(|| vec![super::Language::Javascript]);
-            Ok(Worker {
-                process,
-                stdin,
-                stdout,
-                versions: (oldest, newest),
-                languages,
-            })
         }
     }
 

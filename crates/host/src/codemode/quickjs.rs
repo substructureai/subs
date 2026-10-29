@@ -4,6 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use rquickjs::allocator::{Allocator, RustAllocator};
+use rquickjs::convert::List;
 use rquickjs::{Context, Function, Runtime};
 
 use super::engine::{cpu_ms, Engine};
@@ -55,17 +56,17 @@ impl Engine for QuickJs {
 
 const PRELUDE: &str = r#"
 (() => {
-  const call = globalThis.__call, log = globalThis.__log, done = globalThis.__done;
-  delete globalThis.__call; delete globalThis.__log; delete globalThis.__done;
+  const { __call: call, __log: log, __done: done, __names: names, __now: NOW } = globalThis;
+  let seed = globalThis.__seed;
+  for (const k of ["__call", "__log", "__done", "__names", "__now", "__seed"]) delete globalThis[k];
   const parse = (s) => { try { return JSON.parse(s); } catch { return s; } };
   const invoke = (name, args) => {
     const json = JSON.stringify(args === undefined ? {} : args);
     const r = call(name, json === undefined ? "{}" : json);
     if (r == null) return new Promise(() => {});
-    const { ok, output } = JSON.parse(r);
+    const [ok, output] = r;
     return ok ? Promise.resolve(parse(output)) : Promise.reject(new Error(output));
   };
-  const names = NAMES;
   globalThis.tools = new Proxy(Object.fromEntries(names.map((n) => [n, true])), {
     get: (_, name) => typeof name === "string" && name !== "then" ? (args) => invoke(name, args) : undefined,
   });
@@ -75,7 +76,6 @@ const PRELUDE: &str = r#"
   };
   const write = (...a) => log(a.map(show).join(" "));
   globalThis.console = { log: write, info: write, warn: write, error: write, debug: write };
-  let seed = SEED | 0;
   Math.random = () => {
     seed = (seed + 0x6D2B79F5) | 0;
     let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
@@ -91,21 +91,32 @@ const PRELUDE: &str = r#"
   globalThis.__run = (f) => {
     delete globalThis.__run;
     f().then(
-      (v) => { if (settled) return; settled = true; let s; try { s = JSON.stringify(v); } catch { s = JSON.stringify(String(v)); } done(true, s === undefined ? null : s); },
-      (e) => { if (settled) return; settled = true; done(false, e instanceof Error ? `${e}${e.stack ? "\n" + e.stack : ""}` : show(e)); },
+      (v) => { if (settled) return; settled = true; let s; try { s = JSON.stringify(v); } catch { s = JSON.stringify(String(v)); } done(true, s === undefined ? null : s, null); },
+      (e) => { if (settled) return; settled = true; done(false, e instanceof Error ? `${e}${e.stack ? "\n" + e.stack : ""}` : show(e), e instanceof RangeError ? e.message : null); },
     );
   };
 })();
 "#;
 
-/// QuickJS's allocator, keeping the most it held at once.
+/// QuickJS's allocator: it holds the heap to `limit`, notes when it refused,
+/// and keeps the most it held at once.
 struct Peak {
     inner: RustAllocator,
     now: usize,
+    limit: usize,
     peak: Rc<Cell<usize>>,
+    refused: Rc<Cell<bool>>,
 }
 
 impl Peak {
+    fn fits(&self, size: usize) -> bool {
+        let fits = self.now.saturating_add(size) <= self.limit;
+        if !fits {
+            self.refused.set(true);
+        }
+        fits
+    }
+
     fn grew(&mut self, ptr: *mut u8) -> *mut u8 {
         if !ptr.is_null() {
             self.now += unsafe { RustAllocator::usable_size(ptr) };
@@ -117,11 +128,17 @@ impl Peak {
 
 unsafe impl Allocator for Peak {
     fn alloc(&mut self, size: usize) -> *mut u8 {
+        if !self.fits(size) {
+            return std::ptr::null_mut();
+        }
         let ptr = self.inner.alloc(size);
         self.grew(ptr)
     }
 
     fn calloc(&mut self, count: usize, size: usize) -> *mut u8 {
+        if !self.fits(count.saturating_mul(size)) {
+            return std::ptr::null_mut();
+        }
         let ptr = self.inner.calloc(count, size);
         self.grew(ptr)
     }
@@ -138,6 +155,9 @@ unsafe impl Allocator for Peak {
             true => 0,
             false => RustAllocator::usable_size(ptr),
         };
+        if new_size > old && !self.fits(new_size - old) {
+            return std::ptr::null_mut();
+        }
         let moved = self.inner.realloc(ptr, new_size);
         if !moved.is_null() || new_size == 0 {
             self.now = self.now.saturating_sub(old);
@@ -150,25 +170,30 @@ unsafe impl Allocator for Peak {
     }
 }
 
-fn raised(message: String) -> End {
-    let limit = match &message {
-        m if m.contains("out of memory") => Some(Limit::Memory),
-        m if m.contains("stack overflow") || m.contains("call stack") => Some(Limit::Stack),
-        _ => None,
-    };
-    End::Raised { message, limit }
+/// QuickJS's message for a `RangeError` past the stack limit.
+const OVERFLOW: &str = "Maximum call stack size exceeded";
+
+/// An error the script raised. `range` is the message when it is a
+/// `RangeError`.
+fn raised(message: String, range: Option<&str>) -> End {
+    End::Raised {
+        message,
+        limit: (range == Some(OVERFLOW)).then_some(Limit::Stack),
+    }
 }
 
 /// Runs the script on QuickJS, and returns the most heap it held.
 fn execute(script: &Script, replay: &Rc<RefCell<Replay>>, started: u64) -> rquickjs::Result<usize> {
     let limits = replay.borrow().limits().clone();
     let peak = Rc::new(Cell::new(0));
+    let refused = Rc::new(Cell::new(false));
     let rt = Runtime::new_with_alloc(Peak {
         inner: RustAllocator,
         now: 0,
+        limit: limits.memory,
         peak: peak.clone(),
+        refused: refused.clone(),
     })?;
-    rt.set_memory_limit(limits.memory);
     rt.set_max_stack_size(STACK);
     let mut ticks = 0u64;
     let stop = replay.clone();
@@ -182,7 +207,7 @@ fn execute(script: &Script, replay: &Rc<RefCell<Replay>>, started: u64) -> rquic
         true
     })));
     let ctx = Context::full(&rt)?;
-    let compiled = ctx.with(|ctx| -> rquickjs::Result<Option<String>> {
+    let compiled = ctx.with(|ctx| -> rquickjs::Result<Option<End>> {
         let globals = ctx.globals();
         let r = replay.clone();
         globals.set(
@@ -191,12 +216,8 @@ fn execute(script: &Script, replay: &Rc<RefCell<Replay>>, started: u64) -> rquic
                 .borrow_mut()
                 .call(name, arguments)
             {
-                Answer::Result { ok, output } => {
-                    Some(serde_json::json!({ "ok": ok, "output": output }).to_string())
-                }
-                Answer::Refused(message) => {
-                    Some(serde_json::json!({ "ok": false, "output": message }).to_string())
-                }
+                Answer::Result { ok, output } => Some(List((ok, output))),
+                Answer::Refused(message) => Some(List((false, message))),
                 Answer::Pending => None,
             })?,
         )?;
@@ -208,21 +229,20 @@ fn execute(script: &Script, replay: &Rc<RefCell<Replay>>, started: u64) -> rquic
         let r = replay.clone();
         globals.set(
             "__done",
-            Function::new(ctx.clone(), move |ok: bool, value: Option<String>| {
-                r.borrow_mut().end(match ok {
-                    true => End::Returned(value),
-                    false => raised(value.unwrap_or_default()),
-                });
-            })?,
+            Function::new(
+                ctx.clone(),
+                move |ok: bool, value: Option<String>, range: Option<String>| {
+                    r.borrow_mut().end(match ok {
+                        true => End::Returned(value),
+                        false => raised(value.unwrap_or_default(), range.as_deref()),
+                    });
+                },
+            )?,
         )?;
-        let prelude = PRELUDE
-            .replace("SEED", &(script.seed as u32 as i32).to_string())
-            .replace("NOW", &script.now_ms.to_string())
-            .replace(
-                "NAMES",
-                &serde_json::to_string(&script.tools).unwrap_or_else(|_| "[]".to_string()),
-            );
-        ctx.eval::<(), _>(prelude)?;
+        globals.set("__names", script.tools.clone())?;
+        globals.set("__now", script.now_ms as f64)?;
+        globals.set("__seed", script.seed as u32 as i32)?;
+        ctx.eval::<(), _>(PRELUDE)?;
         let source = format!("__run(async () => {{\n{}\n}});", script.code);
         match ctx.eval::<(), _>(source) {
             Ok(()) => Ok(None),
@@ -230,16 +250,16 @@ fn execute(script: &Script, replay: &Rc<RefCell<Replay>>, started: u64) -> rquic
             Err(e) => Err(e),
         }
     })?;
-    if let Some(error) = compiled {
-        replay.borrow_mut().end(raised(error));
+    if let Some(end) = compiled {
+        replay.borrow_mut().end(end);
     }
     for _ in 0..JOBS {
         match rt.execute_pending_job() {
             Ok(true) => {}
             Ok(false) => break,
             Err(e) => {
-                let error = e.0.with(|ctx| exception(&ctx));
-                replay.borrow_mut().end(raised(error));
+                let end = e.0.with(|ctx| exception(&ctx));
+                replay.borrow_mut().end(end);
                 break;
             }
         }
@@ -247,32 +267,33 @@ fn execute(script: &Script, replay: &Rc<RefCell<Replay>>, started: u64) -> rquic
     if rt.is_job_pending() {
         replay.borrow_mut().stop(Limit::Compute);
     }
-    let held = rt.memory_usage().malloc_size.max(0) as usize;
-    {
-        let mut replay = replay.borrow_mut();
-        if !replay.returned() && !replay.waits_on_calls() && held > limits.memory / 10 * 9 {
-            replay.stop(Limit::Memory);
-        }
+    if refused.get() {
+        replay.borrow_mut().stop(Limit::Memory);
     }
     drop(ctx);
     rt.set_interrupt_handler(None);
     Ok(peak.get())
 }
 
-fn exception(ctx: &rquickjs::Ctx<'_>) -> String {
+fn exception(ctx: &rquickjs::Ctx<'_>) -> End {
     let caught = ctx.catch();
     if let Some(e) = caught.as_exception() {
         let message = e.message().unwrap_or_default();
-        return match e.stack() {
+        let name: Option<String> = e.get("name").ok();
+        let range = (name.as_deref() == Some("RangeError")).then_some(message.as_str());
+        let text = match e.stack() {
             Some(stack) if !stack.is_empty() => format!("{message}\n{stack}"),
-            _ => message,
+            _ => message.clone(),
         };
+        return raised(text, range);
     }
-    ctx.json_stringify(caught)
+    let text = ctx
+        .json_stringify(caught)
         .ok()
         .flatten()
         .map(|s| s.to_string().unwrap_or_default())
-        .unwrap_or_else(|| "The script threw.".to_string())
+        .unwrap_or_else(|| "The script threw.".to_string());
+    raised(text, None)
 }
 
 #[cfg(test)]
@@ -441,22 +462,38 @@ mod tests {
 
     #[test]
     fn runaway_memory_fails_the_run() {
-        let step = run(&script(
+        let ran = engine::run(&script(
             "const a = []; while (true) a.push('x'.repeat(1 << 20));",
             vec![],
         ));
-        assert!(matches!(step, Step::Failed(_)), "{step:?}");
+        assert_eq!(ran.stats.limit, Some(Limit::Memory), "{ran:?}");
+    }
+
+    #[test]
+    fn a_tool_error_that_names_a_limit_is_not_that_limit() {
+        for message in ["database out of memory", "Maximum call stack size exceeded"] {
+            let ran = engine::run(&script(
+                "await tools.a();",
+                vec![record("a", "{}", false, message)],
+            ));
+            assert!(
+                matches!(&ran.step, Step::Failed(m) if m.contains(message)),
+                "{ran:?}"
+            );
+            assert_eq!(ran.stats.limit, None, "{ran:?}");
+        }
     }
 
     #[test]
     fn deep_recursion_fails_the_run() {
-        let step = run(&script(
+        let ran = engine::run(&script(
             "const f = (n) => f(n + 1) + 1; return f(0);",
             vec![],
         ));
+        assert_eq!(ran.stats.limit, Some(Limit::Stack), "{ran:?}");
         assert!(
-            matches!(&step, Step::Failed(m) if m.contains("stack") || m.contains("Range")),
-            "{step:?}"
+            matches!(&ran.step, Step::Failed(m) if m.contains("call stack")),
+            "{ran:?}"
         );
     }
 

@@ -18,7 +18,7 @@ use crate::runtime::session::state::EffectKind;
 use crate::runtime::span::SpanContext;
 use crate::runtime::Caller;
 
-const RESULT_NOT_SAVED: Duration = Duration::from_secs(5);
+pub(crate) const RESULT_NOT_SAVED: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct TaskBound {

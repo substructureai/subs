@@ -104,8 +104,9 @@ first in `main`, before it starts a thread. Without it, every script fails
 with an error that says so.
 
 The process speaks JSON lines on stdin and stdout. It first writes
-`{"ready": true, "version": N, "oldest": M}`, then reads one `Script` and
-writes one `Step`. A runner on another machine can start the same binary with
+`{"ready": {"version": N, "oldest": M, "languages": [...]}}`, or
+`{"unconfined": {"error": "..."}}` when it could not confine itself. Then it
+reads one `Script` and writes one `Ran`. A runner on another machine can start the same binary with
 `__sandbox` the same way, behind its own endpoint, and needs no other code. A
 `Script` carries its version, and a runner takes every version from `OLDEST` to
 `VERSION`, so an engine and its runners can be deployed one before the other.

@@ -112,9 +112,10 @@ pub fn callable(config: Option<&AgentConfig>, connector_tools: &[ConnectorTool])
 }
 
 /// A script waits on its calls, so its own deadline is the run's whole life.
+/// Each step's wait for a sandbox is the runtime's `script_wait`.
 pub fn retry() -> RetryPolicy {
     RetryPolicy {
-        queue_timeout_secs: Some(60),
+        queue_timeout_secs: None,
         run_timeout_secs: None,
         total_timeout_secs: Some(3600),
         max_attempts: 1,

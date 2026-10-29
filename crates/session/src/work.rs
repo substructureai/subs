@@ -507,8 +507,7 @@ impl Session {
         if effect.tool()?.target != Some(ConnectorTarget::Code) || state.script_waits(id) {
             return None;
         }
-        let arguments: serde_json::Value =
-            serde_json::from_str(&effect.tool()?.arguments).unwrap_or_default();
+        let arguments: serde_json::Value = serde_json::from_str(&effect.tool()?.arguments).ok()?;
         let mut read = 0;
         let mut spent = false;
         let calls = state
@@ -544,21 +543,13 @@ impl Session {
             version: crate::codemode::VERSION,
             language: effect.tool()?.script_language,
             tools,
-            code: arguments
-                .get("code")
-                .and_then(|c| c.as_str())
-                .unwrap_or_default()
-                .to_string(),
+            code: arguments.get("code")?.as_str()?.to_string(),
             calls,
             spent,
             limits: limits.clone(),
             cpu_used_ms: effect.tool()?.script_cpu_ms,
             seed: xxhash_rust::xxh3::xxh3_64(id.as_bytes()),
-            now_ms: effect
-                .tracking
-                .started_at
-                .map(|t| t.timestamp_millis())
-                .unwrap_or_default(),
+            now_ms: effect.tracking.started_at?.timestamp_millis(),
         })
     }
 
