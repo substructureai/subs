@@ -1,12 +1,14 @@
 // Adapted from OpenAI Codex, codex-rs/code-mode-protocol/src/json_schema_types.rs.
 // Copyright 2025 OpenAI. Licensed under the Apache License, Version 2.0:
-// http://www.apache.org/licenses/LICENSE-2.0. Changed: identifier check is local.
+// http://www.apache.org/licenses/LICENSE-2.0. Changed: identifier check is local;
+// local refs become named types; an object's properties render beside its
+// combinators, and `if`/`then` parts are left out.
 
 use serde_json::Value as JsonValue;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-// Expose one nested recursive shape, then fall back to `unknown` on the next
-// occurrence so generated tool declarations remain finite.
+// Refs to the root: expose one nested recursive shape, then fall back to
+// `unknown` on the next occurrence so generated tool declarations remain finite.
 const MAX_LOCAL_REF_EXPANSIONS_PER_PATH: usize = 2;
 // Bound repeated refs and DAG fan-out separately from cycle depth so one
 // compact schema cannot expand into an arbitrarily large model-visible item.
@@ -17,19 +19,47 @@ pub const DEFAULT_INPUT_SCHEMA_MAX_BYTES: usize = 16_000;
 // cannot allocate unbounded expanded copies before the final schema cap runs.
 const RENDER_WORK_MULTIPLIER: usize = 4;
 
-pub fn render_json_schema_to_typescript(schema: &JsonValue) -> String {
-    render_json_schema_to_typescript_with_budget(schema, DEFAULT_INPUT_SCHEMA_MAX_BYTES)
+/// A schema as a TypeScript type, and the named types it refers to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rendered {
+    pub types: Vec<String>,
+    pub body: String,
+}
+
+/// `schema` as a TypeScript type. Each local `$ref` becomes a type, named
+/// `prefix` and its definition's name, unless `taken` has that name.
+pub fn render_json_schema_to_typescript(
+    schema: &JsonValue,
+    prefix: &str,
+    taken: &mut BTreeSet<String>,
+) -> Rendered {
+    render_json_schema_to_typescript_with_budget(
+        schema,
+        prefix,
+        taken,
+        DEFAULT_INPUT_SCHEMA_MAX_BYTES,
+    )
 }
 
 pub(crate) fn render_json_schema_to_typescript_with_budget(
     schema: &JsonValue,
+    prefix: &str,
+    taken: &mut BTreeSet<String>,
     max_bytes: usize,
-) -> String {
-    let rendered = JsonSchemaTypeRenderer::new(schema, max_bytes).render(schema);
-    if rendered.len() > max_bytes {
-        "unknown".to_string()
+) -> Rendered {
+    let mut renderer = JsonSchemaTypeRenderer::new(schema, max_bytes);
+    renderer.prefix = pascal(prefix);
+    renderer.taken = std::mem::take(taken);
+    let body = renderer.render(schema);
+    *taken = std::mem::take(&mut renderer.taken);
+    let types = renderer.types;
+    if body.len() + types.iter().map(String::len).sum::<usize>() > max_bytes {
+        Rendered {
+            types: Vec::new(),
+            body: "unknown".to_string(),
+        }
     } else {
-        rendered
+        Rendered { types, body }
     }
 }
 
@@ -40,6 +70,10 @@ struct JsonSchemaTypeRenderer<'a> {
     remaining_local_ref_expansions: usize,
     remaining_render_work_bytes: usize,
     render_work_budget_exhausted: bool,
+    prefix: String,
+    names: BTreeMap<String, String>,
+    taken: BTreeSet<String>,
+    types: Vec<String>,
 }
 
 impl<'a> JsonSchemaTypeRenderer<'a> {
@@ -51,6 +85,10 @@ impl<'a> JsonSchemaTypeRenderer<'a> {
             remaining_local_ref_expansions: MAX_TOTAL_LOCAL_REF_EXPANSIONS,
             remaining_render_work_bytes: max_bytes.saturating_mul(RENDER_WORK_MULTIPLIER),
             render_work_budget_exhausted: false,
+            prefix: String::new(),
+            names: BTreeMap::new(),
+            taken: BTreeSet::new(),
+            types: Vec::new(),
         }
     }
 
@@ -120,8 +158,11 @@ impl<'a> JsonSchemaTypeRenderer<'a> {
                     }
                     rendered.push(self.render(variant));
                 }
+                if rendered.iter().any(|r| r == "unknown") {
+                    return self.render_with_rest(map, key, String::new());
+                }
                 if !rendered.is_empty() {
-                    return rendered.join(" | ");
+                    return self.render_with_rest(map, key, rendered.join(" | "));
                 }
             }
         }
@@ -132,11 +173,12 @@ impl<'a> JsonSchemaTypeRenderer<'a> {
                 if self.render_work_budget_exhausted {
                     return "unknown".to_string();
                 }
-                rendered.push(parenthesize_union_for_intersection(self.render(variant)));
+                let part = self.render(variant);
+                if part != "unknown" {
+                    rendered.push(parenthesize_union_for_intersection(part));
+                }
             }
-            if !rendered.is_empty() {
-                return rendered.join(" & ");
-            }
+            return self.render_with_rest(map, "allOf", rendered.join(" & "));
         }
 
         if let Some(schema_type) = map.get("type") {
@@ -172,6 +214,38 @@ impl<'a> JsonSchemaTypeRenderer<'a> {
         "unknown".to_string()
     }
 
+    /// `combined` with the type `map` gives besides `key`, as an object's
+    /// properties beside its `oneOf`.
+    fn render_with_rest(
+        &mut self,
+        map: &serde_json::Map<String, JsonValue>,
+        key: &str,
+        combined: String,
+    ) -> String {
+        let rest: serde_json::Map<String, JsonValue> = map
+            .iter()
+            .filter(|(k, _)| k.as_str() != key)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let combined = match combined.as_str() {
+            "" | "unknown" => None,
+            _ => Some(combined),
+        };
+        if !has_structural_keywords(&rest) {
+            return match combined {
+                Some(combined) => combined,
+                None if has_renderable_schema_keywords(&rest) => self.render_map(&rest),
+                None => "unknown".to_string(),
+            };
+        }
+        let base = self.render_map(&rest);
+        match combined {
+            None => base,
+            Some(combined) if base == "unknown" => combined,
+            Some(combined) => format!("{base} & {}", parenthesize_union_for_intersection(combined)),
+        }
+    }
+
     fn render_ref(&mut self, map: &serde_json::Map<String, JsonValue>) -> String {
         let referenced_type = if self.nested_schema_resource_depth > 0 {
             None
@@ -180,6 +254,9 @@ impl<'a> JsonSchemaTypeRenderer<'a> {
                 .and_then(JsonValue::as_str)
                 .and_then(local_json_pointer)
                 .and_then(|pointer| {
+                    if !pointer.is_empty() {
+                        return self.render_named(pointer);
+                    }
                     let active_expansions = self
                         .active_local_ref_expansions
                         .get(&pointer)
@@ -232,6 +309,46 @@ impl<'a> JsonSchemaTypeRenderer<'a> {
             (_, "unknown") => referenced_type,
             _ => format!("({referenced_type}) & ({sibling_type})"),
         }
+    }
+
+    /// The name of the type `pointer` refers to, declared once.
+    fn render_named(&mut self, pointer: String) -> Option<String> {
+        if let Some(name) = self.names.get(&pointer) {
+            return Some(name.clone());
+        }
+        let root = self.root;
+        let target = root.pointer(&pointer)?;
+        let segment = pointer.rsplit('/').next().unwrap_or_default();
+        let base = format!("{}{}", self.prefix, pascal(&unescape_pointer(segment)));
+        let base = match base.chars().next() {
+            Some(c) if c.is_ascii_alphabetic() => base,
+            _ => format!("T{base}"),
+        };
+        let name = (1..)
+            .map(|n| match n {
+                1 => base.clone(),
+                n => format!("{base}{n}"),
+            })
+            .find(|name| !self.taken.contains(name))?;
+        self.taken.insert(name.clone());
+        self.names.insert(pointer, name.clone());
+        let body = self.render(target);
+        let mut lines: Vec<String> = target
+            .get("description")
+            .and_then(JsonValue::as_str)
+            .into_iter()
+            .flat_map(str::lines)
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(|line| format!("// {line}"))
+            .collect();
+        lines.push(format!("type {name} = {body};"));
+        let declared = lines.join("\n");
+        if !self.consume_render_work(declared.len()) {
+            return Some("unknown".to_string());
+        }
+        self.types.push(declared);
+        Some(name)
     }
 
     fn render_type_keyword(
@@ -492,6 +609,41 @@ fn has_renderable_schema_keywords(map: &serde_json::Map<String, JsonValue>) -> b
         "oneOf",
         "allOf",
         "type",
+        "properties",
+        "additionalProperties",
+        "required",
+        "items",
+        "prefixItems",
+    ]
+    .iter()
+    .any(|key| map.contains_key(*key))
+}
+
+/// `text` in PascalCase, as `find_customers` to `FindCustomers`.
+fn pascal(text: &str) -> String {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            chars
+                .next()
+                .map(|c| c.to_ascii_uppercase().to_string() + chars.as_str())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+fn unescape_pointer(segment: &str) -> String {
+    segment.replace("~1", "/").replace("~0", "~")
+}
+
+fn has_structural_keywords(map: &serde_json::Map<String, JsonValue>) -> bool {
+    [
+        "const",
+        "enum",
+        "anyOf",
+        "oneOf",
+        "allOf",
         "properties",
         "additionalProperties",
         "required",

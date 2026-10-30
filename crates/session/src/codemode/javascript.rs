@@ -1,5 +1,7 @@
 //! `run_code` in JavaScript: tools as async functions, declared in TypeScript.
 
+use std::collections::BTreeSet;
+
 use super::typescript::{is_identifier, render_json_schema_to_typescript};
 use super::Dialect;
 use crate::protocol::{LlmTool, TOOL_SEARCH};
@@ -7,105 +9,116 @@ use crate::protocol::{LlmTool, TOOL_SEARCH};
 pub const DIALECT: Dialect = Dialect {
     code: "JavaScript: the body of an async function.",
     describe,
+    declares,
     declare: declaration,
+    fence: "ts",
 };
 
-/// Declarations `run_code`'s description holds, in bytes. Past it, tools are
-/// listed by name.
+/// Declarations `run_code`'s description holds, in bytes. Past it, a script
+/// finds tools with `tool_search`.
 const DECLARED: usize = 12 << 10;
-/// Names `run_code`'s description lists, in bytes.
-const LISTED: usize = 4 << 10;
-/// Characters of a listed tool's description.
-const SUMMARY: usize = 100;
 
-const INTRO: &str = "Run JavaScript that calls your tools. Use it to chain calls, to run them at \
-once, or to filter a large result before you read it.
-- `code` is the body of an async function. `return` a value to get it back.
-- Call a tool with `await tools.<name>(args)`. Use `tools[\"<name>\"](args)` when the name is not \
+const INTRO: &str = "Run JavaScript code to orchestrate tool calls: chain them, run them at once, \
+and filter large results before you read them.
+- `code` is the body of an async function. All tools are on the global `tools` object. Call one \
+by its exact name: `await tools.<name>(args)`, or `tools[\"<name>\"](args)` when the name is not \
 an identifier. A call returns the tool's result, parsed when it is JSON.
-- A call that fails throws an `Error` with the tool's message. For many calls at once, use \
-`Promise.allSettled`, so one failure does not lose the rest.
-- Tools that the worker runs answer one at a time. Other tools run at once.
-- `console.log` output comes back with the return value. Results you do not return or log stay \
-out of the conversation.
-- Return a summary, not raw results: what a script returns and logs is capped.
-- A script resumes from the start after its calls finish, so work done before a call is done \
-again each time. It has limits on its calls, on the results it reads, on memory and on compute; \
-an error names the limit and what to do.
-- Files in the conversation show as `[attachment <id> …]` lines. Read one by its id: \
-`await files.text(id)` for a small file, or stream it with `for await (const row of \
-files.csv(id))`, `files.lines(id)`, `files.jsonl(id)` or `files.chunks(id)`. Each takes \
-`{ limit }`. `files.list()` lists them. Read files before you call tools: a script resumes from \
-the start after its calls, and reads them again.
-- `files.show(id)` puts a file in front of you when the script ends: an image, PDF, audio or video \
-as itself, any other file as its text. Print anything else with `console.log`.
-- Load a skill with `await tools.skill({ name })`. Its instructions reach you when the script \
-ends, and its tools can then be called. Read the files they mention with `files.text`, by their \
-path under the skill's base directory.
-- There is no network, file system, timer or module. `Date` and `Math.random` stay the same \
-for the whole run.
+- One call: `const issue = await tools.get_issue({ id: 7 }); return issue.title;`
+- Calls at once: `const [a, b] = await Promise.all([tools.get_issue({ id: 1 }), \
+tools.get_issue({ id: 2 })]);`. A call that fails throws an `Error` with the tool's message; use \
+`Promise.allSettled` so that one failure does not lose the rest.
+- You see what the script logs and returns: strings as they are, objects as JSON. Past {output} \
+KiB, the sandbox cuts the middle.
+- A script runs again from the start each time its calls finish, and gets their results without \
+calling again. Work before a call is done again on each run. A script has limits on calls, \
+results, memory and compute; an error names the limit and what to do.
+- Files in the conversation show as `[attachment <id> …]` lines. Read one by its id with \
+`await files.text(id)`, or stream it with `for await (const row of files.csv(id))`. \
+`files.lines`, `files.jsonl` and `files.chunks` stream too. Each stream takes `{ limit }`, \
+`files.csv` also `{ header, delimiter }`, and `files.chunks` also `{ size, offset }`. \
+`files.list()` lists the files.
+- `files.show(id)` puts a file in front of you when the script returns: an image, PDF, audio or \
+video as itself, any other file as its text.
+- Load a skill with `console.log(await tools.skill({ name }))`, and several with \
+`for (const s of await Promise.all([tools.skill({ name: \"a\" }), tools.skill({ name: \"b\" })])) \
+console.log(s);`. Log each answer whole: it holds the skill's instructions and the declarations \
+of the tools it brings, which you can call in your next script. Read the files it mentions with \
+`files.text`, by their path under the skill's base directory.
+- There is no network, file system, timer or module. No state persists between scripts. \
+`Date` and `Math.random` stay the same for the whole run.
 - A call that needs approval waits for a person, and a client tool waits for the client. A \
 subagent call returns the subagent's answer.";
 
 fn describe(tools: &[&LlmTool]) -> String {
     let budget = Budget::split(tools);
     let mut sections = vec![
-        INTRO.to_string(),
-        format!(
-            "Find tools with `await tools.{TOOL_SEARCH}({{ query }})`. It answers with each \
-             match's declaration. Search before you call a tool that is not declared here."
+        INTRO.replace(
+            "{output}",
+            &(super::Limits::default().output >> 10).to_string(),
         ),
         format!(
-            "```ts\ndeclare const tools: {{\n{}\n}};\n```",
-            budget.declared.join("\n")
+            "Find tools that are not declared here, and skills, with \
+             `await tools.{TOOL_SEARCH}({{ query }})`, or name tools exactly to get just their \
+             declarations. It answers with text that is already short: log it with \
+             `console.log` as it is, then call the tools in your next script."
         ),
     ];
-    if !budget.listed.is_empty() {
-        let mut listed = budget.listed;
-        if budget.more > 0 {
-            listed.push(format!("- and {} more.", budget.more));
-        }
+    if !budget.declared.is_empty() {
         sections.push(format!(
-            "These tools can be called too. Search for one by its name to get its \
-             declaration:\n{}",
-            listed.join("\n")
+            "```ts\n{}declare const tools: {{\n{}\n}};\n```",
+            budget
+                .types
+                .iter()
+                .map(|t| format!("{t}\n"))
+                .collect::<String>(),
+            budget.declared.join("\n")
         ));
     }
     sections.join("\n\n")
 }
 
-/// The tools `run_code`'s description declares, those it lists by name, and
-/// how many more there are.
+fn declares(tools: &[&LlmTool]) -> usize {
+    Budget::split(tools).declared.len()
+}
+
+/// The tools `run_code`'s description declares, from the first, with the
+/// types they name.
 struct Budget {
+    types: Vec<String>,
     declared: Vec<String>,
-    listed: Vec<String>,
-    more: usize,
 }
 
 impl Budget {
     fn split(tools: &[&LlmTool]) -> Self {
-        let lines: Vec<String> = tools.iter().map(|t| indent(&declaration(t))).collect();
-        let declared = fit(&lines, DECLARED);
-        let entries: Vec<String> = tools[declared..]
+        let declarations: Vec<Declared> = tools.iter().map(|t| declared(t)).collect();
+        let sizes: Vec<usize> = declarations
             .iter()
-            .map(|t| format!("- {}: {}", t.name, summary(&t.description)))
+            .zip(tools)
+            .map(|(d, t)| {
+                let summary = super::summary(&t.description).len() + 6;
+                summary + d.method.len() + 2 + d.types.iter().map(|t| t.len() + 1).sum::<usize>()
+            })
             .collect();
-        let listed = fit(&entries, LISTED);
+        let count = fit(&sizes, DECLARED);
+        let declarations = &declarations[..count];
         Budget {
-            more: entries.len() - listed,
-            declared: lines[..declared].to_vec(),
-            listed: entries[..listed].to_vec(),
+            types: declarations.iter().flat_map(|d| d.types.clone()).collect(),
+            declared: declarations
+                .iter()
+                .zip(tools)
+                .map(|(d, t)| indent(&commented(&super::summary(&t.description), &d.method)))
+                .collect(),
         }
     }
 }
 
-/// How many of `lines`, from the first, fit in `bytes`.
-fn fit(lines: &[String], bytes: usize) -> usize {
+/// How many of `sizes`, from the first, fit in `bytes`.
+fn fit(sizes: &[usize], bytes: usize) -> usize {
     let mut used = 0;
-    lines
+    sizes
         .iter()
-        .take_while(|line| {
-            used += line.len();
+        .take_while(|size| {
+            used += *size;
             used <= bytes
         })
         .count()
@@ -115,30 +128,52 @@ fn indent(line: &str) -> String {
     format!("  {}", line.replace('\n', "\n  "))
 }
 
-fn summary(description: &str) -> String {
-    let line = description.lines().next().unwrap_or_default().trim();
-    match line.char_indices().nth(SUMMARY) {
-        Some((at, _)) => format!("{}…", &line[..at]),
-        None => line.to_string(),
-    }
+/// A tool's method, and the types it names.
+struct Declared {
+    types: Vec<String>,
+    method: String,
 }
 
-fn declaration(tool: &LlmTool) -> String {
+fn declared(tool: &LlmTool) -> Declared {
     let name = match is_identifier(&tool.name) {
         true => tool.name.clone(),
         false => serde_json::to_string(&tool.name).unwrap_or_default(),
     };
-    let input = tool
-        .input
-        .as_ref()
-        .map(render_json_schema_to_typescript)
-        .unwrap_or_else(|| "{}".to_string());
-    let output = tool
-        .output
-        .as_ref()
-        .map(render_json_schema_to_typescript)
-        .unwrap_or_else(|| "unknown".to_string());
-    format!("{name}(args: {input}): Promise<{output}>;")
+    let mut taken = BTreeSet::new();
+    let mut types = Vec::new();
+    let mut render = |schema: Option<&serde_json::Value>, empty: &str| match schema {
+        Some(schema) => {
+            let rendered = render_json_schema_to_typescript(schema, &tool.name, &mut taken);
+            types.extend(rendered.types);
+            rendered.body
+        }
+        None => empty.to_string(),
+    };
+    let input = render(tool.input.as_ref(), "{}");
+    let output = render(tool.output.as_ref(), "unknown");
+    Declared {
+        types,
+        method: format!("{name}(args: {input}): Promise<{output}>;"),
+    }
+}
+
+/// A tool's declaration: the types it names, then its description, then its
+/// method.
+fn declaration(tool: &LlmTool) -> String {
+    let declared = declared(tool);
+    let mut lines = declared.types;
+    lines.push(commented(&tool.description, &declared.method));
+    lines.join("\n")
+}
+
+/// `code` after `text` as comment lines.
+fn commented(text: &str, code: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| format!("// {line}\n"))
+        .chain([code.to_string()])
+        .collect()
 }
 
 #[cfg(test)]
@@ -181,7 +216,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_past_the_budget_are_listed_by_name() {
+    fn the_description_declares_tools_until_its_budget() {
         let schema = serde_json::json!({
             "type": "object",
             "properties": { "a_long_property_name": { "type": "string" } }
@@ -194,15 +229,20 @@ mod tests {
             .collect();
         let refs: Vec<&LlmTool> = tools.iter().collect();
         let budget = Budget::split(&refs);
-        assert!(!budget.declared.is_empty() && !budget.listed.is_empty() && budget.more > 0);
-        assert_eq!(
-            budget.declared.len() + budget.listed.len() + budget.more,
-            400
+        let count = declares(&refs);
+        assert!(count > 0 && count < 400);
+        assert!(
+            budget
+                .declared
+                .iter()
+                .chain(&budget.types)
+                .map(String::len)
+                .sum::<usize>()
+                <= DECLARED
         );
-        assert!(budget.declared.iter().map(String::len).sum::<usize>() <= DECLARED);
-        assert!(budget.listed.iter().map(String::len).sum::<usize>() <= LISTED);
         let text = describe(&refs);
-        assert!(text.contains(&format!("- and {} more.", budget.more)));
+        assert!(text.contains(&format!("tool_{}(args:", count - 1)));
+        assert!(!text.contains(&format!("tool_{count}(args:")));
         assert!(!text.contains("More detail."));
     }
 }

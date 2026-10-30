@@ -37,14 +37,27 @@ Code mode is all or nothing. The model gets one tool, `run_code`, and reaches
 every other tool from a script: there is no direct `tool_search`, `call_tool`,
 `skill` or attachment tool.
 
-The description of `run_code` declares each tool the script can call, with its
-input type and, when the tool declares an output schema, its result type. The
-declarations stop at 12 KiB. Past that, tools are listed by name, up to 4 KiB.
-A deferred tool is neither declared nor listed.
+The description of `run_code` declares each tool the script can call in
+TypeScript: the first line of its description as a comment, its input type and,
+when the tool declares an output schema, its result type. Each definition a
+schema refers to with `$ref` becomes a named type, declared once, so a
+recursive schema stays finite. The declarations stop at 12 KiB. The
+description holds nothing that changes while a session runs, so the cached
+prefix holds.
 
-A script finds tools with `tools.tool_search({ query })`, which answers with
-each match's declaration, and then calls them by name. It works whether or not
-the agent defers tools.
+A script finds the other tools, past the budget or deferred, with
+`tools.tool_search`. The conversation lists each skill with the tools it names,
+in the system prompt on the first call. A skill added later is listed when it
+is, after what the model has read. In code mode a skill holds back no tools:
+its `tools` says which tools it is about.
+
+A script finds tools with `tools.tool_search({ query })`. It answers as text:
+the declarations of the tools that match, each with its whole description, up
+to 8 KiB, then the other matches by name, then the skills that match, with how
+to load them. A query of exact tool names, as `"get_audience, find_customers"`,
+answers just those tools, declared up to the output limit. The model reads the
+answer, then calls the tools in its next script. A call to a tool that does not
+exist throws an error that names the closest tools.
 
 A call returns the tool's result, parsed when it is JSON. A call that fails
 throws an `Error` with the tool's message.
@@ -58,10 +71,10 @@ subagent call returns the subagent's answer. A script cannot call `call_tool`,
 the attachment tools, or `run_code`: it calls tools by name, and reads files
 with `files`. A call to one of these throws, and the script can catch it.
 
-`await tools.skill({ name })` loads a skill as a direct call does: its tools
-unlock. The model reads its instructions in the `run_code` result, whether or
-not the script returns them. When the agent searches its skills,
-`tools.tool_search` finds them too.
+`await tools.skill({ name })` loads a skill. It answers with the skill's
+instructions, then the declarations of the tools it names, as many as fit under
+the output limit; the rest it names. The script logs the answer, and the model
+can then call those tools in its next script without a search. When the agent searches its skills, `tools.tool_search` finds them too.
 
 A skill's other files are files. A script reads them by `<skill>/<path>`, such
 as `files.text("runbooks:respond/references/escalation.md")`, and shows them
@@ -72,8 +85,21 @@ and the model can run it again.
 
 ## What reaches the model
 
-The `run_code` result is what the script returns and prints, then each file it
-showed, then the instructions of each skill it loaded.
+The `run_code` result is text: `Script finished.`, what the script printed,
+then the value it returned, a string as itself and any other value as JSON.
+
+```text
+Script finished.
+Printed:
+3 stale PRs
+Returned:
+[{"number":12,"reviews":0},{"number":15,"reviews":2}]
+```
+
+Past 24 KiB, the middle is cut out with a note, so the start and the end stay.
+A script that throws gives `Script failed.`, the error and the lines of the
+script in its stack, then what it printed. Then comes each file the script
+showed.
 
 `files.show(id)` puts a file in front of the model: an image, PDF, audio or
 video as itself, and any other file as its text. A script shows at most 4
@@ -116,10 +142,6 @@ nothing, because the log holds every result.
 So a script must make the same calls each time it runs. `Date` and
 `Math.random` give the same values on every run. A run that makes a different
 call fails.
-
-`run_code` has no deadline of its own. Its calls keep theirs, and the script's
-[limits](#limits) bound what it runs. An [interrupt](./100-interrupts.md) holds
-a script: no step runs, and no call it asks for goes out, until the resume.
 
 `run_code` has no deadline of its own. Its calls keep theirs, and the script's
 [limits](#limits) bound what it runs. An [interrupt](./100-interrupts.md) holds
@@ -243,8 +265,7 @@ them. An error names the limit that was met and what to do.
 | `calls` | 1,000 | Calls over the whole script |
 | `results` | 8 MiB | Results the script reads, over all its calls |
 | `arguments` | 32 MiB | Arguments over the whole script, and 256 KiB in one call |
-| `returned` | 64 KiB | The value it returns; past it, the start is shown with a note |
-| `logs` | 16 KiB | `console.log` output |
+| `output` | 24 KiB | What a run prints and returns; past it, the middle is cut |
 | `memory` | 96 MiB | JavaScript heap in one run |
 | `compute_ms` | 500 | CPU in one run |
 | `total_compute_ms` | 10,000 | CPU over all of a script's runs |

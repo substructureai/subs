@@ -89,7 +89,7 @@ impl KindSpec for LlmSpec {
         let call = effect.llm().filter(|c| c.handler == LlmHandler::Worker)?;
         Some(Trigger::LlmExecute {
             id: id.to_string(),
-            request: call.spec.to_request(call.prompt.clone()),
+            request: call.sent_request(),
             format: call.format,
             defer_tools_strategy: call.defer_tools_strategy,
             stream: call.stream,

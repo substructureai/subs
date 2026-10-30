@@ -419,7 +419,7 @@ impl Session {
                 call_id: id.to_string(),
                 attempt,
                 llm: call.llm.clone(),
-                request: call.spec.to_request(call.prompt.clone()),
+                request: call.sent_request(),
                 defer_tools_strategy: call.defer_tools_strategy,
                 stream: call.stream,
                 owner: state.owner.clone()?,

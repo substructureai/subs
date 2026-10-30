@@ -4,8 +4,16 @@
 use super::*;
 use serde_json::json;
 
+fn render(schema: &JsonValue) -> Rendered {
+    render_json_schema_to_typescript(schema, "", &mut BTreeSet::new())
+}
+
+fn body(schema: &JsonValue) -> String {
+    render(schema).body
+}
+
 #[test]
-fn renders_recursive_local_refs_with_escaped_pointer_segments() {
+fn renders_recursive_local_refs_as_named_types() {
     let schema = json!({
         "type": "object",
         "properties": {
@@ -38,30 +46,40 @@ fn renders_recursive_local_refs_with_escaped_pointer_segments() {
         }
     });
 
-    let rendered = render_json_schema_to_typescript(&schema);
-    assert!(rendered.contains("clauses?: Array<{ query?: string | { clauses?: Array<{"));
-    assert!(rendered.contains("query?: string | { clauses?: Array<unknown>; };"));
+    assert_eq!(
+        render_json_schema_to_typescript(&schema, "find", &mut BTreeSet::new()),
+        Rendered {
+            types: vec![
+                "type FindQuery = string | { clauses?: Array<FindBooleanClauseV1>; };".to_string(),
+                "type FindBooleanClauseV1 = { query?: FindQuery; };".to_string(),
+            ],
+            body: "{ clauses?: Array<FindBooleanClauseV1>; }".to_string(),
+        }
+    );
 }
 
 #[test]
 fn renders_ref_siblings_uri_fragments_and_all_of_precedence() {
     assert_eq!(
-        render_json_schema_to_typescript(&json!({
+        body(&json!({
             "$ref": "#/$defs/Label",
             "enum": ["A"],
             "$defs": { "Label": { "type": "string" } }
         })),
-        r#"(string) & ("A")"#
+        r#"(Label) & ("A")"#
     );
     assert_eq!(
-        render_json_schema_to_typescript(&json!({
+        render(&json!({
             "$ref": "#/$defs/Foo%20Bar",
-            "$defs": { "Foo Bar": { "type": "string" } }
+            "$defs": { "Foo Bar": { "type": "string", "description": "A name." } }
         })),
-        "string"
+        Rendered {
+            types: vec!["// A name.\ntype FooBar = string;".to_string()],
+            body: "FooBar".to_string(),
+        }
     );
     assert_eq!(
-        render_json_schema_to_typescript(&json!({
+        body(&json!({
             "allOf": [
                 { "$ref": "#/$defs/Choice" },
                 { "type": "object", "properties": { "value": { "type": "string" } } }
@@ -70,7 +88,35 @@ fn renders_ref_siblings_uri_fragments_and_all_of_precedence() {
                 "Choice": { "oneOf": [{ "type": "string" }, { "type": "number" }] }
             }
         })),
-        "(string | number) & { value?: string; }"
+        "Choice & { value?: string; }"
+    );
+}
+
+#[test]
+fn renders_an_objects_properties_beside_its_combinators() {
+    assert_eq!(
+        body(&json!({
+            "type": "object",
+            "properties": { "operator": { "enum": ["in", "exists"] }, "value": {} },
+            "required": ["operator"],
+            "allOf": [
+                { "if": { "properties": { "operator": { "const": "in" } } },
+                  "then": { "required": ["value"] } }
+            ]
+        })),
+        r#"{ operator: "in" | "exists"; value?: unknown; }"#
+    );
+    assert_eq!(
+        body(&json!({
+            "type": "object",
+            "properties": { "id": { "type": "string" } },
+            "oneOf": [{ "required": ["id"] }, { "properties": { "name": { "type": "string" } } }]
+        })),
+        "{ id?: string; } & ({ [key: string]: unknown; } | { name?: string; })"
+    );
+    assert_eq!(
+        body(&json!({ "type": "string", "oneOf": [{ "format": "date" }, { "format": "uuid" }] })),
+        "string"
     );
 }
 
@@ -95,65 +141,18 @@ fn leaves_local_refs_under_nested_schema_resources_unresolved() {
         }
     });
 
-    assert_eq!(
-        render_json_schema_to_typescript(&schema),
-        "{ nested?: { value?: unknown; }; }"
-    );
+    assert_eq!(body(&schema), "{ nested?: { value?: unknown; }; }");
 }
 
 #[test]
-fn bounds_expansions_without_charging_dangling_refs() {
-    let mut properties = (0..MAX_TOTAL_LOCAL_REF_EXPANSIONS)
-        .map(|index| {
-            (
-                format!("a_missing_{index}"),
-                json!({ "$ref": format!("#/$defs/Missing{index}") }),
-            )
-        })
-        .collect::<serde_json::Map<_, _>>();
-    properties.insert("z_valid".to_string(), json!({ "$ref": "#/$defs/Valid" }));
-    let schema = json!({
+fn declares_a_repeated_ref_once_and_leaves_dangling_refs_unknown() {
+    let rendered = render(&json!({
         "type": "object",
-        "properties": properties,
-        "$defs": { "Valid": { "type": "string" } }
-    });
-
-    let rendered = render_json_schema_to_typescript(&schema);
-    assert!(rendered.contains("z_valid?: string;"));
-
-    let properties = (0..MAX_TOTAL_LOCAL_REF_EXPANSIONS + 2)
-        .map(|index| {
-            (
-                format!("property_{index}"),
-                json!({ "$ref": "#/$defs/Item" }),
-            )
-        })
-        .collect::<serde_json::Map<_, _>>();
-    let rendered = render_json_schema_to_typescript(&json!({
-        "type": "object",
-        "properties": properties,
-        "$defs": { "Item": { "type": "string" } }
-    }));
-    assert_eq!(
-        rendered.matches("string").count(),
-        MAX_TOTAL_LOCAL_REF_EXPANSIONS
-    );
-    assert_eq!(rendered.matches("unknown").count(), 2);
-}
-
-#[test]
-fn repeated_large_ref_expansions_exhaust_render_work_budget() {
-    let properties = (0..MAX_TOTAL_LOCAL_REF_EXPANSIONS)
-        .map(|index| {
-            (
-                format!("property_{index}"),
-                json!({ "$ref": "#/$defs/Item" }),
-            )
-        })
-        .collect::<serde_json::Map<_, _>>();
-    let schema = json!({
-        "type": "object",
-        "properties": properties,
+        "properties": {
+            "a": { "$ref": "#/$defs/Item" },
+            "b": { "$ref": "#/$defs/Item" },
+            "c": { "$ref": "#/$defs/Missing" }
+        },
         "$defs": {
             "Item": {
                 "type": "object",
@@ -165,11 +164,21 @@ fn repeated_large_ref_expansions_exhaust_render_work_budget() {
                 }
             }
         }
-    });
+    }));
+    assert_eq!(rendered.types.len(), 1);
+    assert_eq!(rendered.body, "{ a?: Item; b?: Item; c?: unknown; }");
+}
 
-    let mut renderer = JsonSchemaTypeRenderer::new(&schema, DEFAULT_INPUT_SCHEMA_MAX_BYTES);
-    assert_eq!(renderer.render(&schema), "unknown");
-    assert!(renderer.render_work_budget_exhausted);
+#[test]
+fn names_stay_unique_across_schemas() {
+    let schema = json!({ "$ref": "#/$defs/Item", "$defs": { "Item": { "type": "string" } } });
+    let mut taken = BTreeSet::new();
+    let first = render_json_schema_to_typescript(&schema, "tool", &mut taken);
+    let second = render_json_schema_to_typescript(&schema, "tool", &mut taken);
+    assert_eq!(
+        (first.body.as_str(), second.body.as_str()),
+        ("ToolItem", "ToolItem2")
+    );
 }
 
 #[test]
@@ -198,5 +207,5 @@ fn rendered_schema_has_a_hard_size_cap() {
         }
     });
 
-    assert_eq!(render_json_schema_to_typescript(&schema), "unknown");
+    assert_eq!(body(&schema), "unknown");
 }

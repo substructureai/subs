@@ -173,7 +173,7 @@ pub fn overflow(state: &SessionState, id: &str) -> Option<ContextLimited> {
     }
     let effect = state.effect(EffectKind::LlmCall, id)?;
     let call = effect.llm()?;
-    let request = call.spec.to_request(call.prompt.clone());
+    let request = call.sent_request();
     let config = state.at_head().resolve_agent_for();
     Some(ContextLimited {
         reason: ContextReason::Overflow,

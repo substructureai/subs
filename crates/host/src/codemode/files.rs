@@ -123,7 +123,7 @@ impl Read for Source {
 
 /// How a stream reads its file.
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
-#[serde(tag = "format", rename_all = "snake_case")]
+#[serde(tag = "format", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Format {
     Lines {},
     Jsonl {},
@@ -517,9 +517,10 @@ fn read_full(source: &mut Source, buf: &mut [u8]) -> io::Result<usize> {
 }
 
 fn csv_error(e: csv::Error) -> io::Error {
+    let message = format!("The CSV could not be read: {e}.");
     match e.into_kind() {
         csv::ErrorKind::Io(e) => e,
-        other => io::Error::other(format!("The CSV could not be read: {other:?}")),
+        _ => io::Error::other(message),
     }
 }
 
@@ -566,6 +567,18 @@ mod tests {
             out.extend(serde_json::from_str::<Vec<serde_json::Value>>(&batch).unwrap());
         }
         out
+    }
+
+    #[test]
+    fn a_stream_with_an_unknown_option_names_the_options() {
+        let mut files = files(&[("a.csv", "x\n1\n")], Limits::default());
+        let error = files
+            .open_with("a.csv", r#"{"format":"csv","delimeter":";"}"#)
+            .unwrap_err();
+        assert!(
+            error.contains("expected `header` or `delimiter`"),
+            "{error}"
+        );
     }
 
     #[test]

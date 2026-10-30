@@ -161,9 +161,15 @@ fn in_script(state: &SessionState, id: &str) -> bool {
     state.tool_call(id).is_some_and(|t| t.script.is_some())
 }
 
-/// A call its script made settles without the model hearing of it.
+/// A call its script made settles without the model hearing of it. A skill
+/// a script loads answers with the declarations of the tools it names, so
+/// the script can log them with its instructions.
 fn finished(state: &Cx<'_>, id: &str, name: String, result: StoredResult) -> Vec<EventPayload> {
     if in_script(state, id) {
+        let result = match name == SKILL && !result.is_error {
+            true => with_skill_tools(state, id, result),
+            false => result,
+        };
         return vec![EventPayload::ToolCallCompleted(ToolCallCompleted {
             id: id.to_string(),
             name,
@@ -171,31 +177,33 @@ fn finished(state: &Cx<'_>, id: &str, name: String, result: StoredResult) -> Vec
         })];
     }
     let mut events = void_script(state, id);
-    let result = with_skills(state, id, result);
     events.extend(complete(state.ids(), id.to_string(), name, result));
     events
 }
 
-/// A `run_code` result, with the instructions of each skill its script
-/// loaded: they are for the model, whatever the script did with them.
-fn with_skills(state: &SessionState, id: &str, mut result: StoredResult) -> StoredResult {
-    for call in state.script_calls(id) {
-        let Some(tc) = call.tool().filter(|t| t.name == SKILL && !t.is_error) else {
-            continue;
-        };
-        let Some(text) = &tc.result else { continue };
-        let quoted = serde_json::to_string(text).unwrap_or_default();
-        let quoted = quoted.trim_matches('"');
-        let said = result.content.iter().any(|c| {
-            matches!(c, crate::protocol::StoredContent::Text { text: t }
-                if t.contains(text.as_str()) || t.contains(quoted))
-        });
-        if said {
-            continue;
-        }
-        let named = argument(&tc.arguments, "name").unwrap_or_default();
+fn with_skill_tools(state: &SessionState, id: &str, mut result: StoredResult) -> StoredResult {
+    let Some(tc) = state.tool_call(id) else {
+        return result;
+    };
+    let anchor = state
+        .effect(EffectKind::ToolCall, id)
+        .and_then(|e| e.anchor.clone());
+    let named = argument(&tc.arguments, "name").unwrap_or_default();
+    let tools = state.at(anchor.as_deref()).skill_tools(&named);
+    let language = tc
+        .script
+        .as_ref()
+        .and_then(|s| state.tool_call(&s.parent))
+        .map(|parent| parent.script_language)
+        .unwrap_or_default();
+    let budget = (codemode::Limits::default().output)
+        .saturating_sub(result.as_text().len() + codemode::MARGIN);
+    let tools: Vec<&crate::protocol::LlmTool> = tools.iter().collect();
+    if let Some(block) = codemode::declarations(language, &tools, budget) {
         result.content.push(crate::protocol::StoredContent::Text {
-            text: format!("[skill {named}]\n{text}"),
+            text: format!(
+                "\nTools this skill uses. You can call them in your next script:\n{block}"
+            ),
         });
     }
     result
@@ -333,11 +341,20 @@ fn scripted(
     let spawns = tools
         .iter()
         .any(|t| t.name == name && t.kind == ConnectorToolKind::Subagent);
-    let target = target.or_else(|| match reach.refusal(&name) {
+    let searchable = match reach {
+        codemode::Reach::Unknown => here.script_searchable_tools(),
+        _ => Vec::new(),
+    };
+    let near: Vec<&str> = crate::connectors::filter::find(&searchable, &name)
+        .into_iter()
+        .take(3)
+        .map(|t| t.name.as_str())
+        .collect();
+    let target = target.or_else(|| match reach.refusal(&name, &near) {
         Some(reason) => Some(ConnectorTarget::Refused { reason }),
         None if reach == codemode::Reach::Search => Some(ConnectorTarget::ScriptSearch),
         None if spawns => Some(ConnectorTarget::Refused {
-            reason: format!("`{name}` starts a subagent. Answer it with `subagent.spawn`."),
+            reason: format!("The worker did not start the subagent of `{name}`."),
         }),
         None => None,
     });

@@ -20,6 +20,7 @@ pub type Contributor = fn(SessionStateAtNode, &str) -> Vec<PromptContext>;
 const CONTRIBUTORS: &[Contributor] = &[
     plugin_catalog,
     skill_catalog,
+    code_catalog,
     announce_servers,
     announce_unavailable,
 ];
@@ -94,6 +95,7 @@ fn plugin_catalog(at: SessionStateAtNode, call_id: &str) -> Vec<PromptContext> {
     };
     let said = at.context_ids_on_path(call_id);
     let searched = config.searches_skills();
+    let code = config.codemode.is_some();
     config
         .plugins
         .iter()
@@ -108,6 +110,10 @@ fn plugin_catalog(at: SessionStateAtNode, call_id: &str) -> Vec<PromptContext> {
                     .map(|s| SkillListing {
                         name: format!("{}:{}", plugin.id, s.name),
                         description: s.description.clone(),
+                        tools: match code {
+                            true => s.tools.clone(),
+                            false => Vec::new(),
+                        },
                     })
                     .collect(),
             };
@@ -116,8 +122,8 @@ fn plugin_catalog(at: SessionStateAtNode, call_id: &str) -> Vec<PromptContext> {
                 about: (!plugin.description.is_empty()).then_some(&plugin.description),
                 skills,
                 usage: match searched {
-                    true => crate::copy::SEARCHED_SKILLS,
-                    false => crate::copy::PLUGIN_USAGE,
+                    true => crate::copy::searched_skills(code),
+                    false => crate::copy::plugin_usage(code),
                 },
             })
             .unwrap_or_default();
@@ -126,6 +132,36 @@ fn plugin_catalog(at: SessionStateAtNode, call_id: &str) -> Vec<PromptContext> {
                 placement: Placement::System,
                 content,
             }
+        })
+        .collect()
+}
+
+/// In code mode, when the agent searches its skills, one entry for each
+/// skill, with the tools it names. A script finds other tools with
+/// `tool_search`.
+fn code_catalog(at: SessionStateAtNode, call_id: &str) -> Vec<PromptContext> {
+    let Some(config) = at.resolve_agent_for() else {
+        return Vec::new();
+    };
+    if config.codemode.is_none() || !config.searches_skills() {
+        return Vec::new();
+    }
+    let said = at.context_ids_on_path(call_id);
+    config
+        .named_skills()
+        .iter()
+        .map(|s| (format!("codemode.skill.{}", s.name), s))
+        .filter(|(id, _)| !said.contains(id))
+        .map(|(id, s)| PromptContext {
+            id,
+            placement: Placement::System,
+            content: serde_json::to_string(&OwnSkillListing {
+                skill: &s.name,
+                about: s.description,
+                tools: s.tools,
+                usage: crate::copy::plugin_usage(true),
+            })
+            .unwrap_or_default(),
         })
         .collect()
 }
@@ -151,7 +187,11 @@ fn skill_catalog(at: SessionStateAtNode, call_id: &str) -> Vec<PromptContext> {
             content: serde_json::to_string(&OwnSkillListing {
                 skill: &skill.name,
                 about: &skill.description,
-                usage: crate::copy::PLUGIN_USAGE,
+                tools: match config.codemode.is_some() {
+                    true => &skill.tools,
+                    false => &[],
+                },
+                usage: crate::copy::plugin_usage(config.codemode.is_some()),
             })
             .unwrap_or_default(),
         })
@@ -173,6 +213,9 @@ struct OwnSkillListing<'a> {
     skill: &'a str,
     #[serde(skip_serializing_if = "str::is_empty")]
     about: &'a str,
+    /// The tools it names, in code mode.
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    tools: &'a [String],
     usage: &'static str,
 }
 
@@ -181,8 +224,13 @@ struct SkillListing {
     name: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     description: String,
+    /// The tools it names, in code mode.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<String>,
 }
 
+/// Places each context `owed` that `applied` does not hold yet. Contexts
+/// placed at the same spot share one message, a line each.
 pub fn merge(
     prompt: &mut Vec<Message>,
     applied: &mut Vec<String>,
@@ -190,13 +238,25 @@ pub fn merge(
     system_open: bool,
     owed: Vec<PromptContext>,
 ) {
+    let mut groups: Vec<(Placement, Vec<PromptContext>)> = Vec::new();
     for c in owed {
-        if applied.contains(&c.id) {
+        if applied.contains(&c.id) || groups.iter().any(|(_, g)| g.iter().any(|o| o.id == c.id)) {
             continue;
         }
         let placement = resolve(c.placement, prompt, system_open);
-        place(prompt, call_id, &c, placement);
-        applied.push(c.id);
+        match groups.iter_mut().find(|(p, _)| *p == placement) {
+            Some((_, group)) => group.push(c),
+            None => groups.push((placement, vec![c])),
+        }
+    }
+    for (placement, group) in groups {
+        let content = group
+            .iter()
+            .map(|c| c.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        place(prompt, call_id, &group[0].id, &content, placement);
+        applied.extend(group.into_iter().map(|c| c.id));
     }
 }
 
@@ -215,14 +275,14 @@ fn resolve(wanted: Placement, prompt: &[Message], system_open: bool) -> Placemen
     }
 }
 
-fn place(prompt: &mut Vec<Message>, call_id: &str, c: &PromptContext, placement: Placement) {
+fn place(prompt: &mut Vec<Message>, call_id: &str, id: &str, content: &str, placement: Placement) {
     match placement {
         Placement::System => {
             let at = prompt
                 .iter()
                 .position(|m| m.role != Role::System)
                 .unwrap_or(prompt.len());
-            prompt.insert(at, message(call_id, &c.id, Role::System, &c.content));
+            prompt.insert(at, message(call_id, id, Role::System, content));
         }
         Placement::Inline => {
             let Some(last) = prompt.last_mut() else {
@@ -231,15 +291,15 @@ fn place(prompt: &mut Vec<Message>, call_id: &str, c: &PromptContext, placement:
             last.content = Some(match last.content.take() {
                 Some(Content::Parts(mut parts)) => {
                     parts.push(crate::protocol::StoredContent::Text {
-                        text: c.content.clone(),
+                        text: content.to_string(),
                     });
                     Content::Parts(parts)
                 }
-                Some(Content::Text(head)) => Content::Text(format!("{head}\n\n{}", c.content)),
-                None => Content::Text(format!("\n\n{}", c.content)),
+                Some(Content::Text(head)) => Content::Text(format!("{head}\n\n{content}")),
+                None => Content::Text(format!("\n\n{content}")),
             });
         }
-        Placement::Own => prompt.push(message(call_id, &c.id, Role::User, &c.content)),
+        Placement::Own => prompt.push(message(call_id, id, Role::User, content)),
     }
 }
 
@@ -607,12 +667,7 @@ mod tests {
             name: None,
             reasoning: None,
         }];
-        let c = PromptContext {
-            id: "ctx1".into(),
-            placement: Placement::Inline,
-            content: "server up".into(),
-        };
-        place(&mut prompt, "c1", &c, Placement::Inline);
+        place(&mut prompt, "c1", "ctx1", "server up", Placement::Inline);
         match prompt[0].content.as_ref().unwrap() {
             Content::Parts(parts) => {
                 assert_eq!(parts.len(), 3);
@@ -621,5 +676,28 @@ mod tests {
             }
             _ => panic!("expected parts"),
         }
+    }
+
+    #[test]
+    fn contexts_placed_together_share_one_message() {
+        let ctx = |id: &str| PromptContext {
+            id: id.into(),
+            placement: Placement::System,
+            content: format!("{{\"about\":\"{id}\"}}"),
+        };
+        let mut prompt = Vec::new();
+        let mut applied = vec!["told".to_string()];
+        merge(
+            &mut prompt,
+            &mut applied,
+            "c1",
+            true,
+            vec![ctx("a"), ctx("told"), ctx("b"), ctx("a")],
+        );
+        assert_eq!(prompt.len(), 1);
+        assert_eq!(prompt[0].id, "c1-ctx-a");
+        assert!(matches!(&prompt[0].content,
+            Some(Content::Text(t)) if t == "{\"about\":\"a\"}\n{\"about\":\"b\"}"));
+        assert_eq!(applied, ["told", "a", "b"]);
     }
 }

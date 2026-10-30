@@ -108,9 +108,17 @@ async fn a_sandbox_process_is_never_root() {
 async fn scripts_run_in_sandbox_processes() {
     let runner = runner();
     let step = runner.step(script("return [1 + 1, typeof fetch];")).await;
-    assert_eq!(step, Ok(Step::Done(r#"{"result":[2,"undefined"]}"#.into())));
+    assert_eq!(
+        step,
+        Ok(Step::Done(
+            "Script finished.\nReturned:\n[2,\"undefined\"]".into()
+        ))
+    );
     let step = runner.step(script("return 'again';")).await;
-    assert_eq!(step, Ok(Step::Done(r#"{"result":"again"}"#.into())));
+    assert_eq!(
+        step,
+        Ok(Step::Done("Script finished.\nReturned:\nagain".into()))
+    );
 }
 
 #[tokio::test]
@@ -124,7 +132,13 @@ async fn scripts_run_at_once() {
         .collect();
     for (i, run) in runs.into_iter().enumerate() {
         let step = run.await.unwrap();
-        assert_eq!(step, Ok(Step::Done(format!(r#"{{"result":{}}}"#, i * 2))));
+        assert_eq!(
+            step,
+            Ok(Step::Done(format!(
+                "Script finished.\nReturned:\n{}",
+                i * 2
+            )))
+        );
     }
 }
 
@@ -137,7 +151,10 @@ async fn a_script_past_its_deadline_fails_and_the_next_runs() {
         "{step:?}"
     );
     let step = runner.step(script("return 'next';")).await;
-    assert_eq!(step, Ok(Step::Done(r#"{"result":"next"}"#.into())));
+    assert_eq!(
+        step,
+        Ok(Step::Done("Script finished.\nReturned:\nnext".into()))
+    );
 }
 
 #[tokio::test]
@@ -236,7 +253,7 @@ mod files {
         let total: u64 = (0..20_000).sum();
         assert_eq!(
             ran.step,
-            Step::Done(format!(r#"{{"result":[20000,{total}]}}"#))
+            Step::Done(format!("Script finished.\nReturned:\n[20000,{total}]"))
         );
         assert_eq!(ran.stats.file_bytes, csv.len() as u64);
     }
@@ -282,7 +299,9 @@ mod files {
         let ran = runner().run(s, files).await.unwrap();
         assert_eq!(
             ran.step,
-            Step::Done(r#"{"result":[["runbooks:respond"],"Page the lead"]}"#.into()),
+            Step::Done(
+                "Script finished.\nReturned:\n[[\"runbooks:respond\"],\"Page the lead\"]".into()
+            ),
             "a skill's file is listed with its skill, and read by id"
         );
     }

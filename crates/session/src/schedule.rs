@@ -346,6 +346,7 @@ mod tests {
             EffectPayload::LlmCall(LlmCallState {
                 defer_tools_strategy: Default::default(),
                 context_ids: Vec::new(),
+                sent_tools: None,
                 format: None,
                 llm: "claude".to_string(),
                 prompt: vec![],

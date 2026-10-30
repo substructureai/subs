@@ -120,8 +120,12 @@ impl AgentConfig {
     }
 
     /// Each tool a skill holds back while none of its skills is in `loaded`,
-    /// with the skills that would bring it.
+    /// with the skills that would bring it. In code mode a skill holds back
+    /// nothing: loading it declares its tools.
     pub fn locked_tools(&self, loaded: &HashSet<String>) -> BTreeMap<String, Vec<String>> {
+        if self.codemode.is_some() {
+            return BTreeMap::new();
+        }
         let skills = self.named_skills();
         let unlocked: HashSet<&str> = skills
             .iter()

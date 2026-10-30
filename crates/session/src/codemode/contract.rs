@@ -33,10 +33,9 @@ pub struct Limits {
     pub results: usize,
     /// Bytes of arguments over the whole script.
     pub arguments: usize,
-    /// Bytes of the value it returns.
-    pub returned: usize,
-    /// Bytes of output the script prints.
-    pub logs: usize,
+    /// Bytes of text a run sends back: what it prints and returns. Past it,
+    /// the middle is cut.
+    pub output: usize,
     /// Bytes of heap in one run.
     pub memory: usize,
     /// Milliseconds of CPU in one run.
@@ -63,8 +62,7 @@ impl Default for Limits {
             calls: 1_000,
             results: 8 << 20,
             arguments: 32 << 20,
-            returned: 64 << 10,
-            logs: 16 << 10,
+            output: 24 << 10,
             memory: 96 << 20,
             compute_ms: 500,
             total_compute_ms: 10_000,
@@ -221,8 +219,7 @@ pub enum Limit {
     Calls,
     Arguments,
     Results,
-    Returned,
-    Logs,
+    Output,
     Compute,
     Memory,
     Stack,

@@ -39,6 +39,7 @@ const LEASE: Duration = Duration::from_secs(2);
 #[derive(Default)]
 struct Seen {
     description: Option<String>,
+    prompt: Option<String>,
     result: Option<String>,
 }
 
@@ -69,7 +70,11 @@ impl LlmCallable for Model {
                     .flatten()
                     .find(|t| t.name == "run_code")
                     .map(|t| t.description.clone());
-                self.seen.lock().unwrap().description = description;
+                let prompt = serde_json::to_string(&request.messages).unwrap_or_default();
+                let mut seen = self.seen.lock().unwrap();
+                seen.description = description;
+                seen.prompt = Some(prompt);
+                drop(seen);
                 vec![ToolCall {
                     id: "tc-1".to_string(),
                     call_type: "function".to_string(),
@@ -379,7 +384,11 @@ async fn a_script_calls_tools_and_only_its_result_reaches_the_model() {
 
     let seen = seen.lock().unwrap();
     let description = seen.description.as_deref().expect("run_code was offered");
-    assert!(description.contains("declare const tools"), "{description}");
+    let prompt = seen.prompt.as_deref().expect("the model was prompted");
+    assert!(
+        !prompt.contains("weather"),
+        "a script finds deferred tools with tool_search: {prompt}"
+    );
     assert!(
         description.contains("tools.tool_search({ query })"),
         "{description}"
@@ -497,7 +506,7 @@ async fn a_script_survives_the_engine_restarting_mid_run() {
         .result
         .clone()
         .expect("the model heard the result");
-    assert!(result.contains(r#"\"result\":7"#), "{result}");
+    assert!(result.contains(r"Returned:\n7"), "{result}");
     let calls = worker.calls();
     let first_call = calls.iter().filter(|c| c.contains(r#""a":1"#)).count();
     let second_call = calls.iter().filter(|c| c.contains(r#""a":3"#)).count();
@@ -535,7 +544,7 @@ async fn a_step_the_runner_could_not_take_is_tried_again() {
         .result
         .clone()
         .expect("the model heard the result");
-    assert!(result.contains(r#"\"result\":42"#), "{result}");
+    assert!(result.contains(r"Returned:\n42"), "{result}");
 }
 
 #[tokio::test]

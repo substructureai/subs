@@ -87,6 +87,9 @@ The request changes when a skill unlocks a tool that is not deferred. To keep
 the cached prefix, defer the tools that skills hold back. See
 [Deferred tools](./65-deferred-tools.md).
 
+In [code mode](./67-code-mode.md) a skill holds back nothing. Loading it answers
+with the declarations of its `tools`.
+
 ## Find skills by search
 
 The system prompt lists each skill by default: its name and its description.

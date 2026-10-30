@@ -5,10 +5,23 @@ pub const NOTHING_MATCHED: &str =
 
 pub const CALL_NOT_ROUTED: &str = "the call could not be routed";
 
-pub const PLUGIN_USAGE: &str = "load a skill with the `skill` tool";
+/// How the model loads a skill, in `run_code` when `code`.
+pub fn plugin_usage(code: bool) -> &'static str {
+    match code {
+        false => "load a skill with the `skill` tool",
+        true => "load a skill in `run_code` with `await tools.skill({ name })`",
+    }
+}
 
-pub const SEARCHED_SKILLS: &str =
-    "find its skills with `tool_search`, and load one with the `skill` tool";
+pub fn searched_skills(code: bool) -> &'static str {
+    match code {
+        false => "find its skills with `tool_search`, and load one with the `skill` tool",
+        true => {
+            "find its skills in `run_code` with `await tools.tool_search({ query })`, and load \
+             one with `await tools.skill({ name })`"
+        }
+    }
+}
 
 pub const CALL_TOOL_IN_CALL: &str =
     "`call_tool` can't call itself. Name the tool you want in `name`, beside its `arguments`.";

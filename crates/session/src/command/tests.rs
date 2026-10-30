@@ -7943,8 +7943,7 @@ fn connector_tools_reach_the_model_and_route_to_the_engine() {
         .state
         .llm_call("call-1")
         .unwrap()
-        .spec
-        .tools
+        .sent_tools
         .clone()
         .expect("tools offered")
         .into_iter()
@@ -8198,9 +8197,8 @@ fn a_searched_connector_offers_two_tools_however_many_it_has() {
             .any(|e| matches!(e, EventPayload::LlmCallDispatched(_))),
         "the call dispatches; got {events:?}"
     );
-    let spec = agg.state.llm_call("call-1").unwrap().spec.clone();
-    let carried: Vec<String> = spec
-        .tools
+    let sent = agg.state.llm_call("call-1").unwrap().sent_tools.clone();
+    let carried: Vec<String> = sent
         .as_ref()
         .expect("tools offered")
         .iter()
@@ -8213,7 +8211,7 @@ fn a_searched_connector_offers_two_tools_however_many_it_has() {
         "four tools cost the request two definitions, and thirty would cost the same two"
     );
     assert_eq!(
-        spec.tools.as_ref().unwrap().len(),
+        sent.as_ref().unwrap().len(),
         5,
         "the engine still holds each one; only the request leaves them out"
     );
@@ -9209,8 +9207,7 @@ fn a_call_beside_a_new_connector_waits_for_the_fetch_and_gets_its_tools() {
         .state
         .llm_call("call-1")
         .unwrap()
-        .spec
-        .tools
+        .sent_tools
         .clone()
         .unwrap_or_default()
         .into_iter()
@@ -9255,7 +9252,7 @@ fn a_dead_connection_dispatches_the_call_without_its_tools() {
         "a settled failure opens the gate rather than parking forever; got {events:?}"
     );
     assert!(
-        agg.state.llm_call("call-1").unwrap().spec.tools.is_none(),
+        agg.state.llm_call("call-1").unwrap().sent_tools.is_none(),
         "no tools to offer"
     );
 }
@@ -12802,12 +12799,33 @@ fn dispatched_tools(agg: &mut Session, call_id: &str) -> Vec<String> {
         &system(),
     );
     let call = agg.state.llm_call(call_id).expect("the call");
-    call.spec
-        .tools
+    call.sent_tools
         .iter()
         .flatten()
         .map(|t| t.name.clone())
         .collect()
+}
+
+fn finish_llm(agg: &mut Session, call_id: &str) {
+    dispatch(
+        agg,
+        CommandPayload::settle(
+            EffectKind::LlmCall,
+            call_id.to_string(),
+            Some(0),
+            Outcome::Llm(Box::new(LlmResponse {
+                model: "test-model".to_string(),
+                content: Some("done".to_string()),
+                tool_calls: vec![],
+                finish_reason: Some("stop".to_string()),
+                usage: None,
+                cost: None,
+                images: vec![],
+                reasoning: None,
+            })),
+        ),
+        &system(),
+    );
 }
 
 fn load_worker_skill(agg: &mut Session, id: &str, named: &str) {
@@ -12848,6 +12866,13 @@ fn a_skills_tools_wait_until_it_loads() {
         !before.contains(&"find_bookings".to_string()),
         "the skill's tool stays out of the request: {before:?}"
     );
+    assert!(
+        agg.state
+            .llm_call("call-1")
+            .and_then(|c| c.spec.tools.as_ref())
+            .is_some_and(|t| t.iter().any(|t| t.name == "find_bookings")),
+        "the call still asks for it, so the next call can send it"
+    );
 
     call(&mut agg, "tc-0", "find_bookings", "{}");
     let refused = agg
@@ -12866,6 +12891,13 @@ fn a_skills_tools_wait_until_it_loads() {
         agg.state.at_head().locked_tools().is_empty(),
         "loading the skill brings its tools"
     );
+    finish_llm(&mut agg, "call-1");
+    while let Some(decision) = agg.open_work().into_iter().find_map(|w| match w {
+        crate::work::Work::AskWorker { request, .. } => Some(request.decision_id),
+        _ => None,
+    }) {
+        submit_decision(&mut agg, decision, vec![], vec![]);
+    }
     let after = dispatched_tools(&mut agg, "call-2");
     assert!(
         after.contains(&"find_bookings".to_string()),
@@ -13215,8 +13247,7 @@ fn tools_a_script_can_call_reach_the_model_only_through_run_code() {
     assert_eq!(tools, ["run_code"], "code mode is all or nothing");
     let call = agg.state.llm_call("llm-1").expect("the call");
     let run_code = call
-        .spec
-        .tools
+        .sent_tools
         .iter()
         .flatten()
         .find(|t| t.name == "run_code")
@@ -13242,14 +13273,27 @@ fn a_script_searches_its_tools_without_tool_search() {
     let script = script_work(&agg).expect("the search is answered at once");
     let found = &script.calls[0];
     assert!(found.ok, "{found:?}");
-    let answer: serde_json::Value = serde_json::from_str(&found.output).unwrap();
-    assert_eq!(answer["tools"][0]["name"], "weather", "{answer}");
-    assert!(answer["tools"][0]["declaration"]
-        .as_str()
-        .is_some_and(|d| d.starts_with("weather(args:")));
     assert!(
-        !found.output.contains("\"ask\""),
-        "client tools are not found"
+        found.output.starts_with("1 match.\n\n```ts\n") && found.output.contains("\nweather(args:"),
+        "{}",
+        found.output
+    );
+}
+
+#[test]
+fn a_script_that_calls_no_such_tool_is_told_the_closest() {
+    let mut agg = coding_session();
+    run_code(&mut agg, "...");
+    script_step(&mut agg, 0, &[("get_weather", "{}")]);
+    let script = script_work(&agg).expect("the refusal is answered at once");
+    let refused = &script.calls[0];
+    assert!(!refused.ok);
+    assert!(
+        refused
+            .output
+            .starts_with("There is no tool named `get_weather`. The closest are: `weather`."),
+        "{}",
+        refused.output
     );
 }
 
@@ -13597,15 +13641,14 @@ fn a_script_may_read_the_files_on_its_branch() {
 }
 
 #[test]
-fn a_script_loads_a_skill_and_the_model_reads_its_instructions() {
+fn a_skill_a_script_loads_answers_with_the_tools_it_names() {
     let mut config = skilled_config(crate::protocol::SkillSource::Worker);
     config.codemode = Some(crate::codemode::Language::Javascript);
     let mut agg = create_session_with_config("sess-1", "tenant-a", "user-1", Some(config));
-    assert!(agg
-        .state
-        .at_head()
-        .locked_tools()
-        .contains_key("find_bookings"));
+    assert!(
+        agg.state.at_head().locked_tools().is_empty(),
+        "in code mode a skill holds back nothing"
+    );
     run_code(&mut agg, "...");
     let events = script_step(&mut agg, 0, &[("skill", r#"{"name":"visits"}"#)]);
     let skill = events
@@ -13616,65 +13659,138 @@ fn a_script_loads_a_skill_and_the_model_reads_its_instructions() {
         })
         .expect("the script loads the skill");
     settle_tool(&mut agg, &skill, "Bookings are by day.");
+    let script = script_work(&agg).expect("the script runs again");
+    let answer = &script.calls[0].output;
     assert!(
-        agg.state.at_head().locked_tools().is_empty(),
-        "the skill's tools unlock"
+        answer.starts_with(
+            "Bookings are by day.\n\nTools this skill uses. You can call them in your next \
+             script:\n```ts\n"
+        ) && answer.contains("\nfind_bookings(args: "),
+        "the script gets the instructions and the declarations: {answer}"
     );
-    let events = settle_tool(&mut agg, "tc-1", r#"{"result":"loaded"}"#);
-    let texts: Vec<String> = events
-        .iter()
-        .find_map(|e| match e {
-            EventPayload::ToolCallCompleted(c) if c.id == "tc-1" => Some(
-                c.result
-                    .content
-                    .iter()
-                    .filter_map(|c| match c {
-                        crate::protocol::StoredContent::Text { text } => Some(text.clone()),
-                        _ => None,
-                    })
-                    .collect(),
-            ),
-            _ => None,
-        })
-        .expect("run_code completes");
-    assert_eq!(
-        texts,
-        [
-            r#"{"result":"loaded"}"#.to_string(),
-            "[skill visits]\nBookings are by day.".to_string()
-        ],
-        "the model reads the instructions though the script did not return them"
-    );
-}
-
-#[test]
-fn skill_instructions_the_script_printed_are_not_added_again() {
-    let mut config = skilled_config(crate::protocol::SkillSource::Worker);
-    config.codemode = Some(crate::codemode::Language::Javascript);
-    let mut agg = create_session_with_config("sess-1", "tenant-a", "user-1", Some(config));
-    run_code(&mut agg, "...");
-    let events = script_step(&mut agg, 0, &[("skill", r#"{"name":"visits"}"#)]);
-    let skill = events
-        .iter()
-        .find_map(|e| match e {
-            EventPayload::ToolCallRequested(r) if r.name == "skill" => Some(r.id.clone()),
-            _ => None,
-        })
-        .expect("the script loads the skill");
-    settle_tool(&mut agg, &skill, "Bookings are by day.\nAsk first.");
-    let events = settle_tool(
-        &mut agg,
-        "tc-1",
-        r#"{"logs":["Bookings are by day.\nAsk first."]}"#,
-    );
-    let blocks = events
+    let events = settle_tool(&mut agg, "tc-1", "Script finished.");
+    let content = events
         .iter()
         .find_map(|e| match e {
             EventPayload::ToolCallCompleted(c) if c.id == "tc-1" => Some(c.result.content.len()),
             _ => None,
         })
         .expect("run_code completes");
-    assert_eq!(blocks, 1, "the printed instructions are not repeated");
+    assert_eq!(content, 1, "the model reads only what the script returned");
+}
+
+#[test]
+fn code_mode_sends_the_same_tools_on_every_call() {
+    let mut config = skilled_config(crate::protocol::SkillSource::Worker);
+    config.codemode = Some(crate::codemode::Language::Javascript);
+    let mut agg = create_session_with_config("sess-1", "tenant-a", "user-1", Some(config));
+    dispatched_tools(&mut agg, "call-1");
+    let call = agg.state.llm_call("call-1").expect("the call");
+    let first = call.sent_tools.clone();
+    let asked = call.spec.tools.clone();
+    assert!(
+        asked.iter().flatten().any(|t| t.name == "find_bookings"),
+        "the call keeps the tools it asked for"
+    );
+    load_worker_skill(&mut agg, "tc-1", "visits");
+    finish_llm(&mut agg, "call-1");
+    while let Some(decision) = agg.open_work().into_iter().find_map(|w| match w {
+        crate::work::Work::AskWorker { request, .. } => Some(request.decision_id),
+        _ => None,
+    }) {
+        submit_decision(&mut agg, decision, vec![], vec![]);
+    }
+    dispatch(
+        &mut agg,
+        CommandPayload::RequestLlmCall {
+            llm: "claude".to_string(),
+            call_id: "call-2".to_string(),
+            request: LlmRequest {
+                tools: asked,
+                ..request_with(vec![])
+            },
+            stream: false,
+            retry: RetryPolicy::no_retry(),
+            handler: LlmHandler::Server,
+            format: None,
+        },
+        &system(),
+    );
+    let second = agg
+        .state
+        .llm_call("call-2")
+        .expect("the call")
+        .sent_tools
+        .clone();
+    assert!(second.is_some(), "the next call dispatches");
+    assert_eq!(
+        serde_json::to_string(&first).unwrap(),
+        serde_json::to_string(&second).unwrap(),
+        "a skill that loads changes nothing the model is sent, so the cache holds"
+    );
+}
+
+#[test]
+fn code_mode_lists_each_skill_with_its_tools_once_in_the_conversation() {
+    let mut config = skilled_config(crate::protocol::SkillSource::Worker);
+    config.codemode = Some(crate::codemode::Language::Javascript);
+    config.defer_tools = Some(crate::protocol::DeferTools {
+        skills: crate::protocol::SkillListing::Search,
+        ..Default::default()
+    });
+    let mut agg = create_session_with_config("sess-1", "tenant-a", "user-1", Some(config));
+    let catalog = |agg: &Session, call: &str| -> Vec<String> {
+        agg.state
+            .llm_call(call)
+            .expect("the call")
+            .prompt
+            .iter()
+            .filter_map(|m| match &m.content {
+                Some(crate::protocol::Content::Text(t)) if t.contains("in `run_code`") => {
+                    Some(format!("{:?}: {t}", m.role))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    dispatched_tools(&mut agg, "call-1");
+    let first = catalog(&agg, "call-1");
+    assert_eq!(first.len(), 1, "{first:?}");
+    assert!(
+        first[0].starts_with("System: "),
+        "the first call lists them in the system prompt"
+    );
+    assert!(
+        first[0].contains(
+            r#"{"skill":"visits","about":"Who visited, and when","tools":["find_bookings"],"#
+        ),
+        "{}",
+        first[0]
+    );
+    assert!(
+        !first[0].contains("get_time"),
+        "a script finds the other tools with tool_search"
+    );
+    load_worker_skill(&mut agg, "tc-1", "visits");
+    finish_llm(&mut agg, "call-1");
+    while let Some(decision) = agg.open_work().into_iter().find_map(|w| match w {
+        crate::work::Work::AskWorker { request, .. } => Some(request.decision_id),
+        _ => None,
+    }) {
+        submit_decision(&mut agg, decision, vec![], vec![]);
+    }
+    dispatched_tools(&mut agg, "call-2");
+    assert!(
+        agg.state
+            .llm_call("call-2")
+            .and_then(|c| c.sent_tools.as_ref())
+            .is_some(),
+        "the next call dispatches"
+    );
+    assert!(
+        catalog(&agg, "call-2").is_empty(),
+        "what was told is not told again"
+    );
 }
 
 #[test]

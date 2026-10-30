@@ -64,7 +64,7 @@ pub fn declared_tool<'a>(
         .find(|m| m.tool_calls.iter().any(|c| c.id == tool_call_id));
     let tools = assistant
         .and_then(|m| llm_call(&m.id))
-        .and_then(|call| call.spec.tools.as_deref());
+        .and_then(|call| call.sent());
     match tools {
         None => DeclaredTool::Unknowable,
         Some(tools) => match tools.iter().find(|t| t.name == name) {
@@ -232,6 +232,7 @@ mod tests {
             EffectPayload::LlmCall(LlmCallState {
                 defer_tools_strategy: Default::default(),
                 context_ids: Vec::new(),
+                sent_tools: None,
                 format: None,
                 llm: "claude".to_string(),
                 prompt: vec![],

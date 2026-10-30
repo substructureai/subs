@@ -961,6 +961,7 @@ mod tests {
             EffectPayload::LlmCall(LlmCallState {
                 defer_tools_strategy: Default::default(),
                 context_ids: Vec::new(),
+                sent_tools: None,
                 format: None,
                 llm: "claude".to_string(),
                 prompt,
@@ -1333,6 +1334,48 @@ mod tests {
         assert_eq!(tool.tool_call_id.as_deref(), Some("tc-1"));
         assert_eq!(tool.name.as_deref(), Some("get_time"));
         assert_eq!(tool.content.as_ref().and_then(Content::text), Some("3pm"));
+    }
+
+    #[test]
+    fn a_reissue_asks_for_the_tools_the_call_asked_for_not_those_it_sent() {
+        let tool = |name: &str| crate::protocol::LlmTool {
+            name: name.to_string(),
+            description: String::new(),
+            input: None,
+            output: None,
+            defer: false,
+        };
+        let transcript = vec![
+            msg("u1", Role::User, "hi"),
+            assistant_with_calls("call-1", &[("tc-1", "skill")]),
+        ];
+        let mut call = call_state("call-1", vec![msg("u1", Role::User, "hi")]);
+        let llm = call.llm_mut().unwrap();
+        llm.spec.tools = Some(vec![tool("find_bookings"), tool("skill")]);
+        llm.sent_tools = Some(vec![tool("skill")]);
+        let llm_calls = HashMap::from([("call-1".to_string(), call)]);
+
+        let p = propose(
+            &tool_finished_trigger("tc-1", "skill", Ok("Bookings are by day.")),
+            &transcript,
+            &llm_calls,
+            0,
+            None,
+        )
+        .expect("proposes");
+
+        let (request, _, _) = reissued_request(&p);
+        let names: Vec<String> = request
+            .tools
+            .iter()
+            .flatten()
+            .map(|t| t.name.clone())
+            .collect();
+        assert_eq!(
+            names,
+            ["find_bookings", "skill"],
+            "a tool the skill unlocked reaches the next call in the same turn"
+        );
     }
 
     #[test]

@@ -406,6 +406,26 @@ pub struct LlmCallState {
     pub defer_tools_strategy: DeferToolsStrategy,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context_ids: Vec<String>,
+    /// The tools the model gets, set at dispatch from `spec.tools`, which
+    /// keeps the tools the call asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_tools: Option<Vec<LlmTool>>,
+}
+
+impl LlmCallState {
+    /// The request the model gets: its prompt, and the tools it was sent.
+    pub fn sent_request(&self) -> LlmRequest {
+        let mut request = self.spec.to_request(self.prompt.clone());
+        if let Some(tools) = &self.sent_tools {
+            request.tools = Some(tools.clone());
+        }
+        request
+    }
+
+    /// The tools the model was sent, or asked for before dispatch.
+    pub fn sent(&self) -> Option<&[LlmTool]> {
+        self.sent_tools.as_deref().or(self.spec.tools.as_deref())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1160,6 +1180,7 @@ impl SessionState {
                     handler: payload.handler,
                     format: payload.format,
                     context_ids: Vec::new(),
+                    sent_tools: None,
                     defer_tools_strategy: payload.defer_tools_strategy,
                 }),
             );
@@ -1180,23 +1201,26 @@ impl SessionState {
         let connector_tools = at.connector_tools().tools;
         let locked = at.locked_tools();
         let config = at.resolve_agent_for();
+        let declared = at.declared_code_tools();
         let owed = prompt_context::owed(at, &payload.id);
         let system_open = at.system_prefix_open(&payload.id);
         if let Some(effect) = self.effect_mut(EffectKind::LlmCall, &payload.id) {
             effect.tracking.dispatch(now);
             if let Some(call) = effect.llm_mut() {
+                let mut sent = call.spec.tools.clone();
                 if !connector_tools.is_empty() {
-                    let tools = call.spec.tools.get_or_insert_with(Vec::new);
+                    let tools = sent.get_or_insert_with(Vec::new);
                     for tool in &connector_tools {
                         if !tools.iter().any(|t| t.name == tool.name) {
                             tools.push(tool.to_llm_tool());
                         }
                     }
                 }
-                if let Some(tools) = call.spec.tools.as_mut() {
+                if let Some(tools) = sent.as_mut() {
                     tools.retain(|t| !locked.contains_key(&t.name));
-                    describe_run_code(tools, config.as_ref(), &connector_tools);
+                    describe_run_code(tools, config.as_ref(), &connector_tools, &declared);
                 }
+                call.sent_tools = sent;
                 prompt_context::merge(
                     &mut call.prompt,
                     &mut call.context_ids,
@@ -2537,6 +2561,43 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
         self.searchable(true)
     }
 
+    /// The tools `run_code`'s description declares: those a script can call
+    /// that are not deferred, as many as fit. None of them changes while the
+    /// session runs, but for tools that connect later.
+    pub fn declared_code_tools(&self) -> Vec<LlmTool> {
+        let Some(config) = self.resolve_agent_for() else {
+            return Vec::new();
+        };
+        let Some(language) = config.codemode else {
+            return Vec::new();
+        };
+        let mut direct: Vec<LlmTool> = self
+            .script_searchable_tools()
+            .into_iter()
+            .filter(|t| !t.defer)
+            .collect();
+        let count = crate::codemode::declares(language, &direct.iter().collect::<Vec<_>>());
+        direct.truncate(count);
+        direct
+    }
+
+    /// The tools a script can call that the skill `named` names.
+    pub fn skill_tools(&self, named: &str) -> Vec<LlmTool> {
+        let Some(config) = self.resolve_agent_for() else {
+            return Vec::new();
+        };
+        let named_tools: Vec<String> = config
+            .named_skills()
+            .iter()
+            .filter(|s| s.name == named)
+            .flat_map(|s| s.tools.iter().cloned())
+            .collect();
+        self.script_searchable_tools()
+            .into_iter()
+            .filter(|t| named_tools.contains(&t.name))
+            .collect()
+    }
+
     fn searchable(&self, from_code: bool) -> Vec<LlmTool> {
         let Some(config) = self.resolve_agent_for() else {
             return Vec::new();
@@ -2843,6 +2904,7 @@ mod open_llm_calls_tests {
             EffectPayload::LlmCall(LlmCallState {
                 defer_tools_strategy: Default::default(),
                 context_ids: Vec::new(),
+                sent_tools: None,
                 format: None,
                 llm: "claude".to_string(),
                 prompt: vec![],
@@ -3325,25 +3387,12 @@ mod summary_fold_tests {
     }
 }
 
-/// A script reads a skill's files as files, so its `skill` takes no `file`.
-fn without_skill_file(mut tool: LlmTool) -> LlmTool {
-    if tool.name == SKILL {
-        if let Some(properties) = tool
-            .input
-            .as_mut()
-            .and_then(|i| i.get_mut("properties"))
-            .and_then(|p| p.as_object_mut())
-        {
-            properties.remove("file");
-        }
-    }
-    tool
-}
-
+/// In code mode, the model gets only `run_code`, which declares `declared`.
 fn describe_run_code(
     tools: &mut Vec<LlmTool>,
     config: Option<&AgentConfig>,
     connector_tools: &[ConnectorTool],
+    declared: &[LlmTool],
 ) {
     let offered = connector_tools
         .iter()
@@ -3351,21 +3400,10 @@ fn describe_run_code(
     if !offered {
         return;
     }
-    let in_code = |t: &LlmTool| {
-        crate::codemode::reach(&t.name, config, connector_tools) == crate::codemode::Reach::Code
-    };
-    let description = {
-        let declared: Vec<LlmTool> = tools
-            .iter()
-            .filter(|t| !t.defer && in_code(t))
-            .cloned()
-            .map(without_skill_file)
-            .collect();
-        crate::codemode::describe(
-            config.and_then(|c| c.codemode).unwrap_or_default(),
-            &declared.iter().collect::<Vec<_>>(),
-        )
-    };
+    let description = crate::codemode::describe(
+        config.and_then(|c| c.codemode).unwrap_or_default(),
+        &declared.iter().collect::<Vec<_>>(),
+    );
     tools.retain(|t| t.name == RUN_CODE);
     if let Some(tool) = tools.iter_mut().find(|t| t.name == RUN_CODE) {
         tool.description = description;

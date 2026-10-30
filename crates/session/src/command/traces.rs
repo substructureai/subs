@@ -1004,8 +1004,7 @@ fn trace_connector_fetch_gates_an_llm_call() {
         .state
         .llm_call("call-1")
         .unwrap()
-        .spec
-        .tools
+        .sent_tools
         .clone()
         .unwrap_or_default();
     assert_eq!(

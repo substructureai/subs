@@ -217,7 +217,26 @@ const OVERFLOW: &str = "Maximum call stack size exceeded";
 
 /// An error the script raised. `range` is the message when it is a
 /// `RangeError`.
+/// The script's file name in its stack, where its lines are the model's.
+const SCRIPT: &str = "script.js";
+
+fn named(file: &str) -> rquickjs::context::EvalOptions {
+    let mut options = rquickjs::context::EvalOptions::default();
+    options.filename = Some(file.to_string());
+    options
+}
+
+/// `message` with only the stack frames in the script itself.
 fn raised(message: String, range: Option<&str>) -> End {
+    let message = message
+        .lines()
+        .filter(|line| {
+            let frame = line.trim_start();
+            !frame.starts_with("at ")
+                || (frame.contains(&format!("({SCRIPT}:")) && !frame.starts_with("at <eval>"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     End::Raised {
         message,
         limit: (range == Some(OVERFLOW)).then_some(Limit::Stack),
@@ -336,9 +355,9 @@ fn execute(
             "__files_close",
             Function::new(ctx.clone(), move |stream: u32| f.borrow_mut().close(stream))?,
         )?;
-        ctx.eval::<(), _>(PRELUDE)?;
-        let source = format!("__run(async () => {{\n{}\n}});", script.code);
-        match ctx.eval::<(), _>(source) {
+        ctx.eval_with_options::<(), _>(PRELUDE, named("prelude"))?;
+        let source = format!("__run(async () => {{{}\n}});", script.code);
+        match ctx.eval_with_options::<(), _>(source, named(SCRIPT)) {
             Ok(()) => Ok(None),
             Err(rquickjs::Error::Exception) => Ok(Some(exception(&ctx))),
             Err(e) => Err(e),
@@ -452,6 +471,10 @@ mod tests {
         engine::run(&s, Box::new(host))
     }
 
+    fn returned(value: &str) -> Step {
+        Step::Done(format!("Script finished.\nReturned:\n{value}"))
+    }
+
     #[test]
     fn a_script_streams_a_csv_and_sums_it() {
         let mut csv = String::from("region,amount\n");
@@ -466,10 +489,10 @@ mod tests {
         assert_eq!(
             ran.step,
             Step::Done(format!(
-                r#"{{"result":[["sales.csv"],{{"APAC":{},"EU":{},"US":{}}}]}}"#,
-                sum(2),
+                "Script finished.\nReturned:\n[[\"sales.csv\"],{{\"EU\":{},\"US\":{},\"APAC\":{}}}]",
                 sum(0),
-                sum(1)
+                sum(1),
+                sum(2)
             ))
         );
         assert_eq!(ran.stats.file_bytes, csv.len() as u64);
@@ -487,7 +510,7 @@ mod tests {
         let ran = with_files(code, &[("app.log", &log), ("note.txt", "hi")]);
         assert_eq!(
             ran.step,
-            Step::Done(r#"{"result":[["line 0","line 1"],["line 0"],"hi",2]}"#.into())
+            returned(r#"[["line 0","line 1"],["line 0"],"hi",2]"#)
         );
     }
 
@@ -545,10 +568,7 @@ mod tests {
         let code = "return [await files.text('a.txt'), await files.text({ id: 'a.txt' }), \
                     await files.text(files.list()[0])];";
         let ran = with_files(code, &[("a.txt", "hi")]);
-        assert_eq!(
-            ran.step,
-            Step::Done(r#"{"result":["hi","hi","hi"]}"#.into())
-        );
+        assert_eq!(ran.step, returned(r#"["hi","hi","hi"]"#));
     }
 
     #[test]
@@ -582,7 +602,7 @@ mod tests {
         let step = run(&script("console.log('hi', {a: 1}); return [1, 2];", vec![]));
         assert_eq!(
             step,
-            Step::Done(r#"{"logs":["hi {\"a\":1}"],"result":[1,2]}"#.into())
+            Step::Done("Script finished.\nPrinted:\nhi {\"a\":1}\nReturned:\n[1,2]".into())
         );
     }
 
@@ -610,7 +630,7 @@ mod tests {
                 r#"{"temp":3}"#,
             )],
         ));
-        assert_eq!(step, Step::Done(r#"{"result":4}"#.into()));
+        assert_eq!(step, returned(r#"4"#));
     }
 
     #[test]
@@ -629,7 +649,7 @@ mod tests {
                 record("b-c", r#"{"x":1}"#, true, "2"),
             ],
         ));
-        assert_eq!(step, Step::Done(r#"{"result":3}"#.into()));
+        assert_eq!(step, returned(r#"3"#));
     }
 
     #[test]
@@ -639,7 +659,10 @@ mod tests {
             code,
             vec![record("a", "{}", false, "no such issue")],
         ));
-        assert_eq!(step, Step::Done(r#"{"result":"no such issue"}"#.into()));
+        assert_eq!(
+            step,
+            Step::Done("Script finished.\nReturned:\nno such issue".into())
+        );
     }
 
     #[test]
@@ -658,7 +681,7 @@ mod tests {
             vec![],
         ));
         assert!(
-            matches!(&step, Step::Failed(m) if m.starts_with("Error: boom") && m.contains("before")),
+            matches!(&step, Step::Failed(m) if m == "Script failed.\nError: boom\n    at <anonymous> (script.js:1:53)\nPrinted:\nbefore"),
             "{step:?}"
         );
     }
@@ -751,7 +774,7 @@ mod tests {
         let first = run(&script(code, vec![]));
         assert_eq!(first, run(&script(code, vec![])));
         assert!(
-            matches!(&first, Step::Done(t) if t.starts_with(r#"{"result":[1700000000000,1700000000000,"#)),
+            matches!(&first, Step::Done(t) if t.starts_with("Script finished.\nReturned:\n[1700000000000,1700000000000,")),
             "{first:?}"
         );
     }
@@ -760,7 +783,12 @@ mod tests {
     fn the_sandbox_has_no_host_access() {
         let code = "return [typeof fetch, typeof require, typeof setTimeout, typeof __call, typeof os, typeof std];";
         let step = run(&script(code, vec![]));
-        assert_eq!(step, Step::Done(r#"{"result":["undefined","undefined","undefined","undefined","undefined","undefined"]}"#.into()));
+        assert_eq!(
+            step,
+            returned(
+                r#"["undefined","undefined","undefined","undefined","undefined","undefined"]"#
+            )
+        );
     }
 
     #[test]
@@ -781,17 +809,14 @@ mod tests {
     fn the_tools_can_be_listed() {
         let code = "return [Object.keys(tools), 'weather' in tools];";
         let step = run(&script(code, vec![]));
-        assert_eq!(
-            step,
-            Step::Done(r#"{"result":[["weather","list-prs"],true]}"#.into())
-        );
+        assert_eq!(step, returned(r#"[["weather","list-prs"],true]"#));
     }
 
     #[test]
-    fn an_oversized_result_is_replaced_with_a_note() {
+    fn an_oversized_result_is_cut_in_the_middle() {
         let step = run(&script("return 'x'.repeat(100000);", vec![]));
         assert!(
-            matches!(&step, Step::Done(t) if t.contains("over the 64 KiB limit") && t.contains("It began:")),
+            matches!(&step, Step::Done(t) if t.contains("cut from the middle") && t.len() < 41 << 10),
             "{step:?}"
         );
     }
@@ -800,7 +825,7 @@ mod tests {
     fn a_script_that_finishes_is_not_failed_for_the_memory_it_still_holds() {
         let code = "const kept = Array.from({ length: 40000 }, (_, i) => ({ i, s: 'x'.repeat(200) })); return kept.length;";
         let step = run(&script(code, vec![]));
-        assert_eq!(step, Step::Done(r#"{"result":40000}"#.into()));
+        assert_eq!(step, returned(r#"40000"#));
     }
 
     #[test]

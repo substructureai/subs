@@ -36,7 +36,8 @@ Each plugin puts one entry in the system prompt from turn one: its description
 and its skills, with the name and the description of each skill. The engine
 writes the entry once per branch, in the same placement order that MCP
 announcements use, so a plugin added mid-session introduces itself without
-rewriting the cached prefix.
+rewriting the cached prefix. Entries written together share one message, a line
+each.
 
 One engine tool, `skill`, loads a skill.
 
