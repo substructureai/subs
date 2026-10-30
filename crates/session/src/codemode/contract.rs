@@ -33,9 +33,8 @@ pub struct Limits {
     pub results: usize,
     /// Bytes of arguments over the whole script.
     pub arguments: usize,
-    /// Bytes of text a run sends back: what it prints and returns. Past it,
-    /// the middle is cut.
-    pub output: usize,
+    /// Bytes of arguments in one call.
+    pub call_arguments: usize,
     /// Bytes of heap in one run.
     pub memory: usize,
     /// Milliseconds of CPU in one run.
@@ -49,6 +48,8 @@ pub struct Limits {
     pub total_file_bytes: u64,
     /// Files open at once.
     pub streams: u32,
+    /// Files a script shows the model.
+    pub shown_files: usize,
     /// Bytes of file text a script shows the model.
     pub shown: usize,
     /// Bytes of media files a script shows the model. Bytes stand in for the
@@ -62,18 +63,24 @@ impl Default for Limits {
             calls: 1_000,
             results: 8 << 20,
             arguments: 32 << 20,
-            output: 24 << 10,
+            call_arguments: 256 << 10,
             memory: 96 << 20,
             compute_ms: 500,
             total_compute_ms: 10_000,
             file_bytes: 64 << 20,
             total_file_bytes: 512 << 20,
             streams: 4,
+            shown_files: 4,
             shown: 64 << 10,
             shown_media: 2 << 20,
         }
     }
 }
+
+/// Bytes of text a run sends back to the model: what it prints and returns.
+/// Past it, the middle is cut. It is part of what the model is told, so the
+/// session sets it, not the runtime.
+pub const OUTPUT: usize = 24 << 10;
 
 pub fn spent(results: usize) -> String {
     format!(
@@ -81,6 +88,10 @@ pub fn spent(results: usize) -> String {
          several run_code calls.",
         results >> 20
     )
+}
+
+fn output() -> usize {
+    OUTPUT
 }
 
 fn version() -> u32 {
@@ -102,6 +113,14 @@ pub struct ScriptFile {
     pub skill: Option<String>,
 }
 
+/// A file a script reads, and the blob that holds it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredFile {
+    #[serde(flatten)]
+    pub file: ScriptFile,
+    pub uri: String,
+}
+
 /// A script to run past the calls it already made.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Script {
@@ -113,14 +132,14 @@ pub struct Script {
     pub calls: Vec<ScriptRecord>,
     pub seed: u64,
     pub now_ms: i64,
-    /// The names `tools` lists. A script can still call any name.
-    #[serde(default)]
-    pub tools: Vec<String>,
     /// The script's results reached their budget: it may make no new call.
     #[serde(default)]
     pub spent: bool,
     #[serde(default)]
     pub limits: Limits,
+    /// Bytes of text the run sends back; see [`OUTPUT`].
+    #[serde(default = "output")]
+    pub output: usize,
     /// CPU the script's earlier runs used.
     #[serde(default)]
     pub cpu_used_ms: u64,

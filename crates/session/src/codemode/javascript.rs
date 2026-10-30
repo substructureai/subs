@@ -9,14 +9,9 @@ use crate::protocol::{LlmTool, TOOL_SEARCH};
 pub const DIALECT: Dialect = Dialect {
     code: "JavaScript: the body of an async function.",
     describe,
-    declares,
     declare: declaration,
     fence: "ts",
 };
-
-/// Declarations `run_code`'s description holds, in bytes. Past it, a script
-/// finds tools with `tool_search`.
-const DECLARED: usize = 12 << 10;
 
 const INTRO: &str = "Run JavaScript code to orchestrate tool calls: chain them, run them at once, \
 and filter large results before you read them.
@@ -47,15 +42,13 @@ of the tools it brings, which you can call in your next script. Read the files i
 - There is no network, file system, timer or module. No state persists between scripts. \
 `Date` and `Math.random` stay the same for the whole run.
 - A call that needs approval waits for a person, and a client tool waits for the client. A \
-subagent call returns the subagent's answer.";
+subagent call returns `{ session, result }`: its answer, and the session to pass as `session` \
+to continue it.";
 
 fn describe(tools: &[&LlmTool]) -> String {
     let budget = Budget::split(tools);
     let mut sections = vec![
-        INTRO.replace(
-            "{output}",
-            &(super::Limits::default().output >> 10).to_string(),
-        ),
+        INTRO.replace("{output}", &(super::OUTPUT >> 10).to_string()),
         format!(
             "Find tools that are not declared here, and skills, with \
              `await tools.{TOOL_SEARCH}({{ query }})`, or name tools exactly to get just their \
@@ -77,10 +70,6 @@ fn describe(tools: &[&LlmTool]) -> String {
     sections.join("\n\n")
 }
 
-fn declares(tools: &[&LlmTool]) -> usize {
-    Budget::split(tools).declared.len()
-}
-
 /// The tools `run_code`'s description declares, from the first, with the
 /// types they name.
 struct Budget {
@@ -90,7 +79,8 @@ struct Budget {
 
 impl Budget {
     fn split(tools: &[&LlmTool]) -> Self {
-        let declarations: Vec<Declared> = tools.iter().map(|t| declared(t)).collect();
+        let mut taken = BTreeSet::new();
+        let declarations: Vec<Declared> = tools.iter().map(|t| declared(t, &mut taken)).collect();
         let sizes: Vec<usize> = declarations
             .iter()
             .zip(tools)
@@ -99,7 +89,7 @@ impl Budget {
                 summary + d.method.len() + 2 + d.types.iter().map(|t| t.len() + 1).sum::<usize>()
             })
             .collect();
-        let count = fit(&sizes, DECLARED);
+        let count = fit(&sizes, super::DECLARED);
         let declarations = &declarations[..count];
         Budget {
             types: declarations.iter().flat_map(|d| d.types.clone()).collect(),
@@ -134,16 +124,16 @@ struct Declared {
     method: String,
 }
 
-fn declared(tool: &LlmTool) -> Declared {
+/// `tool`'s method and the types it names, with names not in `taken`.
+fn declared(tool: &LlmTool, taken: &mut BTreeSet<String>) -> Declared {
     let name = match is_identifier(&tool.name) {
         true => tool.name.clone(),
         false => serde_json::to_string(&tool.name).unwrap_or_default(),
     };
-    let mut taken = BTreeSet::new();
     let mut types = Vec::new();
     let mut render = |schema: Option<&serde_json::Value>, empty: &str| match schema {
         Some(schema) => {
-            let rendered = render_json_schema_to_typescript(schema, &tool.name, &mut taken);
+            let rendered = render_json_schema_to_typescript(schema, &tool.name, taken);
             types.extend(rendered.types);
             rendered.body
         }
@@ -159,8 +149,8 @@ fn declared(tool: &LlmTool) -> Declared {
 
 /// A tool's declaration: the types it names, then its description, then its
 /// method.
-fn declaration(tool: &LlmTool) -> String {
-    let declared = declared(tool);
+fn declaration(tool: &LlmTool, taken: &mut BTreeSet<String>) -> String {
+    let declared = declared(tool, taken);
     let mut lines = declared.types;
     lines.push(commented(&tool.description, &declared.method));
     lines.join("\n")
@@ -229,7 +219,7 @@ mod tests {
             .collect();
         let refs: Vec<&LlmTool> = tools.iter().collect();
         let budget = Budget::split(&refs);
-        let count = declares(&refs);
+        let count = Budget::split(&refs).declared.len();
         assert!(count > 0 && count < 400);
         assert!(
             budget
@@ -238,7 +228,7 @@ mod tests {
                 .chain(&budget.types)
                 .map(String::len)
                 .sum::<usize>()
-                <= DECLARED
+                <= super::super::DECLARED
         );
         let text = describe(&refs);
         assert!(text.contains(&format!("tool_{}(args:", count - 1)));

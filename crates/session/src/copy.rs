@@ -13,14 +13,13 @@ pub fn plugin_usage(code: bool) -> &'static str {
     }
 }
 
-pub fn searched_skills(code: bool) -> &'static str {
-    match code {
-        false => "find its skills with `tool_search`, and load one with the `skill` tool",
-        true => {
-            "find its skills in `run_code` with `await tools.tool_search({ query })`, and load \
-             one with `await tools.skill({ name })`"
-        }
-    }
+pub const SEARCHED_SKILLS: &str =
+    "find its skills with `tool_search`, and load one with the `skill` tool";
+
+/// The model called `named` directly, though code mode reaches it only from
+/// `run_code`.
+pub fn call_from_code(named: &str) -> String {
+    format!("Call `{named}` from `run_code`: `await tools.{named}(args)`.")
 }
 
 pub const CALL_TOOL_IN_CALL: &str =

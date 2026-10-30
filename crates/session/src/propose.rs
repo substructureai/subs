@@ -909,11 +909,10 @@ mod tests {
                 result: None,
                 is_error: false,
                 script: None,
-                script_tools: Vec::new(),
                 script_language: Default::default(),
                 script_cpu_ms: 0,
                 script_file_bytes: 0,
-                script_pins: Default::default(),
+                script_skill_files: None,
                 script_asked: Vec::new(),
             }),
         )

@@ -209,3 +209,18 @@ fn rendered_schema_has_a_hard_size_cap() {
 
     assert_eq!(body(&schema), "unknown");
 }
+
+#[test]
+fn a_ref_to_the_root_is_a_named_type_too() {
+    let schema = json!({
+        "type": "object",
+        "properties": { "child": { "$ref": "#" } }
+    });
+    assert_eq!(
+        render_json_schema_to_typescript(&schema, "tree", &mut BTreeSet::new()),
+        Rendered {
+            types: vec!["type TreeArgs = { child?: TreeArgs; };".to_string()],
+            body: "{ child?: TreeArgs; }".to_string(),
+        }
+    );
+}

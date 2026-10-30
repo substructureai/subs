@@ -61,7 +61,7 @@ pub fn script_find(
         .unwrap_or_default();
     StoredResult::text(crate::codemode::search(
         language,
-        &at.script_searchable_tools(),
+        &at.searchable_tools(),
         &skills,
         &argument(arguments, "query"),
         max,

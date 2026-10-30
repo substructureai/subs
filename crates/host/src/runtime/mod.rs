@@ -78,6 +78,9 @@ pub struct RuntimeConfig {
     pub script_limits: crate::codemode::Limits,
     /// How long a script step may wait for a slot, or for a runner to take it.
     pub script_wait: std::time::Duration,
+    /// A disk cache in front of the blob store that scripts read files from.
+    /// Worth it when the store is remote, as object storage is.
+    pub script_blob_cache: Option<blob_cache::CacheConfig>,
 }
 
 impl Default for RuntimeConfig {
@@ -97,6 +100,25 @@ impl Default for RuntimeConfig {
             script_slots: std::thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 8)),
             script_limits: crate::codemode::Limits::default(),
             script_wait: std::time::Duration::from_secs(60),
+            script_blob_cache: None,
+        }
+    }
+}
+
+/// The store scripts read files from: `blobs`, behind `cache` when there is
+/// one. A cache that cannot start is left out, with a warning.
+fn script_blobs(
+    blobs: Arc<dyn BlobStore>,
+    cache: Option<blob_cache::CacheConfig>,
+) -> Arc<dyn BlobStore> {
+    let Some(cache) = cache else {
+        return blobs;
+    };
+    match blob_cache::CachedBlobStore::new(blobs.clone(), cache) {
+        Ok(cached) => Arc::new(cached),
+        Err(e) => {
+            tracing::warn!(error = %e, "the script blob cache could not start; reading uncached");
+            blobs
         }
     }
 }
@@ -1008,7 +1030,7 @@ pub async fn start(deps: RuntimeDeps, config: RuntimeConfig) -> Arc<Runtime> {
             admission: Arc::new(crate::codemode::Admission::new(config.script_slots)),
             limits: config.script_limits.clone(),
             wait: config.script_wait,
-            blobs: blobs.clone(),
+            blobs: script_blobs(blobs.clone(), config.script_blob_cache.clone()),
             plugins: plugins.clone(),
         }),
         script_task_queue,

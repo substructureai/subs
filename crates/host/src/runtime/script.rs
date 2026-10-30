@@ -8,12 +8,11 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::codemode::{
-    settle, Admission, FileSource, Limit, Limits, Ran, Script, ScriptFile, ScriptFiles,
-    ScriptRunner, Stats, Step,
+    settle, Admission, Limit, Limits, Ran, ScriptFile, ScriptFiles, ScriptRunner, Stats, Step,
 };
 use crate::plugins::PluginResolver;
 use crate::protocol::RetryPolicy;
-use crate::runtime::blob::{BlobRef, BlobStore};
+use crate::runtime::blob::{BlobRef, BlobStore, NewBlob};
 use crate::runtime::executor::{
     settled, spawn_bounded_executors, Bound, BoundedTask, ExecutorPool, RESULT_NOT_SAVED,
 };
@@ -21,6 +20,7 @@ use crate::runtime::inbox::Inbox;
 use crate::runtime::queue::{Queue, SCRIPT};
 use crate::runtime::sessions::Sessions;
 use crate::runtime::span::SpanContext;
+use substructure_session::codemode::StoredFile;
 use substructure_session::plugins::PluginBundle;
 use substructure_session::Session;
 
@@ -95,18 +95,24 @@ async fn step(
     let Some(mut script) = session.script(&task.tool_call_id, &scripts.limits) else {
         return Ok(());
     };
-    let mut sources: BTreeMap<String, FileSource> = session
-        .script_blobs(&task.tool_call_id)
+    let mut sources: BTreeMap<String, BlobRef> = session
+        .script_files(&task.tool_call_id)
         .into_iter()
-        .map(|(id, blob)| (id, FileSource::Blob(blob)))
+        .map(|(file, blob)| (file.id, blob))
         .collect();
-    let pins = skill_files(&session, &task, scripts, &mut script, &mut sources).await;
-    let changed: Vec<String> = session
-        .script_pins(&task.tool_call_id)
-        .into_iter()
-        .filter(|(bundle, hash)| pins.get(bundle) != Some(hash))
-        .map(|(bundle, _)| bundle)
-        .collect();
+    let stored = match session.skill_files_stored(&task.tool_call_id) {
+        true => None,
+        false => {
+            let stored = store_skill_files(&session, &task, scripts).await?;
+            for f in &stored {
+                if let Some(blob) = BlobRef::parse(&f.uri) {
+                    sources.insert(f.file.id.clone(), blob);
+                }
+                script.files.push(f.file.clone());
+            }
+            Some(stored)
+        }
+    };
     let files = ScriptFiles {
         tenant_id: task.tenant_id.clone(),
         sources: sources.clone(),
@@ -116,7 +122,6 @@ async fn step(
     let records: usize = script.calls.iter().map(|c| c.output.len()).sum();
     let started = Instant::now();
     let ran = match waited > scripts.wait {
-        _ if !changed.is_empty() => changed_plugins(&changed),
         true => late(waited, Limit::Wait),
         false => match scripts.runner.run(script, files).await {
             Ok(ran) => ran,
@@ -136,7 +141,14 @@ async fn step(
         &ran,
         &scripts.limits,
     );
-    let command = settle(task.tool_call_id, task.attempt, known, ran, &sources, pins);
+    let command = settle(
+        task.tool_call_id,
+        task.attempt,
+        known,
+        ran,
+        &sources,
+        stored,
+    );
     settled(
         sessions,
         &task.tenant_id,
@@ -147,16 +159,15 @@ async fn step(
     .await
 }
 
-/// Adds the files of the agent's bundle skills to `script`, as
-/// `<skill>/<path>`, and answers each bundle's hash.
-async fn skill_files(
+/// Stores the files of the agent's bundle skills as blobs, as
+/// `<skill>/<path>`, so every run of the script reads the same bytes.
+async fn store_skill_files(
     session: &Session,
     task: &ScriptTask,
     scripts: &Scripts,
-    script: &mut Script,
-    sources: &mut BTreeMap<String, FileSource>,
-) -> BTreeMap<String, String> {
+) -> Result<Vec<StoredFile>, String> {
     let mut bundles: BTreeMap<String, Option<PluginBundle>> = BTreeMap::new();
+    let mut stored = Vec::new();
     for (named, bundle, skill) in session.script_skills(&task.tool_call_id) {
         if !bundles.contains_key(&bundle) {
             let found = scripts.plugins.resolve(&task.tenant_id, &bundle).await;
@@ -167,32 +178,38 @@ async fn skill_files(
         };
         for (path, text) in &skill.files {
             let id = format!("{named}/{path}");
-            script.files.push(ScriptFile {
-                id: id.clone(),
-                mime: text_mime(path).to_string(),
-                size: text.len() as u64,
-                skill: Some(named.clone()),
-            });
-            sources.insert(id, FileSource::Text(Arc::from(text.as_str())));
+            let blob = scripts
+                .blobs
+                .put(NewBlob {
+                    tenant_id: task.tenant_id.clone(),
+                    mime: text_mime(path).to_string(),
+                    name: Some(id.clone()),
+                    bytes: text.as_bytes().to_vec(),
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+            stored.push(stored_file(id, &named, blob));
         }
         for (path, binary) in &skill.binaries {
             let Some(blob) = BlobRef::parse(&binary.uri) else {
                 continue;
             };
-            let id = format!("{named}/{path}");
-            script.files.push(ScriptFile {
-                id: id.clone(),
-                mime: binary.mime.clone(),
-                size: binary.size,
-                skill: Some(named.clone()),
-            });
-            sources.insert(id, FileSource::Blob(blob));
+            stored.push(stored_file(format!("{named}/{path}"), &named, blob));
         }
     }
-    bundles
-        .into_iter()
-        .filter_map(|(id, bundle)| Some((id, bundle?.hash())))
-        .collect()
+    Ok(stored)
+}
+
+fn stored_file(id: String, skill: &str, blob: BlobRef) -> StoredFile {
+    StoredFile {
+        file: ScriptFile {
+            id,
+            mime: blob.mime.clone(),
+            size: blob.size,
+            skill: Some(skill.to_string()),
+        },
+        uri: blob.uri(),
+    }
 }
 
 fn text_mime(path: &str) -> &'static str {
@@ -201,21 +218,6 @@ fn text_mime(path: &str) -> &'static str {
         Some("json") => "application/json",
         Some("csv") => "text/csv",
         _ => "text/plain",
-    }
-}
-
-fn changed_plugins(changed: &[String]) -> Ran {
-    Ran {
-        step: Step::Failed(format!(
-            "A plugin changed while the script ran ({}), so its files may differ between \
-             runs. Run the script again.",
-            changed.join(", ")
-        )),
-        stats: Stats {
-            limit: Some(Limit::Diverged),
-            ..Stats::default()
-        },
-        shown: Vec::new(),
     }
 }
 

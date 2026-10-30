@@ -549,24 +549,19 @@ impl Session {
                 })
             })
             .collect();
-        let tools = effect.tool()?.script_tools.clone();
         Some(Script {
             version: crate::codemode::VERSION,
             language: effect.tool()?.script_language,
-            tools,
             code: arguments.get("code")?.as_str()?.to_string(),
             calls,
             spent,
             limits: limits.clone(),
+            output: crate::codemode::OUTPUT,
             cpu_used_ms: effect.tool()?.script_cpu_ms,
-            files: crate::attachments::on_path(&state.message_tree(), effect.anchor.as_deref())
+            files: self
+                .script_files(id)
                 .into_iter()
-                .map(|a| crate::codemode::ScriptFile {
-                    id: a.id,
-                    mime: a.mime,
-                    size: a.size,
-                    skill: None,
-                })
+                .map(|(file, _)| file)
                 .collect(),
             file_bytes_used: effect.tool()?.script_file_bytes,
             seed: xxhash_rust::xxh3::xxh3_64(id.as_bytes()),
@@ -591,28 +586,43 @@ impl Session {
             .collect()
     }
 
-    /// The plugin bundles a `run_code` call's script reads from, by hash, as
-    /// they were at its first step.
-    pub fn script_pins(&self, id: &str) -> std::collections::BTreeMap<String, String> {
+    /// Whether a `run_code` call's first step stored its skills' files.
+    pub fn skill_files_stored(&self, id: &str) -> bool {
         self.state
             .tool_call(id)
-            .map(|t| t.script_pins.clone())
-            .unwrap_or_default()
+            .is_some_and(|t| t.script_skill_files.is_some())
     }
 
-    /// The blob behind each file a `run_code` call's script may read, by
-    /// file id. Only the runner sees these; the script sees the ids.
-    pub fn script_blobs(
+    /// Each file a `run_code` call's script may read, and the blob that holds
+    /// it: the attachments on its branch, then the skills' files its first
+    /// step stored. The script sees the files; only the runner sees the blobs.
+    pub fn script_files(
         &self,
         id: &str,
-    ) -> std::collections::BTreeMap<String, crate::blob::BlobRef> {
+    ) -> Vec<(crate::codemode::ScriptFile, crate::blob::BlobRef)> {
         let Some(effect) = self.state.effect(EffectKind::ToolCall, id) else {
-            return Default::default();
+            return Vec::new();
         };
-        crate::attachments::on_path(&self.state.message_tree(), effect.anchor.as_deref())
+        let attachments =
+            crate::attachments::on_path(&self.state.message_tree(), effect.anchor.as_deref())
+                .into_iter()
+                .filter_map(|a| {
+                    let blob = crate::blob::BlobRef::parse(&a.uri)?;
+                    let file = crate::codemode::ScriptFile {
+                        id: a.id,
+                        mime: a.mime,
+                        size: a.size,
+                        skill: None,
+                    };
+                    Some((file, blob))
+                });
+        let skills = effect
+            .tool()
+            .and_then(|t| t.script_skill_files.clone())
+            .unwrap_or_default()
             .into_iter()
-            .filter_map(|a| Some((a.id, crate::blob::BlobRef::parse(&a.uri)?)))
-            .collect()
+            .filter_map(|f| Some((f.file, crate::blob::BlobRef::parse(&f.uri)?)));
+        attachments.chain(skills).collect()
     }
 
     fn subagent(&self, id: &str) -> Option<Work> {

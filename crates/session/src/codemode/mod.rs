@@ -13,6 +13,8 @@ use crate::protocol::{
     AgentConfig, ConnectorTool, ConnectorToolKind, LlmTool, RetryPolicy, RUN_CODE, TOOL_SEARCH,
 };
 
+/// `run_code` as the engine routes it. [`offered`] is the tool as the model
+/// gets it.
 pub fn tool(language: Language) -> ConnectorTool {
     filter::engine_tool(
         RUN_CODE,
@@ -31,25 +33,22 @@ pub fn tool(language: Language) -> ConnectorTool {
     )
 }
 
-/// `run_code`'s description, with a declaration for each tool a script can call.
-/// `run_code`'s description, which declares `tools` from the first, as many
-/// as fit. It holds nothing that changes while a session runs.
-pub fn describe(language: Language, tools: &[&LlmTool]) -> String {
-    (dialect(language).describe)(tools)
-}
-
-/// How many of `tools`, from the first, `run_code`'s description declares.
-pub fn declares(language: Language, tools: &[&LlmTool]) -> usize {
-    (dialect(language).declares)(tools)
+/// `run_code` as the model gets it: its description declares `tools`, from
+/// the first, as many as fit, and holds nothing that changes while a session
+/// runs.
+pub fn offered(language: Language, tools: &[&LlmTool]) -> LlmTool {
+    LlmTool {
+        description: (dialect(language).describe)(tools),
+        ..tool(language).to_llm_tool()
+    }
 }
 
 /// Characters of a listed description.
 const SUMMARY: usize = 100;
-/// Bytes of declarations a search answers with, but for one that names its
-/// tools. Past it, matches are listed by name.
-const SEARCHED: usize = 8 << 10;
-/// Bytes an answer leaves free under the output limit.
-pub const MARGIN: usize = 1 << 10;
+/// Bytes of one block of declarations: in `run_code`'s description, a search
+/// answer, or a skill's answer. Past it, tools are listed by name. The first
+/// tool is always declared, so a search for its name always finds it.
+pub const DECLARED: usize = 12 << 10;
 
 /// The first line of `description`, cut at [`SUMMARY`] characters.
 pub fn summary(description: &str) -> String {
@@ -65,10 +64,9 @@ pub struct Dialect {
     /// What `code` holds.
     pub code: &'static str,
     pub describe: fn(&[&LlmTool]) -> String,
-    /// How many tools, from the first, `describe` declares.
-    pub declares: fn(&[&LlmTool]) -> usize,
     /// One tool's declaration, with its description, as a search answers it.
-    pub declare: fn(&LlmTool) -> String,
+    /// The types it names avoid the names in the set, and join it.
+    pub declare: fn(&LlmTool, &mut std::collections::BTreeSet<String>) -> String,
     /// The fence of a block of declarations.
     pub fence: &'static str,
 }
@@ -79,25 +77,18 @@ pub fn dialect(language: Language) -> &'static Dialect {
     }
 }
 
-/// How the model reaches a tool when its agent has code mode.
+/// How a script reaches a tool. In code mode the model gets only
+/// `run_code`, and the agent's tool set holds only what scripts reach.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reach {
-    /// Only from code: `run_code` offers it in place of the tool itself.
+    /// A tool a script calls.
     Code,
-    /// `tool_search`: directly, and from code over the tools code reaches.
+    /// `tool_search`, answered over the tools scripts call.
     Search,
-    /// Only directly, for this reason.
-    Direct(Direct),
+    /// `run_code` itself.
+    Itself,
     /// There is no such tool.
     Unknown,
-}
-
-/// Why a tool is called only directly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Direct {
-    Itself,
-    Engine,
-    Files,
 }
 
 impl Reach {
@@ -106,6 +97,7 @@ impl Reach {
     pub fn refusal(self, name: &str, near: &[&str]) -> Option<String> {
         Some(match self {
             Reach::Code | Reach::Search => return None,
+            Reach::Itself => format!("`{name}` cannot call itself."),
             Reach::Unknown if near.is_empty() => format!(
                 "There is no tool named `{name}`. Find tools with \
                  `await tools.{TOOL_SEARCH}({{ query }})`."
@@ -117,15 +109,6 @@ impl Reach {
                     .map(|n| format!("`{n}`"))
                     .collect::<Vec<_>>()
                     .join(", ")
-            ),
-            Reach::Direct(Direct::Itself) => format!("`{name}` cannot call itself."),
-            Reach::Direct(Direct::Engine) => format!(
-                "`{name}` is not for code. Call tools by name, and find them with \
-                 `await tools.{TOOL_SEARCH}({{ query }})`."
-            ),
-            Reach::Direct(Direct::Files) => format!(
-                "`{name}` is not for code. Read files with `files`, and show one with \
-                 `files.show`."
             ),
         })
     }
@@ -140,9 +123,8 @@ pub fn reach(name: &str, config: Option<&AgentConfig>, connector_tools: &[Connec
             ConnectorToolKind::Remote | ConnectorToolKind::Subagent | ConnectorToolKind::Skill => {
                 Reach::Code
             }
-            ConnectorToolKind::Code => Reach::Direct(Direct::Itself),
-            ConnectorToolKind::Attachment => Reach::Direct(Direct::Files),
-            _ => Reach::Direct(Direct::Engine),
+            ConnectorToolKind::Code => Reach::Itself,
+            _ => Reach::Unknown,
         };
     }
     match config.and_then(|c| c.tool(name)) {
@@ -151,25 +133,8 @@ pub fn reach(name: &str, config: Option<&AgentConfig>, connector_tools: &[Connec
     }
 }
 
-/// The names a script may call, sorted.
-pub fn callable(config: Option<&AgentConfig>, connector_tools: &[ConnectorTool]) -> Vec<String> {
-    let declared = config
-        .into_iter()
-        .flat_map(|c| c.tools.iter().map(|t| &t.name));
-    let mut names: Vec<String> = declared
-        .chain(connector_tools.iter().map(|t| &t.name))
-        .filter(|name| reach(name, config, connector_tools) == Reach::Code)
-        .cloned()
-        .chain([TOOL_SEARCH.to_string()])
-        .collect();
-    names.sort();
-    names.dedup();
-    names
-}
-
-/// A script's `tool_search`: the tools and skills that match `query`, best
-/// first, as text for the model. Tools come with their declarations. A tool
-/// named exactly comes first.
+/// A script's `tool_search`: [`filter::search`]'s matches as text for the
+/// model, the tools with their declarations.
 pub fn search(
     language: Language,
     tools: &[LlmTool],
@@ -177,47 +142,10 @@ pub fn search(
     query: &str,
     max: NonZeroUsize,
 ) -> String {
-    let skill_tools: Vec<LlmTool> = skills
+    let found = filter::search(tools, skills, query, max);
+    let loaded: Vec<String> = found
+        .skills
         .iter()
-        .map(|s| LlmTool {
-            name: s.name.clone(),
-            description: format!("{} {}", s.description, s.tools.join(" ")),
-            input: None,
-            output: None,
-            defer: true,
-        })
-        .collect();
-    let corpus: Vec<LlmTool> = tools.iter().chain(&skill_tools).cloned().collect();
-    let words: Vec<&str> = query
-        .split(|c: char| c.is_whitespace() || c == ',')
-        .filter(|w| !w.is_empty())
-        .collect();
-    let named: Vec<&LlmTool> = words
-        .iter()
-        .filter_map(|w| tools.iter().find(|t| t.name == *w))
-        .collect();
-    let exact = !words.is_empty() && named.len() == words.len();
-    let mut found = match exact {
-        true => named,
-        false => filter::find(&corpus, query),
-    };
-    if let Some(at) = found.iter().position(|t| t.name == query.trim()) {
-        let named = found.remove(at);
-        found.insert(0, named);
-    }
-    let shown = &found[..found.len().min(max.get())];
-    let declarable: Vec<&LlmTool> = shown
-        .iter()
-        .filter(|t| !skills.iter().any(|s| s.name == t.name))
-        .copied()
-        .collect();
-    let budget = match exact {
-        true => Limits::default().output - MARGIN,
-        false => SEARCHED,
-    };
-    let loaded: Vec<String> = shown
-        .iter()
-        .filter_map(|t| skills.iter().find(|s| s.name == t.name))
         .map(|s| {
             format!(
                 "- Skill `{}`: {} Load it with `await tools.skill({{ name: {:?} }})`.",
@@ -227,16 +155,14 @@ pub fn search(
             )
         })
         .collect();
-    let mut sections = vec![match found.len() {
+    let shown = found.tools.len() + found.skills.len();
+    let mut sections = vec![match found.matched {
         0 => crate::copy::NOTHING_MATCHED.to_string(),
-        n if n > shown.len() => format!(
-            "{} of {n} matches. Narrow the query to see the rest.",
-            shown.len()
-        ),
+        n if n > shown => format!("{shown} of {n} matches. Narrow the query to see the rest."),
         1 => "1 match.".to_string(),
         n => format!("{n} matches."),
     }];
-    if let Some(block) = declarations(language, &declarable, budget) {
+    if let Some(block) = declarations(language, &found.tools) {
         sections.push(block);
     }
     if !loaded.is_empty() {
@@ -245,16 +171,17 @@ pub fn search(
     sections.join("\n\n")
 }
 
-/// `tools` declared in one block, as many as fit in `budget` bytes, then the
-/// rest by name, to search for by name.
-pub fn declarations(language: Language, tools: &[&LlmTool], budget: usize) -> Option<String> {
+/// `tools` declared in one block, as many as fit in [`DECLARED`], the first
+/// always, then the rest by name, to search for by name.
+pub fn declarations(language: Language, tools: &[&LlmTool]) -> Option<String> {
     let dialect = dialect(language);
+    let mut taken = std::collections::BTreeSet::new();
     let mut used = 0;
     let mut declared = Vec::new();
     let mut rest = Vec::new();
     for tool in tools {
-        let declaration = (dialect.declare)(tool);
-        match rest.is_empty() && used + declaration.len() <= budget {
+        let declaration = (dialect.declare)(tool, &mut taken);
+        match declared.is_empty() || (rest.is_empty() && used + declaration.len() <= DECLARED) {
             true => {
                 used += declaration.len();
                 declared.push(declaration);
@@ -352,7 +279,7 @@ mod tests {
     fn a_broad_search_lists_what_does_not_fit_and_a_named_one_declares_it() {
         let tool = |name: &str| LlmTool {
             name: name.into(),
-            description: format!("{name} audiences.\n{}", "x".repeat(5 << 10)),
+            description: format!("{name} audiences.\n{}", "x".repeat(7 << 10)),
             input: None,
             output: None,
             defer: true,
@@ -373,35 +300,39 @@ mod tests {
             broad.contains("query: \"get_audience\" })`:\n- get_audience: get_audience audiences."),
             "{broad}"
         );
-        let named = answer("find_audiences, get_audience");
+        let named = answer("get_audience");
         assert!(named.contains("\nget_audience(args: "), "{named}");
     }
 
     #[test]
-    fn declarations_past_the_budget_are_named() {
-        let tool = |name: &str| LlmTool {
+    fn declarations_past_the_budget_are_named_but_the_first_is_always_declared() {
+        let tool = |name: &str, size: usize| LlmTool {
             name: name.into(),
-            description: String::new(),
+            description: "x".repeat(size),
             input: None,
             output: None,
             defer: true,
         };
-        let (a, b) = (tool("a"), tool("b"));
-        let tools = [&a, &b];
-        let both = declarations(Language::Javascript, &tools, 1 << 10).unwrap();
+        let (a, b) = (tool("a", 0), tool("b", 0));
+        let both = declarations(Language::Javascript, &[&a, &b]).unwrap();
         assert_eq!(
             both,
             "```ts\na(args: {}): Promise<unknown>;\n\nb(args: {}): Promise<unknown>;\n```"
         );
-        let one = declarations(Language::Javascript, &tools, 30).unwrap();
+        let (big, small) = (tool("big", DECLARED * 2), tool("small", 0));
+        let one = declarations(Language::Javascript, &[&big, &small]).unwrap();
+        assert!(
+            one.contains("\nbig(args: "),
+            "the first is declared, however big"
+        );
         assert!(
             one.ends_with(
                 "Get the declarations of these with \
-                 `await tools.tool_search({ query: \"b\" })`:\n- b: "
+                 `await tools.tool_search({ query: \"small\" })`:\n- small: "
             ),
             "{one}"
         );
-        assert_eq!(declarations(Language::Javascript, &[], 30), None);
+        assert_eq!(declarations(Language::Javascript, &[]), None);
     }
 
     #[test]

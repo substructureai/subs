@@ -41,9 +41,10 @@ pub enum Outcome {
         cpu_ms: u64,
         #[serde(default)]
         file_bytes: u64,
-        /// The hash of each plugin bundle whose files the script may read.
+        /// The skills' files, stored as blobs at the script's first step, so
+        /// every later run reads the same bytes.
         #[serde(default)]
-        pins: std::collections::BTreeMap<String, String>,
+        skill_files: Option<Vec<crate::codemode::StoredFile>>,
     },
     Error(SettleError),
 }

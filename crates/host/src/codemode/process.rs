@@ -35,18 +35,10 @@ pub trait ScriptRunner: Send + Sync {
 #[derive(Clone)]
 pub struct ScriptFiles {
     pub tenant_id: String,
-    pub sources: BTreeMap<String, FileSource>,
+    /// The blob behind each file, by id. A blob never changes, so a file
+    /// reads the same on every run.
+    pub sources: BTreeMap<String, BlobRef>,
     pub store: Arc<dyn BlobStore>,
-}
-
-/// Where a file's bytes are. Neither changes, so a file reads the same on
-/// every run.
-#[derive(Debug, Clone, PartialEq)]
-pub enum FileSource {
-    /// A stored blob, such as an attachment.
-    Blob(BlobRef),
-    /// Text held in a plugin bundle, such as a skill's reference file.
-    Text(Arc<str>),
 }
 
 /// Why a file could not be read.
@@ -69,15 +61,7 @@ impl ScriptFiles {
     /// Bytes `offset..offset + len` of `file`, fewer at its end.
     pub async fn read(&self, file: &str, offset: u64, len: u64) -> Result<Vec<u8>, ReadError> {
         let missing = || ReadError::Missing(format!("There is no file \"{file}\"."));
-        let blob = match self.sources.get(file).ok_or_else(missing)? {
-            FileSource::Text(text) => {
-                return Ok(substructure_session::blob::slice(
-                    text.as_bytes(),
-                    offset..offset.saturating_add(len),
-                ))
-            }
-            FileSource::Blob(blob) => blob,
-        };
+        let blob = self.sources.get(file).ok_or_else(missing)?;
         if blob.tenant_id != self.tenant_id {
             return Err(missing());
         }

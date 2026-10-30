@@ -32,6 +32,7 @@ fn script(code: &str) -> Script {
         version: VERSION,
         language: Default::default(),
         limits: Default::default(),
+        output: subs::codemode::OUTPUT,
         cpu_used_ms: 0,
         files: vec![],
         file_bytes_used: 0,
@@ -40,7 +41,6 @@ fn script(code: &str) -> Script {
         seed: 1,
         now_ms: 0,
         spent: false,
-        tools: vec![],
     }
 }
 
@@ -192,7 +192,7 @@ mod files {
     use super::*;
     use std::collections::BTreeMap;
     use std::sync::Arc;
-    use subs::codemode::{FileSource, ScriptFile};
+    use subs::codemode::ScriptFile;
     use subs::runtime::blob::{BlobError, BlobRef, BlobStore, MemoryBlobStore, NewBlob};
 
     async fn put(store: &MemoryBlobStore, tenant: &str, text: &str) -> BlobRef {
@@ -226,7 +226,7 @@ mod files {
             tenant_id: "t1".to_string(),
             sources: files
                 .iter()
-                .map(|(id, r)| (id.to_string(), FileSource::Blob((*r).clone())))
+                .map(|(id, r)| (id.to_string(), (*r).clone()))
                 .collect::<BTreeMap<_, _>>(),
             store,
         }
@@ -288,13 +288,20 @@ mod files {
             size: 13,
             skill: Some("runbooks:respond".to_string()),
         }];
+        let store = Arc::new(MemoryBlobStore::new());
+        let blob = store
+            .put(NewBlob {
+                tenant_id: "t1".to_string(),
+                mime: "text/markdown".to_string(),
+                name: Some(id.to_string()),
+                bytes: b"Page the lead".to_vec(),
+            })
+            .await
+            .unwrap();
         let files = ScriptFiles {
             tenant_id: "t1".to_string(),
-            sources: BTreeMap::from([(
-                id.to_string(),
-                FileSource::Text(Arc::from("Page the lead")),
-            )]),
-            store: Arc::new(MemoryBlobStore::new()),
+            sources: BTreeMap::from([(id.to_string(), blob)]),
+            store,
         };
         let ran = runner().run(s, files).await.unwrap();
         assert_eq!(

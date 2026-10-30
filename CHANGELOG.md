@@ -13,6 +13,11 @@ The `@substructure.ai/cli` package and the `subs`, `substructure-host` and
 
 - An agent can have `codemode`. The model gets `run_code`, which runs JavaScript that calls the agent's tools. Only the return value and the `console.log` output go back to the model.
 
+### Changed
+
+- A `tool_search` query that names tools exactly now answers only those tools. A tool that the query names exactly comes first.
+- Plugin, skill and server entries that the engine adds to the prompt at the same place now share one message.
+
 ### Fixed
 
 - After the model loads a skill, the tools of the skill now go to the model in the same turn.

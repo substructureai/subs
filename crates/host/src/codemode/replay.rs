@@ -6,8 +6,6 @@ use std::collections::VecDeque;
 
 use super::{spent, Limit, Limits, Ran, Script, ScriptCall, ScriptRecord, Stats, Step};
 
-const ARGUMENTS: usize = 256 << 10;
-
 /// The answer to a call the script made.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Answer {
@@ -37,6 +35,7 @@ pub enum End {
 /// One run of a script, answered from its records.
 pub struct Replay {
     limits: Limits,
+    output: usize,
     records: Vec<ScriptRecord>,
     spent: bool,
     /// The run may use less than a run's limit, because the script's whole
@@ -56,6 +55,7 @@ impl Replay {
     pub fn new(script: &Script) -> Self {
         Replay {
             limits: script.limits.clone(),
+            output: script.output,
             records: script.calls.clone(),
             spent: script.spent,
             whole: script.compute_ms() < script.limits.compute_ms,
@@ -63,7 +63,7 @@ impl Replay {
             calls: Vec::new(),
             argument_bytes: 0,
             diverged: None,
-            printed: Printed::new(script.limits.output),
+            printed: Printed::new(script.output),
             end: None,
             stopped: None,
             refused: None,
@@ -88,12 +88,12 @@ impl Replay {
                 ),
             );
         }
-        if arguments.len() > ARGUMENTS {
+        if arguments.len() > self.limits.call_arguments {
             return refuse(
                 Limit::Arguments,
                 format!(
                     "Arguments to `{name}` are over {} KiB. Pass less in one call.",
-                    ARGUMENTS >> 10
+                    self.limits.call_arguments >> 10
                 ),
             );
         }
@@ -174,11 +174,12 @@ impl Replay {
         if let Some(diverged) = &self.diverged {
             return (Step::Failed(diverged.clone()), Some(Limit::Diverged));
         }
-        let output = self.limits.output;
+        let output = self.output;
         let printed = self.printed.text();
+        let dropped = self.printed.dropped;
         match self.end.clone().unwrap_or(End::Waiting) {
             End::Returned(value) => {
-                let (text, cut) = finished(&printed, value.as_deref(), output);
+                let (text, cut) = finished(&printed, value.as_deref(), (output, dropped));
                 (
                     Step::Done(text),
                     cut.then_some(Limit::Output).or(self.refused),
@@ -190,7 +191,7 @@ impl Replay {
                     _ => message,
                 };
                 (
-                    Step::Failed(failed(&message, &printed, output)),
+                    Step::Failed(failed(&message, &printed, (output, dropped))),
                     limit.or(self.refused),
                 )
             }
@@ -200,7 +201,7 @@ impl Replay {
                     "The script waits on something that never finishes. Wait only on tool \
                      calls.",
                     &printed,
-                    output,
+                    (output, dropped),
                 )),
                 Some(Limit::NeverSettles),
             ),
@@ -214,6 +215,8 @@ struct Printed {
     tail: VecDeque<String>,
     bytes: (usize, usize),
     keep: usize,
+    /// Bytes dropped between the head and the tail.
+    dropped: usize,
 }
 
 impl Printed {
@@ -223,6 +226,7 @@ impl Printed {
             tail: VecDeque::new(),
             bytes: (0, 0),
             keep,
+            dropped: 0,
         }
     }
 
@@ -237,6 +241,7 @@ impl Printed {
         while self.bytes.1 > self.keep && self.tail.len() > 1 {
             let dropped = self.tail.pop_front().unwrap_or_default();
             self.bytes.1 -= dropped.len() + 1;
+            self.dropped += dropped.len() + 1;
         }
     }
 
@@ -298,7 +303,9 @@ fn memory(limits: &Limits) -> String {
 
 /// A finished run's text: what it printed, then the value it returned, a
 /// string as itself and any other value as JSON. Says whether it was cut.
-fn finished(printed: &str, value: Option<&str>, output: usize) -> (String, bool) {
+/// `budget` is the output limit, and the bytes of printed lines already
+/// dropped from the middle.
+fn finished(printed: &str, value: Option<&str>, budget: (usize, usize)) -> (String, bool) {
     let value = value.map(|v| match serde_json::from_str::<serde_json::Value>(v) {
         Ok(serde_json::Value::String(s)) => s,
         _ => v.to_string(),
@@ -312,29 +319,37 @@ fn finished(printed: &str, value: Option<&str>, output: usize) -> (String, bool)
         None if printed.is_empty() => text.push_str(" It printed and returned nothing."),
         None => {}
     }
-    cut(text, output)
+    cut(text, budget)
 }
 
-fn failed(error: &str, printed: &str, output: usize) -> String {
+fn failed(error: &str, printed: &str, budget: (usize, usize)) -> String {
     let text = match printed.is_empty() {
         true => format!("Script failed.\n{}", error.trim_end()),
         false => format!("Script failed.\n{}\nPrinted:\n{printed}", error.trim_end()),
     };
-    cut(text, output).0
+    cut(text, budget).0
 }
 
-/// `text` within `output` bytes, its middle cut out with a note.
-fn cut(text: String, output: usize) -> (String, bool) {
-    if text.len() <= output {
+/// `text` within `output` bytes, its middle cut out with a note that counts
+/// it and the `dropped` bytes already cut.
+fn cut(text: String, (output, dropped): (usize, usize)) -> (String, bool) {
+    if text.len() <= output && dropped == 0 {
         return (text, false);
     }
-    let side = output / 2;
-    let head = floor(&text, side);
-    let tail = ceil(&text, text.len() - side);
+    let (head, tail) = match text.len() > output {
+        true => (
+            floor(&text, output / 2),
+            ceil(&text, text.len() - output / 2),
+        ),
+        false => {
+            let middle = floor(&text, text.len() / 2);
+            (middle, middle)
+        }
+    };
     let note = format!(
         "\n[… {} KiB cut from the middle. Print and return less: filter or count in the \
          script. …]\n",
-        (tail - head).div_ceil(1024)
+        (tail - head + dropped).div_ceil(1024)
     );
     (format!("{}{note}{}", &text[..head], &text[tail..]), true)
 }
@@ -365,9 +380,9 @@ mod tests {
             calls,
             seed: 0,
             now_ms: 0,
-            tools: vec![],
             spent: false,
             limits: Limits::default(),
+            output: crate::codemode::OUTPUT,
             cpu_used_ms: 0,
             files: vec![],
             file_bytes_used: 0,
@@ -436,7 +451,7 @@ mod tests {
     #[test]
     fn long_output_keeps_its_start_and_its_end() {
         let mut replay = Replay::new(&script(vec![]));
-        let output = replay.limits().output;
+        let output = crate::codemode::OUTPUT;
         for i in 0..10_000 {
             replay.log(format!("line {i}"));
         }
@@ -447,7 +462,13 @@ mod tests {
         };
         assert!(text.len() < output + 200);
         assert!(text.starts_with("Script finished.\nPrinted:\nline 0\n"));
-        assert!(text.contains("cut from the middle"));
+        let printed: usize = (0..10_000).map(|i| format!("line {i}").len() + 1).sum();
+        let note = text.split("[… ").nth(1).expect("a cut note");
+        let cut: usize = note.split(' ').next().unwrap().parse().unwrap();
+        assert!(
+            cut >= (printed - output) >> 10,
+            "the note counts every byte cut: {cut} KiB of {printed}"
+        );
         assert!(text.ends_with("line 9999\nReturned:\nthe answer"));
         assert_eq!(limit, Some(Limit::Output));
     }

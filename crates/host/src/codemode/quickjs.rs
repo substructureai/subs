@@ -69,10 +69,10 @@ impl Engine for QuickJs {
 
 const PRELUDE: &str = r#"
 (() => {
-  const { __call: call, __log: log, __done: done, __names: names, __now: NOW } = globalThis;
+  const { __call: call, __log: log, __done: done, __now: NOW } = globalThis;
   const { __files_list: listed, __files_text: ftext, __files_open: fopen, __files_next: fnext, __files_close: fclose, __files_show: fshow } = globalThis;
   let seed = globalThis.__seed;
-  for (const k of ["__call", "__log", "__done", "__names", "__now", "__seed", "__files_list", "__files_text", "__files_open", "__files_next", "__files_close", "__files_show"]) delete globalThis[k];
+  for (const k of ["__call", "__log", "__done", "__now", "__seed", "__files_list", "__files_text", "__files_open", "__files_next", "__files_close", "__files_show"]) delete globalThis[k];
   const answered = (r) => { const a = JSON.parse(r); if ("error" in a) throw new Error(a.error); return a.value; };
   const known = JSON.parse(listed);
   const idOf = (file) => String(file !== null && typeof file === "object" ? file.id : file);
@@ -109,7 +109,7 @@ const PRELUDE: &str = r#"
     const [ok, output] = r;
     return ok ? Promise.resolve(parse(output)) : Promise.reject(new Error(output));
   };
-  globalThis.tools = new Proxy(Object.fromEntries(names.map((n) => [n, true])), {
+  globalThis.tools = new Proxy({}, {
     get: (_, name) => typeof name === "string" && name !== "then" ? (args) => invoke(name, args) : undefined,
   });
   const show = (v) => {
@@ -215,8 +215,6 @@ unsafe impl Allocator for Peak {
 /// QuickJS's message for a `RangeError` past the stack limit.
 const OVERFLOW: &str = "Maximum call stack size exceeded";
 
-/// An error the script raised. `range` is the message when it is a
-/// `RangeError`.
 /// The script's file name in its stack, where its lines are the model's.
 const SCRIPT: &str = "script.js";
 
@@ -226,7 +224,8 @@ fn named(file: &str) -> rquickjs::context::EvalOptions {
     options
 }
 
-/// `message` with only the stack frames in the script itself.
+/// An error the script raised, with only the stack frames in the script
+/// itself. `range` is the message when it is a `RangeError`.
 fn raised(message: String, range: Option<&str>) -> End {
     let message = message
         .lines()
@@ -305,7 +304,6 @@ fn execute(
                 },
             )?,
         )?;
-        globals.set("__names", script.tools.clone())?;
         globals.set("__now", script.now_ms as f64)?;
         globals.set("__seed", script.seed as u32 as i32)?;
         let listed = serde_json::to_string(files.borrow().list()).unwrap_or_default();
@@ -439,6 +437,7 @@ mod tests {
                 memory: 16 << 20,
                 ..Limits::default()
             },
+            output: crate::codemode::OUTPUT,
             code: code.to_string(),
             calls,
             seed: 7,
@@ -446,7 +445,6 @@ mod tests {
             spent: false,
             version: crate::codemode::VERSION,
             language: Default::default(),
-            tools: vec!["weather".to_string(), "list-prs".to_string()],
         }
     }
 
@@ -806,10 +804,10 @@ mod tests {
     }
 
     #[test]
-    fn the_tools_can_be_listed() {
-        let code = "return [Object.keys(tools), 'weather' in tools];";
+    fn any_tool_name_is_a_function() {
+        let code = "return [typeof tools.weather, typeof tools[\"list-prs\"]];";
         let step = run(&script(code, vec![]));
-        assert_eq!(step, returned(r#"[["weather","list-prs"],true]"#));
+        assert_eq!(step, returned(r#"["function","function"]"#));
     }
 
     #[test]

@@ -12806,6 +12806,21 @@ fn dispatched_tools(agg: &mut Session, call_id: &str) -> Vec<String> {
         .collect()
 }
 
+/// Loads `named` from a script, as code mode does: `run_code` `tc-1`, whose
+/// first step calls `skill`.
+fn load_skill_in_script(agg: &mut Session, named: &str) {
+    run_code(agg, "...");
+    let events = script_step(agg, 0, &[("skill", &format!(r#"{{"name":"{named}"}}"#))]);
+    let skill = events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::ToolCallRequested(r) if r.name == "skill" => Some(r.id.clone()),
+            _ => None,
+        })
+        .expect("the script loads the skill");
+    settle_tool(agg, &skill, "instructions");
+}
+
 fn finish_llm(agg: &mut Session, call_id: &str) {
     dispatch(
         agg,
@@ -13126,7 +13141,7 @@ fn step_asks(agg: &mut Session, known: u32, calls: &[(&str, &str)]) -> Vec<Event
                 calls,
                 cpu_ms: 7,
                 file_bytes: 0,
-                pins: Default::default(),
+                skill_files: None,
             },
         ),
         &system(),
@@ -13213,7 +13228,6 @@ fn run_code_runs_its_script_in_the_engine() {
     let script = script_work(&agg).expect("the script is sent to run");
     assert_eq!(script.code, "return 1;");
     assert!(script.calls.is_empty());
-    assert_eq!(script.tools, ["ask", "tool_search", "weather"]);
 }
 
 #[test]
@@ -13257,12 +13271,80 @@ fn tools_a_script_can_call_reach_the_model_only_through_run_code() {
 }
 
 #[test]
-fn a_direct_search_leaves_out_tools_reached_from_code() {
+fn a_scripts_calls_meet_the_tools_contract() {
+    let mut agent = agent_config("m1");
+    agent.codemode = Some(crate::codemode::Language::Javascript);
+    agent.tools.push(AgentTool {
+        input: Some(json!({
+            "type": "object",
+            "properties": { "city": { "type": "string" } },
+            "required": ["city"]
+        })),
+        output: Some(json!({
+            "type": "object",
+            "properties": { "temp": { "type": "number" } },
+            "required": ["temp"]
+        })),
+        ..worker_tool("weather")
+    });
+    let mut agg = create_session_with_config("sess-1", "tenant-a", "user-1", Some(agent));
+    run_code(&mut agg, "...");
+    script_step(&mut agg, 0, &[("weather", r#"{"town":"Oslo"}"#)]);
+    let script = script_work(&agg).expect("the bad call is answered at once");
+    assert!(
+        !script.calls[0].ok
+            && script.calls[0]
+                .output
+                .starts_with("invalid tool arguments:"),
+        "{:?}",
+        script.calls[0]
+    );
+    script_step(&mut agg, 1, &[("weather", r#"{"city":"Oslo"}"#)]);
+    let call = script_call(&agg, 2);
+    settle_tool(&mut agg, &call, r#"{"temp":"warm"}"#);
+    let script = script_work(&agg).expect("the script runs again");
+    assert!(
+        !script.calls[1].ok
+            && script.calls[1]
+                .output
+                .contains("violated its declared schema"),
+        "{:?}",
+        script.calls[1]
+    );
+}
+
+#[test]
+fn code_mode_builds_only_what_scripts_reach() {
     let agg = coding_session();
-    let names = |tools: Vec<LlmTool>| tools.into_iter().map(|t| t.name).collect::<Vec<_>>();
     let at = agg.state.at_head();
-    assert!(names(at.searchable_tools()).is_empty());
-    assert_eq!(names(at.script_searchable_tools()), ["weather", "ask"]);
+    let engine: Vec<String> = at
+        .connector_tools()
+        .tools
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert_eq!(
+        engine,
+        ["run_code", "tool_search"],
+        "no call_tool, no attachment tools"
+    );
+    let searched: Vec<String> = at.searchable_tools().into_iter().map(|t| t.name).collect();
+    assert_eq!(searched, ["weather", "ask"]);
+}
+
+#[test]
+fn code_mode_refuses_a_direct_call_to_any_tool_but_run_code() {
+    let mut agg = coding_session();
+    let events = call(&mut agg, "tc-0", "weather", r#"{"city":"Oslo"}"#);
+    let target = events.iter().find_map(|e| match e {
+        EventPayload::ToolCallRequested(r) => r.target.clone(),
+        _ => None,
+    });
+    assert!(
+        matches!(&target, Some(ConnectorTarget::Refused { reason })
+            if reason == "Call `weather` from `run_code`: `await tools.weather(args)`."),
+        "{target:?}"
+    );
 }
 
 #[test]
@@ -13637,7 +13719,18 @@ fn a_script_may_read_the_files_on_its_branch() {
         }],
         "the script sees ids, not blobs"
     );
-    assert_eq!(agg.script_blobs("tc-1").get("sales.csv"), Some(&blob));
+    assert_eq!(
+        agg.script_files("tc-1"),
+        [(
+            crate::codemode::ScriptFile {
+                id: "sales.csv".to_string(),
+                mime: "text/csv".to_string(),
+                size: 42,
+                skill: None,
+            },
+            blob
+        )]
+    );
 }
 
 #[test]
@@ -13692,7 +13785,7 @@ fn code_mode_sends_the_same_tools_on_every_call() {
         asked.iter().flatten().any(|t| t.name == "find_bookings"),
         "the call keeps the tools it asked for"
     );
-    load_worker_skill(&mut agg, "tc-1", "visits");
+    load_skill_in_script(&mut agg, "visits");
     finish_llm(&mut agg, "call-1");
     while let Some(decision) = agg.open_work().into_iter().find_map(|w| match w {
         crate::work::Work::AskWorker { request, .. } => Some(request.decision_id),
@@ -13771,7 +13864,7 @@ fn code_mode_lists_each_skill_with_its_tools_once_in_the_conversation() {
         !first[0].contains("get_time"),
         "a script finds the other tools with tool_search"
     );
-    load_worker_skill(&mut agg, "tc-1", "visits");
+    load_skill_in_script(&mut agg, "visits");
     finish_llm(&mut agg, "call-1");
     while let Some(decision) = agg.open_work().into_iter().find_map(|w| match w {
         crate::work::Work::AskWorker { request, .. } => Some(request.decision_id),
@@ -13794,10 +13887,28 @@ fn code_mode_lists_each_skill_with_its_tools_once_in_the_conversation() {
 }
 
 #[test]
-fn a_script_keeps_the_plugin_bundles_of_its_first_step() {
+fn a_script_keeps_the_skill_files_of_its_first_step() {
     let mut agg = coding_session();
     run_code(&mut agg, "...");
-    let step = |known: u32, hash: &str| {
+    let stored = |name: &str| {
+        let blob = crate::blob::BlobRef {
+            tenant_id: "tenant-a".into(),
+            id: "01a18700-0000-7000-8000-000000000000".into(),
+            mime: "text/markdown".into(),
+            name: Some(name.into()),
+            size: 3,
+        };
+        vec![crate::codemode::StoredFile {
+            file: crate::codemode::ScriptFile {
+                id: name.into(),
+                mime: blob.mime.clone(),
+                size: blob.size,
+                skill: Some("runbooks:respond".into()),
+            },
+            uri: blob.uri(),
+        }]
+    };
+    let step = |known: u32, name: &str| {
         CommandPayload::settle(
             EffectKind::ToolCall,
             "tc-1",
@@ -13810,11 +13921,11 @@ fn a_script_keeps_the_plugin_bundles_of_its_first_step() {
                 }],
                 cpu_ms: 1,
                 file_bytes: 0,
-                pins: [("runbooks".to_string(), hash.to_string())].into(),
+                skill_files: Some(stored(name)),
             },
         )
     };
-    let events = dispatch(&mut agg, step(0, "first"), &system());
+    let events = dispatch(&mut agg, step(0, "runbooks:respond/first.md"), &system());
     let (decision, asked) = codemode_calls(&events).expect("the step asks");
     submit_decision(
         &mut agg,
@@ -13827,10 +13938,17 @@ fn a_script_keeps_the_plugin_bundles_of_its_first_step() {
             retryable: false,
         }],
     );
-    dispatch(&mut agg, step(1, "second"), &system());
+    dispatch(&mut agg, step(1, "runbooks:respond/second.md"), &system());
+    assert!(agg.skill_files_stored("tc-1"));
+    let ids: Vec<String> = agg
+        .script_files("tc-1")
+        .into_iter()
+        .map(|(f, _)| f.id)
+        .collect();
     assert_eq!(
-        agg.script_pins("tc-1"),
-        [("runbooks".to_string(), "first".to_string())].into()
+        ids,
+        ["runbooks:respond/first.md"],
+        "the first step's files stay"
     );
 }
 
@@ -14028,7 +14146,7 @@ fn a_script_step_has_no_natural_command_id() {
             calls: vec![],
             cpu_ms: 0,
             file_bytes: 0,
-            pins: Default::default(),
+            skill_files: None,
         },
     );
     assert_eq!(step.natural_id(), None, "the session fences steps itself");

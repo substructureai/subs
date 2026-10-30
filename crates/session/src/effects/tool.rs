@@ -13,7 +13,7 @@ use crate::protocol::{
 use crate::protocol::{RetryOverride, RetryPolicy};
 use crate::schedule::Dep;
 use crate::state::{inner_arguments, CallTarget, EffectKind, SessionState};
-use crate::tool_contract::{declared_tool, output_violation, DeclaredTool};
+use crate::tool_contract::{classify_arguments, declared_tool, output_violation, DeclaredTool};
 use crate::Caller;
 
 pub struct ToolSpec;
@@ -75,8 +75,8 @@ impl KindSpec for ToolSpec {
                 calls,
                 cpu_ms,
                 file_bytes,
-                pins,
-            } => script_step(state, id, known, calls, (cpu_ms, file_bytes), pins),
+                skill_files,
+            } => script_step(state, id, known, calls, (cpu_ms, file_bytes), skill_files),
             Outcome::Error(e) => fail(self, state, id, &e),
             other => mismatched(self.kind(), &other),
         }
@@ -196,10 +196,8 @@ fn with_skill_tools(state: &SessionState, id: &str, mut result: StoredResult) ->
         .and_then(|s| state.tool_call(&s.parent))
         .map(|parent| parent.script_language)
         .unwrap_or_default();
-    let budget = (codemode::Limits::default().output)
-        .saturating_sub(result.as_text().len() + codemode::MARGIN);
     let tools: Vec<&crate::protocol::LlmTool> = tools.iter().collect();
-    if let Some(block) = codemode::declarations(language, &tools, budget) {
+    if let Some(block) = codemode::declarations(language, &tools) {
         result.content.push(crate::protocol::StoredContent::Text {
             text: format!(
                 "\nTools this skill uses. You can call them in your next script:\n{block}"
@@ -225,7 +223,7 @@ fn script_step(
     known: u32,
     calls: Vec<ScriptCall>,
     (cpu_ms, file_bytes): (u64, u64),
-    pins: std::collections::BTreeMap<String, String>,
+    skill_files: Option<Vec<codemode::StoredFile>>,
 ) -> Vec<EventPayload> {
     let made = state.script_calls(parent);
     let stale = made.len() != known as usize
@@ -256,7 +254,7 @@ fn script_step(
             id: parent.to_string(),
             cpu_ms,
             file_bytes,
-            pins,
+            skill_files,
             asked,
         }),
         decision_queued(state.ids(), trigger),
@@ -298,17 +296,23 @@ pub fn answer_ask(state: &SessionState, id: &str, answer: AskAnswer) -> Vec<Even
 /// Ends with an error each call a script asked for that nothing can answer
 /// any more: no decision about it waits, and no interrupt holds it.
 pub fn unanswered(state: &SessionState) -> Vec<EventPayload> {
-    let deciding: Vec<&str> = state
+    let triggers: Vec<&Trigger> = state
         .effects_of(EffectKind::Decision)
-        .filter_map(|e| match &e.decision()?.trigger {
+        .filter_map(|e| Some(&e.decision()?.trigger))
+        .collect();
+    if triggers
+        .iter()
+        .any(|t| matches!(t, Trigger::InterruptResumed { .. }))
+    {
+        return Vec::new();
+    }
+    let deciding: Vec<&str> = triggers
+        .iter()
+        .filter_map(|t| match t {
             Trigger::CodemodeCalls { id, .. } => Some(id.as_str()),
-            Trigger::InterruptResumed { .. } => Some(""),
             _ => None,
         })
         .collect();
-    if deciding.contains(&"") {
-        return Vec::new();
-    }
     state
         .effects_of(EffectKind::ToolCall)
         .filter(|e| !deciding.contains(&e.id.as_str()))
@@ -334,30 +338,46 @@ fn scripted(
     (name, arguments): (String, String),
     target: Option<ConnectorTarget>,
 ) -> EventPayload {
-    let here = state.at_head();
+    let anchor = state
+        .effect(EffectKind::ToolCall, &script.parent)
+        .and_then(|e| e.anchor.clone());
+    let here = state.at(anchor.as_deref());
     let config = here.resolve_agent_for();
     let tools = here.connector_tools().tools;
     let reach = codemode::reach(&name, config.as_ref(), &tools);
     let spawns = tools
         .iter()
         .any(|t| t.name == name && t.kind == ConnectorToolKind::Subagent);
-    let searchable = match reach {
-        codemode::Reach::Unknown => here.script_searchable_tools(),
+    let searchable = here.searchable_tools();
+    let near: Vec<&str> = match reach {
+        codemode::Reach::Unknown => crate::connectors::filter::closest(
+            &searchable,
+            &name,
+            config
+                .as_ref()
+                .map(crate::protocol::AgentConfig::defer_settings)
+                .unwrap_or_default()
+                .max_matches,
+        ),
         _ => Vec::new(),
     };
-    let near: Vec<&str> = crate::connectors::filter::find(&searchable, &name)
-        .into_iter()
-        .take(3)
-        .map(|t| t.name.as_str())
-        .collect();
-    let target = target.or_else(|| match reach.refusal(&name, &near) {
-        Some(reason) => Some(ConnectorTarget::Refused { reason }),
-        None if reach == codemode::Reach::Search => Some(ConnectorTarget::ScriptSearch),
-        None if spawns => Some(ConnectorTarget::Refused {
-            reason: format!("The worker did not start the subagent of `{name}`."),
-        }),
-        None => None,
+    let invalid = searchable.iter().find(|t| t.name == name).and_then(|t| {
+        classify_arguments(&arguments, t.input.as_ref())
+            .error()
+            .map(|error| ConnectorTarget::Refused {
+                reason: format!("invalid tool arguments: {error}"),
+            })
     });
+    let target = invalid
+        .or(target)
+        .or_else(|| match reach.refusal(&name, &near) {
+            Some(reason) => Some(ConnectorTarget::Refused { reason }),
+            None if reach == codemode::Reach::Search => Some(ConnectorTarget::ScriptSearch),
+            None if spawns => Some(ConnectorTarget::Refused {
+                reason: format!("The worker did not start the subagent of `{name}`."),
+            }),
+            None => None,
+        });
     let called = asked;
     let mut call = requested(state, id, name, arguments, None, Some(script));
     if let Some(script) = call.script.as_mut() {
@@ -448,7 +468,20 @@ fn requested(
         .connector_tool_for(&name)
         .filter(|t| t.kind != ConnectorToolKind::Subagent);
     let locked = state.at_head().locked_tools().contains_key(&name);
+    let in_code_mode = state
+        .at_head()
+        .resolve_agent_for()
+        .is_some_and(|c| c.codemode.is_some());
     let (name, arguments, handler, target) = match engine_tool {
+        _ if in_code_mode && script.is_none() && name != crate::protocol::RUN_CODE => {
+            let reason = crate::copy::call_from_code(&name);
+            (
+                name,
+                arguments,
+                ToolHandler::Server,
+                Some(ConnectorTarget::Refused { reason }),
+            )
+        }
         _ if locked => (
             name,
             arguments,
@@ -592,7 +625,19 @@ fn argument(arguments: &str, key: &str) -> Option<String> {
 }
 
 impl SessionState {
+    /// The output schema `name` declares, for this call: a script's call is
+    /// made against the tool as code mode declares it, the model's against
+    /// the tools its call sent.
     fn declared_output_schema(&self, tool_call_id: &str, name: &str) -> Option<serde_json::Value> {
+        let effect = self.effect(EffectKind::ToolCall, tool_call_id)?;
+        if effect.tool()?.script.is_some() {
+            return self
+                .at(effect.anchor.as_deref())
+                .searchable_tools()
+                .into_iter()
+                .find(|t| t.name == name)?
+                .output;
+        }
         let tree = self.message_tree();
         let path = tree.path_to(tree.head_id.as_deref()?);
         match declared_tool(tool_call_id, name, &path, |id| self.llm_call(id)) {

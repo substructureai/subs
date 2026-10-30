@@ -15,7 +15,6 @@ const BATCH: usize = 512;
 /// Bytes of one line or row.
 const RECORD: usize = 4 << 20;
 /// Files a script shows the model.
-const SHOWN: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileError {
@@ -181,6 +180,7 @@ pub struct Files {
     files: Vec<ScriptFile>,
     streams: BTreeMap<u32, Stream>,
     max_streams: usize,
+    max_shown: usize,
     next: u32,
     text_cap: u64,
     shown: Vec<Shown>,
@@ -200,6 +200,7 @@ impl Files {
             files: script.files.clone(),
             streams: BTreeMap::new(),
             max_streams: script.limits.streams as usize,
+            max_shown: script.limits.shown_files,
             next: 1,
             text_cap: (script.limits.memory / 8) as u64,
             shown: Vec::new(),
@@ -243,8 +244,8 @@ impl Files {
     /// file as its text.
     pub fn show(&mut self, id: &str) -> Result<(), String> {
         let file = self.file(id)?.clone();
-        if self.shown.len() >= SHOWN {
-            return Err(format!("A script shows at most {SHOWN} files."));
+        if self.shown.len() >= self.max_shown {
+            return Err(format!("A script shows at most {} files.", self.max_shown));
         }
         let media = ["image/", "audio/", "video/"]
             .iter()
@@ -537,9 +538,9 @@ mod tests {
             calls: vec![],
             seed: 0,
             now_ms: 0,
-            tools: vec![],
             spent: false,
             limits,
+            output: crate::codemode::OUTPUT,
             cpu_used_ms: 0,
             files: contents
                 .iter()

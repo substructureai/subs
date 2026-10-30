@@ -34,8 +34,9 @@ return stale.map((pr, i) => ({ number: pr.number, reviews: reviews[i].length }))
 ```
 
 Code mode is all or nothing. The model gets one tool, `run_code`, and reaches
-every other tool from a script: there is no direct `tool_search`, `call_tool`,
-`skill` or attachment tool.
+every other tool from a script. The agent has no `call_tool` or attachment
+tools, and a direct call to any tool but `run_code` is refused with an error
+that says to call it from `run_code`.
 
 The description of `run_code` declares each tool the script can call in
 TypeScript: the first line of its description as a comment, its input type and,
@@ -52,11 +53,13 @@ is, after what the model has read. In code mode a skill holds back no tools:
 its `tools` says which tools it is about.
 
 A script finds tools with `tools.tool_search({ query })`. It answers as text:
-the declarations of the tools that match, each with its whole description, up
-to 8 KiB, then the other matches by name, then the skills that match, with how
-to load them. A query of exact tool names, as `"get_audience, find_customers"`,
-answers just those tools, declared up to the output limit. The model reads the
-answer, then calls the tools in its next script. A call to a tool that does not
+the declarations of the tools that match, each with its whole description, then
+the other matches by name, then the skills that match, with how to load them. A
+query of exact tool names, as `"get_audience, find_customers"`, answers just
+those tools. A block of declarations, in a search answer, a skill's answer or
+the description of `run_code`, holds at most 12 KiB, but its first tool is
+always declared, so a search for a tool's name always finds its declaration.
+The model reads the answer, then calls the tools in its next script. A call to a tool that does not
 exist throws an error that names the closest tools.
 
 A call returns the tool's result, parsed when it is JSON. A call that fails
@@ -67,21 +70,23 @@ throws an `Error` with the tool's message.
 A script can call the agent's worker tools, connector tools, client tools,
 subagents, `skill` and `tool_search`. A call that needs approval waits for a
 person, and a client tool waits for the client, as a direct call does. A
-subagent call returns the subagent's answer. A script cannot call `call_tool`,
-the attachment tools, or `run_code`: it calls tools by name, and reads files
-with `files`. A call to one of these throws, and the script can catch it.
+subagent call returns `{ session, result }`, as a direct call does. A script
+calls tools by name, and reads files with `files`. A call to `run_code`, or to
+a tool that does not exist, throws, and the script can catch it. A call is
+checked against the tool's input schema before it runs, and its result
+against the tool's output schema, as a direct call is.
 
 `await tools.skill({ name })` loads a skill. It answers with the skill's
-instructions, then the declarations of the tools it names, as many as fit under
-the output limit; the rest it names. The script logs the answer, and the model
-can then call those tools in its next script without a search. When the agent searches its skills, `tools.tool_search` finds them too.
+instructions, then the declarations of the tools it names. The script logs the
+answer, and the model can then call those tools in its next script without a
+search. When the agent searches its skills, `tools.tool_search` finds them too.
 
 A skill's other files are files. A script reads them by `<skill>/<path>`, such
 as `files.text("runbooks:respond/references/escalation.md")`, and shows them
 with `files.show`. `files.list` lists them with the skill they belong to, as
-`skill`. A script reads the plugin as it
-was at its first step: a plugin that changes while the script runs fails it,
-and the model can run it again.
+`skill`. The script's first step stores the skills' files as blobs, and every
+later run reads those, so a plugin that changes while the script runs does not
+change what it reads.
 
 ## What reaches the model
 
@@ -130,8 +135,8 @@ catch the error. A worker that returns `proposed` for triggers it does not know
 needs no change.
 
 Each call a script makes is a tool call in the session log, under the
-`run_code` call. It runs as a direct call does, with the same retries,
-deadlines and skill locks. The model does not see it in the transcript.
+`run_code` call. It runs as a direct call does, with the same retries and
+deadlines. The model does not see it in the transcript.
 
 The engine does not keep a script running while it waits. When the calls a
 script made have settled, the engine runs the script again from the start. A
@@ -182,6 +187,10 @@ tools, so the reading happens once per run.
 
 A file that is gone throws in the script. A store that fails sends the step
 back to its queue, as a runner that is down does.
+
+`RuntimeConfig::script_blob_cache` puts a disk cache in front of the store that
+scripts read from. It is worth it when the store is remote, as object storage
+is.
 
 ## Sandbox
 
@@ -258,20 +267,23 @@ language it does not run is tried again elsewhere.
 
 A script has no network, file system, timer or module. The engine sets these
 limits with `RuntimeConfig::script_limits`, and a runner holds each script to
-them. An error names the limit that was met and what to do.
+them. An error names the limit that was met and what to do. The 24 KiB of text a
+run sends back is not among them: the model is told it, so the session sets it.
+Files a script shows have their own budget, `shown` and `shown_media`.
 
 | Limit | Default | Applies to |
 |---|---|---|
 | `calls` | 1,000 | Calls over the whole script |
 | `results` | 8 MiB | Results the script reads, over all its calls |
-| `arguments` | 32 MiB | Arguments over the whole script, and 256 KiB in one call |
-| `output` | 24 KiB | What a run prints and returns; past it, the middle is cut |
+| `arguments` | 32 MiB | Arguments over the whole script |
+| `call_arguments` | 256 KiB | Arguments in one call |
 | `memory` | 96 MiB | JavaScript heap in one run |
 | `compute_ms` | 500 | CPU in one run |
 | `total_compute_ms` | 10,000 | CPU over all of a script's runs |
 | `file_bytes` | 64 MiB | File bytes one run reads |
 | `total_file_bytes` | 512 MiB | File bytes over all of a script's runs |
 | `streams` | 4 | Files open at once |
+| `shown_files` | 4 | Files the script shows the model |
 | `shown` | 64 KiB | File text the script shows the model |
 | `shown_media` | 2 MiB | Media files the script shows the model |
 

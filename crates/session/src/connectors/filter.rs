@@ -322,7 +322,7 @@ pub fn engine_tool(
     }
 }
 
-fn find_tool(skills: bool) -> ConnectorTool {
+pub fn find_tool(skills: bool) -> ConnectorTool {
     let mut description = "Search the tools this agent can reach. They are not listed up front. \
          Answers with the name, the description, and the input schema of each match, best match \
          first. Any word can match, so a plain description of the task searches well. A \
@@ -440,7 +440,79 @@ fn frequency(doc: &[String], term: &str) -> f64 {
     doc.iter().filter(|word| word.starts_with(term)).count() as f64
 }
 
-/// Searches `skills` beside `tools`, when the agent's skills are searched.
+/// What a search found, best first: tools and skills, at most the cap, and
+/// how many matched in all.
+pub struct Matches<'a> {
+    pub tools: Vec<&'a LlmTool>,
+    pub skills: Vec<&'a NamedSkill<'a>>,
+    pub matched: usize,
+}
+
+/// The tools and skills that match `query`, best first, at most `max`. A
+/// skill matches on the tools it names as well as on what it says. A query
+/// that only names tools, as "get_audience, find_customers", gets just those.
+/// A tool named exactly comes first.
+pub fn search<'a>(
+    tools: &'a [LlmTool],
+    skills: &'a [NamedSkill<'a>],
+    query: &str,
+    max: NonZeroUsize,
+) -> Matches<'a> {
+    let words: Vec<&str> = query
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|w| !w.is_empty())
+        .collect();
+    let named: Vec<usize> = words
+        .iter()
+        .filter_map(|w| tools.iter().position(|t| t.name == *w))
+        .collect();
+    let mut matched = match !words.is_empty() && named.len() == words.len() {
+        true => named,
+        false => {
+            let corpus: Vec<LlmTool> = tools
+                .iter()
+                .cloned()
+                .chain(skills.iter().map(|s| LlmTool {
+                    name: s.name.clone(),
+                    description: format!("{} {}", s.description, s.tools.join(" ")),
+                    input: None,
+                    output: None,
+                    defer: true,
+                }))
+                .collect();
+            rank(&corpus, query)
+        }
+    };
+    if let Some(at) = matched
+        .iter()
+        .position(|&i| tools.get(i).is_some_and(|t| t.name == query.trim()))
+    {
+        let named = matched.remove(at);
+        matched.insert(0, named);
+    }
+    let shown = &matched[..matched.len().min(max.get())];
+    Matches {
+        tools: shown.iter().filter_map(|&i| tools.get(i)).collect(),
+        skills: shown
+            .iter()
+            .filter_map(|&i| skills.get(i.checked_sub(tools.len())?))
+            .collect(),
+        matched: matched.len(),
+    }
+}
+
+/// The names of the tools most like `name`, for an error that names a tool
+/// that does not exist.
+pub fn closest<'a>(tools: &'a [LlmTool], name: &str, max: NonZeroUsize) -> Vec<&'a str> {
+    find(tools, name)
+        .into_iter()
+        .take(max.get())
+        .map(|t| t.name.as_str())
+        .collect()
+}
+
+/// A direct `tool_search`'s answer, as JSON: each matching tool with its
+/// input schema, and each matching skill.
 pub fn find_answer(
     tools: &[LlmTool],
     skills: &[NamedSkill],
@@ -448,23 +520,10 @@ pub fn find_answer(
     max_matches: NonZeroUsize,
     unavailable: &[ConnectionPath],
 ) -> String {
-    // A skill matches on the tools it brings, as well as on what it says.
-    let corpus: Vec<LlmTool> = tools
+    let found = search(tools, skills, query, max_matches);
+    let found_tools: Vec<serde_json::Value> = found
+        .tools
         .iter()
-        .cloned()
-        .chain(skills.iter().map(|s| LlmTool {
-            name: s.name.clone(),
-            description: format!("{} {}", s.description, s.tools.join(" ")),
-            input: None,
-            output: None,
-            defer: true,
-        }))
-        .collect();
-    let matched = rank(&corpus, query);
-    let shown = &matched[..matched.len().min(max_matches.get())];
-    let found_tools: Vec<serde_json::Value> = shown
-        .iter()
-        .filter_map(|&i| tools.get(i))
         .map(|tool| {
             serde_json::json!({
                 "name": tool.name,
@@ -475,33 +534,33 @@ pub fn find_answer(
         .collect();
     let mut answer = serde_json::json!({
         "tools": found_tools,
-        "matched": matched.len(),
-        "searched": corpus.len(),
+        "matched": found.matched,
+        "searched": tools.len() + skills.len(),
         "call_with": CALL_TOOL,
     });
     if !skills.is_empty() {
-        let found_skills: Vec<serde_json::Value> = shown
+        let found_skills: Vec<serde_json::Value> = found
+            .skills
             .iter()
-            .filter_map(|&i| skills.get(i.checked_sub(tools.len())?))
             .map(|skill| {
-                let mut found = serde_json::json!({
+                let mut entry = serde_json::json!({
                     "name": skill.name,
                     "description": skill.description,
                 });
                 if !skill.tools.is_empty() {
-                    found["tools"] = serde_json::json!(skill.tools);
+                    entry["tools"] = serde_json::json!(skill.tools);
                 }
-                found
+                entry
             })
             .collect();
         answer["skills"] = serde_json::json!(found_skills);
         answer["load_with"] = serde_json::json!(SKILL);
     }
-    if matched.is_empty() {
+    let shown = found.tools.len() + found.skills.len();
+    if found.matched == 0 {
         answer["note"] = serde_json::json!(crate::copy::NOTHING_MATCHED);
-    } else if matched.len() > shown.len() {
-        answer["note"] =
-            serde_json::json!(crate::copy::matches_truncated(shown.len(), matched.len()));
+    } else if found.matched > shown {
+        answer["note"] = serde_json::json!(crate::copy::matches_truncated(shown, found.matched));
     }
     if !unavailable.is_empty() {
         answer["unavailable"] = serde_json::json!(unavailable);
@@ -1264,6 +1323,30 @@ mod tests {
 
     fn cap() -> NonZeroUsize {
         crate::protocol::DeferTools::default().max_matches
+    }
+
+    #[test]
+    fn a_query_of_tool_names_answers_only_those_tools() {
+        let tools = [
+            llm("github__list_prs", "List pull requests."),
+            llm("github__create_pr", "Open a pull request."),
+            llm("github__merge_pr", "Merge a pull request."),
+        ];
+        let answer: serde_json::Value = serde_json::from_str(&find_answer(
+            &tools,
+            &[],
+            "github__merge_pr, github__list_prs",
+            cap(),
+            &[],
+        ))
+        .expect("json");
+        let names: Vec<&str> = answer["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["github__merge_pr", "github__list_prs"]);
     }
 
     #[test]

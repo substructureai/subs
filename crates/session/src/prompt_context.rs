@@ -20,7 +20,6 @@ pub type Contributor = fn(SessionStateAtNode, &str) -> Vec<PromptContext>;
 const CONTRIBUTORS: &[Contributor] = &[
     plugin_catalog,
     skill_catalog,
-    code_catalog,
     announce_servers,
     announce_unavailable,
 ];
@@ -94,8 +93,8 @@ fn plugin_catalog(at: SessionStateAtNode, call_id: &str) -> Vec<PromptContext> {
         return Vec::new();
     };
     let said = at.context_ids_on_path(call_id);
-    let searched = config.searches_skills();
     let code = config.codemode.is_some();
+    let searched = config.searches_skills() && !code;
     config
         .plugins
         .iter()
@@ -122,7 +121,7 @@ fn plugin_catalog(at: SessionStateAtNode, call_id: &str) -> Vec<PromptContext> {
                 about: (!plugin.description.is_empty()).then_some(&plugin.description),
                 skills,
                 usage: match searched {
-                    true => crate::copy::searched_skills(code),
+                    true => crate::copy::SEARCHED_SKILLS,
                     false => crate::copy::plugin_usage(code),
                 },
             })
@@ -136,43 +135,13 @@ fn plugin_catalog(at: SessionStateAtNode, call_id: &str) -> Vec<PromptContext> {
         .collect()
 }
 
-/// In code mode, when the agent searches its skills, one entry for each
-/// skill, with the tools it names. A script finds other tools with
-/// `tool_search`.
-fn code_catalog(at: SessionStateAtNode, call_id: &str) -> Vec<PromptContext> {
-    let Some(config) = at.resolve_agent_for() else {
-        return Vec::new();
-    };
-    if config.codemode.is_none() || !config.searches_skills() {
-        return Vec::new();
-    }
-    let said = at.context_ids_on_path(call_id);
-    config
-        .named_skills()
-        .iter()
-        .map(|s| (format!("codemode.skill.{}", s.name), s))
-        .filter(|(id, _)| !said.contains(id))
-        .map(|(id, s)| PromptContext {
-            id,
-            placement: Placement::System,
-            content: serde_json::to_string(&OwnSkillListing {
-                skill: &s.name,
-                about: s.description,
-                tools: s.tools,
-                usage: crate::copy::plugin_usage(true),
-            })
-            .unwrap_or_default(),
-        })
-        .collect()
-}
-
 /// One entry for each of the agent's own skills, so a skill the worker adds
 /// later lists itself without rewriting what the model has read.
 fn skill_catalog(at: SessionStateAtNode, call_id: &str) -> Vec<PromptContext> {
     let Some(config) = at.resolve_agent_for() else {
         return Vec::new();
     };
-    if config.searches_skills() {
+    if config.searches_skills() && config.codemode.is_none() {
         return Vec::new();
     }
     let said = at.context_ids_on_path(call_id);
@@ -699,5 +668,51 @@ mod tests {
         assert!(matches!(&prompt[0].content,
             Some(Content::Text(t)) if t == "{\"about\":\"a\"}\n{\"about\":\"b\"}"));
         assert_eq!(applied, ["told", "a", "b"]);
+    }
+
+    #[test]
+    fn code_mode_lists_a_plugins_skills_with_their_tools_even_when_skills_are_searched() {
+        let config = AgentConfig {
+            model: "m1".to_string(),
+            codemode: Some(crate::codemode::Language::Javascript),
+            defer_tools: Some(crate::protocol::DeferTools {
+                skills: crate::protocol::SkillListing::Search,
+                ..Default::default()
+            }),
+            plugins: vec![AgentPlugin {
+                id: "org".to_string(),
+                description: "The org.".to_string(),
+                skills: vec![SkillMeta {
+                    name: "audiences".to_string(),
+                    description: "Its audiences.".to_string(),
+                    tools: vec!["create_audience".to_string()],
+                }],
+                servers: vec![],
+                tools: None,
+                auth_failure: Default::default(),
+                tool_sync_failure: Default::default(),
+                approve: Default::default(),
+                source: Default::default(),
+            }],
+            ..Default::default()
+        };
+        let mut s = SessionState::new("sess-1".to_string());
+        apply(
+            &mut s,
+            1,
+            EventPayload::AgentConfigUpdated(AgentConfigUpdated {
+                config,
+                anchor: None,
+            }),
+        );
+        let owed = owed(s.at_head(), "call-1");
+        let plugin = owed
+            .iter()
+            .find(|c| c.id == "plugin.org")
+            .expect("the plugin is listed");
+        assert_eq!(
+            plugin.content,
+            r#"{"plugin":"org","about":"The org.","skills":[{"name":"org:audiences","description":"Its audiences.","tools":["create_audience"]}],"usage":"load a skill in `run_code` with `await tools.skill({ name })`"}"#
+        );
     }
 }

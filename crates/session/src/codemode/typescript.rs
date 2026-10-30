@@ -1,18 +1,12 @@
 // Adapted from OpenAI Codex, codex-rs/code-mode-protocol/src/json_schema_types.rs.
 // Copyright 2025 OpenAI. Licensed under the Apache License, Version 2.0:
 // http://www.apache.org/licenses/LICENSE-2.0. Changed: identifier check is local;
-// local refs become named types; an object's properties render beside its
+// local refs, the root's too, become named types; an object's properties render beside its
 // combinators, and `if`/`then` parts are left out.
 
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, BTreeSet};
 
-// Refs to the root: expose one nested recursive shape, then fall back to
-// `unknown` on the next occurrence so generated tool declarations remain finite.
-const MAX_LOCAL_REF_EXPANSIONS_PER_PATH: usize = 2;
-// Bound repeated refs and DAG fan-out separately from cycle depth so one
-// compact schema cannot expand into an arbitrarily large model-visible item.
-const MAX_TOTAL_LOCAL_REF_EXPANSIONS: usize = 32;
 // Bound individual schema rendering before assembling the final declaration.
 pub const DEFAULT_INPUT_SCHEMA_MAX_BYTES: usize = 16_000;
 // Charge intermediate render strings as they are built so repeated local refs
@@ -33,20 +27,7 @@ pub fn render_json_schema_to_typescript(
     prefix: &str,
     taken: &mut BTreeSet<String>,
 ) -> Rendered {
-    render_json_schema_to_typescript_with_budget(
-        schema,
-        prefix,
-        taken,
-        DEFAULT_INPUT_SCHEMA_MAX_BYTES,
-    )
-}
-
-pub(crate) fn render_json_schema_to_typescript_with_budget(
-    schema: &JsonValue,
-    prefix: &str,
-    taken: &mut BTreeSet<String>,
-    max_bytes: usize,
-) -> Rendered {
+    let max_bytes = DEFAULT_INPUT_SCHEMA_MAX_BYTES;
     let mut renderer = JsonSchemaTypeRenderer::new(schema, max_bytes);
     renderer.prefix = pascal(prefix);
     renderer.taken = std::mem::take(taken);
@@ -66,8 +47,6 @@ pub(crate) fn render_json_schema_to_typescript_with_budget(
 struct JsonSchemaTypeRenderer<'a> {
     root: &'a JsonValue,
     nested_schema_resource_depth: usize,
-    active_local_ref_expansions: BTreeMap<String, usize>,
-    remaining_local_ref_expansions: usize,
     remaining_render_work_bytes: usize,
     render_work_budget_exhausted: bool,
     prefix: String,
@@ -81,8 +60,6 @@ impl<'a> JsonSchemaTypeRenderer<'a> {
         Self {
             root,
             nested_schema_resource_depth: 0,
-            active_local_ref_expansions: BTreeMap::new(),
-            remaining_local_ref_expansions: MAX_TOTAL_LOCAL_REF_EXPANSIONS,
             remaining_render_work_bytes: max_bytes.saturating_mul(RENDER_WORK_MULTIPLIER),
             render_work_budget_exhausted: false,
             prefix: String::new(),
@@ -253,41 +230,7 @@ impl<'a> JsonSchemaTypeRenderer<'a> {
             map.get("$ref")
                 .and_then(JsonValue::as_str)
                 .and_then(local_json_pointer)
-                .and_then(|pointer| {
-                    if !pointer.is_empty() {
-                        return self.render_named(pointer);
-                    }
-                    let active_expansions = self
-                        .active_local_ref_expansions
-                        .get(&pointer)
-                        .copied()
-                        .unwrap_or_default();
-                    if active_expansions >= MAX_LOCAL_REF_EXPANSIONS_PER_PATH {
-                        return Some("unknown".to_string());
-                    }
-                    if self.remaining_local_ref_expansions == 0 {
-                        return Some("unknown".to_string());
-                    }
-
-                    let root = self.root;
-                    let target = if pointer.is_empty() {
-                        Some(root)
-                    } else {
-                        root.pointer(&pointer)
-                    }?;
-                    self.remaining_local_ref_expansions -= 1;
-                    self.active_local_ref_expansions
-                        .insert(pointer.clone(), active_expansions + 1);
-
-                    let rendered = self.render(target);
-                    if active_expansions == 0 {
-                        self.active_local_ref_expansions.remove(&pointer);
-                    } else {
-                        self.active_local_ref_expansions
-                            .insert(pointer, active_expansions);
-                    }
-                    Some(rendered)
-                })
+                .and_then(|pointer| self.render_named(pointer))
         }
         .unwrap_or_else(|| "unknown".to_string());
         if self.render_work_budget_exhausted {
@@ -318,8 +261,11 @@ impl<'a> JsonSchemaTypeRenderer<'a> {
         }
         let root = self.root;
         let target = root.pointer(&pointer)?;
-        let segment = pointer.rsplit('/').next().unwrap_or_default();
-        let base = format!("{}{}", self.prefix, pascal(&unescape_pointer(segment)));
+        let segment = match pointer.is_empty() {
+            true => "args".to_string(),
+            false => unescape_pointer(pointer.rsplit('/').next().unwrap_or_default()),
+        };
+        let base = format!("{}{}", self.prefix, pascal(&segment));
         let base = match base.chars().next() {
             Some(c) if c.is_ascii_alphabetic() => base,
             _ => format!("T{base}"),
@@ -602,21 +548,7 @@ fn decode_hex_digit(digit: u8) -> Option<u8> {
 }
 
 fn has_renderable_schema_keywords(map: &serde_json::Map<String, JsonValue>) -> bool {
-    [
-        "const",
-        "enum",
-        "anyOf",
-        "oneOf",
-        "allOf",
-        "type",
-        "properties",
-        "additionalProperties",
-        "required",
-        "items",
-        "prefixItems",
-    ]
-    .iter()
-    .any(|key| map.contains_key(*key))
+    has_structural_keywords(map) || map.contains_key("type")
 }
 
 /// `text` in PascalCase, as `find_customers` to `FindCustomers`.
