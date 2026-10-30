@@ -66,7 +66,14 @@ uploads only what the deployment does not already hold, so an unchanged
 directory sends nothing, and apply reports what it sent.
 
 A local engine needs none of this. It reads the directory at startup and stores
-the binaries while it reads.
+the skills' files while it reads.
+
+Every file of a skill but its `SKILL.md` is stored as a blob when the plugin is
+saved, text and binary alike, and the skill keeps a reference. A file that
+cannot be stored fails the save, naming the file. A blob's id comes from its
+content, so a file that did not change is not stored again. The plugin's hash
+is of its content, not of the references, so an unchanged directory keeps its
+hash.
 
 ## Enable a plugin
 

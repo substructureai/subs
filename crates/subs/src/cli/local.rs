@@ -257,14 +257,10 @@ pub(crate) async fn start_engine(
         .collect();
 
     for (id, bundle) in &mut bundles {
-        let Some(pending) = resolved.pending.remove(id) else {
-            continue;
-        };
-        let notices =
-            crate::plugins::store_binaries(bundle, pending, DEFAULT_TENANT, blobs.as_ref()).await;
-        for notice in notices {
-            tracing::warn!("[plugin.{id}]: {notice}");
-        }
+        let pending = resolved.pending.remove(id).unwrap_or_default();
+        crate::plugins::store_files(bundle, pending, DEFAULT_TENANT, blobs.as_ref())
+            .await
+            .map_err(|e| anyhow::anyhow!("[plugin.{id}]: {e}"))?;
     }
     let plugins: Arc<dyn crate::plugins::PluginResolver> =
         Arc::new(crate::plugins::StaticPlugins::new(bundles));

@@ -29,14 +29,34 @@ pub struct Skill {
     pub body: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<String>,
+    /// Its text files, by path.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub files: BTreeMap<String, String>,
+    pub files: BTreeMap<String, SkillFile>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub binaries: BTreeMap<String, Binary>,
+    pub binaries: BTreeMap<String, FileRef>,
 }
 
+/// A skill's text file: as it was loaded, or stored as a blob once its
+/// bundle was saved.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SkillFile {
+    Text(String),
+    Stored(FileRef),
+}
+
+impl SkillFile {
+    pub fn size(&self) -> u64 {
+        match self {
+            SkillFile::Text(text) => text.len() as u64,
+            SkillFile::Stored(file) => file.size,
+        }
+    }
+}
+
+/// A file stored as a blob.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct Binary {
+pub struct FileRef {
     pub uri: String,
     pub mime: String,
     pub size: u64,

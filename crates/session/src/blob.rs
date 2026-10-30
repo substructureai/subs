@@ -83,8 +83,23 @@ pub struct NewBlob {
     pub bytes: Vec<u8>,
 }
 
+/// A blob's id, from its tenant, type and bytes. The same content gets the
+/// same id, so a store keeps it once, and a blob never changes.
+pub fn content_id(tenant_id: &str, mime: &str, bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    for part in [tenant_id.as_bytes(), mime.as_bytes()] {
+        hash.update((part.len() as u64).to_le_bytes());
+        hash.update(part);
+    }
+    hash.update(bytes);
+    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, &hash.finalize()).to_string()
+}
+
 #[async_trait]
 pub trait BlobStore: Send + Sync {
+    /// Stores `blob` under its [`content_id`]. Content already stored is not
+    /// stored again.
     async fn put(&self, blob: NewBlob) -> Result<BlobRef, BlobError>;
     async fn get(&self, r: &BlobRef) -> Result<Vec<u8>, BlobError>;
 
@@ -118,12 +133,13 @@ impl Default for MemoryBlobStore {
 #[async_trait]
 impl BlobStore for MemoryBlobStore {
     async fn put(&self, blob: NewBlob) -> Result<BlobRef, BlobError> {
-        let id = uuid::Uuid::now_v7().to_string();
+        let id = content_id(&blob.tenant_id, &blob.mime, &blob.bytes);
         let size = blob.bytes.len() as u64;
         self.0
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(id.clone(), blob.bytes);
+            .entry(id.clone())
+            .or_insert(blob.bytes);
         Ok(BlobRef {
             tenant_id: blob.tenant_id,
             id,

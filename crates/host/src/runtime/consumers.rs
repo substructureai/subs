@@ -157,6 +157,7 @@ impl WorkRouter {
                         self.plugins.as_ref(),
                     )
                     .await
+                    .map_err(transient)?
                     else {
                         tracing::error!(%session_id, tool_call_id = %call.tool_call_id, "no local answer for a call routed to the engine");
                         return Ok(());

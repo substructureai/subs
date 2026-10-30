@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 use crate::codemode::{
     settle, Admission, Limit, Limits, Ran, ScriptFile, ScriptFiles, ScriptRunner, Stats, Step,
 };
+use crate::plugins::text_mime;
 use crate::plugins::PluginResolver;
 use crate::protocol::RetryPolicy;
 use crate::runtime::blob::{BlobRef, BlobStore, NewBlob};
@@ -21,7 +22,7 @@ use crate::runtime::queue::{Queue, SCRIPT};
 use crate::runtime::sessions::Sessions;
 use crate::runtime::span::SpanContext;
 use substructure_session::codemode::StoredFile;
-use substructure_session::plugins::PluginBundle;
+use substructure_session::plugins::{PluginBundle, SkillFile};
 use substructure_session::Session;
 
 /// Run a `run_code` call's script again. The script and its calls are read
@@ -159,8 +160,9 @@ async fn step(
     .await
 }
 
-/// Stores the files of the agent's bundle skills as blobs, as
-/// `<skill>/<path>`, so every run of the script reads the same bytes.
+/// The blobs of the agent's bundle skills' files, as `<skill>/<path>`, so
+/// every run of the script reads the same bytes. Text a bundle holds inline
+/// is stored here.
 async fn store_skill_files(
     session: &Session,
     task: &ScriptTask,
@@ -176,19 +178,26 @@ async fn store_skill_files(
         let Some(skill) = bundles[&bundle].as_ref().and_then(|b| b.skill(&skill)) else {
             continue;
         };
-        for (path, text) in &skill.files {
+        for (path, file) in &skill.files {
             let id = format!("{named}/{path}");
-            let blob = scripts
-                .blobs
-                .put(NewBlob {
-                    tenant_id: task.tenant_id.clone(),
-                    mime: text_mime(path).to_string(),
-                    name: Some(id.clone()),
-                    bytes: text.as_bytes().to_vec(),
-                })
-                .await
-                .map_err(|e| e.to_string())?;
-            stored.push(stored_file(id, &named, blob));
+            let blob = match file {
+                SkillFile::Stored(file) => BlobRef::parse(&file.uri),
+                SkillFile::Text(text) => Some(
+                    scripts
+                        .blobs
+                        .put(NewBlob {
+                            tenant_id: task.tenant_id.clone(),
+                            mime: text_mime(path).to_string(),
+                            name: Some(id.clone()),
+                            bytes: text.as_bytes().to_vec(),
+                        })
+                        .await
+                        .map_err(|e| e.to_string())?,
+                ),
+            };
+            if let Some(blob) = blob {
+                stored.push(stored_file(id, &named, blob));
+            }
         }
         for (path, binary) in &skill.binaries {
             let Some(blob) = BlobRef::parse(&binary.uri) else {
@@ -209,15 +218,6 @@ fn stored_file(id: String, skill: &str, blob: BlobRef) -> StoredFile {
             skill: Some(skill.to_string()),
         },
         uri: blob.uri(),
-    }
-}
-
-fn text_mime(path: &str) -> &'static str {
-    match path.rsplit_once('.').map(|(_, ext)| ext) {
-        Some("md") => "text/markdown",
-        Some("json") => "application/json",
-        Some("csv") => "text/csv",
-        _ => "text/plain",
     }
 }
 

@@ -17,6 +17,9 @@ The `@substructure.ai/cli` package and the `subs`, `substructure-host` and
 
 - A `tool_search` query that names tools exactly now answers only those tools. A tool that the query names exactly comes first.
 - Plugin, skill and server entries that the engine adds to the prompt at the same place now share one message.
+- A skill's text files are now stored as blobs when its plugin is saved, as its binary files are.
+- A skill file that cannot be stored now fails the plugin's save. Before, the file was skipped with a warning.
+- A blob's id now comes from its content, so the same content is stored once.
 
 ### Fixed
 

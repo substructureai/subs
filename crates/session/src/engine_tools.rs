@@ -1,6 +1,6 @@
 use super::state::SessionStateAtNode;
 use crate::connectors::filter;
-use crate::plugins::{PluginBundle, Skill};
+use crate::plugins::{FileRef, PluginBundle, Skill, SkillFile};
 use crate::protocol::{AgentConfig, ConnectorToolKind, StoredContent, StoredResult};
 
 pub fn answer(
@@ -86,40 +86,71 @@ pub fn split_skill(named: &str) -> (&str, &str) {
     named.split_once(':').unwrap_or(("", named))
 }
 
+/// The skill a `skill` call names, by the name it gave, and the file it
+/// asks for, if any.
+fn requested<'b>(
+    at: SessionStateAtNode,
+    bundle: Option<&'b PluginBundle>,
+    arguments: &str,
+) -> Result<(String, &'b Skill, Option<String>), StoredResult> {
+    let named = argument(arguments, "name");
+    let file = Some(argument(arguments, "file")).filter(|f| !f.is_empty());
+    let Some(config) = at.resolve_agent_for() else {
+        return Err(StoredResult::error(
+            "this agent has no config on this branch",
+        ));
+    };
+    let Some(found) = config.named_skill(&named) else {
+        return Err(StoredResult::error(no_such_skill(&config, &named)));
+    };
+    let Some(bundle) = bundle else {
+        return Err(StoredResult::error(format!(
+            "skill `{named}` has no data on this engine; re-apply the project"
+        )));
+    };
+    let Some(skill) = bundle.skill(found.skill) else {
+        return Err(StoredResult::error(format!(
+            "skill `{named}` is not in the data this engine holds; re-apply the project"
+        )));
+    };
+    Ok((named, skill, file))
+}
+
+/// The stored text file a `skill` call asks for: the host reads it, and hands
+/// its text to [`skill_answer`].
+pub fn stored_file(
+    at: SessionStateAtNode,
+    bundle: Option<&PluginBundle>,
+    arguments: &str,
+) -> Option<FileRef> {
+    let (_, skill, file) = requested(at, bundle, arguments).ok()?;
+    match skill.files.get(&file?)? {
+        SkillFile::Stored(stored) => Some(stored.clone()),
+        SkillFile::Text(_) => None,
+    }
+}
+
 /// A skill's instructions, or one of its files. A script reads the files as
-/// files, `<skill>/<path>`, so `scripted` names them that way.
+/// files, `<skill>/<path>`, so `scripted` names them that way. `stored` is the
+/// text of the [`stored_file`] the call asks for.
 pub fn skill_answer(
     at: SessionStateAtNode,
     bundle: Option<&PluginBundle>,
     arguments: &str,
     scripted: bool,
+    stored: Option<&str>,
 ) -> StoredResult {
-    let named = argument(arguments, "name");
-    let file = Some(argument(arguments, "file")).filter(|f| !f.is_empty());
-    let Some(config) = at.resolve_agent_for() else {
-        return StoredResult::error("this agent has no config on this branch");
+    let (named, skill, file) = match requested(at, bundle, arguments) {
+        Ok(found) => found,
+        Err(refused) => return refused,
     };
-    let Some(found) = config.named_skill(&named) else {
-        return StoredResult::error(no_such_skill(&config, &named));
-    };
-    let Some(bundle) = bundle else {
-        return StoredResult::error(format!(
-            "skill `{named}` has no data on this engine; re-apply the project"
-        ));
-    };
-    let Some(skill) = bundle.skill(found.skill) else {
-        return StoredResult::error(format!(
-            "skill `{named}` is not in the data this engine holds; re-apply the project"
-        ));
-    };
-
     match file {
         Some(path) if scripted => StoredResult::error(format!(
             "Read a skill's files with `files.text`, by their path under its base directory: \
              `files.text({:?})`.",
             format!("{named}/{path}")
         )),
-        Some(path) => file_answer(skill, &named, &path),
+        Some(path) => file_answer(skill, &named, &path, stored),
         None if scripted => StoredResult::text(format!(
             "Base directory for this skill: {named}/\n\n{}",
             skill.body
@@ -175,9 +206,14 @@ fn no_such_skill(config: &AgentConfig, named: &str) -> String {
     )
 }
 
-fn file_answer(skill: &Skill, named: &str, path: &str) -> StoredResult {
-    if let Some(content) = skill.files.get(path) {
-        return StoredResult::text(content.clone());
+fn file_answer(skill: &Skill, named: &str, path: &str, stored: Option<&str>) -> StoredResult {
+    match (skill.files.get(path), stored) {
+        (Some(SkillFile::Text(text)), _) => return StoredResult::text(text.clone()),
+        (Some(SkillFile::Stored(_)), Some(text)) => return StoredResult::text(text),
+        (Some(SkillFile::Stored(_)), None) => {
+            return StoredResult::error(format!("`{path}` in skill `{named}` could not be read."))
+        }
+        (None, _) => {}
     }
     match skill.binaries.get(path) {
         Some(binary) => StoredResult {
@@ -253,10 +289,14 @@ mod tests {
                     description: "Fill out PDF forms.".to_string(),
                     body: "Read references/FORMS.md first.".to_string(),
                     tools: vec![],
-                    files: [("references/FORMS.md".to_string(), "field rules".to_string())].into(),
+                    files: [(
+                        "references/FORMS.md".to_string(),
+                        crate::plugins::SkillFile::Text("field rules".to_string()),
+                    )]
+                    .into(),
                     binaries: [(
                         "references/sample.pdf".to_string(),
-                        crate::plugins::Binary {
+                        crate::plugins::FileRef {
                             uri: "blob://t1/1?mime=application/pdf&size=3".to_string(),
                             mime: "application/pdf".to_string(),
                             size: 3,
@@ -277,6 +317,7 @@ mod tests {
             bundles().get("pdf"),
             r#"{"name":"pdf:form-filling","file":"references/FORMS.md"}"#,
             true,
+            None,
         );
         assert!(answer.is_error);
         assert!(
@@ -290,6 +331,7 @@ mod tests {
             bundles().get("pdf"),
             r#"{"name":"pdf:form-filling"}"#,
             true,
+            None,
         );
         assert!(
             loaded
@@ -306,6 +348,7 @@ mod tests {
             bundles().get("pdf"),
             r#"{"name":"pdf:form-filling"}"#,
             false,
+            None,
         );
         assert!(!answer.is_error, "expected a result; got {answer:?}");
         let text = answer.as_text();
@@ -324,8 +367,40 @@ mod tests {
             bundles().get("pdf"),
             r#"{"name":"pdf:form-filling","file":"references/FORMS.md"}"#,
             false,
+            None,
         );
         assert_eq!(answer, StoredResult::text("field rules"));
+    }
+
+    #[test]
+    fn a_stored_file_answers_with_the_text_the_host_read() {
+        let mut set = bundles();
+        let stored = crate::plugins::FileRef {
+            uri: "blob://t1/2?mime=text/markdown&size=11".to_string(),
+            mime: "text/markdown".to_string(),
+            size: 11,
+        };
+        set.get_mut("pdf").unwrap().skills[0].files.insert(
+            "references/FORMS.md".to_string(),
+            crate::plugins::SkillFile::Stored(stored.clone()),
+        );
+        let state = state_with_plugin();
+        let arguments = r#"{"name":"pdf:form-filling","file":"references/FORMS.md"}"#;
+        assert_eq!(
+            stored_file(state.at(None), set.get("pdf"), arguments),
+            Some(stored),
+            "the host is told which blob to read"
+        );
+        let answer = skill_answer(
+            state.at(None),
+            set.get("pdf"),
+            arguments,
+            false,
+            Some("field rules"),
+        );
+        assert_eq!(answer, StoredResult::text("field rules"));
+        let unread = skill_answer(state.at(None), set.get("pdf"), arguments, false, None);
+        assert!(unread.is_error, "{unread:?}");
     }
 
     #[test]
@@ -335,6 +410,7 @@ mod tests {
             bundles().get("pdf"),
             r#"{"name":"pdf:form-filling","file":"references/sample.pdf"}"#,
             false,
+            None,
         );
         assert_eq!(
             answer.content,
@@ -369,6 +445,7 @@ mod tests {
                 bundles().get("pdf"),
                 arguments,
                 false,
+                None,
             );
             assert!(
                 answer.is_error,

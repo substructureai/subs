@@ -8,7 +8,7 @@ use crate::protocol::OCTET_STREAM;
 use crate::runtime::blob::{BlobStore, NewBlob};
 
 pub use substructure_session::plugins::{
-    Binary, BundleServer, Pending, PluginBundle, PluginSet, Skill, SKILLS_BUNDLE,
+    BundleServer, FileRef, Pending, PluginBundle, PluginSet, Skill, SkillFile, SKILLS_BUNDLE,
 };
 
 #[async_trait::async_trait]
@@ -150,50 +150,75 @@ const MAX_BUNDLE_BYTES: usize = 10 * 1024 * 1024;
 
 const MAX_BINARY_BYTES: usize = 100 * 1024 * 1024;
 
-pub async fn store_binaries(
+/// Stores a bundle's files as blobs: its pending binaries, and each text
+/// file it still holds as text. A file that is not stored fails the save, so a
+/// bundle is never saved with files it cannot read.
+pub async fn store_files(
     bundle: &mut PluginBundle,
     pending: Vec<Pending>,
     tenant_id: &str,
     blobs: &dyn BlobStore,
-) -> Vec<String> {
-    let mut notices = Vec::new();
-    for file in pending {
-        let size = file.bytes.len() as u64;
-        let put = blobs
-            .put(NewBlob {
-                tenant_id: tenant_id.to_string(),
-                mime: file.mime.clone(),
-                name: file.path.rsplit('/').next().map(str::to_string),
-                bytes: file.bytes,
+) -> Result<(), String> {
+    let put = |path: &str, mime: &str, bytes: Vec<u8>| {
+        let blob = NewBlob {
+            tenant_id: tenant_id.to_string(),
+            mime: mime.to_string(),
+            name: path.rsplit('/').next().map(str::to_string),
+            bytes,
+        };
+        async move {
+            let size = blob.bytes.len() as u64;
+            let mime = blob.mime.clone();
+            let stored = blobs.put(blob).await?;
+            Ok::<_, crate::runtime::blob::BlobError>(FileRef {
+                uri: stored.uri(),
+                mime,
+                size,
             })
-            .await;
-        match put {
-            Ok(stored) => {
-                if let Some(skill) = bundle.skills.iter_mut().find(|s| s.name == file.skill) {
-                    skill.binaries.insert(
-                        file.path,
-                        Binary {
-                            uri: stored.uri(),
-                            mime: file.mime,
-                            size,
-                        },
-                    );
-                }
-            }
-            Err(e) => notices.push(format!(
-                "{} in skill `{}` was not stored and is unreadable: {e}",
+        }
+    };
+    for file in pending {
+        let stored = put(&file.path, &file.mime, file.bytes).await.map_err(|e| {
+            format!(
+                "{} in skill `{}` could not be stored: {e}",
                 file.path, file.skill
-            )),
+            )
+        })?;
+        if let Some(skill) = bundle.skills.iter_mut().find(|s| s.name == file.skill) {
+            skill.binaries.insert(file.path, stored);
         }
     }
-    notices
+    for skill in &mut bundle.skills {
+        for (path, file) in &mut skill.files {
+            let SkillFile::Text(text) = file else {
+                continue;
+            };
+            let stored = put(path, text_mime(path), std::mem::take(text).into_bytes())
+                .await
+                .map_err(|e| {
+                    format!("{path} in skill `{}` could not be stored: {e}", skill.name)
+                })?;
+            *file = SkillFile::Stored(stored);
+        }
+    }
+    Ok(())
+}
+
+/// The type of a skill's text file, by its extension.
+pub fn text_mime(path: &str) -> &'static str {
+    match path.rsplit_once('.').map(|(_, ext)| ext) {
+        Some("md") => "text/markdown",
+        Some("json") => "application/json",
+        Some("csv") => "text/csv",
+        _ => "text/plain",
+    }
 }
 
 fn content_bytes(bundle: &PluginBundle) -> usize {
     bundle
         .skills
         .iter()
-        .map(|s| s.body.len() + s.files.values().map(String::len).sum::<usize>())
+        .map(|s| s.body.len() + s.files.values().map(|f| f.size() as usize).sum::<usize>())
         .sum()
 }
 
@@ -263,7 +288,10 @@ fn load_skill(dir: &Path, pending: &mut Vec<Pending>, notices: &mut Vec<String>)
         description: sanitize_line(&description),
         body: sanitize_text(body),
         tools: frontmatter_list(front, "tools"),
-        files,
+        files: files
+            .into_iter()
+            .map(|(path, text)| (path, SkillFile::Text(text)))
+            .collect(),
         binaries: BTreeMap::new(),
     })
 }
@@ -546,7 +574,10 @@ mod tests {
         assert_eq!(skill.name, "form-filling");
         assert_eq!(skill.description, "Fill out PDF forms.");
         assert!(skill.body.starts_with("Read references/FORMS.md"));
-        assert_eq!(skill.files["references/FORMS.md"], "fields…");
+        assert_eq!(
+            skill.files["references/FORMS.md"],
+            SkillFile::Text("fields…".into())
+        );
         assert!(
             !skill.files.contains_key("SKILL.md"),
             "the body is not a file"
@@ -581,13 +612,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn storing_a_binary_leaves_the_bundle_holding_a_ref() {
+    async fn storing_a_bundle_leaves_it_holding_refs() {
         let dir = plugin_dir();
         png(dir.path(), "skills/form-filling/references/form.png");
         let mut loaded = load_dir(dir.path()).unwrap();
+        let hash = loaded.hash();
         let blobs = crate::runtime::blob::MemoryBlobStore::new();
-        let notices = store_binaries(&mut loaded.bundle, loaded.pending, "t1", &blobs).await;
-        assert!(notices.is_empty(), "got {notices:?}");
+        store_files(&mut loaded.bundle, loaded.pending, "t1", &blobs)
+            .await
+            .unwrap();
+
+        let SkillFile::Stored(text) = &loaded.bundle.skills[0].files["references/FORMS.md"] else {
+            panic!("the text file is stored");
+        };
+        assert_eq!(text.mime, "text/markdown");
+        let stored = crate::runtime::blob::BlobRef::parse(&text.uri).expect("a ref");
+        assert_eq!(blobs.get(&stored).await.unwrap(), "fields…".as_bytes());
+        assert_eq!(
+            load_dir(dir.path()).unwrap().hash(),
+            hash,
+            "the hash is of the content, so loading again finds it the same"
+        );
 
         let binary = &loaded.bundle.skills[0].binaries["references/form.png"];
         assert_eq!(binary.mime, "image/png");

@@ -22,9 +22,10 @@ fn io_err(e: impl std::fmt::Display) -> BlobError {
 #[async_trait]
 impl BlobStore for SqliteBlobStore {
     async fn put(&self, blob: NewBlob) -> Result<BlobRef, BlobError> {
+        let id = substructure_session::blob::content_id(&blob.tenant_id, &blob.mime, &blob.bytes);
         let r = BlobRef {
             tenant_id: blob.tenant_id,
-            id: uuid::Uuid::now_v7().to_string(),
+            id,
             mime: blob.mime,
             name: blob.name,
             size: blob.bytes.len() as u64,
@@ -34,7 +35,7 @@ impl BlobStore for SqliteBlobStore {
         tokio::task::spawn_blocking(move || {
             let conn = writer.lock().map_err(io_err)?;
             conn.execute(
-                "INSERT INTO blobs (tenant_id, id, mime, name, size, bytes, created_at)
+                "INSERT OR IGNORE INTO blobs (tenant_id, id, mime, name, size, bytes, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 rusqlite::params![
                     row.tenant_id,
@@ -182,18 +183,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_put_is_its_own_row() {
+    async fn the_same_content_is_stored_once() {
         let store = store("rows");
-        let blob = || NewBlob {
+        let blob = |mime: &str| NewBlob {
             tenant_id: "t1".into(),
-            mime: "image/png".into(),
+            mime: mime.into(),
             name: None,
             bytes: b"x".to_vec(),
         };
-        let a = store.put(blob()).await.unwrap();
-        let b = store.put(blob()).await.unwrap();
-        assert_ne!(a.id, b.id);
+        let a = store.put(blob("image/png")).await.unwrap();
+        let b = store.put(blob("image/png")).await.unwrap();
+        assert_eq!(a.id, b.id, "the same bytes keep their id");
+        let other = store.put(blob("text/plain")).await.unwrap();
+        assert_ne!(a.id, other.id, "another type is another blob");
+        let rows: i64 = store
+            .db
+            .writer
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM blobs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 2);
         assert_eq!(store.get(&a).await.unwrap(), b"x");
-        assert_eq!(store.get(&b).await.unwrap(), b"x");
     }
 }

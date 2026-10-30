@@ -5,9 +5,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::connectors::registry::Connections;
 use crate::connectors::ConnectorError;
+use crate::plugins::FileRef;
 use crate::plugins::PluginResolver;
 use crate::protocol::StoredResult;
-use crate::runtime::blob::BlobStore;
+use crate::runtime::blob::{BlobError, BlobRef, BlobStore};
 use crate::runtime::executor::{settled, spawn_bounded_executors, ExecutorPool};
 use crate::runtime::inbox::Inbox;
 use crate::runtime::queue::{Queue, CONNECTOR};
@@ -130,27 +131,49 @@ async fn handle_task(
     }
 }
 
+/// The engine's own answer to a call it routes to itself, or none. A store
+/// that fails is an error, so the call is tried again.
 pub async fn answer_locally(
     session: &Session,
     tool_call_id: &str,
     blobs: &dyn BlobStore,
     plugins: &dyn PluginResolver,
-) -> Option<StoredResult> {
+) -> Result<Option<StoredResult>, String> {
     let state = session.state();
     if let Some(call) = state.attachment_call(tool_call_id) {
-        return Some(crate::attachments::tools::answer(call, blobs).await);
+        return Ok(Some(crate::attachments::tools::answer(call, blobs).await));
     }
-    let call = state.skill_call(tool_call_id)?;
+    let Some(call) = state.skill_call(tool_call_id) else {
+        return Ok(None);
+    };
     let bundle = match call.plugin_id.is_empty() {
         true => None,
         false => plugins.resolve(session.tenant_id(), &call.plugin_id).await,
     };
-    Some(engine_tools::skill_answer(
-        state.at(call.node.as_deref()),
+    let at = state.at(call.node.as_deref());
+    let stored = match engine_tools::stored_file(at, bundle.as_ref(), &call.arguments) {
+        Some(file) => match read_text(&file, blobs).await {
+            Ok(text) => Some(text),
+            Err(BlobError::NotFound) => {
+                return Ok(Some(StoredResult::error("This file is no longer stored.")))
+            }
+            Err(e) => return Err(e.to_string()),
+        },
+        None => None,
+    };
+    Ok(Some(engine_tools::skill_answer(
+        at,
         bundle.as_ref(),
         &call.arguments,
         call.scripted,
-    ))
+        stored.as_deref(),
+    )))
+}
+
+async fn read_text(file: &FileRef, blobs: &dyn BlobStore) -> Result<String, BlobError> {
+    let blob = BlobRef::parse(&file.uri).ok_or(BlobError::NotFound)?;
+    let bytes = blobs.get(&blob).await?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 pub fn settle_call(

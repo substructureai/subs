@@ -84,9 +84,9 @@ search. When the agent searches its skills, `tools.tool_search` finds them too.
 A skill's other files are files. A script reads them by `<skill>/<path>`, such
 as `files.text("runbooks:respond/references/escalation.md")`, and shows them
 with `files.show`. `files.list` lists them with the skill they belong to, as
-`skill`. The script's first step stores the skills' files as blobs, and every
-later run reads those, so a plugin that changes while the script runs does not
-change what it reads.
+`skill`. The script's first step records the blobs that hold the skills' files,
+and every later run reads those, so a plugin that changes while the script runs
+does not change what it reads.
 
 ## What reaches the model
 
