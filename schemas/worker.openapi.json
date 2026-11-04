@@ -3693,7 +3693,7 @@
       "url": "https://opensource.org/license/mit"
     },
     "title": "Substructure worker",
-    "version": "0.10.3"
+    "version": "0.10.4"
   },
   "openapi": "3.1.0",
   "paths": {

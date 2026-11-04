@@ -9,6 +9,8 @@ The `@substructure.ai/cli` package and the `subs`, `substructure-host` and
 
 ## [Unreleased]
 
+## [0.10.4] - 2026-11-04
+
 ### Added
 
 - An agent can have `codemode`. The model gets `run_code`, which runs JavaScript that calls the agent's tools. Only the return value and the `console.log` output go back to the model.
@@ -381,7 +383,8 @@ The `@substructure.ai/cli` package and the `subs`, `substructure-host` and
 - The changelog starts again at this release. For the changes before it, refer
   to the git history.
 
-[Unreleased]: https://github.com/substructureai/substructure/compare/v0.10.3...HEAD
+[Unreleased]: https://github.com/substructureai/substructure/compare/v0.10.4...HEAD
+[0.10.4]: https://github.com/substructureai/substructure/compare/v0.10.3...v0.10.4
 [0.10.3]: https://github.com/substructureai/substructure/compare/v0.10.2...v0.10.3
 [0.10.2]: https://github.com/substructureai/substructure/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/substructureai/substructure/compare/v0.10.0...v0.10.1
