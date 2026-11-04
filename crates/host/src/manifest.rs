@@ -7,8 +7,8 @@ use crate::attachments::Attachments;
 use crate::connectors::registry::{
     AuthKind, ConnectionDecl, ConnectionPath, ConnectionSpec, CredentialScope,
 };
-use crate::copy::declared;
 use crate::plugins::{BundleServer, PluginBundle, SKILLS_BUNDLE};
+use crate::prompts::declared;
 use crate::protocol::ReasoningEffort;
 use crate::protocol::{
     AgentConfig, AgentPlugin, AgentSkill, AgentTool, Approve, ConnectorProtocol, ContextConfig,

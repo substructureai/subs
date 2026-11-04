@@ -53,7 +53,7 @@ pub(crate) fn declared_agent(agent_id: String, cfg: &ProjectConfig) -> Result<St
         anyhow::bail!(
             "no [agent.{agent_id}] in subs.toml, and no `default_worker` to send it to. \
              Declared: {}",
-            crate::copy::declared(cfg.agent_ids())
+            crate::prompts::declared(cfg.agent_ids())
         );
     };
     eprintln!("agent \"{agent_id}\" is not declared; using default_worker = \"{worker}\"");
@@ -211,6 +211,7 @@ impl Turns for LocalTurns {
             .cancel_session(
                 self.session_id.clone(),
                 self.caller.clone(),
+                false,
                 crate::span::SpanContext::root().child(SPAN),
             )
             .await?;

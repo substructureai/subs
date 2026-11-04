@@ -59,6 +59,7 @@ Render a chat from these.
 | `message.new` | A message joined the tree: `{ message, parent_id?, copied_from? }`. `copied_from` names the original of a copy. |
 | `head.moved` | The active leaf changed. A client branched or edited. |
 | `turn.started` | A turn began: `{ turn_id, metadata? }`. `metadata` is the `metadata` the turn was submitted with. For a merged turn, a later submit's key wins. |
+| `turn.joined` | Messages sent with `queue: "join"` run in the running turn: `{ turn_id, next_turn_id?, metadata? }`. `next_turn_id` is the `next_turn_id` their submit got. `metadata` is the keys they add to the turn. |
 | `turn.completed` | A turn ended: `{ turn_id, data?, turn_cost, turn_token_usage, turn_calls, turn_started_at?, error? }`. See [Turn calls](#turn-calls). |
 | `session.done` | The session finished its work. |
 | `session.cancelled` | The current run was cancelled. A `turn.completed` with the error code `cancelled` follows. The session stays usable. |
@@ -175,7 +176,7 @@ Engine bookkeeping. Useful for monitoring.
 | `decision.dispatched` | The request went to the worker. |
 | `decision.completed` | The worker answered. |
 | `decision.errored` | The decision failed. |
-| `decision.dropped` | The decision was abandoned. |
+| `decision.dropped` | The decision was abandoned: `{ id, messages? }`. `messages` holds the ids of the client messages that it held. |
 | `call.voided` | A call was canceled before it settled. |
 | `session.message_requested` | A `message.send` targeted another session. |
 

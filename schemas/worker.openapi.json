@@ -1393,6 +1393,10 @@
           "identity": {
             "$ref": "#/components/schemas/WorkerIdentity"
           },
+          "joining": {
+            "description": "A message waits to join the turn. Its decision calls the model next,\nso do not call the model or end the turn.",
+            "type": "boolean"
+          },
           "messages": {
             "items": {
               "$ref": "#/components/schemas/Message"
@@ -1523,6 +1527,10 @@
               "client": {
                 "$ref": "#/components/schemas/ClientContext",
                 "description": "Inputs the client declared on its run. The engine adds\n`client.tools` to the proposed config."
+              },
+              "join": {
+                "description": "The new messages were sent with `queue: \"join\"`, and join the\nrunning turn.",
+                "type": "boolean"
               },
               "messages": {
                 "items": {

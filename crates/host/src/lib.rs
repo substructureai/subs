@@ -5,7 +5,7 @@ pub use substructure_session::size;
 pub mod api;
 pub mod codemode;
 pub mod connectors;
-pub use substructure_session::copy;
+pub use substructure_session::prompts;
 pub mod manifest;
 pub mod plugins;
 pub mod providers;

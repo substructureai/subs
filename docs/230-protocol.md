@@ -91,6 +91,7 @@ type DecisionRequest = {
     agent: AgentConfig | null
     calls: Call[]
     pending_calls: number
+    joining?: boolean
     messages: Message[]
     ancestry: string[]
     attempts: number
@@ -111,6 +112,7 @@ type DecisionRequest = {
 | `agent` | The config resolved for the active path. `null` when nothing has set one. |
 | `calls` | Tool, model, subagent, and connector calls in flight. |
 | `pending_calls` | How many tool and subagent calls are in flight. |
+| `joining` | `true` when a message waits to join the turn. Its `client.messages` decision calls the model next. Do not call the model or end the turn. |
 | `messages` | The active conversation, root to head. This is what the model sees. |
 | `ancestry` | Parent session IDs, for a subagent. Empty for a root session. |
 | `attempts` | How many times the engine has delivered this decision. |
@@ -175,15 +177,15 @@ What fires, what the engine proposes, and what you return.
 | Trigger | Fires when | `proposed` holds | Return |
 | --- | --- | --- | --- |
 | `session.start` | The session was created. | The config from the file, with the changes of the `agent` that opened the session. Empty when neither sets one. | An `agent` config. |
-| `client.messages` | A client sent or edited messages. | Record the view, then call the model. | `proposed` |
+| `client.messages` | A client sent or edited messages. A message sent with `queue: "join"` fires it in the running turn, when that turn has no work in flight. Then `join` is `true`. | Record the view, then call the model. | `proposed` |
 | `client.action` | A client called a named action. It joins the running turn, or opens the turn that the submit named. While a turn ends, it waits. A submit that names a turn id in use is refused. When its own turn has no more work, that turn ends. | Empty. | Your own actions. |
 | `context.limit` | A model call waits for room. See [Make room](./120-conversations.md#make-room). | The plan of the strategy that applied. | `proposed`, `context.replace` and `call`, a summary `llm.call`, or `call` alone. |
 | `codemode.calls` | A [code mode](./67-code-mode.md) script stopped on calls. `id` is the `run_code` call. | Run each call with `tool.call`. When one needs approval, an interrupt that asks about it first. | `proposed`, or `tool.call` or `tool.error` for each call, by `id`. |
 | `tool.execute` | The model called your tool. | Empty. A `tool.error` when the arguments failed validation or the tool is undeclared. | `tool.result` or `tool.error`. |
-| `tool.finished` | A tool call ended, after retries. | Record the result, then call the model. Waits when other calls are in flight. | `proposed` |
+| `tool.finished` | A tool call ended, after retries. | Record the result, then call the model. Waits when other calls are in flight, or when a message waits to join the turn. | `proposed` |
 | `llm.execute` | The agent's LLM block is `type = "worker"`. | Empty. | `llm.result` or `llm.error`, or a stream. |
-| `llm.finished` | A model call ended. | Record the reply, then start its tool calls or end the turn. A failed, truncated, or refused call fails the turn. | `proposed` |
-| `subagent.finished` | A child session's turn ended. | Record the child's result as the tool result, then call the model. | `proposed` |
+| `llm.finished` | A model call ended. | Record the reply, then start its tool calls or end the turn. While a message waits to join the turn, a final answer does not end it. A failed, truncated, or refused call fails the turn. | `proposed` |
+| `subagent.finished` | A child session's turn ended. | Record the child's result as the tool result, then call the model. Waits when a message waits to join the turn. | `proposed` |
 | `system1.finished` | A `system1.call` ended, after retries. | Empty. | Your own actions. |
 | `interrupt.resumed` | Someone resumed a paused branch. | Call the model again over the transcript. | `proposed` |
 | `turn.finished` | A turn completed. Carries its cost and output. If your answer starts work, the turn ends when that work ends. | `done`. | `proposed` |
@@ -196,6 +198,7 @@ type Trigger =
           messages: DraftMessage[]  // the client's full view of the conversation
           new_from: number          // the index of the first new message
           client: ClientContext
+          join?: boolean            // the new messages join the running turn
       }
     | { type: "client.action"; name: string; args?: unknown }
     | {
@@ -436,6 +439,14 @@ type Answer =  // every answer keeps the fields the provider adds
           confidence: number | null
       }
 ```
+
+`message.send` writes a user message into another session, the same as a
+submit with `queue: "join"`. When that session runs a turn, the message joins
+it at its next model call. When the session is idle, the message opens a turn.
+When the turn ends before the message runs, the message opens the next turn.
+The engine drops a message whose ID that session already recorded or holds. It
+refuses the message while that session's head is interrupted, and logs the
+refusal.
 
 `connector.sync` names a connection that the current config already names. Use
 it after a person corrects a credential. The fetch runs again with a full retry
@@ -734,7 +745,7 @@ type ClientInput =
           turn_id?: string        // idempotency key
           message: DraftMessage
           stream?: boolean
-          queue?: boolean | "merge"  // wait for the next turn
+          queue?: boolean | "merge" | "join"  // wait for the next turn, or join this one
       }
     | {
           type: "client.messages"
@@ -751,7 +762,7 @@ type ClientInput =
           messages: DraftMessage[]  // added at the head, never branching
           stream?: boolean
           client?: ClientContext
-          queue?: boolean | "merge"
+          queue?: boolean | "merge" | "join"
       }
     | {
           type: "client.action"
@@ -801,6 +812,20 @@ Set `queue: "merge"` to add the message to the turn that is waiting, when that
 turn was also merged. Messages sent during one turn then run as one next turn.
 Each merged submit gets back the same `turn_id`.
 
+Set `queue: "join"` to add the message to the running turn. The model call,
+tool calls and scripts that run do not stop. The message waits until the turn
+has no work in flight. Then the worker gets a `client.messages` decision for
+it, in the running turn, with `join: true`. While a message waits to join, each
+decision has `joining: true`. The `tool.finished` and `subagent.finished`
+proposals then do not call the model, and the `llm.finished` proposal does not
+end the turn on a final answer. The `client.messages` proposal calls the model.
+The reply carries the running turn's `turn_id`, `queued: false`, and
+`next_turn_id`. When the message runs in the running turn, the engine emits
+`turn.joined`. A later `metadata` key of the join wins in `turn.metadata`. If
+the turn ends before the message runs, the message opens the turn
+`next_turn_id`. The engine refuses a join while the head is interrupted. It
+drops a message whose ID it already recorded or holds.
+
 ## Delivery
 
 The engine POSTs to your worker's URL.
@@ -811,6 +836,7 @@ The engine POSTs to your worker's URL.
 | `Accept` | `text/event-stream, application/json` |
 | `traceparent` | W3C trace context |
 | `X-Substructure-Signature` | `sha256=<hex HMAC-SHA256 of the body>`, when the agent has a signing secret |
+| `Content-Encoding` | `gzip`, when the worker has `compress = "gzip"`. The signature covers the gzipped bytes. |
 
 Answer with `application/json` holding a `DecisionResponse`. To stream, answer
 with `text/event-stream`.

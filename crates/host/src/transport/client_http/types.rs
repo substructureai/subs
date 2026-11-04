@@ -24,6 +24,8 @@ pub struct ClientInputResponse {
     pub session_id: String,
     pub turn_id: String,
     pub queued: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_turn_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

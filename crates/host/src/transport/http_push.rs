@@ -27,6 +27,7 @@ pub struct HttpDecider {
     endpoint_url: String,
     idle_timeout: Duration,
     signing_secret: String,
+    compress: Option<crate::transport::compress::Compress>,
 }
 
 impl HttpDecider {
@@ -36,7 +37,12 @@ impl HttpDecider {
             endpoint_url,
             idle_timeout: Duration::from_secs(60),
             signing_secret,
+            compress: None,
         }
+    }
+
+    pub fn with_compress(self, compress: Option<crate::transport::compress::Compress>) -> Self {
+        Self { compress, ..self }
     }
 
     pub fn client() -> Client {
@@ -60,6 +66,13 @@ impl Decider for HttpDecider {
                 format!("failed to serialize decision: {e}"),
             )
         })?;
+        let (body, encoding) =
+            crate::transport::compress::encode(self.compress, body).map_err(|e| {
+                PushError::fatal(
+                    ErrorCode::WorkerUnreachable,
+                    format!("compressing a decision: {e}"),
+                )
+            })?;
 
         let mut builder = self
             .http
@@ -67,6 +80,9 @@ impl Decider for HttpDecider {
             .header("Content-Type", "application/json")
             .header(ACCEPT, "text/event-stream, application/json")
             .header("traceparent", decision.span.traceparent());
+        if let Some(encoding) = encoding {
+            builder = builder.header(reqwest::header::CONTENT_ENCODING, encoding);
+        }
 
         let mut mac = HmacSha256::new_from_slice(self.signing_secret.as_bytes()).map_err(|e| {
             PushError::fatal(
@@ -430,6 +446,7 @@ mod tests {
             agent: None,
             calls: Default::default(),
             pending_calls: 0,
+            joining: false,
             transcript: vec![],
             ancestry: vec![],
             span: SpanContext::root(),
@@ -442,6 +459,49 @@ mod tests {
     fn chunked(body: &str) -> impl futures_util::Stream<Item = Result<Vec<u8>, std::io::Error>> {
         let chunks: Vec<_> = body.as_bytes().chunks(3).map(|c| Ok(c.to_vec())).collect();
         futures_util::stream::iter(chunks)
+    }
+
+    #[tokio::test]
+    async fn a_gzip_worker_gets_the_compressed_bytes_signed() {
+        use axum::http::{HeaderMap, StatusCode};
+        type Raw = Arc<Mutex<Vec<(HeaderMap, axum::body::Bytes)>>>;
+        let raw: Raw = Arc::default();
+        let seen = raw.clone();
+        let router = axum::Router::new().route(
+            "/agent",
+            axum::routing::post(move |headers: HeaderMap, body: axum::body::Bytes| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().unwrap().push((headers, body));
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/agent", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let decider = HttpDecider::new(HttpDecider::client(), url, "secret".into())
+            .with_compress(Some(crate::transport::compress::Compress::Gzip));
+        let _ = decider
+            .push(
+                &streaming_decision(),
+                Arc::new(RecordingTransport::default()),
+            )
+            .await;
+
+        let (headers, body) = raw.lock().unwrap()[0].clone();
+        assert_eq!(headers["content-encoding"], "gzip");
+        let mut mac = HmacSha256::new_from_slice(b"secret").unwrap();
+        mac.update(&body);
+        let expected = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+        assert_eq!(headers["x-substructure-signature"], expected.as_str());
+        let mut json = String::new();
+        std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(&body[..]), &mut json)
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(json["decision_id"], "dec-1");
     }
 
     #[tokio::test]

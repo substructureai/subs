@@ -148,6 +148,7 @@ impl Router {
         tenant_id: &str,
         id: &str,
         url: String,
+        compress: Option<crate::transport::compress::Compress>,
     ) -> Result<HttpDecider, PushError> {
         let path = SecretPath::Worker(id.to_string());
         let secret = get_or_mint(&*self.secrets, tenant_id, &path.secret_ref())
@@ -158,7 +159,7 @@ impl Router {
                     format!("reading the signing secret for worker.{id} failed: {e}"),
                 )
             })?;
-        Ok(HttpDecider::new(self.http.clone(), url, secret))
+        Ok(HttpDecider::new(self.http.clone(), url, secret).with_compress(compress))
     }
 }
 
@@ -183,8 +184,8 @@ async fn decide(
             record_failure(runtime, &decision, &tenant_id, failure).await
         }
         Ok(Route::Engine) => decide_in_engine(runtime, decision, &tenant_id).await,
-        Ok(Route::Worker { id, url }) => {
-            let transport = match router.transport(&tenant_id, &id, url).await {
+        Ok(Route::Worker { id, url, compress }) => {
+            let transport = match router.transport(&tenant_id, &id, url, compress).await {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::warn!(decision_id = %decision.decision_id, error = %e, "no transport");

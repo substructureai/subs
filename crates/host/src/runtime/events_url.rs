@@ -31,6 +31,8 @@ pub struct EventsBlock {
     pub url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<std::num::NonZeroU64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compress: Option<crate::transport::compress::Compress>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -88,6 +90,7 @@ pub struct Target {
     pub url: String,
     pub timeout: Duration,
     pub secret: String,
+    pub compress: Option<crate::transport::compress::Compress>,
     pub about: About,
 }
 
@@ -180,6 +183,7 @@ impl EventsReader {
             url,
             timeout,
             secret,
+            compress: block.compress,
             about: About::of(session),
         }))
     }
@@ -200,16 +204,24 @@ impl EventsReader {
     async fn post(&self, target: &Target, post: &Post<'_>) -> Result<(), DeliveryError> {
         let body = serde_json::to_vec(post)
             .map_err(|e| DeliveryError::permanent(None, format!("the body did not encode: {e}")))?;
+        let (body, encoding) =
+            crate::transport::compress::encode(target.compress, body).map_err(|e| {
+                DeliveryError::permanent(None, format!("the body did not compress: {e}"))
+            })?;
         let path = SecretPath::Events(target.id.clone());
         let mut mac = HmacSha256::new_from_slice(target.secret.as_bytes())
             .map_err(|e| DeliveryError::retry(None, format!("signing for {path} failed: {e}")))?;
         mac.update(&body);
         let signature = hex::encode(mac.finalize().into_bytes());
-        let sent = self
+        let mut request = self
             .http
             .post(&target.url)
             .header(CONTENT_TYPE, "application/json")
-            .header("X-Substructure-Signature", format!("sha256={signature}"))
+            .header("X-Substructure-Signature", format!("sha256={signature}"));
+        if let Some(encoding) = encoding {
+            request = request.header(reqwest::header::CONTENT_ENCODING, encoding);
+        }
+        let sent = request
             .timeout(target.timeout)
             .body(body)
             .send()
@@ -330,7 +342,7 @@ mod tests {
         reader_with(
             EventsBlock {
                 url: Some(url.to_string()),
-                timeout_secs: None,
+                ..Default::default()
             },
             secrets,
         )
@@ -458,6 +470,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_gzip_events_url_gets_the_compressed_bytes_signed() {
+        type Raw = Arc<Mutex<Vec<(HeaderMap, axum::body::Bytes)>>>;
+        let raw: Raw = Arc::default();
+        let seen = raw.clone();
+        let router = Router::new().route(
+            "/events",
+            post(move |headers: HeaderMap, body: axum::body::Bytes| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().unwrap().push((headers, body));
+                    StatusCode::OK
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/events", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let secrets = Arc::new(Secrets::default());
+        let events = reader_with(
+            EventsBlock {
+                url: Some(url),
+                compress: Some(crate::transport::compress::Compress::Gzip),
+                ..Default::default()
+            },
+            secrets.clone(),
+        );
+        let disk = crate::runtime::sessions::testing::disk();
+        let sessions = disk.sessions();
+        let s1 = session(&sessions, "s1", Some("app")).await;
+        let logged = logged(&sessions, "s1").await;
+        events.deliver(&sessions, &s1, &logged).await.unwrap();
+
+        let (headers, body) = raw.lock().unwrap()[0].clone();
+        assert_eq!(headers["content-encoding"], "gzip");
+        assert_eq!(headers["content-type"], "application/json");
+        let secret = secrets.0.lock().unwrap()["events.app"].clone();
+        let mut mac = HmacSha256::new_from_slice(&secret).unwrap();
+        mac.update(&body);
+        let expected = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+        assert_eq!(headers["x-substructure-signature"], expected.as_str());
+        let mut json = String::new();
+        std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(&body[..]), &mut json)
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(json["type"], "events");
+    }
+
+    #[tokio::test]
     async fn an_events_url_that_never_answers_fails_after_its_own_timeout() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/events", listener.local_addr().unwrap());
@@ -471,6 +533,7 @@ mod tests {
             EventsBlock {
                 url: Some(url),
                 timeout_secs: std::num::NonZeroU64::new(1),
+                ..Default::default()
             },
             Arc::default(),
         );

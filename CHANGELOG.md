@@ -12,6 +12,10 @@ The `@substructure.ai/cli` package and the `subs`, `substructure-host` and
 ### Added
 
 - An agent can have `codemode`. The model gets `run_code`, which runs JavaScript that calls the agent's tools. Only the return value and the `console.log` output go back to the model.
+- Add a `[codemode.limits]` table to `subs.toml`. It sets the limits of each script.
+- Add `compress = "gzip"` to `[worker.*]` and `[events.*]`. The engine then sends gzipped request bodies and signs the gzipped bytes.
+- Add `queue: "join"` to submits. It adds the messages to the running turn at its next model call. A final answer does not end the turn while the messages wait.
+- Add `?drop_queued=true` to the cancel endpoints. It drops the messages that wait for a turn.
 
 ### Changed
 
@@ -20,10 +24,14 @@ The `@substructure.ai/cli` package and the `subs`, `substructure-host` and
 - A skill's text files are now stored as blobs when its plugin is saved, as its binary files are.
 - A skill file that cannot be stored now fails the plugin's save. Before, the file was skipped with a warning.
 - A blob's id now comes from its content, so the same content is stored once.
+- The `copy` module is now `prompts`. It holds all the text that the engine writes for the model.
+- A cancel now keeps the messages that wait for a turn, and runs them next.
+- The `decision.dropped` event now gives the ids of the messages that the decision held.
 
 ### Fixed
 
 - After the model loads a skill, the tools of the skill now go to the model in the same turn.
+- A `message.send` to a session that runs a turn now joins that turn.
 
 ## [0.10.3] - 2026-10-27
 

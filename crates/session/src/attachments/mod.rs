@@ -24,12 +24,7 @@ pub struct Attachment {
 
 impl Attachment {
     pub fn line(&self) -> String {
-        format!(
-            "[attachment {} {} {}]",
-            self.id,
-            self.mime,
-            crate::size::text(self.size)
-        )
+        crate::prompts::context::attachment(&self.id, &self.mime, &crate::size::text(self.size))
     }
 }
 

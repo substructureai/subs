@@ -61,7 +61,7 @@ impl KindSpec for ToolSpec {
                         &SettleError::new(
                             ErrorInfo::new(
                                 ErrorCode::InvalidResponse,
-                                format!("tool output violated its declared schema: {v}"),
+                                crate::prompts::errors::output_violation(&v),
                             )
                             .with_param("output"),
                             false,
@@ -199,9 +199,7 @@ fn with_skill_tools(state: &SessionState, id: &str, mut result: StoredResult) ->
     let tools: Vec<&crate::protocol::LlmTool> = tools.iter().collect();
     if let Some(block) = codemode::declarations(language, &tools) {
         result.content.push(crate::protocol::StoredContent::Text {
-            text: format!(
-                "\nTools this skill uses. You can call them in your next script:\n{block}"
-            ),
+            text: crate::prompts::codemode::skill_tools(&block),
         });
     }
     result
@@ -322,7 +320,7 @@ pub fn unanswered(state: &SessionState) -> Vec<EventPayload> {
             answer_ask(
                 state,
                 &ask.id,
-                AskAnswer::Refuse(format!("The worker did not run `{}`.", ask.name)),
+                AskAnswer::Refuse(crate::prompts::codemode::not_run(&ask.name)),
             )
         })
         .collect()
@@ -365,7 +363,7 @@ fn scripted(
         classify_arguments(&arguments, t.input.as_ref())
             .error()
             .map(|error| ConnectorTarget::Refused {
-                reason: format!("invalid tool arguments: {error}"),
+                reason: crate::prompts::errors::invalid_arguments(error),
             })
     });
     let target = invalid
@@ -374,7 +372,7 @@ fn scripted(
             Some(reason) => Some(ConnectorTarget::Refused { reason }),
             None if reach == codemode::Reach::Search => Some(ConnectorTarget::ScriptSearch),
             None if spawns => Some(ConnectorTarget::Refused {
-                reason: format!("The worker did not start the subagent of `{name}`."),
+                reason: crate::prompts::codemode::subagent_not_started(&name),
             }),
             None => None,
         });
@@ -474,7 +472,7 @@ fn requested(
         .is_some_and(|c| c.codemode.is_some());
     let (name, arguments, handler, target) = match engine_tool {
         _ if in_code_mode && script.is_none() && name != crate::protocol::RUN_CODE => {
-            let reason = crate::copy::call_from_code(&name);
+            let reason = crate::prompts::codemode::javascript::call_from_code(&name);
             (
                 name,
                 arguments,
@@ -493,7 +491,7 @@ fn requested(
             let target = match argument(&arguments, "code") {
                 Some(_) => ConnectorTarget::Code,
                 None => ConnectorTarget::Refused {
-                    reason: format!("`{name}` takes `code`, a string."),
+                    reason: crate::prompts::codemode::code_missing(&name),
                 },
             };
             (name, arguments, ToolHandler::Server, Some(target))

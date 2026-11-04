@@ -61,7 +61,7 @@ fn announce_unavailable(at: SessionStateAtNode, call_id: &str) -> Vec<PromptCont
     let said = at.context_ids_on_path(call_id);
     let mut owed = Vec::new();
     for (path, auth) in at.unavailable_connectors(&config) {
-        let reason = crate::copy::unavailable_reason(auth);
+        let reason = crate::prompts::context::unavailable_reason(auth);
         let id = format!("{path}:unavailable:{reason}");
         if said.contains(&id) {
             continue;
@@ -121,8 +121,8 @@ fn plugin_catalog(at: SessionStateAtNode, call_id: &str) -> Vec<PromptContext> {
                 about: (!plugin.description.is_empty()).then_some(&plugin.description),
                 skills,
                 usage: match searched {
-                    true => crate::copy::SEARCHED_SKILLS,
-                    false => crate::copy::plugin_usage(code),
+                    true => crate::prompts::context::searched_skills(),
+                    false => crate::prompts::context::plugin_usage(code),
                 },
             })
             .unwrap_or_default();
@@ -160,7 +160,7 @@ fn skill_catalog(at: SessionStateAtNode, call_id: &str) -> Vec<PromptContext> {
                     true => &skill.tools,
                     false => &[],
                 },
-                usage: crate::copy::plugin_usage(config.codemode.is_some()),
+                usage: crate::prompts::context::plugin_usage(config.codemode.is_some()),
             })
             .unwrap_or_default(),
         })
@@ -174,7 +174,7 @@ struct PluginListing<'a> {
     about: Option<&'a String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     skills: Vec<SkillListing>,
-    usage: &'static str,
+    usage: String,
 }
 
 #[derive(serde::Serialize)]
@@ -185,7 +185,7 @@ struct OwnSkillListing<'a> {
     /// The tools it names, in code mode.
     #[serde(skip_serializing_if = "<[String]>::is_empty")]
     tools: &'a [String],
-    usage: &'static str,
+    usage: String,
 }
 
 #[derive(serde::Serialize)]

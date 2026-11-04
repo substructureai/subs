@@ -19,6 +19,7 @@ chrono = { version = "0.4", features = ["serde"] }
 eventsource-stream = "0.2"
 futures-util = "0.3"
 hex = "0.4"
+flate2 = "1"
 hmac = "0.12"
 jsonwebtoken = "9"
 rand = "0.9"
@@ -46,11 +47,14 @@ shellexpand = "3"
 csv = "1"
 rquickjs = { version = "0.14", features = ["allocator"] }
 libc = "0.2"
+calamine = { version = "0.38", default-features = false, features = ["dates"] }
+ouroboros = "0.18"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 seccompiler = "0.5"
 
 [dev-dependencies]
 proptest = "1.11.0"
+rust_xlsxwriter = { version = "0.102", default-features = false }
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }

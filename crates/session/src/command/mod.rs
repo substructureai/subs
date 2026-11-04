@@ -12,9 +12,9 @@ use crate::branch::Outside;
 use crate::cx::Cx;
 use crate::ids::Ids;
 use crate::protocol::{
-    AgentConfig, ClientContext, ClientPayload, DraftMessage, EffectStatus, InterruptOrigin,
-    LlmFormat, LlmRequest, QueueMode, RetryOverride, RetryPolicy, Role, SessionOwner, SpawnMode,
-    Usage, WorkerRef, WorkerState,
+    AgentConfig, ClientMessage, ClientPayload, DraftMessage, EffectStatus, InterruptOrigin,
+    LlmFormat, LlmRequest, QueueMode, RetryOverride, RetryPolicy, SessionOwner, SpawnMode, Usage,
+    WorkerRef, WorkerState,
 };
 use crate::protocol::{ErrorInfo, HeldCall};
 use crate::retry::RetryTarget;
@@ -114,7 +114,12 @@ pub enum CommandPayload {
         state: Option<WorkerState>,
         agent: Option<AgentConfig>,
     },
-    CancelSession,
+    CancelSession {
+        /// Drop the messages that wait for the turn, instead of running them
+        /// next.
+        #[serde(default)]
+        drop_queued: bool,
+    },
     FinishTurn {
         data: serde_json::Value,
     },
@@ -370,9 +375,7 @@ impl SessionState {
                 EffectStatus::Queued | EffectStatus::RetryScheduled
             ) && self.stale_decision(node, &wd.trigger)
             {
-                events.push(EventPayload::DecisionDropped(DecisionDropped {
-                    id: e.id.clone(),
-                }));
+                events.push(self.decision_dropped(&e.id));
             }
         }
         events
@@ -442,6 +445,7 @@ pub struct Working {
     plan_now: DateTime<Utc>,
     events: Vec<(EventPayload, EventMeta)>,
     waiting: Option<String>,
+    joining: Option<String>,
     outside: Outside,
 }
 
@@ -463,6 +467,7 @@ impl Working {
             plan_now: now,
             events: Vec::new(),
             waiting: None,
+            joining: None,
             outside: Outside::default(),
         }
     }
@@ -529,6 +534,14 @@ impl Working {
 
     pub fn waiting_turn(&self) -> Option<&str> {
         self.waiting.as_deref()
+    }
+
+    /// The turn a joining message opens when the running turn ends first.
+    pub fn joining_turn(&self) -> Option<&str> {
+        let waiting = self.waiting_join()?;
+        self.joining
+            .as_deref()
+            .filter(|t| *t == waiting.turn_id && self.phase.active_turn_id().is_some())
     }
 
     pub fn finish(self) -> (SessionState, Vec<(EventPayload, EventMeta)>) {
@@ -722,12 +735,12 @@ impl Working {
     }
 
     fn queued_turn_ids(&self) -> impl Iterator<Item = &str> {
-        self.queued_decisions()
-            .into_iter()
-            .filter_map(|e| match &e.decision()?.trigger {
-                Trigger::ClientAction { turn_id, .. } => turn_id.as_deref(),
-                trigger => trigger.deferred_turn_id(),
-            })
+        self.queued_decisions().into_iter().filter_map(|e| {
+            let trigger = &e.decision()?.trigger;
+            trigger
+                .joining_turn_id()
+                .unwrap_or(trigger.deferred_turn_id())
+        })
     }
 
     fn begin_turn(
@@ -979,32 +992,45 @@ impl Working {
                 let Some(payload) = self.outside.drop_known(payload) else {
                     return Ok(());
                 };
-                let (turn, own_turn) = match payload {
-                    ClientPayload::Action(_) => {
+                let joins = queue == QueueMode::Join
+                    && self.phase.turn_id().is_some()
+                    && matches!(
+                        payload,
+                        ClientPayload::Message(_) | ClientPayload::Append(_)
+                    );
+                let (turn, own_turn) = match joins || matches!(payload, ClientPayload::Action(_)) {
+                    true => {
                         let (turn, own) = self.action_turn(turn)?;
                         (turn, Some(own))
                     }
-                    _ => (turn, None),
+                    false => (turn, None),
                 };
-                let action_waits = self.phase.finalizing().is_some();
+                let action_waits = self.phase.finalizing().is_some() && !joins;
                 let deferred = self.deferred_turn(&turn, queue, &payload)?;
                 if deferred.is_none() {
                     self.begin_turn(turn, metadata.clone())?;
                 }
-                let merge = deferred.is_some() && queue == QueueMode::Merge;
-                let (events, waiting) = {
+                let mode = match (joins, deferred.is_some()) {
+                    (true, _) => QueueMode::Join,
+                    (false, true) => queue,
+                    (false, false) => QueueMode::Refuse,
+                };
+                let (events, turn) = {
                     let cx = self.cx();
                     cx.client_payload_events(
                         cx.ids(),
                         payload,
                         caller,
                         deferred.or(own_turn.clone()),
-                        merge,
+                        mode,
                         metadata,
                     )?
                 };
                 self.emit_all(events);
-                self.waiting = waiting.or(own_turn.filter(|_| action_waits));
+                match joins && self.phase.finalizing().is_none() {
+                    true => self.joining = turn,
+                    false => self.waiting = turn.or(own_turn.filter(|_| action_waits)),
+                }
                 Ok(())
             }
 
@@ -1015,23 +1041,18 @@ impl Working {
                 parent_id: _,
             } => {
                 SessionState::ensure_internal(caller)?;
-                if self.head_parked() && message.role == Role::User {
-                    return Err(SessionError::SessionInterrupted);
-                }
-                self.begin_turn(
-                    turn_id.map_or(TurnTarget::Detached, TurnTarget::Open),
-                    BTreeMap::new(),
-                )?;
-                if message.role == Role::User {
-                    self.queue_decision(Trigger::ClientMessage {
-                        messages: vec![message],
-                        client: ClientContext::default(),
-                        turn_id: None,
-                        merge: false,
+                self.run_active(
+                    CommandPayload::SubmitClientPayload {
+                        payload: ClientPayload::Message(ClientMessage {
+                            message,
+                            stream: false,
+                        }),
+                        turn: turn_id.map_or(TurnTarget::Detached, TurnTarget::Open),
+                        queue: QueueMode::Join,
                         metadata: BTreeMap::new(),
-                    });
-                }
-                Ok(())
+                    },
+                    caller,
+                )
             }
 
             CommandPayload::RequestLlmCall {
@@ -1185,9 +1206,7 @@ impl Working {
                                 prior.sessions.to_vec(),
                                 prior.turn_id.to_string(),
                             );
-                            events.push(EventPayload::DecisionDropped(DecisionDropped {
-                                id: queued,
-                            }));
+                            events.push(self.state.decision_dropped(&queued));
                             held
                         }
                         None => (Vec::new(), Vec::new(), self.ids.next()),
@@ -1284,14 +1303,14 @@ impl Working {
                 Ok(())
             }
 
-            CommandPayload::CancelSession => {
+            CommandPayload::CancelSession { drop_queued } => {
                 self.ensure_owns_session(caller)?;
                 if !self.cancellable() {
                     return Ok(());
                 }
                 self.emit(EventPayload::SessionCancelled);
                 self.then(|s| s.close_open_calls(s.ids(), None))
-                    .then(|s| s.cancel_run());
+                    .then(|s| s.cancel_run(drop_queued));
                 Ok(())
             }
 

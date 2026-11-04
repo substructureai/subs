@@ -117,8 +117,15 @@ async fn cancel_session(
     State(state): State<V1State>,
     Extension(caller): Extension<Caller>,
     Path((_project, session_id)): Path<(String, String)>,
+    params: axum::extract::Query<crate::transport::http::CancelParams>,
 ) -> Response {
-    routes::cancel_session(State(state.admin), Extension(caller), Path(session_id)).await
+    routes::cancel_session(
+        State(state.admin),
+        Extension(caller),
+        Path(session_id),
+        params,
+    )
+    .await
 }
 
 async fn run(

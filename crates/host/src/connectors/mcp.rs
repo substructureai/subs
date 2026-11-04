@@ -120,7 +120,7 @@ impl McpClient {
                         self.keep(blob, mime, Some(uri), &mut content).await
                     }
                     _ => content.push(StoredContent::Text {
-                        text: "[resource content]".to_string(),
+                        text: crate::prompts::answers::media("resource"),
                     }),
                 },
                 ContentBlock::ResourceLink(r) => content.push(StoredContent::Link {
@@ -129,7 +129,7 @@ impl McpClient {
                     mime_type: r.mime_type.clone(),
                 }),
                 _ => content.push(StoredContent::Text {
-                    text: "[content]".to_string(),
+                    text: crate::prompts::answers::CONTENT.to_string(),
                 }),
             }
         }
@@ -144,13 +144,19 @@ impl McpClient {
         let named = mime.split('/').next().unwrap_or("file").to_string();
         let mut note = |text: String| out.push(StoredContent::Text { text });
         let Ok(bytes) = BASE64.decode(data) else {
-            note(format!("[unreadable {named} content]"));
+            note(crate::prompts::answers::media_not_kept(
+                "unreadable",
+                &named,
+            ));
             return;
         };
         if text_like(mime) {
             match String::from_utf8(bytes) {
                 Ok(text) => note(text),
-                Err(_) => note(format!("[unreadable {named} content]")),
+                Err(_) => note(crate::prompts::answers::media_not_kept(
+                    "unreadable",
+                    &named,
+                )),
             }
             return;
         }
@@ -165,7 +171,7 @@ impl McpClient {
             Ok(r) => out.push(StoredContent::Blob { uri: r.uri() }),
             Err(e) => {
                 tracing::warn!("keeping {named} content from a tool failed: {e}");
-                note(format!("[{named} content]"));
+                note(crate::prompts::answers::media(&named));
             }
         }
     }

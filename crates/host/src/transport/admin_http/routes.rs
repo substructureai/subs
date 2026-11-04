@@ -117,9 +117,14 @@ pub async fn cancel_session(
     State(state): State<AdminHttpState>,
     Extension(caller): Extension<Caller>,
     Path(session_id): Path<String>,
+    Query(params): Query<crate::transport::http::CancelParams>,
 ) -> Response {
     let span = crate::span::SpanContext::root().child("admin_cancel");
-    match state.runtime.cancel_session(session_id, caller, span).await {
+    match state
+        .runtime
+        .cancel_session(session_id, caller, params.drop_queued, span)
+        .await
+    {
         Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
         Err(e) => crate::transport::http::runtime_error_response(e),
     }

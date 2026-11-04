@@ -10,8 +10,8 @@ use super::super::events::EventPayload;
 use super::*;
 use crate::connectors::{AuthNeed, RemoteTool};
 use crate::protocol::{
-    AgentConfig, AgentTool, ClientAppend, ClientMessage, ClientPayload, Content, DraftMessage,
-    Handler, McpServer, Role, ToolCall, ToolCallFunction,
+    AgentConfig, AgentTool, ClientAppend, ClientContext, ClientMessage, ClientPayload, Content,
+    DraftMessage, Handler, McpServer, Role, ToolCall, ToolCallFunction,
 };
 use crate::protocol::{Issuer, Requester, Subject};
 use crate::span::SpanContext;
@@ -69,7 +69,7 @@ fn arm(cmd: &CommandPayload) -> &'static str {
         CommandPayload::Interrupt { .. } => "Interrupt",
         CommandPayload::ResumeInterrupt { .. } => "ResumeInterrupt",
         CommandPayload::SubmitWorkerDecision { .. } => "SubmitWorkerDecision",
-        CommandPayload::CancelSession => "CancelSession",
+        CommandPayload::CancelSession { .. } => "CancelSession",
         CommandPayload::FinishTurn { .. } => "FinishTurn",
         CommandPayload::CompleteTurn => "CompleteTurn",
         CommandPayload::Wake { .. } => "Wake",
@@ -649,7 +649,10 @@ fn at_tool_execute() -> Trace {
 #[test]
 fn cancel_closes_the_open_calls_and_keeps_the_session() {
     let mut t = at_tool_execute();
-    t.run(CommandPayload::CancelSession, &frontend());
+    t.run(
+        CommandPayload::CancelSession { drop_queued: false },
+        &frontend(),
+    );
     let last = t.recorded().pop().expect("the call gets a result");
     assert_eq!(last.tool_call_id.as_deref(), Some("tc-1"));
     assert!(t.agg.state.phase.turn_id().is_none());
@@ -1774,7 +1777,10 @@ fn flow_message_mid_turn() -> Trace {
         },
         &system(),
     );
-    assert!(t.agg.state.has_pending_worker_decision());
+    assert!(
+        !t.agg.state.has_pending_worker_decision(),
+        "the message waits for the running call"
+    );
     t
 }
 
@@ -1838,7 +1844,10 @@ fn flow_direct_commands_then_cancel() -> Trace {
     t.run(CommandPayload::CompleteTurn, &system());
 
     t.submit("again", Some("turn-2"));
-    t.run(CommandPayload::CancelSession, &system());
+    t.run(
+        CommandPayload::CancelSession { drop_queued: false },
+        &system(),
+    );
     t
 }
 
@@ -1957,3 +1966,4 @@ fn traces_cover_every_command_arm() {
 }
 
 mod context;
+mod join;

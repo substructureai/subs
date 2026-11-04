@@ -98,7 +98,7 @@ fn key_is_a_variable(block: &str, config: &ProjectConfig, verb: &str) -> Result<
     let Some(spec) = config.llm.get(block) else {
         bail!(
             "no [llm.{block}] in subs.toml. Declared: {}",
-            crate::copy::declared(config.llm.keys())
+            crate::prompts::declared(config.llm.keys())
         );
     };
     if spec.kind == ProviderKind::Worker {

@@ -332,6 +332,7 @@ mod tests {
                 url: "http://app.test/events".into(),
                 timeout: crate::runtime::events_url::DEFAULT_TIMEOUT,
                 secret: String::new(),
+                compress: None,
                 about: crate::runtime::events_url::About {
                     session_id: session_id.into(),
                     ..Default::default()

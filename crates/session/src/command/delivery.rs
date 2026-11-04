@@ -111,7 +111,7 @@ impl Working {
             let spec = id.kind.spec();
             if permanent {
                 let failed = SettleError::new(
-                    ErrorInfo::internal(format!("could not send the work: {error}")),
+                    ErrorInfo::internal(crate::prompts::errors::not_sent(&error.to_string())),
                     false,
                 );
                 self.then(|s| spec.settle(s, &id.id, Outcome::Error(failed)));

@@ -8,9 +8,9 @@ use substructure_host::llm::{
     LlmProviderRegistry, LlmProviderTrait, LlmTask,
 };
 use substructure_host::protocol::{
-    AgentConfig, AgentConfigPatch, ClientInput, Content, DraftMessage, ErrorCode, LlmResponse,
-    PromptContent, PromptRequest, Role, SessionOwner, Subagent, SubagentTools, ToolCall,
-    ToolCallFunction, WorkerRef,
+    AgentConfig, AgentConfigPatch, AgentTool, ClientInput, Content, DraftMessage, ErrorCode,
+    Handler, LlmResponse, PromptContent, PromptRequest, QueueMode, Role, SessionOwner, Subagent,
+    SubagentTools, ToolCall, ToolCallFunction, WorkerRef,
 };
 use substructure_host::protocol::{Issuer, Requester, Subject};
 use substructure_host::providers::sqlite::{
@@ -233,6 +233,7 @@ fn delegating(subagent_tools: Option<SubagentTools>) -> AgentConfig {
 fn block(url: &str) -> WorkerBlock {
     WorkerBlock {
         url: Some(url.to_string()),
+        compress: None,
     }
 }
 
@@ -549,7 +550,7 @@ async fn a_session_brings_its_own_address_to_a_declared_worker() {
     let worker = configuring_worker(config("claude")).await;
     let h = start_workers(
         BTreeMap::new(),
-        BTreeMap::from([("w".to_string(), WorkerBlock { url: None })]),
+        BTreeMap::from([("w".to_string(), WorkerBlock::default())]),
         None,
     )
     .await;
@@ -1184,6 +1185,7 @@ async fn cancel_ends_the_run_and_its_subagents_and_keeps_the_session() {
             Caller::System {
                 tenant_id: TENANT.to_string(),
             },
+            false,
             SpanContext::root(),
         )
         .await
@@ -1700,5 +1702,250 @@ async fn a_started_turn_translates_to_a_finished_run() {
     assert!(
         matches!(seen.last(), Some(AgUiEvent::RunFinished { .. })),
         "and ends with RunFinished: {seen:#?}"
+    );
+}
+
+fn looking() -> AgentEntry {
+    AgentEntry {
+        config: Some(AgentConfig {
+            tools: vec![AgentTool {
+                name: "look".to_string(),
+                description: "Looks.".to_string(),
+                input: None,
+                output: None,
+                handler: Some(Handler::Client),
+                defer: None,
+            }],
+            ..config("claude")
+        }),
+        hosting: Hosting::Engine,
+        events: None,
+    }
+}
+
+fn tool_answer() -> ClientInput {
+    ClientInput::ToolResult {
+        id: "tc-1".to_string(),
+        attempt: None,
+        result: Some(serde_json::json!({"content": [{"type": "text", "text": "seen"}]})),
+        content: None,
+        structured_content: None,
+        is_error: false,
+    }
+}
+
+fn input(h: &Harness, session_id: &str, input: ClientInput) -> HandleClientInput {
+    HandleClientInput {
+        session_id: session_id.to_string(),
+        caller: Caller::System {
+            tenant_id: TENANT.to_string(),
+        },
+        owner: SessionOwner {
+            tenant_id: TENANT.to_string(),
+            requester: Requester::new(
+                Subject::new(h.issuer.clone(), "user-1".to_string()),
+                Default::default(),
+            ),
+            metadata: Default::default(),
+        },
+        input,
+        agent: None,
+        worker: None,
+        span: SpanContext::root(),
+    }
+}
+
+#[tokio::test]
+async fn a_joined_message_reaches_the_running_turns_next_model_call() {
+    let h = start(BTreeMap::from([("assistant".to_string(), looking())])).await;
+    let session_id = uuid::Uuid::now_v7().to_string();
+    let running = h
+        .runtime
+        .handle_client_input(input(&h, &session_id, client_message("assistant", "hi")))
+        .await
+        .expect("the turn starts");
+    until(&h, &session_id, |e| {
+        matches!(e, EventPayload::ToolCallRequested(_))
+    })
+    .await;
+
+    let ClientInput::Message { message, .. } = client_message("assistant", "make it blue") else {
+        unreachable!()
+    };
+    let joined = h
+        .runtime
+        .handle_client_input(input(
+            &h,
+            &session_id,
+            ClientInput::Message {
+                agent_id: "assistant".to_string(),
+                turn_id: None,
+                message,
+                stream: false,
+                queue: QueueMode::Join,
+            },
+        ))
+        .await
+        .expect("a join mid-turn is accepted");
+    assert_eq!(
+        (joined.turn_id.as_str(), joined.queued),
+        (running.turn_id.as_str(), false),
+        "the message joins the running turn"
+    );
+    let next = joined
+        .next_turn_id
+        .clone()
+        .expect("the reply names the turn the message opens if the running turn ends first");
+
+    h.runtime
+        .handle_client_input(input(&h, &session_id, tool_answer()))
+        .await
+        .expect("the tool settles");
+    let events = until(&h, &session_id, |e| {
+        matches!(e, EventPayload::TurnCompleted(_))
+    })
+    .await;
+
+    let started = events
+        .iter()
+        .filter(|e| matches!(e, EventPayload::TurnStarted(_)))
+        .count();
+    assert_eq!(started, 1, "no turn starts for the joined message");
+    assert!(
+        events.iter().any(|e| matches!(e,
+            EventPayload::TurnJoined(j) if j.turn_id == running.turn_id && j.next_turn_id.as_deref() == Some(next.as_str()))),
+        "the client hears that the message joined"
+    );
+    let seen = h.model.seen.lock().unwrap();
+    assert_eq!(
+        seen.len(),
+        2,
+        "the tool's answer and the message go in one call"
+    );
+    let roles: Vec<_> = seen[1].messages.iter().map(|m| &m.role).collect();
+    assert!(
+        matches!(
+            roles[..],
+            [
+                Role::System,
+                Role::User,
+                Role::Assistant,
+                Role::Tool,
+                Role::User
+            ]
+        ),
+        "{roles:?}"
+    );
+    let last = seen[1].messages.last().and_then(|m| m.content.as_ref());
+    assert_eq!(
+        last.map(PromptContent::text_owned).as_deref(),
+        Some("make it blue")
+    );
+}
+
+async fn messaging_worker(target: &str, text: &str) -> StubWorker {
+    use axum::routing::post;
+    use axum::{Json, Router};
+
+    let seen: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder = seen.clone();
+    let send = serde_json::json!({
+        "type": "message.send",
+        "session_id": target,
+        "message": DraftMessage {
+            id: None,
+            role: Role::User,
+            content: Some(Content::Text(text.to_string())),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            reasoning: None,
+        },
+    });
+    let app = Router::new().route(
+        "/agent",
+        post(move |Json(req): Json<serde_json::Value>| {
+            let recorder = recorder.clone();
+            let send = send.clone();
+            async move {
+                recorder.lock().unwrap().push(req.clone());
+                let mut proposed = req["proposed"].clone();
+                let trigger = req["trigger"]["type"].as_str().unwrap_or_default();
+                if trigger.starts_with("client.message") {
+                    let mut actions = proposed["actions"].as_array().cloned().unwrap_or_default();
+                    actions.push(send);
+                    proposed["actions"] = serde_json::Value::Array(actions);
+                }
+                Json(proposed)
+            }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    StubWorker {
+        addr,
+        seen,
+        _handle: handle,
+    }
+}
+
+#[tokio::test]
+async fn a_session_message_joins_the_targets_running_turn() {
+    let target = uuid::Uuid::now_v7().to_string();
+    let worker = messaging_worker(&target, "from A").await;
+    let h = start_workers(
+        BTreeMap::from([
+            ("assistant".to_string(), looking()),
+            ("sender".to_string(), worker_hosted("claude")),
+        ]),
+        workers(&worker.url()),
+        None,
+    )
+    .await;
+    h.runtime
+        .handle_client_input(input(&h, &target, client_message("assistant", "hi")))
+        .await
+        .expect("the turn starts");
+    until(&h, &target, |e| {
+        matches!(e, EventPayload::ToolCallRequested(_))
+    })
+    .await;
+
+    turn_completed(&h, "sender", "tell the assistant").await;
+    h.runtime.settled().await;
+
+    h.runtime
+        .handle_client_input(input(&h, &target, tool_answer()))
+        .await
+        .expect("the tool settles");
+    until(&h, &target, |e| matches!(e, EventPayload::TurnCompleted(_))).await;
+
+    let text = |m: &substructure_host::protocol::PromptMessage| {
+        m.content.as_ref().map(PromptContent::text_owned)
+    };
+    let seen = h.model.seen.lock().unwrap();
+    let joined = seen.iter().find(|r| {
+        r.messages
+            .iter()
+            .any(|m| m.role == Role::User && text(m).as_deref() == Some("from A"))
+    });
+    let joined = joined.unwrap_or_else(|| panic!("A's message never reached B's model: {seen:#?}"));
+    let roles: Vec<_> = joined.messages.iter().map(|m| &m.role).collect();
+    assert!(
+        matches!(
+            roles[..],
+            [
+                Role::System,
+                Role::User,
+                Role::Assistant,
+                Role::Tool,
+                Role::User
+            ]
+        ),
+        "the message joins B's turn after the tool's answer: {roles:?}"
     );
 }

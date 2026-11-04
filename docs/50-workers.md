@@ -131,6 +131,20 @@ if (!verify(body, req.headers["x-substructure-signature"])) {
 The cloud creates a signing secret for each agent that has a worker. Read it
 with `subs agents secret <id>`. See [Authentication](./190-auth.md).
 
+## Compress requests
+
+Set `compress = "gzip"` on a worker to get its requests gzipped, with
+`Content-Encoding: gzip`. Large tool arguments shrink five to ten times. The
+signature covers the bytes as sent, so verify it before you decompress.
+
+```toml title="subs.toml"
+[worker.app]
+url = "https://app.example.com/agent"
+compress = "gzip"
+```
+
+Answers from your worker stay as they are.
+
 ## Common patterns
 
 Each of these is a branch inside `decide`. `trigger`, `proposed`, `agent`, and

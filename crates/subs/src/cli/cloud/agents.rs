@@ -56,7 +56,7 @@ fn section<'a>(agent_id: &str, config: &'a ProjectConfig) -> Result<&'a AgentSec
     config.agent.get(agent_id).ok_or_else(|| {
         anyhow::anyhow!(
             "no [agent.{agent_id}] in subs.toml. Declared: {}",
-            crate::copy::declared(config.agent_ids())
+            crate::prompts::declared(config.agent_ids())
         )
     })
 }

@@ -16,6 +16,18 @@ pub struct Proposing<'a> {
     pub pending_calls: usize,
 }
 
+impl Proposing<'_> {
+    /// A joined message calls the model next, so the step before it leaves
+    /// the call to it.
+    pub fn joining(&self) -> bool {
+        self.state.state().waiting_join().is_some()
+    }
+
+    pub fn waiting_calls(&self) -> usize {
+        self.pending_calls + usize::from(self.joining())
+    }
+}
+
 pub fn propose(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionResponse> {
     if let Some(plan) = for_room(trigger, p) {
         return Some(plan);
@@ -135,7 +147,8 @@ fn derive(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionRespon
     let config = config.as_ref();
     let connector_tools = p.state.connector_tools().tools;
     let connector_tools = connector_tools.as_slice();
-    let pending_calls = p.pending_calls;
+    let joining = p.joining();
+    let pending_calls = p.waiting_calls();
     match trigger {
         DecisionTrigger::CodemodeCalls { tool_calls, .. } => Some(DecisionResponse {
             messages: recorded(transcript),
@@ -154,7 +167,7 @@ fn derive(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionRespon
             truncated: false,
             refused: false,
             ..
-        } => Some(llm_finished(message, transcript, connector_tools)),
+        } => Some(llm_finished(message, transcript, connector_tools, joining)),
         DecisionTrigger::LlmFinished {
             ok,
             truncated,
@@ -221,11 +234,17 @@ fn derive(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionRespon
         } => match declared_tool(id, name, transcript, |id| {
             llm_calls.get(id).and_then(|e| e.llm())
         }) {
-            DeclaredTool::Undeclared => {
-                Some(tool_error(id, format!("unknown tool: {name}"), transcript))
-            }
+            DeclaredTool::Undeclared => Some(tool_error(
+                id,
+                crate::prompts::errors::unknown_tool(name),
+                transcript,
+            )),
             _ => input.error().map(|error| {
-                tool_error(id, format!("invalid tool arguments: {error}"), transcript)
+                tool_error(
+                    id,
+                    crate::prompts::errors::invalid_arguments(error),
+                    transcript,
+                )
             }),
         },
         DecisionTrigger::TurnFinished { .. } => Some(DecisionResponse {
@@ -239,7 +258,7 @@ fn derive(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionRespon
             let followups = interrupts::resolve_followups(&resumption.interrupt_id);
             let answered = interrupts::kind_for(&resumption.interrupt_id)
                 .and_then(|(kind, tail)| kind.resumed(tail, &resumption.payload, p))
-                .or_else(|| config.map(|c| resumed(transcript, c)));
+                .or_else(|| config.map(|c| resumed(transcript, c, joining)));
             let mut response = answered.unwrap_or_default();
             response.actions.splice(0..0, followups);
             (!response.authors_nothing()).then_some(response)
@@ -249,8 +268,18 @@ fn derive(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionRespon
     }
 }
 
-pub(super) fn resumed(transcript: &[Message], config: &AgentConfig) -> DecisionResponse {
+pub(super) fn resumed(
+    transcript: &[Message],
+    config: &AgentConfig,
+    joining: bool,
+) -> DecisionResponse {
     let view = recorded(transcript);
+    if joining {
+        return DecisionResponse {
+            messages: view,
+            ..Default::default()
+        };
+    }
     DecisionResponse {
         messages: view.clone(),
         actions: vec![DecisionAction::CallLlm {
@@ -273,13 +302,16 @@ fn llm_finished(
     message: &DraftMessage,
     transcript: &[Message],
     connector_tools: &[ConnectorTool],
+    joining: bool,
 ) -> DecisionResponse {
     let tool_calls = message.tool_calls.as_deref().unwrap_or_default();
     let mut held = tool_calls
         .iter()
         .filter(|call| approval::needed(call, connector_tools));
     let first_held = held.next();
-    let actions = if tool_calls.is_empty() {
+    let actions = if tool_calls.is_empty() && joining {
+        Vec::new()
+    } else if tool_calls.is_empty() {
         vec![DecisionAction::Done {
             data: serde_json::to_value(&message.content).unwrap_or_default(),
         }]
@@ -1523,6 +1555,7 @@ mod tests {
             messages: view.clone(),
             new_from: 0,
             client: ClientContext::default(),
+            join: false,
         };
         let p =
             propose(&trigger, &[], &HashMap::new(), 0, Some(&cfg)).expect("config ⇒ a proposal");
@@ -1568,6 +1601,7 @@ mod tests {
             messages: view,
             new_from: 0,
             client: ClientContext::default(),
+            join: false,
         };
         let p =
             propose(&trigger, &[], &HashMap::new(), 0, Some(&cfg)).expect("config ⇒ a proposal");
@@ -1603,6 +1637,7 @@ mod tests {
             messages: view,
             new_from: 0,
             client: ClientContext::default(),
+            join: false,
         };
         let p =
             propose(&trigger, &[], &HashMap::new(), 0, Some(&cfg)).expect("config ⇒ a proposal");
@@ -1631,6 +1666,7 @@ mod tests {
             messages: view.clone(),
             new_from: 0,
             client,
+            join: false,
         };
         let p =
             propose(&trigger, &[], &HashMap::new(), 0, Some(&cfg)).expect("config ⇒ a proposal");
@@ -1666,6 +1702,7 @@ mod tests {
             messages: view,
             new_from: 0,
             client: ClientContext::default(),
+            join: false,
         };
         let p = propose(&trigger, &[], &HashMap::new(), 0, None).expect("no config still proposes");
         assert!(
@@ -2688,6 +2725,7 @@ mod tests {
             messages: vec![DraftMessage::from(msg("u1", Role::User, "search sentry"))],
             new_from: 0,
             client: ClientContext::default(),
+            join: false,
         };
 
         let ran = propose(&asked, &[], &HashMap::new(), 0, Some(&config)).expect("a proposal");

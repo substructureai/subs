@@ -9,6 +9,7 @@ use std::num::NonZeroUsize;
 
 use crate::agent_config::NamedSkill;
 use crate::connectors::filter;
+use crate::prompts::codemode as prompts;
 use crate::protocol::{
     AgentConfig, ConnectorTool, ConnectorToolKind, LlmTool, RetryPolicy, RUN_CODE, TOOL_SEARCH,
 };
@@ -97,19 +98,8 @@ impl Reach {
     pub fn refusal(self, name: &str, near: &[&str]) -> Option<String> {
         Some(match self {
             Reach::Code | Reach::Search => return None,
-            Reach::Itself => format!("`{name}` cannot call itself."),
-            Reach::Unknown if near.is_empty() => format!(
-                "There is no tool named `{name}`. Find tools with \
-                 `await tools.{TOOL_SEARCH}({{ query }})`."
-            ),
-            Reach::Unknown => format!(
-                "There is no tool named `{name}`. The closest are: {}. Find tools with \
-                 `await tools.{TOOL_SEARCH}({{ query }})`.",
-                near.iter()
-                    .map(|n| format!("`{n}`"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
+            Reach::Itself => prompts::calls_itself(name),
+            Reach::Unknown => prompts::javascript::no_such_tool(name, near),
         })
     }
 }
@@ -146,21 +136,12 @@ pub fn search(
     let loaded: Vec<String> = found
         .skills
         .iter()
-        .map(|s| {
-            format!(
-                "- Skill `{}`: {} Load it with `await tools.skill({{ name: {:?} }})`.",
-                s.name,
-                sentence(s.description),
-                s.name
-            )
-        })
+        .map(|s| prompts::javascript::found_skill(&s.name, &sentence(s.description)))
         .collect();
     let shown = found.tools.len() + found.skills.len();
     let mut sections = vec![match found.matched {
-        0 => crate::copy::NOTHING_MATCHED.to_string(),
-        n if n > shown => format!("{shown} of {n} matches. Narrow the query to see the rest."),
-        1 => "1 match.".to_string(),
-        n => format!("{n} matches."),
+        0 => crate::prompts::answers::NOTHING_MATCHED.to_string(),
+        n => prompts::matches(shown, n),
     }];
     if let Some(block) = declarations(language, &found.tools) {
         sections.push(block);
@@ -208,10 +189,7 @@ pub fn declarations(language: Language, tools: &[&LlmTool]) -> Option<String> {
             .map(|t| format!("- {}: {}", t.name, summary(&t.description)))
             .collect::<Vec<_>>()
             .join("\n");
-        sections.push(format!(
-            "Get the declarations of these with \
-             `await tools.{TOOL_SEARCH}({{ query: \"{names}\" }})`:\n{listed}"
-        ));
+        sections.push(prompts::javascript::get_declarations(&names, &listed));
     }
     (!sections.is_empty()).then(|| sections.join("\n\n"))
 }

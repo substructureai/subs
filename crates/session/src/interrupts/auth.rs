@@ -67,8 +67,20 @@ pub fn prompt(at: SessionStateAtNode) -> Option<DecisionAction> {
     })
 }
 
+/// What a person is asked when `connection` needs authorizing.
 fn ask(connection: &ConnectionPath, need: AuthNeed) -> String {
-    crate::copy::needs_authorization(&connection.to_string(), need)
+    match need {
+        AuthNeed::NeverAuthorized => {
+            format!("`{connection}` is not authorized yet, so I cannot use it.")
+        }
+        AuthNeed::Reauthorize => {
+            format!("`{connection}` needs to be authorized again. Its access expired.")
+        }
+        AuthNeed::TokenRejected => format!(
+            "`{connection}` rejected its token. An operator must set a new one \
+             with `subs auth {connection}`."
+        ),
+    }
 }
 
 #[cfg(test)]

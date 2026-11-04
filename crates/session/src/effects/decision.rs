@@ -91,6 +91,13 @@ impl KindSpec for DecisionSpec {
             DecisionPark::Turn(turn_id) => Dep::TurnSettled {
                 turn_id: turn_id.to_string(),
             },
+            DecisionPark::Work(EffectKind::Decision, id) => Dep::DecisionSettled {
+                decision_id: id.to_string(),
+            },
+            DecisionPark::Work(kind, id) => Dep::WorkSettled {
+                kind,
+                id: id.to_string(),
+            },
         })
     }
 
@@ -116,16 +123,12 @@ impl KindSpec for DecisionSpec {
 
     fn dispatch(&self, state: &SessionState, id: &str) -> Vec<EventPayload> {
         let Some(decision) = state.worker_decision(id) else {
-            return vec![EventPayload::DecisionDropped(DecisionDropped {
-                id: id.to_string(),
-            })];
+            return vec![state.decision_dropped(id)];
         };
         let mut events = Vec::new();
         if let Some(turn_id) = decision.trigger.deferred_turn_id() {
             if state.completed_turn_ids.iter().any(|t| t == turn_id) {
-                return vec![EventPayload::DecisionDropped(DecisionDropped {
-                    id: id.to_string(),
-                })];
+                return vec![state.decision_dropped(id)];
             }
             events.push(EventPayload::TurnStarted(TurnStarted {
                 turn_id: turn_id.to_string(),
@@ -133,6 +136,7 @@ impl KindSpec for DecisionSpec {
             }));
         } else {
             events.extend(own_turn_started(state, id));
+            events.extend(turn_joined(state, &decision.trigger));
         }
         events.push(EventPayload::DecisionDispatched(DecisionDispatched {
             id: id.to_string(),
@@ -158,17 +162,42 @@ fn own_turn_started(state: &SessionState, id: &str) -> Option<EventPayload> {
     }))
 }
 
+fn turn_joined(state: &SessionState, trigger: &Trigger) -> Option<EventPayload> {
+    let Trigger::ClientMessage {
+        join: true,
+        turn_id,
+        metadata,
+        ..
+    } = trigger
+    else {
+        return None;
+    };
+    Some(EventPayload::TurnJoined(TurnJoined {
+        turn_id: state.phase.active_turn_id()?.to_string(),
+        next_turn_id: turn_id.clone(),
+        metadata: metadata.clone(),
+    }))
+}
+
 impl SessionState {
+    pub fn decision_dropped(&self, id: &str) -> EventPayload {
+        let messages = match self.worker_decision(id).map(|d| &d.trigger) {
+            Some(Trigger::ClientMessage { messages, .. }) => {
+                messages.iter().filter_map(|m| m.id.clone()).collect()
+            }
+            _ => Vec::new(),
+        };
+        EventPayload::DecisionDropped(DecisionDropped {
+            id: id.to_string(),
+            messages,
+        })
+    }
+
     pub fn drop_queued_decisions(&self) -> Vec<EventPayload> {
         self.queued_decisions()
             .into_iter()
-            .filter(|e| {
-                e.decision().is_none_or(|d| {
-                    d.trigger.deferred_turn_id().is_none()
-                        && !matches!(d.trigger, Trigger::ClientAction { .. })
-                })
-            })
-            .map(|e| EventPayload::DecisionDropped(DecisionDropped { id: e.id.clone() }))
+            .filter(|e| e.decision().is_none_or(|d| d.trigger.is_turn_work()))
+            .map(|e| self.decision_dropped(&e.id))
             .collect()
     }
 }

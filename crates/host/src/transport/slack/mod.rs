@@ -214,7 +214,7 @@ fn build_batch(
             },
             None => {
                 let text = match &msg.author {
-                    Some(author) => format!("<@{author}>: {}", msg.text),
+                    Some(author) => crate::prompts::context::slack_message(author, &msg.text),
                     None => msg.text.clone(),
                 };
                 let content = with_attachments(text, &msg.files, uploads);
@@ -231,7 +231,7 @@ fn build_batch(
             &inbound_id,
             Role::User,
             with_attachments(
-                format!("<@{}>: {}", inbound.user, inbound.text),
+                crate::prompts::context::slack_message(&inbound.user, &inbound.text),
                 &inbound.files,
                 uploads,
             ),
@@ -250,16 +250,15 @@ fn with_attachments(
     for f in files {
         match uploads.get(&f.id) {
             Some(part) => attached.push(part.clone()),
-            None => notes.push(format!(
-                "{} ({})",
-                f.name.as_deref().unwrap_or("attachment"),
-                f.mimetype
+            None => notes.push(crate::prompts::context::slack_file(
+                f.name.as_deref(),
+                &f.mimetype,
             )),
         }
     }
     let mut text = text;
     if !notes.is_empty() {
-        text.push_str(&format!("\n[unreadable attachments: {}]", notes.join(", ")));
+        text.push_str(&crate::prompts::context::slack_unreadable(&notes));
     }
     if attached.is_empty() {
         return Content::Text(text);

@@ -105,24 +105,15 @@ pub fn callable<'a>(connector: &BoundServer, offered: &'a [RemoteTool]) -> Vec<&
         .collect()
 }
 
+use crate::prompts::tools as prompts;
 pub use crate::protocol::{CALL_TOOL, SKILL, SUBAGENT, TOOL_SEARCH};
-
-const SESSION_DESCRIPTION: &str =
-    "Session id of an earlier call to this agent, to continue that conversation";
-
-const MODE_DESCRIPTION: &str = "How the call returns [default: blocking]. `blocking` waits and \
-     answers with the result. `detached` answers at once with the session id; the result \
-     arrives later as a message.";
-
-const DETACHED_NOTE: &str = " Runs detached: the call answers at once with the session id, and \
-     the result arrives as a later message.";
 
 pub fn subagent_input() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "properties": {
-            "message": { "type": "string", "description": "The message to send to the agent" },
-            "session": { "type": "string", "description": SESSION_DESCRIPTION }
+            "message": { "type": "string", "description": prompts::SUBAGENT_MESSAGE },
+            "session": { "type": "string", "description": prompts::SUBAGENT_SESSION }
         },
         "required": ["message"]
     })
@@ -134,7 +125,7 @@ fn subagent_input_with_modes(modes: &[SpawnMode]) -> serde_json::Value {
         input["properties"]["mode"] = serde_json::json!({
             "type": "string",
             "enum": modes,
-            "description": MODE_DESCRIPTION
+            "description": prompts::SUBAGENT_MODE
         });
     }
     input
@@ -169,14 +160,11 @@ fn wait_tool(defer: bool) -> ConnectorTool {
         via: ConnectorProtocol::Agent,
         ..engine_tool(
             SUBAGENT_WAIT,
-            "Wait for the result of an earlier detached subagent call. Pass the `session` that \
-             call answered with. Answers at once when the result is already in, and holds \
-             until the child finishes when it is not."
-                .to_string(),
+            prompts::WAIT.to_string(),
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session": { "type": "string", "description": "The detached call's session id" }
+                    "session": { "type": "string", "description": prompts::WAIT_SESSION }
                 },
                 "required": ["session"]
             }),
@@ -191,13 +179,10 @@ fn subagent_switch(subagents: &[Subagent], defer: bool) -> ConnectorTool {
         .map(|s| {
             let mode = match s.resolved_mode() {
                 SubagentMode::Any => "",
-                SubagentMode::Blocking => " [always blocking]",
-                SubagentMode::Detached => " [always detached]",
+                SubagentMode::Blocking => prompts::ALWAYS_BLOCKING,
+                SubagentMode::Detached => prompts::ALWAYS_DETACHED,
             };
-            match s.description.is_empty() {
-                true => format!("- {}{mode}", s.id),
-                false => format!("- {} — {}{mode}", s.id, s.description),
-            }
+            prompts::subagent_listed(&s.id, &s.description, mode)
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -214,7 +199,7 @@ fn subagent_switch(subagents: &[Subagent], defer: bool) -> ConnectorTool {
     input["properties"]["agent"] = serde_json::json!({
         "type": "string",
         "enum": ids,
-        "description": "The agent to delegate to."
+        "description": prompts::SUBAGENT_AGENT
     });
     input["required"] = serde_json::json!(["agent", "message"]);
     ConnectorTool {
@@ -222,11 +207,7 @@ fn subagent_switch(subagents: &[Subagent], defer: bool) -> ConnectorTool {
         via: ConnectorProtocol::Agent,
         ..engine_tool(
             SUBAGENT,
-            format!(
-                "Delegate a turn to one of this agent's subagents. The call runs in the named \
-                 agent's own session and answers with its result and that session's id. Pass \
-                 the id back as `session` to continue where it left off. Agents:\n{listed}"
-            ),
+            prompts::subagent(&listed),
             input,
             ConnectorToolKind::Subagent,
         )
@@ -244,12 +225,12 @@ fn per_agent_subagent_tools(subagents: &[Subagent], default_defer: bool) -> Reso
             continue;
         }
         let mut description = match sub.description.is_empty() {
-            true => format!("Delegate to {}", sub.id),
+            true => prompts::delegate_to(&sub.id),
             false => sub.description.clone(),
         };
         let modes = sub.resolved_mode().offered();
         if modes == [SpawnMode::Detached] {
-            description.push_str(DETACHED_NOTE);
+            description.push_str(prompts::DETACHED_ONLY);
         }
         tools.push(ConnectorTool {
             name,
@@ -273,21 +254,17 @@ fn per_agent_subagent_tools(subagents: &[Subagent], default_defer: bool) -> Reso
 pub fn skill_tool() -> ConnectorTool {
     engine_tool(
         SKILL,
-        "Load a skill's instructions, and follow what comes back. Name the skill as it was \
-         listed or found: `<plugin>:<skill>` for a plugin's skill, the bare name for one of \
-         the agent's own. Some tools come with a skill and can't be found or called until it \
-         is loaded. Pass `file` to read one of the files the instructions reference."
-            .to_string(),
+        prompts::SKILL_TOOL.to_string(),
         serde_json::json!({
             "type": "object",
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": "The skill, as it was listed or found."
+                    "description": prompts::SKILL_NAME
                 },
                 "file": {
                     "type": "string",
-                    "description": "A file the skill's instructions reference, by its listed path."
+                    "description": prompts::SKILL_FILE
                 }
             },
             "required": ["name"]
@@ -323,18 +300,9 @@ pub fn engine_tool(
 }
 
 pub fn find_tool(skills: bool) -> ConnectorTool {
-    let mut description = "Search the tools this agent can reach. They are not listed up front. \
-         Answers with the name, the description, and the input schema of each match, best match \
-         first. Any word can match, so a plain description of the task searches well. A \
-         connector's name is a word in every one of its tools, so adding it keeps the search to \
-         that connection. An empty query matches every tool: start there when you do not know \
-         what is available."
-        .to_string();
+    let mut description = prompts::SEARCH.to_string();
     if skills {
-        description.push_str(
-            " It finds skills too, which are not listed either. Load one with `skill` before \
-             you start a task it covers.",
-        );
+        description.push_str(&prompts::search_skills());
     }
     engine_tool(
         TOOL_SEARCH,
@@ -344,7 +312,7 @@ pub fn find_tool(skills: bool) -> ConnectorTool {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Words to match against tool names and descriptions."
+                    "description": prompts::SEARCH_QUERY
                 }
             },
             "required": ["query"]
@@ -356,20 +324,17 @@ pub fn find_tool(skills: bool) -> ConnectorTool {
 fn call_tool() -> ConnectorTool {
     engine_tool(
         CALL_TOOL,
-        format!(
-            "Run one tool this agent can reach. Take `name` from `{TOOL_SEARCH}` exactly as it \
-             was given, and pass that tool's own arguments in `arguments`."
-        ),
+        prompts::call(),
         serde_json::json!({
             "type": "object",
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": "The tool's name, exactly as a search gave it."
+                    "description": prompts::CALL_NAME
                 },
                 "arguments": {
                     "type": "object",
-                    "description": "The arguments that tool's own input schema declares; {} for one that takes none."
+                    "description": prompts::CALL_ARGUMENTS
                 }
             },
             "required": ["name", "arguments"]
@@ -558,9 +523,12 @@ pub fn find_answer(
     }
     let shown = found.tools.len() + found.skills.len();
     if found.matched == 0 {
-        answer["note"] = serde_json::json!(crate::copy::NOTHING_MATCHED);
+        answer["note"] = serde_json::json!(crate::prompts::answers::NOTHING_MATCHED);
     } else if found.matched > shown {
-        answer["note"] = serde_json::json!(crate::copy::matches_truncated(shown, found.matched));
+        answer["note"] = serde_json::json!(crate::prompts::answers::matches_truncated(
+            shown,
+            found.matched
+        ));
     }
     if !unavailable.is_empty() {
         answer["unavailable"] = serde_json::json!(unavailable);

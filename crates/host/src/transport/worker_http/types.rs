@@ -137,6 +137,8 @@ pub struct SubmitClientPayloadResponse {
     pub session_id: String,
     pub turn_id: String,
     pub queued: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_turn_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -191,6 +193,15 @@ mod tests {
         let req: SubmitClientPayloadRequest =
             serde_json::from_str(body).expect("the submit deserializes");
         assert_eq!(req.queue, crate::protocol::QueueMode::Merge);
+    }
+
+    #[test]
+    fn a_submit_can_join_the_running_turn() {
+        let body = r#"{"agent_id":"a","identity":{"id":"u"},"queue":"join",
+            "payload":{"type":"client.append","messages":[{"role":"user","content":"hi"}]}}"#;
+        let req: SubmitClientPayloadRequest =
+            serde_json::from_str(body).expect("the submit deserializes");
+        assert_eq!(req.queue, crate::protocol::QueueMode::Join);
     }
 
     #[test]

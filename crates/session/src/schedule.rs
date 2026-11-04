@@ -411,6 +411,7 @@ mod tests {
             client: Default::default(),
             turn_id: None,
             merge: false,
+            join: false,
             metadata: Default::default(),
         }
     }
@@ -421,6 +422,7 @@ mod tests {
             client: Default::default(),
             turn_id: Some(turn_id.to_string()),
             merge: false,
+            join: false,
             metadata: Default::default(),
         }
     }

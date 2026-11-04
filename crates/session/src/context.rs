@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 
 use crate::events::ContextLimited;
+use crate::prompts::context as prompts;
 use crate::protocol::{
     AgentConfig, Content, ContextConfig, ContextReason, ContextStrategy, ContextStrategyKind,
     DecisionAction, DraftMessage, HeldCall, LlmRequest, Message, Role,
@@ -12,37 +13,8 @@ pub const KEEP_TOKENS: u64 = 20_000;
 const RESULT_CHARS: usize = 2_000;
 const LEAST_CHARS: usize = 4_000;
 
-const SUMMARY_SYSTEM: &str = "You write a handoff summary of a conversation for another model that will continue it. Do not continue the conversation. Do not answer what it asks.";
-
-const HANDOFF: &str = "Summarize the conversation above for whoever continues it. Use these sections, and leave out a section that does not apply.
-
-## Goal
-- What the user wants, in one or two lines.
-
-## Requirements
-- The rules, preferences and limits the user gave.
-
-## Decisions
-- What was decided, and why.
-
-## Done
-- What is finished.
-
-## Open
-- What is in progress, blocked, or not yet answered.
-
-## Next
-1. The next steps, in order.
-
-## Facts
-- The names, ids, numbers and values that later steps need.
-
-Keep each line short. Keep names, ids and values exact. Do not say that this is a summary.";
-
-const SUMMARIZED: &str = "The earlier conversation was summarized:";
-
 pub fn summary_message(summary: &str) -> DraftMessage {
-    text_message(Role::User, format!("{SUMMARIZED}\n\n{summary}"))
+    text_message(Role::User, prompts::summarized(summary))
 }
 
 fn text_message(role: Role, text: String) -> DraftMessage {
@@ -244,11 +216,7 @@ fn text(message: &Message) -> String {
 
 fn clipped(text: String, chars: usize) -> String {
     match text.char_indices().nth(chars) {
-        Some((at, _)) => format!(
-            "{}… [{} more characters]",
-            &text[..at],
-            text[at..].chars().count()
-        ),
+        Some((at, _)) => prompts::clipped(&text[..at], text[at..].chars().count()),
         None => text,
     }
 }
@@ -257,20 +225,20 @@ fn written(messages: &[&Message]) -> String {
     let mut lines = Vec::new();
     for m in messages {
         match m.role {
-            Role::User => lines.push(format!("[User]: {}", text(m))),
+            Role::User => lines.push(prompts::user_said(&text(m))),
             Role::Assistant => {
                 let said = text(m);
                 if !said.is_empty() {
-                    lines.push(format!("[Assistant]: {said}"));
+                    lines.push(prompts::assistant_said(&said));
                 }
                 for call in &m.tool_calls {
-                    lines.push(format!(
-                        "[Assistant called {}]: {}",
-                        call.function.name, call.function.arguments
+                    lines.push(prompts::assistant_called(
+                        &call.function.name,
+                        &call.function.arguments,
                     ));
                 }
             }
-            Role::Tool => lines.push(format!("[Tool result]: {}", clipped(text(m), RESULT_CHARS))),
+            Role::Tool => lines.push(prompts::tool_result(&clipped(text(m), RESULT_CHARS))),
             Role::System => {}
         }
     }
@@ -287,7 +255,7 @@ fn tail(text: String, chars: Option<usize>) -> String {
         .char_indices()
         .nth(count - chars)
         .map_or(0, |(at, _)| at);
-    format!("[earlier part left out]\n\n{}", &text[skip..])
+    prompts::left_out(&text[skip..])
 }
 
 pub fn summary_size(state: &SessionState, id: &str) -> usize {
@@ -317,9 +285,9 @@ pub fn summary_call(
         (a, b) => a.or(b),
     };
     let older = tail(written(&messages[..at]), most);
-    let asked = format!(
-        "<conversation>\n{older}\n</conversation>\n\n{}",
-        strategy.prompt.as_deref().unwrap_or(HANDOFF)
+    let asked = prompts::summary_asked(
+        &older,
+        strategy.prompt.as_deref().unwrap_or(prompts::HANDOFF),
     );
     Some(DecisionAction::CallLlm {
         id: None,
@@ -332,7 +300,7 @@ pub fn summary_call(
             .clone()
             .or_else(|| config.map(|c| c.model.clone())),
         messages: Some(vec![
-            text_message(Role::System, SUMMARY_SYSTEM.to_string()),
+            text_message(Role::System, prompts::SUMMARY_SYSTEM.to_string()),
             text_message(Role::User, asked),
         ]),
         tools: Some(Vec::new()),

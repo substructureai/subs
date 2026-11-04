@@ -212,7 +212,10 @@ type DecisionRequest struct {
 	Deadline   *time.Time     `json:"deadline"`
 	DecisionID string         `json:"decision_id"`
 	Identity   WorkerIdentity `json:"identity"`
-	Messages   []Message      `json:"messages"`
+	// A message waits to join the turn. Its decision calls the model next,
+	// so do not call the model or end the turn.
+	Joining  *bool     `json:"joining,omitempty"`
+	Messages []Message `json:"messages"`
 	// Count of in-flight `tool_call`/`subagent` calls.
 	PendingCalls int64 `json:"pending_calls"`
 	// The engine's default continuation for `trigger`. Empty when only the
@@ -221,7 +224,8 @@ type DecisionRequest struct {
 	SessionID string           `json:"session_id"`
 	State     interface{}      `json:"state"`
 	Trigger   DecisionTrigger  `json:"trigger"`
-	TurnID    *string          `json:"turn_id"`
+	// The turn this decision belongs to. `null` outside a turn.
+	Turn *TurnClass `json:"turn"`
 	// The worker this session is pinned to. `null` when the file's own
 	// routing decides.
 	Worker *WorkerRef `json:"worker"`
@@ -234,8 +238,11 @@ type DecisionRequest struct {
 // the call runs and what shape it takes. A config that names no block fails
 // when the engine resolves a call.
 type AgentConfig struct {
-	Attachments *Attachments   `json:"attachments"`
-	Context     *ContextConfig `json:"context"`
+	Attachments *Attachments `json:"attachments"`
+	// Offer `run_code`: the model writes a script in this language that
+	// calls the agent's tools.
+	Codemode *CodemodeEnum  `json:"codemode"`
+	Context  *ContextConfig `json:"context"`
 	// Defer every tool this agent offers, whatever its source. A tool or a
 	// connection overrides this with its own `defer`. Absent, the agent defers
 	// nothing; a connection can still defer on its own.
@@ -257,6 +264,8 @@ type AgentConfig struct {
 	Plugins []AgentPlugin `json:"plugins,omitempty"`
 	// Boxed. Five per-kind overrides are too many bytes to carry inline.
 	Retry *RetryConfig `json:"retry"`
+	// Skills of its own, outside any plugin.
+	Skills []AgentSkill `json:"skills,omitempty"`
 	// What shape the subagents take as tools. Absent ⇒ one tool per agent.
 	SubagentTools *SubagentTools `json:"subagent_tools"`
 	// Subagents the model can delegate to. The model sees them as tools.
@@ -307,6 +316,8 @@ type DeferTools struct {
 	// The most matches one search answers with. Never zero: a search that can
 	// answer with nothing is a search the model cannot use.
 	MaxMatches *int64 `json:"max_matches,omitempty"`
+	// How the model learns the agent's skills.
+	Skills *SkillListing `json:"skills,omitempty"`
 	// Which tools the agent gets to reach the ones it defers.
 	Strategy *DeferToolsStrategy `json:"strategy,omitempty"`
 }
@@ -353,8 +364,10 @@ type AgentPlugin struct {
 	Description *string         `json:"description,omitempty"`
 	ID          string          `json:"id"`
 	// The plugin's server names, from its bundle.
-	Servers         []string            `json:"servers,omitempty"`
-	Skills          []SkillMeta         `json:"skills,omitempty"`
+	Servers []string    `json:"servers,omitempty"`
+	Skills  []SkillMeta `json:"skills,omitempty"`
+	// Where its skills come from. Absent ⇒ its bundle.
+	Source          *SkillSource        `json:"source,omitempty"`
 	ToolSyncFailure *MCPToolSyncFailure `json:"tool_sync_failure,omitempty"`
 	// Applied to each of the plugin's servers.
 	Tools *MCPTools `json:"tools"`
@@ -364,6 +377,9 @@ type AgentPlugin struct {
 type SkillMeta struct {
 	Description *string `json:"description,omitempty"`
 	Name        string  `json:"name"`
+	// Tools the model can't see or call until it loads this skill. A tool
+	// that several skills name comes with any of them.
+	Tools []string `json:"tools,omitempty"`
 }
 
 // Retry overrides, one for each effect kind. `default` covers the kinds that
@@ -373,6 +389,7 @@ type RetryConfig struct {
 	Default   *RetryOverride `json:"default"`
 	Llm       *RetryOverride `json:"llm"`
 	Subagent  *RetryOverride `json:"subagent"`
+	System1   *RetryOverride `json:"system1"`
 	Tool      *RetryOverride `json:"tool"`
 }
 
@@ -385,6 +402,18 @@ type RetryOverride struct {
 	QueueTimeoutSecs *int64 `json:"queue_timeout_secs"`
 	RunTimeoutSecs   *int64 `json:"run_timeout_secs"`
 	TotalTimeoutSecs *int64 `json:"total_timeout_secs"`
+}
+
+// A skill of the agent's own, in no plugin. The model loads it by its bare
+// name.
+type AgentSkill struct {
+	Description *string `json:"description,omitempty"`
+	Name        string  `json:"name"`
+	// Absent ⇒ the project's skills bundle, which holds every `[skill.<id>]`
+	// with a `path`.
+	Source *SkillSource `json:"source,omitempty"`
+	// See [`SkillMeta::tools`].
+	Tools []string `json:"tools,omitempty"`
 }
 
 // What shape an agent's subagents take as tools.
@@ -492,6 +521,13 @@ type DecisionResponse struct {
 // Without `id` and `attempt`, both come from the `llm.execute` trigger
 // this answers. That ties the result to the attempt that ran.
 //
+// Ask a `[system1.*]` block typed questions about `state`. The answers
+// come back as `system1.finished`.
+//
+// Without `id`, the engine mints one. Without `system1`, the call runs on
+// the only block declared. Without `model`, it uses the block's. Without
+// `state`, the model reads the conversation.
+//
 // Without `interrupt_id`, the engine mints one to match the later
 // resume.
 //
@@ -523,6 +559,9 @@ type DecisionAction struct {
 	//
 	// Layered over the agent config's `subagent` policy, or over the
 	// engine's default.
+	//
+	// Layered over the agent config's `system1` policy, or over the
+	// engine's default.
 	Retry             *RetryOverride     `json:"retry"`
 	Stream            *bool              `json:"stream"`
 	Temperature       *float64           `json:"temperature"`
@@ -550,13 +589,26 @@ type DecisionAction struct {
 	Mode      *SpawnMode    `json:"mode"`
 	SessionID *string       `json:"session_id"`
 	// The model tool call this subagent answers. Required.
-	ToolCallID  *string     `json:"tool_call_id,omitempty"`
-	InterruptID *string     `json:"interrupt_id"`
-	Payload     interface{} `json:"payload"`
-	Reason      *string     `json:"reason,omitempty"`
-	Path        *string     `json:"path,omitempty"`
-	Data        interface{} `json:"data"`
-	Summary     *string     `json:"summary"`
+	ToolCallID  *string             `json:"tool_call_id,omitempty"`
+	Assets      map[string]Asset    `json:"assets,omitempty"`
+	Questions   map[string]Question `json:"questions,omitempty"`
+	State       interface{}         `json:"state"`
+	System1     *string             `json:"system1"`
+	InterruptID *string             `json:"interrupt_id"`
+	Payload     interface{}         `json:"payload"`
+	Reason      *string             `json:"reason,omitempty"`
+	Path        *string             `json:"path,omitempty"`
+	Data        interface{}         `json:"data"`
+	Summary     *string             `json:"summary"`
+}
+
+// Media a question can refer to. Its key is a placeholder that stands for
+// it in the state, the instructions or the criteria.
+//
+// `uri` is a `blob://` URI from a message, or a `data:` URI.
+type Asset struct {
+	Type AssetType `json:"type"`
+	URI  string    `json:"uri"`
 }
 
 // Why something failed. One shape on every event and on the wire.
@@ -575,6 +627,28 @@ type ErrorInfo struct {
 	// The one input to fix, when the failure names one. For example
 	// `agent.llm` or `actions[0].type`.
 	Param *string `json:"param"`
+}
+
+// A named question about a `system1.call`'s state. Its type sets the type
+// of its answer.
+//
+// Is it true? The answer is the probability of yes.
+//
+// Which option? `criteria` names each option and says when it applies.
+//
+// Where on a scale? `criteria` lists the levels in order. The first is 0.
+//
+// Where in the image?
+type Question struct {
+	Criteria     *Criteria    `json:"criteria"`
+	Instructions interface{}  `json:"instructions"`
+	Type         QuestionType `json:"type"`
+}
+
+// What counts as yes and what counts as no.
+type NoulCriteria struct {
+	False interface{} `json:"false"`
+	True  interface{} `json:"true"`
 }
 
 type ReasoningConfig struct {
@@ -616,6 +690,10 @@ type LlmTool struct {
 // that applied. A model call made before `call` runs again writes the
 // summary. `call` with its own id runs on whatever history is set by then.
 //
+// A `run_code` call's script paused on these calls. `id` is the
+// `run_code` call. Answer each by its `id`: `tool.call` runs it,
+// `tool.error` refuses it.
+//
 // Answer with `tool.result`/`tool.error`.
 //
 // Answer with `llm.result`/`llm.error`.
@@ -630,7 +708,10 @@ type DecisionTrigger struct {
 	Type DecisionTriggerType `json:"type"`
 	// Inputs the client declared on its run. The engine adds
 	// `client.tools` to the proposed config.
-	Client   *ClientContext       `json:"client,omitempty"`
+	Client *ClientContext `json:"client,omitempty"`
+	// The new messages were sent with `queue: "join"`, and join the
+	// running turn.
+	Join     *bool                `json:"join,omitempty"`
 	Messages []DraftMessage       `json:"messages,omitempty"`
 	NewFrom  *int64               `json:"new_from,omitempty"`
 	Args     interface{}          `json:"args"`
@@ -639,12 +720,13 @@ type DecisionTrigger struct {
 	Reason   *ContextReason       `json:"reason,omitempty"`
 	Strategy *ContextStrategyKind `json:"strategy"`
 	// What the model would read, in tokens.
-	Tokens    *int64     `json:"tokens,omitempty"`
-	Window    *int64     `json:"window"`
-	Arguments *string    `json:"arguments,omitempty"`
-	Attempt   *int64     `json:"attempt,omitempty"`
-	Deadline  *time.Time `json:"deadline"`
-	ID        *string    `json:"id,omitempty"`
+	Tokens    *int64            `json:"tokens,omitempty"`
+	Window    *int64            `json:"window"`
+	ID        *string           `json:"id,omitempty"`
+	ToolCalls []ToolCallElement `json:"tool_calls,omitempty"`
+	Arguments *string           `json:"arguments,omitempty"`
+	Attempt   *int64            `json:"attempt,omitempty"`
+	Deadline  *time.Time        `json:"deadline"`
 	// What the engine made of `arguments` against the tool's `input`
 	// schema: `valid`, `invalid`, or `malformed`. Always on the wire.
 	Input  *ToolInput `json:"input,omitempty"`
@@ -660,15 +742,44 @@ type DecisionTrigger struct {
 	Message *DraftMessage `json:"message"`
 	// True when the model declined the request. Without it, a refusal
 	// looks like a turn that ended well and said nothing.
-	Refused     *bool       `json:"refused,omitempty"`
-	Truncated   *bool       `json:"truncated,omitempty"`
-	Usage       *Usage      `json:"usage"`
-	AgentID     *string     `json:"agent_id,omitempty"`
-	SessionID   *string     `json:"session_id,omitempty"`
-	InterruptID *string     `json:"interrupt_id,omitempty"`
-	Payload     interface{} `json:"payload"`
-	Data        interface{} `json:"data"`
-	TurnID      *string     `json:"turn_id,omitempty"`
+	Refused   *bool   `json:"refused,omitempty"`
+	Truncated *bool   `json:"truncated,omitempty"`
+	Usage     *Usage  `json:"usage"`
+	AgentID   *string `json:"agent_id,omitempty"`
+	SessionID *string `json:"session_id,omitempty"`
+	// One answer for each question, by the question's name.
+	Answers     map[string]Answer `json:"answers,omitempty"`
+	Model       *string           `json:"model"`
+	InterruptID *string           `json:"interrupt_id,omitempty"`
+	Payload     interface{}       `json:"payload"`
+	Data        interface{}       `json:"data"`
+	TurnID      *string           `json:"turn_id,omitempty"`
+}
+
+// The answer to one question. A field the engine does not name stays on
+// the answer as the provider sent it.
+//
+// `noul` is the probability of yes, from 0 to 1.
+//
+// `score` is the expected level. It can fall between two levels.
+//
+// The edges are fractions of the image's height and width.
+type Answer struct {
+	Noul          *float64               `json:"noul,omitempty"`
+	Type          QuestionType           `json:"type"`
+	Choice        *string                `json:"choice,omitempty"`
+	Confidence    *float64               `json:"confidence"`
+	Probabilities map[string]float64     `json:"probabilities,omitempty"`
+	Legend        map[string]interface{} `json:"legend,omitempty"`
+	Score         *float64               `json:"score,omitempty"`
+	Box           *Edges                 `json:"box,omitempty"`
+}
+
+type Edges struct {
+	Bottom float64 `json:"bottom"`
+	Left   float64 `json:"left"`
+	Right  float64 `json:"right"`
+	Top    float64 `json:"top"`
 }
 
 // A model call that waits for room.
@@ -741,6 +852,12 @@ type Usage struct {
 	Total int64 `json:"total"`
 	// The part of `input` the provider read fresh.
 	UncachedInput int64 `json:"uncached_input"`
+}
+
+type TurnClass struct {
+	ID string `json:"id"`
+	// The `metadata` the turn was submitted with.
+	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
 // Which worker identity decides for a session, and optionally at what
@@ -835,7 +952,7 @@ type ToolContentType string
 
 const (
 	Audio        ToolContentType = "audio"
-	Image        ToolContentType = "image"
+	PurpleImage  ToolContentType = "image"
 	PurpleText   ToolContentType = "text"
 	Resource     ToolContentType = "resource"
 	ResourceLink ToolContentType = "resource_link"
@@ -875,6 +992,7 @@ const (
 type QueueWord string
 
 const (
+	Join  QueueWord = "join"
 	Merge QueueWord = "merge"
 )
 
@@ -913,6 +1031,14 @@ const (
 	View AttachmentTool = "view"
 )
 
+// The language a script is written in. Each has a dialect that describes
+// `run_code` to the model and an engine that runs it.
+type CodemodeEnum string
+
+const (
+	Javascript CodemodeEnum = "javascript"
+)
+
 // Start over with only the turn's own messages.
 //
 // Summarize the older messages and keep the recent ones.
@@ -924,6 +1050,18 @@ const (
 	ContextStrategyKindWorker ContextStrategyKind = "worker"
 	Reset                     ContextStrategyKind = "reset"
 	Summarize                 ContextStrategyKind = "summarize"
+)
+
+// How the model learns the agent's skills.
+//
+// `list` names every skill in the system prompt. `search` names none there:
+// `tool_search` finds skills beside tools, so a growing set of skills costs
+// the prompt nothing.
+type SkillListing string
+
+const (
+	List               SkillListing = "list"
+	SkillListingSearch SkillListing = "search"
 )
 
 // Which tools the agent gets to reach the ones it defers.
@@ -939,7 +1077,7 @@ const (
 type DeferToolsStrategy string
 
 const (
-	Search DeferToolsStrategy = "search"
+	DeferToolsStrategySearch DeferToolsStrategy = "search"
 )
 
 type ReasoningEffort string
@@ -1006,6 +1144,21 @@ const (
 	MCPAnnounceNever MCPAnnounce = "never"
 )
 
+// Where its skills come from. Absent ⇒ its bundle.
+//
+// Where a skill comes from: the bundle `subs apply` sent, or the worker,
+// which lists it in the config it returns and answers each `skill` call as a
+// `tool.execute`, so a skill can say what is true now.
+//
+// Absent ⇒ the project's skills bundle, which holds every `[skill.<id>]`
+// with a `path`.
+type SkillSource string
+
+const (
+	Bundle            SkillSource = "bundle"
+	SkillSourceWorker SkillSource = "worker"
+)
+
 // How the model reaches an agent's subagents.
 //
 // One tool per subagent, named by the agent.
@@ -1038,6 +1191,8 @@ const (
 //
 // The turn's completion, which waits for the `turn.finished` decision to
 // settle. Carries the turn id. Never swept, because it has no deadline.
+//
+// A call to a `[system1.*]` block.
 type EffectKind string
 
 const (
@@ -1045,6 +1200,7 @@ const (
 	Decision      EffectKind = "decision"
 	LlmCall       EffectKind = "llm_call"
 	Subagent      EffectKind = "subagent"
+	System1Call   EffectKind = "system1_call"
 	ToolCall      EffectKind = "tool_call"
 	TurnEnd       EffectKind = "turn_end"
 )
@@ -1076,6 +1232,12 @@ const (
 	Shared  Visibility = "shared"
 )
 
+type AssetType string
+
+const (
+	FluffyImage AssetType = "image"
+)
+
 // What kind of failure, so a consumer can branch on it instead of reading the
 // sentence. A closed set, required on every [`ErrorInfo`].
 //
@@ -1089,17 +1251,18 @@ const (
 type ErrorCode string
 
 const (
-	BudgetExceeded    ErrorCode = "budget_exceeded"
-	ContextOverflow   ErrorCode = "context_overflow"
-	DeadlineExceeded  ErrorCode = "deadline_exceeded"
-	HandlerError      ErrorCode = "handler_error"
-	Internal          ErrorCode = "internal"
-	InvalidResponse   ErrorCode = "invalid_response"
-	ProviderError     ErrorCode = "provider_error"
-	RateLimited       ErrorCode = "rate_limited"
-	Refused           ErrorCode = "refused"
-	Unroutable        ErrorCode = "unroutable"
-	WorkerUnreachable ErrorCode = "worker_unreachable"
+	BudgetExceeded     ErrorCode = "budget_exceeded"
+	ContextOverflow    ErrorCode = "context_overflow"
+	DeadlineExceeded   ErrorCode = "deadline_exceeded"
+	ErrorCodeCancelled ErrorCode = "cancelled"
+	HandlerError       ErrorCode = "handler_error"
+	Internal           ErrorCode = "internal"
+	InvalidResponse    ErrorCode = "invalid_response"
+	ProviderError      ErrorCode = "provider_error"
+	RateLimited        ErrorCode = "rate_limited"
+	Refused            ErrorCode = "refused"
+	Unroutable         ErrorCode = "unroutable"
+	WorkerUnreachable  ErrorCode = "worker_unreachable"
 )
 
 // How one subagent call returns.
@@ -1109,6 +1272,15 @@ const (
 	SpawnModeBlocking SpawnMode = "blocking"
 	SpawnModeDetached SpawnMode = "detached"
 	Wait              SpawnMode = "wait"
+)
+
+type QuestionType string
+
+const (
+	Box    QuestionType = "box"
+	Choice QuestionType = "choice"
+	Noul   QuestionType = "noul"
+	Score  QuestionType = "score"
 )
 
 type DecisionActionType string
@@ -1127,6 +1299,7 @@ const (
 	TypeConnectorSync DecisionActionType = "connector.sync"
 	TypeInterrupt     DecisionActionType = "interrupt"
 	TypeLlmCall       DecisionActionType = "llm.call"
+	TypeSystem1Call   DecisionActionType = "system1.call"
 	TypeToolCall      DecisionActionType = "tool.call"
 )
 
@@ -1174,12 +1347,14 @@ const (
 type DecisionTriggerType string
 
 const (
+	CodemodeCalls           DecisionTriggerType = "codemode.calls"
 	ContextLimit            DecisionTriggerType = "context.limit"
 	InterruptResumed        DecisionTriggerType = "interrupt.resumed"
 	LlmExecute              DecisionTriggerType = "llm.execute"
 	LlmFinished             DecisionTriggerType = "llm.finished"
 	SessionStart            DecisionTriggerType = "session.start"
 	SubagentFinished        DecisionTriggerType = "subagent.finished"
+	System1Finished         DecisionTriggerType = "system1.finished"
 	TentacledClientAction   DecisionTriggerType = "client.action"
 	TentacledClientMessages DecisionTriggerType = "client.messages"
 	ToolExecute             DecisionTriggerType = "tool.execute"
@@ -1190,8 +1365,8 @@ const (
 type ResumeStatus string
 
 const (
-	Cancelled ResumeStatus = "cancelled"
-	Resolved  ResumeStatus = "resolved"
+	Resolved              ResumeStatus = "resolved"
+	ResumeStatusCancelled ResumeStatus = "cancelled"
 )
 
 type Content struct {
@@ -1216,7 +1391,8 @@ func (x *Content) MarshalJSON() ([]byte, error) {
 
 // What a message does while a turn runs. `false` or `null` refuses it. `true` holds it for
 // a turn of its own. `"merge"` adds it to the turn waiting last when that turn also merges,
-// so messages sent during a turn become one turn.
+// so messages sent during a turn become one turn. `"join"` adds it to the running turn,
+// which sees it at its next model call.
 type Queue struct {
 	Bool *bool
 	Enum *QueueWord
@@ -1301,6 +1477,29 @@ func (x *Error) UnmarshalJSON(data []byte) error {
 
 func (x *Error) MarshalJSON() ([]byte, error) {
 	return marshalUnion(nil, nil, nil, x.String, false, nil, x.ErrorInfo != nil, x.ErrorInfo, false, nil, false, nil, false)
+}
+
+type Criteria struct {
+	AnythingArray []interface{}
+	NoulCriteria  *NoulCriteria
+}
+
+func (x *Criteria) UnmarshalJSON(data []byte) error {
+	x.AnythingArray = nil
+	x.NoulCriteria = nil
+	var c NoulCriteria
+	object, err := unmarshalUnion(data, nil, nil, nil, nil, true, &x.AnythingArray, true, &c, false, nil, false, nil, true)
+	if err != nil {
+		return err
+	}
+	if object {
+		x.NoulCriteria = &c
+	}
+	return nil
+}
+
+func (x *Criteria) MarshalJSON() ([]byte, error) {
+	return marshalUnion(nil, nil, nil, nil, x.AnythingArray != nil, x.AnythingArray, x.NoulCriteria != nil, x.NoulCriteria, false, nil, false, nil, true)
 }
 
 type Result struct {

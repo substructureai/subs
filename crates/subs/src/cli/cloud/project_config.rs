@@ -64,6 +64,34 @@ pub struct ProjectConfig {
     pub skill: BTreeMap<String, SkillSpec>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote: Option<Remote>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codemode: Option<CodeModeConfig>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CodeModeConfig {
+    /// What each script may use; a limit left out keeps its default.
+    #[serde(deserialize_with = "limits")]
+    pub limits: crate::codemode::Limits,
+}
+
+fn limits<'de, D: serde::Deserializer<'de>>(d: D) -> Result<crate::codemode::Limits, D::Error> {
+    use serde::de::Error;
+    let table = toml::Table::deserialize(d)?;
+    let known =
+        serde_json::to_value(crate::codemode::Limits::default()).map_err(D::Error::custom)?;
+    let known = known
+        .as_object()
+        .ok_or_else(|| D::Error::custom("limits are not a table"))?;
+    if let Some(key) = table.keys().find(|k| !known.contains_key(*k)) {
+        let names: Vec<&str> = known.keys().map(String::as_str).collect();
+        return Err(D::Error::custom(format!(
+            "unknown limit `{key}`; the limits are {}",
+            names.join(", ")
+        )));
+    }
+    crate::codemode::Limits::deserialize(toml::Value::Table(table)).map_err(D::Error::custom)
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -478,6 +506,32 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("huge"), "{err}");
+    }
+
+    #[test]
+    fn script_limits_take_sizes_and_keep_their_defaults() {
+        let limits = ok(
+            "[codemode.limits]\ncall_arguments = \"8mb\"\ncompute_ms = 9000\nmemory = 1073741824\n",
+        )
+        .codemode
+        .unwrap()
+        .limits;
+        let defaults = crate::codemode::Limits::default();
+        assert_eq!(limits.call_arguments, 8 << 20);
+        assert_eq!(limits.compute_ms, 9_000);
+        assert_eq!(limits.memory, 1 << 30);
+        assert_eq!(
+            limits.calls, defaults.calls,
+            "a limit left out keeps its default"
+        );
+        let err = parse("[codemode.limits]\ncompute = 9000\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown limit `compute`"), "{err}");
+        let err = parse("[codemode.limits]\nmemory = \"lots\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("lots"), "{err}");
     }
 
     #[test]

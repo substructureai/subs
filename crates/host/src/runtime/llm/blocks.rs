@@ -44,7 +44,7 @@ impl LlmBlocks {
     }
 
     pub fn declared(&self) -> String {
-        crate::copy::declared(self.0.keys())
+        crate::prompts::declared(self.0.keys())
     }
 }
 

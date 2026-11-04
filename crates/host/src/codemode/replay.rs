@@ -5,6 +5,7 @@
 use std::collections::VecDeque;
 
 use super::{spent, Limit, Limits, Ran, Script, ScriptCall, ScriptRecord, Stats, Step};
+use substructure_session::prompts::codemode as prompts;
 
 /// The answer to a call the script made.
 #[derive(Debug, Clone, PartialEq)]
@@ -71,56 +72,42 @@ impl Replay {
     }
 
     /// The script called `name` with `arguments`, a JSON object.
+    /// A refused call takes no place in the sequence, so the calls after it
+    /// still find their records.
     pub fn call(&mut self, name: String, arguments: String) -> Answer {
-        self.seq += 1;
-        self.argument_bytes += arguments.len();
-        let mut refuse = |limit: Limit, message: String| {
-            self.refused.get_or_insert(limit);
-            Answer::Refused(message)
+        let total = self.argument_bytes + arguments.len();
+        let refused = if self.seq >= self.limits.calls as usize {
+            Some((Limit::Calls, prompts::too_many_calls(self.limits.calls)))
+        } else if arguments.len() > self.limits.call_arguments {
+            Some((
+                Limit::Arguments,
+                prompts::call_arguments(&name, arguments.len(), self.limits.call_arguments),
+            ))
+        } else if total > self.limits.arguments {
+            Some((
+                Limit::Arguments,
+                prompts::arguments_spent(total, self.limits.arguments),
+            ))
+        } else {
+            None
         };
-        if self.seq > self.limits.calls as usize {
-            return refuse(
-                Limit::Calls,
-                format!(
-                    "A script can make at most {} calls. Make fewer, larger calls, or split the \
-                     work over several run_code calls.",
-                    self.limits.calls
-                ),
-            );
+        if let Some((limit, message)) = refused {
+            self.refused.get_or_insert(limit);
+            return Answer::Refused(message);
         }
-        if arguments.len() > self.limits.call_arguments {
-            return refuse(
-                Limit::Arguments,
-                format!(
-                    "Arguments to `{name}` are over {} KiB. Pass less in one call.",
-                    self.limits.call_arguments >> 10
-                ),
-            );
-        }
-        if self.argument_bytes > self.limits.arguments {
-            return refuse(
-                Limit::Arguments,
-                format!(
-                    "The script's arguments passed {} MiB in all. Pass less in each call.",
-                    self.limits.arguments >> 20
-                ),
-            );
-        }
+        self.seq += 1;
+        self.argument_bytes = total;
         let Some(record) = self.records.get(self.seq - 1) else {
             if self.spent {
-                let message = spent(self.limits.results);
-                return refuse(Limit::Results, message);
+                self.refused.get_or_insert(Limit::Results);
+                return Answer::Refused(spent(self.limits.results));
             }
             self.calls.push(ScriptCall { name, arguments });
             return Answer::Pending;
         };
         if record.name != name || record.arguments != arguments {
-            self.diverged.get_or_insert(format!(
-                "The script changed between runs. Call {} was `{}` and is now `{name}`. A \
-                 script must make the same calls each time it runs: do not branch on timing or \
-                 on anything outside its results.",
-                self.seq, record.name
-            ));
+            self.diverged
+                .get_or_insert(prompts::diverged(self.seq, &record.name, &name));
             return Answer::Pending;
         }
         Answer::Result {
@@ -161,12 +148,7 @@ impl Replay {
         if let Some(limit) = self.stopped {
             let message = match limit {
                 Limit::Compute if self.whole => total_spent(&self.limits),
-                Limit::Compute => format!(
-                    "The script used its {} ms of compute for one run. Do less before each \
-                     call: the script resumes from the start after its calls finish, so that \
-                     work is done again.",
-                    self.limits.compute_ms
-                ),
+                Limit::Compute => prompts::run_compute(self.limits.compute_ms),
                 _ => memory(&self.limits),
             };
             return (Step::Failed(message), Some(limit));
@@ -195,14 +177,19 @@ impl Replay {
                     limit.or(self.refused),
                 )
             }
-            End::Waiting if !self.calls.is_empty() => (Step::Calls(self.calls), self.refused),
+            End::Waiting if !self.calls.is_empty() => {
+                let asked: usize = self.calls.iter().map(|c| c.arguments.len()).sum();
+                if asked > self.limits.step_arguments {
+                    let message = prompts::step_arguments(asked, self.limits.step_arguments);
+                    return (
+                        Step::Failed(failed(&message, &printed, (output, dropped))),
+                        Some(Limit::Arguments),
+                    );
+                }
+                (Step::Calls(self.calls), self.refused)
+            }
             End::Waiting => (
-                Step::Failed(failed(
-                    "The script waits on something that never finishes. Wait only on tool \
-                     calls.",
-                    &printed,
-                    (output, dropped),
-                )),
+                Step::Failed(failed(prompts::NEVER_SETTLES, &printed, (output, dropped))),
                 Some(Limit::NeverSettles),
             ),
         }
@@ -260,11 +247,10 @@ impl Printed {
 pub fn precheck(script: &Script) -> Option<Ran> {
     let (step, limit) = match () {
         _ if !super::supports(script.version) => (
-            Step::Failed(format!(
-                "The runner takes versions {} to {}, not {}.",
+            Step::Failed(prompts::version(
                 super::OLDEST,
                 super::VERSION,
-                script.version
+                script.version,
             )),
             None,
         ),
@@ -285,20 +271,11 @@ pub fn precheck(script: &Script) -> Option<Ran> {
 }
 
 fn total_spent(limits: &Limits) -> String {
-    format!(
-        "The script used its {}s of compute over all its runs. Make fewer calls one after \
-         another, or do less before each: the script resumes from the start after its calls \
-         finish.",
-        limits.total_compute_ms / 1000
-    )
+    prompts::total_compute(limits.total_compute_ms / 1000)
 }
 
 fn memory(limits: &Limits) -> String {
-    format!(
-        "The script ran out of its {} MiB of memory. Keep less: take only the fields you need \
-         from each result.",
-        limits.memory >> 20
-    )
+    prompts::memory(limits.memory >> 20)
 }
 
 /// A finished run's text: what it printed, then the value it returned, a
@@ -310,24 +287,12 @@ fn finished(printed: &str, value: Option<&str>, budget: (usize, usize)) -> (Stri
         Ok(serde_json::Value::String(s)) => s,
         _ => v.to_string(),
     });
-    let mut text = "Script finished.".to_string();
-    if !printed.is_empty() {
-        text.push_str(&format!("\nPrinted:\n{printed}"));
-    }
-    match value {
-        Some(value) => text.push_str(&format!("\nReturned:\n{value}")),
-        None if printed.is_empty() => text.push_str(" It printed and returned nothing."),
-        None => {}
-    }
+    let text = prompts::finished(printed, value.as_deref());
     cut(text, budget)
 }
 
 fn failed(error: &str, printed: &str, budget: (usize, usize)) -> String {
-    let text = match printed.is_empty() {
-        true => format!("Script failed.\n{}", error.trim_end()),
-        false => format!("Script failed.\n{}\nPrinted:\n{printed}", error.trim_end()),
-    };
-    cut(text, budget).0
+    cut(prompts::failed(error, printed), budget).0
 }
 
 /// `text` within `output` bytes, its middle cut out with a note that counts
@@ -346,11 +311,7 @@ fn cut(text: String, (output, dropped): (usize, usize)) -> (String, bool) {
             (middle, middle)
         }
     };
-    let note = format!(
-        "\n[… {} KiB cut from the middle. Print and return less: filter or count in the \
-         script. …]\n",
-        (tail - head + dropped).div_ceil(1024)
-    );
+    let note = prompts::cut((tail - head + dropped).div_ceil(1024));
     (format!("{}{note}{}", &text[..head], &text[tail..]), true)
 }
 

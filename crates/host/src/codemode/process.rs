@@ -16,6 +16,8 @@ use super::child::{Hello, Reply, Request, DATA, DATA_MIB};
 use super::{Ran, Script, Stats, Step, ARG};
 use std::collections::BTreeMap;
 use substructure_session::blob::{BlobError, BlobRef, BlobStore, MemoryBlobStore};
+use substructure_session::prompts::codemode;
+use substructure_session::prompts::codemode::files as prompts;
 
 /// Runs one step of a script. A runner keeps nothing between steps, so any
 /// runner can take any step: a process here, a machine elsewhere, a service.
@@ -60,7 +62,7 @@ impl ScriptFiles {
 
     /// Bytes `offset..offset + len` of `file`, fewer at its end.
     pub async fn read(&self, file: &str, offset: u64, len: u64) -> Result<Vec<u8>, ReadError> {
-        let missing = || ReadError::Missing(format!("There is no file \"{file}\"."));
+        let missing = || ReadError::Missing(prompts::no_file(file));
         let blob = self.sources.get(file).ok_or_else(missing)?;
         if blob.tenant_id != self.tenant_id {
             return Err(missing());
@@ -73,9 +75,7 @@ impl ScriptFiles {
             .read(blob, offset..end)
             .await
             .map_err(|e| match e {
-                BlobError::NotFound => {
-                    ReadError::Missing(format!("\"{file}\" is no longer stored."))
-                }
+                BlobError::NotFound => ReadError::Missing(prompts::no_longer_stored(file)),
                 other => ReadError::Store(other.to_string()),
             })
     }
@@ -173,6 +173,12 @@ impl ProcessRunner {
         }
     }
 
+    /// Room for the heap `limits` give a script, and its records beside it.
+    pub fn with_room_for(self, limits: &super::Limits) -> Self {
+        let mib = (limits.memory as u64 >> 20) * 2;
+        self.with_data_limit(mib.max(DATA_MIB))
+    }
+
     /// The command that starts a runner: no environment, `/` as its
     /// directory, and only the three pipes.
     pub fn command(&self) -> Command {
@@ -228,11 +234,7 @@ impl ProcessRunner {
                 .map_err(|_| Start::Again("it did not start in time".to_string()))?
                 .map_err(|e| Start::Again(e.to_string()))?;
             let hello = serde_json::from_slice(&line).map_err(|_| {
-                Start::Never(format!(
-                    "`{}` did not answer as a runner. Its `main` must call \
-                     `codemode::dispatch()` first",
-                    program.display()
-                ))
+                Start::Never(codemode::not_a_runner(&program.display().to_string()))
             })?;
             match hello {
                 Hello::Ready {
@@ -246,9 +248,7 @@ impl ProcessRunner {
                     versions: (oldest, version),
                     languages,
                 }),
-                Hello::Unconfined { error } => Err(Start::Never(format!(
-                    "it could not confine itself: {error}"
-                ))),
+                Hello::Unconfined { error } => Err(Start::Never(codemode::unconfined(&error))),
             }
         }
     }
@@ -274,17 +274,14 @@ impl ProcessRunner {
         loop {
             let line = tokio::time::timeout_at(deadline, read_line(&mut worker.stdout))
                 .await
-                .map_err(|_| Stop::Failed("the script ran too long".to_string()))?
+                .map_err(|_| Stop::Failed(codemode::RAN_TOO_LONG.to_string()))?
                 .map_err(failed)?;
             let Ok(Request::Read { file, offset, len }) = serde_json::from_slice(&line) else {
                 return serde_json::from_slice(&line).map_err(|e| Stop::Failed(e.to_string()));
             };
             let started = tokio::time::Instant::now();
             let (reply, bytes) = match served.saturating_add(len) > budget {
-                true => (
-                    Reply::Refused("The script read its limit of file bytes.".to_string()),
-                    Vec::new(),
-                ),
+                true => (Reply::Refused(prompts::READ_LIMIT.to_string()), Vec::new()),
                 false => match files.read(&file, offset, len).await {
                     Ok(bytes) => (Reply::Bytes(bytes.len() as u64), bytes),
                     Err(ReadError::Missing(m)) => (Reply::Missing(m), Vec::new()),
@@ -332,10 +329,7 @@ impl ScriptRunner for ProcessRunner {
                 return Err(RunError(format!("the sandbox did not start: {e}")))
             }
             Err(Start::Never(e)) => {
-                return Ok(failed(
-                    format!("The sandbox could not start: {e}"),
-                    super::Limit::Start,
-                ))
+                return Ok(failed(codemode::sandbox_failed(&e), super::Limit::Start))
             }
         };
         if !worker.languages.contains(&script.language) {
@@ -365,13 +359,7 @@ impl ScriptRunner for ProcessRunner {
                     "the script's files could not be read: {e}"
                 )))
             }
-            Err(Stop::Failed(e)) => failed(
-                format!(
-                    "The script stopped: {e}. It may have run long inside one built-in \
-                     operation, or run out of memory."
-                ),
-                super::Limit::Deadline,
-            ),
+            Err(Stop::Failed(e)) => failed(codemode::stopped(&e), super::Limit::Deadline),
         })
     }
 }
@@ -381,7 +369,7 @@ async fn read_line(stdout: &mut BufReader<ChildStdout>) -> io::Result<Vec<u8>> {
     stdout.take(ANSWER).read_until(b'\n', &mut line).await?;
     match line.pop() {
         Some(b'\n') => Ok(line),
-        Some(_) => Err(io::Error::other("its answer was too large")),
-        None => Err(io::Error::other("it exited")),
+        Some(_) => Err(io::Error::other(codemode::ANSWER_TOO_LARGE)),
+        None => Err(io::Error::other(codemode::EXITED)),
     }
 }

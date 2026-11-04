@@ -56,7 +56,7 @@ impl System1Resolver for System1Registry {
         self.blocks.get(block).cloned().ok_or_else(|| {
             format!(
                 "no [system1.{block}] block — declared: {}",
-                crate::copy::declared(self.blocks.keys())
+                crate::prompts::declared(self.blocks.keys())
             )
         })
     }

@@ -217,8 +217,31 @@ Each merged submit gets back the same `turn_id`. If two submits set
 message is not added twice. A merge does not join a turn that was queued with
 `queue: true`, so turns still run in the order they arrived.
 
-To redirect an agent that is working, [interrupt](./100-interrupts.md) it first,
-then submit.
+Send `queue: "join"` to add messages to the running turn. The engine does not
+stop the model call, tool call or script that runs. The turn sees the messages
+at its next model call, after the results that it waits for.
+
+```
+model call -> tool runs      "make it blue"
+tool ends            ->      next model call: the tool result, then the line
+```
+
+When the model gives its final answer while messages wait, the turn does not
+end. It calls the model again with the messages.
+
+The submit gets back the `turn_id` of the running turn, with `queued: false`,
+and a `next_turn_id`. A `turn.joined` event tells you that the messages ran in
+the running turn. Messages that arrive before that model call join as one. A
+later `metadata` key wins, and the turn keeps its other keys. If the turn ends
+first, for example because it fails, the messages open the turn
+`next_turn_id`. A join that arrives while a turn ends waits for that next turn
+too, and gets back `queued: true`. With no turn running, a join starts a turn. The
+engine refuses a join while the session is interrupted. Give each message an
+`id`. The engine drops a message whose ID it already recorded or holds.
+
+To redirect an agent that is working, send the correction with
+`queue: "join"`, then [cancel](./100-interrupts.md#cancel-a-run) the turn. The
+cancel keeps the messages that wait, and they run as the next turn.
 
 ## Next steps
 

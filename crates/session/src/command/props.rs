@@ -58,7 +58,7 @@ enum ActOp {
 #[derive(Debug, Clone)]
 enum Op {
     ClientMessage {
-        queue: bool,
+        queue: QueueMode,
     },
     Decide {
         acts: Vec<ActOp>,
@@ -113,7 +113,13 @@ fn op() -> impl Strategy<Value = Op> {
         4 => (proptest::collection::vec(act_op(), 0..3), any::<bool>(), any::<bool>()).prop_map(
             |(acts, append, set_config)| Op::Decide { acts, append, set_config }
         ),
-        3 => any::<bool>().prop_map(|queue| Op::ClientMessage { queue }),
+        3 => prop_oneof![
+            Just(QueueMode::Refuse),
+            Just(QueueMode::Turn),
+            Just(QueueMode::Merge),
+            Just(QueueMode::Join),
+        ]
+        .prop_map(|queue| Op::ClientMessage { queue }),
         2 => (any::<usize>(), any::<bool>(), any::<bool>())
             .prop_map(|(index, ok, retryable)| Op::SettleLlm { index, ok, retryable }),
         2 => (any::<usize>(), any::<bool>(), any::<bool>())
@@ -382,7 +388,7 @@ impl World {
                             stream: false,
                         }),
                         turn: TurnTarget::Open(turn_id),
-                        queue: queue.into(),
+                        queue,
                         metadata: Default::default(),
                     },
                     &frontend(),
@@ -590,7 +596,10 @@ impl World {
                 self.run(CommandPayload::Wake { now }, &system());
             }
             Op::Cancel => {
-                self.run(CommandPayload::CancelSession, &system());
+                self.run(
+                    CommandPayload::CancelSession { drop_queued: false },
+                    &system(),
+                );
                 self.cancelled = true;
             }
         }

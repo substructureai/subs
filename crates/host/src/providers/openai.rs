@@ -113,7 +113,7 @@ fn part(p: &PromptPart) -> ContentPart {
             ("audio", "wav" | "x-wav" | "wave") => audio(bytes, "wav"),
             ("audio", "mpeg" | "mp3") => audio(bytes, "mp3"),
             (kind, _) => ContentPart::Text {
-                text: format!("[{kind} content]"),
+                text: crate::prompts::answers::media(kind),
             },
         },
         PromptPart::Link {
@@ -166,15 +166,10 @@ pub(super) fn turns(messages: &[PromptMessage], part: PartPolicy) -> Vec<Turn<'_
             out.push(Turn::Message(message));
             continue;
         }
-        let said = match text.is_empty() {
-            true => {
-                "This tool answered with attachments. They follow in the next message.".to_string()
-            }
-            false => format!("{text}\n\nAttachments follow in the next message."),
-        };
+        let said = crate::prompts::answers::attachments_follow(&text);
         out.push(Turn::ToolText(message, said));
         carried.push(ContentPart::Text {
-            text: format!("Attachment from {}:", names(message)),
+            text: crate::prompts::answers::attachment_from(&names(message)),
         });
         carried.extend(media);
     }
@@ -209,12 +204,7 @@ fn wire_messages(messages: &[PromptMessage]) -> Vec<WireMessage<'_>> {
 }
 
 fn names(message: &PromptMessage) -> String {
-    match (&message.name, &message.tool_call_id) {
-        (Some(name), Some(id)) => format!("the `{name}` tool ({id})"),
-        (Some(name), None) => format!("the `{name}` tool"),
-        (None, Some(id)) => format!("tool call {id}"),
-        (None, None) => "the tool result above".to_string(),
-    }
+    crate::prompts::answers::tool_named(message.name.as_deref(), message.tool_call_id.as_deref())
 }
 
 fn split_media(content: Option<&PromptContent>, part: PartPolicy) -> (String, Vec<ContentPart>) {

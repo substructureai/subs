@@ -1,6 +1,7 @@
 use super::state::SessionStateAtNode;
 use crate::connectors::filter;
 use crate::plugins::{FileRef, PluginBundle, Skill, SkillFile};
+use crate::prompts::{answers, errors};
 use crate::protocol::{AgentConfig, ConnectorToolKind, StoredContent, StoredResult};
 
 pub fn answer(
@@ -71,7 +72,7 @@ pub fn script_find(
 fn call(at: SessionStateAtNode, arguments: &str) -> StoredResult {
     StoredResult::error(
         at.call_tool_fault(arguments)
-            .unwrap_or_else(|| crate::copy::CALL_NOT_ROUTED.to_string()),
+            .unwrap_or_else(|| crate::prompts::errors::CALL_NOT_ROUTED.to_string()),
     )
 }
 
@@ -96,22 +97,16 @@ fn requested<'b>(
     let named = argument(arguments, "name");
     let file = Some(argument(arguments, "file")).filter(|f| !f.is_empty());
     let Some(config) = at.resolve_agent_for() else {
-        return Err(StoredResult::error(
-            "this agent has no config on this branch",
-        ));
+        return Err(StoredResult::error(errors::NO_CONFIG));
     };
     let Some(found) = config.named_skill(&named) else {
         return Err(StoredResult::error(no_such_skill(&config, &named)));
     };
     let Some(bundle) = bundle else {
-        return Err(StoredResult::error(format!(
-            "skill `{named}` has no data on this engine; re-apply the project"
-        )));
+        return Err(StoredResult::error(errors::skill_without_data(&named)));
     };
     let Some(skill) = bundle.skill(found.skill) else {
-        return Err(StoredResult::error(format!(
-            "skill `{named}` is not in the data this engine holds; re-apply the project"
-        )));
+        return Err(StoredResult::error(errors::skill_not_in_data(&named)));
     };
     Ok((named, skill, file))
 }
@@ -145,26 +140,19 @@ pub fn skill_answer(
         Err(refused) => return refused,
     };
     match file {
-        Some(path) if scripted => StoredResult::error(format!(
-            "Read a skill's files with `files.text`, by their path under its base directory: \
-             `files.text({:?})`.",
-            format!("{named}/{path}")
-        )),
+        Some(path) if scripted => StoredResult::error(
+            crate::prompts::codemode::javascript::read_skill_file(&format!("{named}/{path}")),
+        ),
         Some(path) => file_answer(skill, &named, &path, stored),
-        None if scripted => StoredResult::text(format!(
-            "Base directory for this skill: {named}/\n\n{}",
-            skill.body
-        )),
-        None => {
-            let mut answer = format!("Skill {named} — {}\n\n{}", skill.description, skill.body);
-            let listed = skill_files(skill);
-            if !listed.is_empty() {
-                answer.push_str(&format!(
-                    "\n\nFiles (read one with `skill` and `file`):\n{listed}"
-                ));
-            }
-            StoredResult::text(answer)
+        None if scripted => {
+            StoredResult::text(crate::prompts::codemode::skill_loaded(&named, &skill.body))
         }
+        None => StoredResult::text(answers::skill(
+            &named,
+            &skill.description,
+            &skill.body,
+            &skill_files(skill),
+        )),
     }
 }
 
@@ -175,7 +163,7 @@ fn no_such_skill(config: &AgentConfig, named: &str) -> String {
     let listing = |skills: Vec<crate::agent_config::NamedSkill>| {
         skills
             .iter()
-            .map(|s| format!("{} — {}", s.name, s.description))
+            .map(|s| answers::skill_listed(&s.name, s.description))
             .collect::<Vec<_>>()
             .join("\n")
     };
@@ -183,27 +171,18 @@ fn no_such_skill(config: &AgentConfig, named: &str) -> String {
     if !plugin_id.is_empty() {
         let Some(plugin) = config.plugins.iter().find(|p| p.id == plugin_id) else {
             let plugins: Vec<&str> = config.plugins.iter().map(|p| p.id.as_str()).collect();
-            return format!(
-                "no plugin `{plugin_id}` for this agent. Declared: {}.",
-                crate::copy::declared(plugins)
-            );
+            return errors::no_such_plugin(plugin_id, &crate::prompts::declared(plugins));
         };
         let in_plugin = skills
             .into_iter()
             .filter(|s| s.plugin == Some(plugin.id.as_str()))
             .collect();
-        return format!(
-            "no skill `{skill_name}` in plugin `{plugin_id}`. Its skills:\n{}",
-            listing(in_plugin)
-        );
+        return errors::no_such_plugin_skill(skill_name, plugin_id, &listing(in_plugin));
     }
     if config.searches_skills() {
-        return format!("no skill `{named}`. Find skills with `tool_search`.");
+        return errors::no_such_searched_skill(named);
     }
-    format!(
-        "no skill `{named}`. This agent's skills:\n{}",
-        listing(skills)
-    )
+    errors::no_such_skill(named, &listing(skills))
 }
 
 fn file_answer(skill: &Skill, named: &str, path: &str, stored: Option<&str>) -> StoredResult {
@@ -211,7 +190,7 @@ fn file_answer(skill: &Skill, named: &str, path: &str, stored: Option<&str>) -> 
         (Some(SkillFile::Text(text)), _) => return StoredResult::text(text.clone()),
         (Some(SkillFile::Stored(_)), Some(text)) => return StoredResult::text(text),
         (Some(SkillFile::Stored(_)), None) => {
-            return StoredResult::error(format!("`{path}` in skill `{named}` could not be read."))
+            return StoredResult::error(errors::skill_file_unread(path, named))
         }
         (None, _) => {}
     }
@@ -222,19 +201,16 @@ fn file_answer(skill: &Skill, named: &str, path: &str, stored: Option<&str>) -> 
             }],
             ..Default::default()
         },
-        None => StoredResult::error(format!(
-            "no file `{path}` in skill `{named}`. Its files:\n{}",
-            skill_files(skill)
-        )),
+        None => StoredResult::error(errors::no_such_skill_file(path, named, &skill_files(skill))),
     }
 }
 
 fn skill_files(skill: &Skill) -> String {
-    let text = skill.files.keys().map(|path| format!("- {path}"));
+    let text = skill.files.keys().map(|path| answers::skill_file(path));
     let binaries = skill
         .binaries
         .iter()
-        .map(|(path, b)| format!("- {path} ({}, {} bytes)", b.mime, b.size));
+        .map(|(path, b)| answers::skill_binary(path, &b.mime, b.size));
     text.chain(binaries).collect::<Vec<_>>().join("\n")
 }
 

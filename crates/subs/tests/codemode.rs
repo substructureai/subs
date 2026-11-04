@@ -182,7 +182,13 @@ impl Engine {
         );
         let directory = Arc::new(match worker {
             Some(url) => directory.with_workers(
-                BTreeMap::from([("w".to_string(), WorkerBlock { url: Some(url) })]),
+                BTreeMap::from([(
+                    "w".to_string(),
+                    WorkerBlock {
+                        url: Some(url),
+                        compress: None,
+                    },
+                )]),
                 None,
             ),
             None => directory,

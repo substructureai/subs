@@ -328,6 +328,10 @@ pub(crate) async fn start_engine(
     if let Some(secs) = cfg.send_timeout_secs {
         config.send_timeout = std::time::Duration::from_secs(secs.get());
     }
+    let limits = cfg.codemode.clone().unwrap_or_default().limits;
+    config.script_runner =
+        Arc::new(crate::codemode::ProcessRunner::current().with_room_for(&limits));
+    config.script_limits = Arc::new(crate::codemode::FixedLimits(limits));
     let llm_task_queue: Arc<dyn Queue<LlmTask>> =
         Arc::new(SqliteQueue::new(db.clone(), TASK_LEASE));
     let subagent_task_queue: Arc<dyn Queue<SubagentTask>> =

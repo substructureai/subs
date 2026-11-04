@@ -176,6 +176,7 @@ async fn engine(block: &'static str) -> Engine {
                 "w".to_string(),
                 WorkerBlock {
                     url: Some(format!("http://{addr}/agent")),
+                    compress: None,
                 },
             )]),
             None,

@@ -380,7 +380,7 @@ fn part_to_block(part: &PromptPart) -> RequestBlock {
                     source: source(),
                     cache_control: None,
                 },
-                (kind, _) => text(format!("[{kind} content]")),
+                (kind, _) => text(crate::prompts::answers::media(kind)),
             }
         }
     }

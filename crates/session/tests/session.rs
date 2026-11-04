@@ -104,7 +104,11 @@ fn a_command_refused_by_a_session_never_created_writes_nothing() {
         .run(
             &store,
             Utc::now(),
-            Command::system("c1", TENANT, CommandPayload::CancelSession),
+            Command::system(
+                "c1",
+                TENANT,
+                CommandPayload::CancelSession { drop_queued: false },
+            ),
         )
         .unwrap();
 
@@ -429,7 +433,11 @@ fn a_voided_subagent_call_mails_its_child_a_cancel() {
         .run(
             &store,
             Utc::now(),
-            Command::system("cancel", TENANT, CommandPayload::CancelSession),
+            Command::system(
+                "cancel",
+                TENANT,
+                CommandPayload::CancelSession { drop_queued: false },
+            ),
         )
         .unwrap()
         .written
@@ -438,7 +446,8 @@ fn a_voided_subagent_call_mails_its_child_a_cancel() {
     let mail = session.mail(&cancelled);
     assert!(
         mail.iter()
-            .any(|m| m.to == child && matches!(m.command.payload, CommandPayload::CancelSession)),
+            .any(|m| m.to == child
+                && matches!(m.command.payload, CommandPayload::CancelSession { .. })),
         "got {mail:?}"
     );
 }
@@ -561,6 +570,61 @@ fn a_merged_submit_answers_with_the_turn_it_joined() {
         (second.turn_id.as_deref(), second.queued),
         (Some("t2"), true)
     );
+}
+
+#[test]
+fn a_joined_submit_answers_with_the_running_turn() {
+    let store = MemoryStore::new();
+    let mut session = load(&store, Settings::default());
+    session.run(&store, Utc::now(), create("c1")).unwrap();
+    finish_open_decision(&store, &mut session, "d0");
+
+    let idle = session
+        .run(&store, Utc::now(), say("m1", "t1", QueueMode::Join))
+        .unwrap()
+        .result
+        .unwrap();
+    assert_eq!((idle.turn_id.as_deref(), idle.queued), (Some("t1"), false));
+    assert_eq!(idle.next_turn_id, None, "an idle session starts the turn");
+
+    let joined = session
+        .run(&store, Utc::now(), say("m2", "t2", QueueMode::Join))
+        .unwrap()
+        .result
+        .unwrap();
+    assert_eq!(
+        (joined.turn_id.as_deref(), joined.queued),
+        (Some("t1"), false),
+        "a join mid-turn answers with the running turn"
+    );
+    assert_eq!(
+        joined.next_turn_id.as_deref(),
+        Some("t2"),
+        "and with the turn it opens when the running turn ends first"
+    );
+    let again = session
+        .run(&store, Utc::now(), say("m2b", "t9", QueueMode::Join))
+        .unwrap()
+        .result
+        .unwrap();
+    assert_eq!(
+        again.next_turn_id.as_deref(),
+        Some("t2"),
+        "a join that waits with another shares its next turn"
+    );
+
+    finish_open_decision(&store, &mut session, "d1");
+    let ending = session
+        .run(&store, Utc::now(), say("m3", "t3", QueueMode::Join))
+        .unwrap()
+        .result
+        .unwrap();
+    assert_eq!(
+        (ending.turn_id.as_deref(), ending.queued),
+        (Some("t2"), true),
+        "while the turn ends, a join waits with the message before it in a turn of its own"
+    );
+    assert_eq!(ending.next_turn_id, None);
 }
 
 #[test]
@@ -941,7 +1005,11 @@ mod delivery {
             .run(
                 &store,
                 now,
-                Command::system("cancel", TENANT, CommandPayload::CancelSession),
+                Command::system(
+                    "cancel",
+                    TENANT,
+                    CommandPayload::CancelSession { drop_queued: false },
+                ),
             )
             .unwrap();
         fail_first(&store, &mut session, &sub, now);

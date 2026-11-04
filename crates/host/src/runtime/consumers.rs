@@ -319,10 +319,20 @@ impl Reader for MailReader {
     ) -> Result<(), DeliveryError> {
         for event in events {
             for mail in session.mail(std::slice::from_ref(event)) {
-                let _answered = sessions
+                let kind = mail.command.payload.kind();
+                let answered = sessions
                     .run(session.tenant_id(), &mail.to, mail.command)
                     .await
                     .map_err(|e| DeliveryError::retry(Some(event.seq), e.to_string()))?;
+                if let Err(rejected) = answered {
+                    tracing::warn!(
+                        from = %session.id(),
+                        to = %mail.to,
+                        command = kind,
+                        error = %rejected.error,
+                        "a session refused mail"
+                    );
+                }
             }
         }
         Ok(())

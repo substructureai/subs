@@ -85,6 +85,13 @@ pub fn runtime_error_response(err: RuntimeError) -> Response {
     (status, Json(serde_json::json!({"error": message}))).into_response()
 }
 
+/// `?drop_queued=true` drops the messages that wait for the turn.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct CancelParams {
+    #[serde(default)]
+    pub drop_queued: bool,
+}
+
 pub trait NamedBody {
     const WHAT: &'static str;
 }

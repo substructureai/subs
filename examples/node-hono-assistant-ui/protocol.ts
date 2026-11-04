@@ -190,7 +190,7 @@ export interface ToolCallFunction {
     name: string;
 }
 
-export type QueueWord = "merge";
+export type QueueWord = "merge" | "join";
 
 export type ClientInputType =
     | "client.message"
@@ -242,6 +242,11 @@ export interface DecisionRequest {
     deadline?: Date | null;
     decision_id: string;
     identity: WorkerIdentity;
+    /**
+     * A message waits to join the turn. Its decision calls the model next,
+     * so do not call the model or end the turn.
+     */
+    joining?: boolean;
     messages: Message[];
     /**
      * Count of in-flight `tool_call`/`subagent` calls.
@@ -255,7 +260,10 @@ export interface DecisionRequest {
     session_id: string;
     state: unknown;
     trigger: DecisionTrigger;
-    turn_id?: null | string;
+    /**
+     * The turn this decision belongs to. `null` outside a turn.
+     */
+    turn?: TurnClass | null;
     /**
      * The worker this session is pinned to. `null` when the file's own
      * routing decides.
@@ -273,6 +281,11 @@ export interface DecisionRequest {
  */
 export interface AgentConfig {
     attachments?: null | Attachments;
+    /**
+     * Offer `run_code`: the model writes a script in this language that
+     * calls the agent's tools.
+     */
+    codemode?: CodemodeEnum | null;
     context?: null | ContextConfig;
     /**
      * Defer every tool this agent offers, whatever its source. A tool or a
@@ -312,6 +325,10 @@ export interface AgentConfig {
      */
     retry?: RetryConfig | null;
     /**
+     * Skills of its own, outside any plugin.
+     */
+    skills?: AgentSkill[];
+    /**
      * What shape the subagents take as tools. Absent ⇒ one tool per agent.
      */
     subagent_tools?: null | SubagentTools;
@@ -337,6 +354,12 @@ export interface Attachments {
 export type Disposition = "inline" | "attachment";
 
 export type AttachmentTool = "read" | "view";
+
+/**
+ * The language a script is written in. Each has a dialect that describes
+ * `run_code` to the model and an engine that runs it.
+ */
+export type CodemodeEnum = "javascript";
 
 /**
  * How the agent makes room in what the model reads. Before each model call
@@ -406,11 +429,24 @@ export interface DeferTools {
      */
     max_matches?: number;
     /**
+     * How the model learns the agent's skills.
+     */
+    skills?: SkillListing;
+    /**
      * Which tools the agent gets to reach the ones it defers.
      */
     strategy?: DeferToolsStrategy;
     [property: string]: unknown;
 }
+
+/**
+ * How the model learns the agent's skills.
+ *
+ * `list` names every skill in the system prompt. `search` names none there:
+ * `tool_search` finds skills beside tools, so a growing set of skills costs
+ * the prompt nothing.
+ */
+export type SkillListing = "list" | "search";
 
 /**
  * Which tools the agent gets to reach the ones it defers.
@@ -524,6 +560,10 @@ export interface AgentPlugin {
      */
     servers?: string[];
     skills?: SkillMeta[];
+    /**
+     * Where its skills come from. Absent ⇒ its bundle.
+     */
+    source?: SkillSource;
     tool_sync_failure?: MCPToolSyncFailure;
     /**
      * Applied to each of the plugin's servers.
@@ -537,7 +577,24 @@ export interface AgentPlugin {
 export interface SkillMeta {
     description?: string;
     name: string;
+    /**
+     * Tools the model can't see or call until it loads this skill. A tool
+     * that several skills name comes with any of them.
+     */
+    tools?: string[];
 }
+
+/**
+ * Where its skills come from. Absent ⇒ its bundle.
+ *
+ * Where a skill comes from: the bundle `subs apply` sent, or the worker,
+ * which lists it in the config it returns and answers each `skill` call as a
+ * `tool.execute`, so a skill can say what is true now.
+ *
+ * Absent ⇒ the project's skills bundle, which holds every `[skill.<id>]`
+ * with a `path`.
+ */
+export type SkillSource = "bundle" | "worker";
 
 /**
  * Retry overrides, one for each effect kind. `default` covers the kinds that
@@ -548,6 +605,7 @@ export interface RetryConfig {
     default?: RetryOverride | null;
     llm?: RetryOverride | null;
     subagent?: RetryOverride | null;
+    system1?: RetryOverride | null;
     tool?: RetryOverride | null;
 }
 
@@ -562,6 +620,24 @@ export interface RetryOverride {
     queue_timeout_secs?: number | null;
     run_timeout_secs?: number | null;
     total_timeout_secs?: number | null;
+}
+
+/**
+ * A skill of the agent's own, in no plugin. The model loads it by its bare
+ * name.
+ */
+export interface AgentSkill {
+    description?: string;
+    name: string;
+    /**
+     * Absent ⇒ the project's skills bundle, which holds every `[skill.<id>]`
+     * with a `path`.
+     */
+    source?: SkillSource;
+    /**
+     * See [`SkillMeta::tools`].
+     */
+    tools?: string[];
 }
 
 /**
@@ -645,8 +721,17 @@ export interface Effect {
  *
  * The turn's completion, which waits for the `turn.finished` decision to
  * settle. Carries the turn id. Never swept, because it has no deadline.
+ *
+ * A call to a `[system1.*]` block.
  */
-export type EffectKind = "tool_call" | "subagent" | "llm_call" | "connector_sync" | "decision" | "turn_end";
+export type EffectKind =
+    | "tool_call"
+    | "subagent"
+    | "llm_call"
+    | "connector_sync"
+    | "decision"
+    | "turn_end"
+    | "system1_call";
 
 /**
  * Running, waiting for its result. Off the deadline clock. A subagent
@@ -741,6 +826,13 @@ export interface DecisionResponse {
  * Without `id` and `attempt`, both come from the `llm.execute` trigger
  * this answers. That ties the result to the attempt that ran.
  *
+ * Ask a `[system1.*]` block typed questions about `state`. The answers
+ * come back as `system1.finished`.
+ *
+ * Without `id`, the engine mints one. Without `system1`, the call runs on
+ * the only block declared. Without `model`, it uses the block's. Without
+ * `state`, the model reads the conversation.
+ *
  * Without `interrupt_id`, the engine mints one to match the later
  * resume.
  *
@@ -775,6 +867,9 @@ export interface DecisionAction {
      * engine's default for where the tool runs.
      *
      * Layered over the agent config's `subagent` policy, or over the
+     * engine's default.
+     *
+     * Layered over the agent config's `system1` policy, or over the
      * engine's default.
      */
     retry?: RetryOverride | null;
@@ -813,6 +908,10 @@ export interface DecisionAction {
      * The model tool call this subagent answers. Required.
      */
     tool_call_id?: string;
+    assets?: { [key: string]: Asset };
+    questions?: { [key: string]: Question };
+    state?: unknown;
+    system1?: null | string;
     interrupt_id?: null | string;
     payload?: unknown;
     reason?: string;
@@ -820,6 +919,19 @@ export interface DecisionAction {
     data?: unknown;
     summary?: null | string;
 }
+
+/**
+ * Media a question can refer to. Its key is a placeholder that stands for
+ * it in the state, the instructions or the criteria.
+ *
+ * `uri` is a `blob://` URI from a message, or a `data:` URI.
+ */
+export interface Asset {
+    type: AssetType;
+    uri: string;
+}
+
+export type AssetType = "image";
 
 /**
  * What kind of failure, so a consumer can branch on it instead of reading the
@@ -844,7 +956,8 @@ export type ErrorCode =
     | "worker_unreachable"
     | "unroutable"
     | "internal"
-    | "context_overflow";
+    | "context_overflow"
+    | "cancelled";
 
 /**
  * Why something failed. One shape on every event and on the wire.
@@ -876,6 +989,35 @@ export interface ErrorInfo {
  * How one subagent call returns.
  */
 export type SpawnMode = "blocking" | "detached" | "wait";
+
+/**
+ * A named question about a `system1.call`'s state. Its type sets the type
+ * of its answer.
+ *
+ * Is it true? The answer is the probability of yes.
+ *
+ * Which option? `criteria` names each option and says when it applies.
+ *
+ * Where on a scale? `criteria` lists the levels in order. The first is 0.
+ *
+ * Where in the image?
+ */
+export interface Question {
+    criteria?: unknown[] | null | NoulCriteria;
+    instructions?: unknown;
+    type: QuestionType;
+}
+
+/**
+ * What counts as yes and what counts as no.
+ */
+export interface NoulCriteria {
+    false?: unknown;
+    true?: unknown;
+    [property: string]: unknown;
+}
+
+export type QuestionType = "noul" | "choice" | "score" | "box";
 
 export interface ReasoningConfig {
     effort?: ReasoningEffort | null;
@@ -923,6 +1065,7 @@ export type DecisionActionType =
     | "llm.error"
     | "subagent.spawn"
     | "message.send"
+    | "system1.call"
     | "interrupt"
     | "interrupt.resolve"
     | "connector.sync"
@@ -940,6 +1083,10 @@ export type DecisionActionType =
  * A model call waits for room. `proposed` holds the plan of the strategy
  * that applied. A model call made before `call` runs again writes the
  * summary. `call` with its own id runs on whatever history is set by then.
+ *
+ * A `run_code` call's script paused on these calls. `id` is the
+ * `run_code` call. Answer each by its `id`: `tool.call` runs it,
+ * `tool.error` refuses it.
  *
  * Answer with `tool.result`/`tool.error`.
  *
@@ -959,6 +1106,11 @@ export interface DecisionTrigger {
      * `client.tools` to the proposed config.
      */
     client?: ClientContext;
+    /**
+     * The new messages were sent with `queue: "join"`, and join the
+     * running turn.
+     */
+    join?: boolean;
     messages?: DraftMessage[];
     new_from?: number;
     args?: unknown;
@@ -971,10 +1123,11 @@ export interface DecisionTrigger {
      */
     tokens?: number;
     window?: number | null;
+    id?: string;
+    tool_calls?: ToolCall[];
     arguments?: string;
     attempt?: number;
     deadline?: Date | null;
-    id?: string;
     /**
      * What the engine made of `arguments` against the tool's `input`
      * schema: `valid`, `invalid`, or `malformed`. Always on the wire.
@@ -1001,10 +1154,44 @@ export interface DecisionTrigger {
     usage?: Usage | null;
     agent_id?: string;
     session_id?: string;
+    /**
+     * One answer for each question, by the question's name.
+     */
+    answers?: { [key: string]: Answer };
+    model?: null | string;
     interrupt_id?: string;
     payload?: unknown;
     data?: unknown;
     turn_id?: string;
+}
+
+/**
+ * The answer to one question. A field the engine does not name stays on
+ * the answer as the provider sent it.
+ *
+ * `noul` is the probability of yes, from 0 to 1.
+ *
+ * `score` is the expected level. It can fall between two levels.
+ *
+ * The edges are fractions of the image's height and width.
+ */
+export interface Answer {
+    noul?: number;
+    type: QuestionType;
+    choice?: string;
+    confidence?: number | null;
+    probabilities?: { [key: string]: number };
+    legend?: { [key: string]: unknown };
+    score?: number;
+    box?: Edges;
+    [property: string]: unknown;
+}
+
+export interface Edges {
+    bottom: number;
+    left: number;
+    right: number;
+    top: number;
 }
 
 /**
@@ -1087,11 +1274,13 @@ export type DecisionTriggerType =
     | "client.messages"
     | "client.action"
     | "context.limit"
+    | "codemode.calls"
     | "tool.execute"
     | "tool.finished"
     | "llm.execute"
     | "llm.finished"
     | "subagent.finished"
+    | "system1.finished"
     | "interrupt.resumed"
     | "turn.finished";
 
@@ -1130,6 +1319,14 @@ export interface Usage {
      * The part of `input` the provider read fresh.
      */
     uncached_input: number;
+}
+
+export interface TurnClass {
+    id: string;
+    /**
+     * The `metadata` the turn was submitted with.
+     */
+    metadata?: { [key: string]: string };
 }
 
 /**

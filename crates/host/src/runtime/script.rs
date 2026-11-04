@@ -8,7 +8,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::codemode::{
-    settle, Admission, Limit, Limits, Ran, ScriptFile, ScriptFiles, ScriptRunner, Stats, Step,
+    settle, Admission, Limit, Limits, LimitsResolver, Ran, ScriptFile, ScriptFiles, ScriptRunner,
+    Stats, Step,
 };
 use crate::plugins::text_mime;
 use crate::plugins::PluginResolver;
@@ -52,7 +53,7 @@ const WAITING: usize = 64;
 pub struct Scripts {
     pub runner: Arc<dyn ScriptRunner>,
     pub admission: Arc<Admission>,
-    pub limits: Limits,
+    pub limits: Arc<dyn LimitsResolver>,
     /// How long a step may wait for a slot, or for a runner to take it.
     pub wait: Duration,
     /// Where the scripts' files are.
@@ -93,7 +94,8 @@ async fn step(
     let Some(session) = session else {
         return Ok(());
     };
-    let Some(mut script) = session.script(&task.tool_call_id, &scripts.limits) else {
+    let limits = scripts.limits.resolve(&task.tenant_id).await;
+    let Some(mut script) = session.script(&task.tool_call_id, &limits) else {
         return Ok(());
     };
     let mut sources: BTreeMap<String, BlobRef> = session
@@ -140,7 +142,7 @@ async fn step(
         waited,
         started.elapsed(),
         &ran,
-        &scripts.limits,
+        &limits,
     );
     let command = settle(
         task.tool_call_id,
@@ -223,14 +225,8 @@ fn stored_file(id: String, skill: &str, blob: BlobRef) -> StoredFile {
 
 fn late(waited: Duration, limit: Limit) -> Ran {
     let message = match limit {
-        Limit::Wait => format!(
-            "The script waited {}s for a free sandbox and did not run. Try again in a moment.",
-            waited.as_secs()
-        ),
-        _ => format!(
-            "No sandbox could run the script for {}s. Try again in a moment.",
-            waited.as_secs()
-        ),
+        Limit::Wait => substructure_session::prompts::codemode::no_free_sandbox(waited.as_secs()),
+        _ => substructure_session::prompts::codemode::no_runner(waited.as_secs()),
     };
     Ran {
         step: Step::Failed(message),

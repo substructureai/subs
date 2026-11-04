@@ -1324,7 +1324,9 @@ mod tests {
     async fn a_command_on_a_session_never_created_writes_nothing() {
         let disk = testing::disk();
         let s = disk.sessions();
-        let refused = s.execute(input(CommandPayload::CancelSession)).await;
+        let refused = s
+            .execute(input(CommandPayload::CancelSession { drop_queued: false }))
+            .await;
 
         assert!(matches!(
             refused,

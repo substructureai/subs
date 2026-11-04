@@ -148,9 +148,7 @@ impl SessionState {
                     EffectStatus::Queued | EffectStatus::RetryScheduled
                 )
             {
-                events.push(EventPayload::DecisionDropped(DecisionDropped {
-                    id: e.id.clone(),
-                }));
+                events.push(self.decision_dropped(&e.id));
             }
         }
         events.extend(
@@ -176,10 +174,7 @@ impl SessionState {
         self.effects
             .values()
             .filter(|e| match e.decision() {
-                Some(d) => {
-                    d.trigger.deferred_turn_id().is_none()
-                        && !matches!(d.trigger, Trigger::ClientAction { .. })
-                }
+                Some(d) => d.trigger.is_turn_work(),
                 None => matches!(
                     e.kind(),
                     EffectKind::ToolCall
@@ -211,7 +206,7 @@ impl SessionState {
         }
     }
 
-    pub fn cancel_run(&self) -> Vec<EventPayload> {
+    pub fn cancel_run(&self, drop_queued: bool) -> Vec<EventPayload> {
         let cancelled = serde_json::to_value(InterruptResolution {
             status: ResumeStatus::Cancelled,
             payload: serde_json::Value::Null,
@@ -232,13 +227,14 @@ impl SessionState {
         events.extend(
             self.effects_of(EffectKind::Decision)
                 .filter(|e| {
+                    let Some(d) = e.decision() else { return false };
+                    let waits =
+                        e.tracking.status() == EffectStatus::Queued && !d.trigger.is_turn_work();
                     e.tracking.is_unsettled()
-                        && !matches!(
-                            e.decision().map(|d| &d.trigger),
-                            Some(Trigger::SessionStart)
-                        )
+                        && !matches!(d.trigger, Trigger::SessionStart)
+                        && (drop_queued || !waits)
                 })
-                .map(|e| EventPayload::DecisionDropped(DecisionDropped { id: e.id.clone() })),
+                .map(|e| self.decision_dropped(&e.id)),
         );
         let error = ErrorInfo::new(ErrorCode::Cancelled, "cancelled");
         match &self.phase {

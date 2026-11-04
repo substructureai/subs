@@ -29,9 +29,8 @@ pub fn run(script: &Script, host: Box<dyn Host>) -> Ran {
     match ENGINES.iter().find(|e| e.language() == script.language) {
         Some(engine) => engine.run(script, host),
         None => Ran {
-            step: Step::Failed(format!(
-                "This runner has no engine for {:?}.",
-                script.language
+            step: Step::Failed(substructure_session::prompts::codemode::no_engine(
+                &format!("{:?}", script.language),
             )),
             stats: Default::default(),
             shown: Vec::new(),

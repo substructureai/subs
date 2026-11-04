@@ -1,5 +1,7 @@
 use std::borrow::Cow;
 
+use crate::prompts::tools as prompts;
+use crate::prompts::{answers, errors};
 use serde_json::{json, Value};
 
 use super::{Attachment, Attachments, Tool, READ, VIEW};
@@ -29,27 +31,22 @@ pub fn definitions(attachments: &Attachments) -> Vec<ConnectorTool> {
 fn definition(tool: Tool) -> ConnectorTool {
     let (description, input) = match tool {
         Tool::Read => (
-            "Read a text attachment. Answers one chunk, with the total size and line count so \
-             you can ask for the next. Name the attachment by the id in its `[attachment …]` \
-             line."
-                .to_string(),
+            prompts::ATTACHMENT_READ.to_string(),
             json!({
                 "type": "object",
                 "properties": {
-                    "attachment": { "type": "string", "description": ID },
-                    "from_line": { "type": "integer", "description": "First line to answer with, counting from 1." },
-                    "lines": { "type": "integer", "description": "How many lines to answer with." }
+                    "attachment": { "type": "string", "description": prompts::ATTACHMENT_ID },
+                    "from_line": { "type": "integer", "description": prompts::ATTACHMENT_FROM_LINE },
+                    "lines": { "type": "integer", "description": prompts::ATTACHMENT_LINES }
                 },
                 "required": ["attachment"]
             }),
         ),
         Tool::View => (
-            "Look at an image, audio, or video attachment. Answers with the file itself. Name \
-             the attachment by the id in its `[attachment …]` line."
-                .to_string(),
+            prompts::ATTACHMENT_VIEW.to_string(),
             json!({
                 "type": "object",
-                "properties": { "attachment": { "type": "string", "description": ID } },
+                "properties": { "attachment": { "type": "string", "description": prompts::ATTACHMENT_ID } },
                 "required": ["attachment"]
             }),
         ),
@@ -62,8 +59,6 @@ fn definition(tool: Tool) -> ConnectorTool {
     )
 }
 
-const ID: &str = "The attachment id, exactly as its line gives it.";
-
 pub async fn answer(call: Call, blobs: &dyn BlobStore) -> StoredResult {
     let arguments: Value = serde_json::from_str(&call.arguments).unwrap_or_default();
     let named = arguments
@@ -71,9 +66,9 @@ pub async fn answer(call: Call, blobs: &dyn BlobStore) -> StoredResult {
         .and_then(Value::as_str)
         .unwrap_or_default();
     let Some(attachment) = call.attachments.iter().find(|a| a.id == named) else {
-        return StoredResult::error(format!(
-            "no attachment `{named}` in this conversation. Attachments: {}",
-            crate::copy::declared(call.attachments.iter().map(|a| a.id.as_str()))
+        return StoredResult::error(errors::no_such_attachment(
+            named,
+            &crate::prompts::declared(call.attachments.iter().map(|a| a.id.as_str())),
         ));
     };
     match call.tool {
@@ -84,10 +79,7 @@ pub async fn answer(call: Call, blobs: &dyn BlobStore) -> StoredResult {
 
 fn view(attachment: &Attachment) -> StoredResult {
     if !matches!(mime::essence(&attachment.mime), "image" | "audio" | "video") {
-        return StoredResult::error(format!(
-            "`{}` is {}; {VIEW} takes image, audio, and video attachments",
-            attachment.id, attachment.mime
-        ));
+        return StoredResult::error(errors::not_viewable(&attachment.id, &attachment.mime, VIEW));
     }
     if attachment.size > MAX_VIEW {
         return StoredResult::error(too_big(attachment, VIEW, MAX_VIEW));
@@ -105,18 +97,20 @@ async fn read(attachment: &Attachment, arguments: &Value, blobs: &dyn BlobStore)
         return StoredResult::error(too_big(attachment, READ, MAX_READ));
     }
     let Some(stored) = BlobRef::parse(&attachment.uri) else {
-        return StoredResult::error(format!("`{}` is not stored", attachment.id));
+        return StoredResult::error(errors::attachment_not_stored(&attachment.id));
     };
     let bytes = match blobs.get(&stored).await {
         Ok(bytes) => bytes,
-        Err(e) => return StoredResult::error(format!("`{}` is unreadable: {e}", attachment.id)),
+        Err(e) => {
+            return StoredResult::error(errors::attachment_unreadable(
+                &attachment.id,
+                &e.to_string(),
+            ))
+        }
     };
     let text = String::from_utf8_lossy(&bytes);
     if !text_enough(&text) {
-        return StoredResult::error(format!(
-            "`{}` is {}; {READ} takes text attachments",
-            attachment.id, attachment.mime
-        ));
+        return StoredResult::error(errors::not_readable(&attachment.id, &attachment.mime, READ));
     }
     let number = |key: &str| {
         arguments
@@ -126,21 +120,22 @@ async fn read(attachment: &Attachment, arguments: &Value, blobs: &dyn BlobStore)
     };
     let lines: Vec<&str> = text.lines().collect();
     let (window, chunk) = by_line(&lines, number("from_line").unwrap_or(1), number("lines"));
-    StoredResult::text(format!(
-        "{} {} {}, {} lines\n{window}\n\n{chunk}",
-        attachment.id,
-        attachment.mime,
-        crate::size::text(attachment.size),
+    StoredResult::text(answers::attachment_chunk(
+        &attachment.id,
+        &attachment.mime,
+        &crate::size::text(attachment.size),
         lines.len(),
+        &window,
+        &chunk,
     ))
 }
 
 fn too_big(attachment: &Attachment, tool: &str, cap: u64) -> String {
-    format!(
-        "`{}` is {}; {tool} takes up to {}",
-        attachment.id,
-        crate::size::text(attachment.size),
-        crate::size::text(cap)
+    errors::attachment_too_big(
+        &attachment.id,
+        &crate::size::text(attachment.size),
+        tool,
+        &crate::size::text(cap),
     )
 }
 
@@ -168,14 +163,14 @@ fn by_line(lines: &[&str], from: usize, count: Option<usize>) -> (String, String
         chunk.push_str(&line);
         taken += 1;
     }
-    let window = format!("lines {}-{} of {}", start + 1, start + taken, lines.len());
+    let window = answers::attachment_window(start + 1, start + taken, lines.len());
     (window, chunk)
 }
 
 fn shorten(line: &str) -> Cow<'_, str> {
     match line.char_indices().nth(MAX_LINE) {
         None => Cow::Borrowed(line),
-        Some((at, _)) => Cow::Owned(format!("{}… [truncated]", &line[..at])),
+        Some((at, _)) => Cow::Owned(format!("{}{}", &line[..at], answers::TRUNCATED)),
     }
 }
 

@@ -218,6 +218,7 @@ async fn engine_with(
                 "w".to_string(),
                 WorkerBlock {
                     url: Some(format!("http://{}/agent", worker.addr)),
+                    compress: None,
                 },
             )]),
             None,
@@ -230,6 +231,7 @@ async fn engine_with(
                         EventsBlock {
                             url: Some(url),
                             timeout_secs: None,
+                            compress: None,
                         },
                     )
                 })

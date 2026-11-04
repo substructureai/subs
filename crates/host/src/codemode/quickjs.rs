@@ -11,6 +11,7 @@ use super::engine::{cpu_ms, Engine};
 use super::files::{Files, Host};
 use super::replay::{Answer, End, Replay};
 use super::{Language, Limit, Ran, Script, Stats, Step};
+use substructure_session::prompts::codemode as prompts;
 
 const STACK: usize = 512 << 10;
 /// QuickJS calls the interrupt handler about every 10k instructions. A
@@ -33,7 +34,7 @@ impl Engine for QuickJs {
             Ok(heap) => heap,
             Err(e) => {
                 replay.borrow_mut().end(End::Raised {
-                    message: format!("The script could not run: {e}"),
+                    message: prompts::could_not_run(&e.to_string()),
                     limit: None,
                 });
                 0
@@ -70,9 +71,9 @@ impl Engine for QuickJs {
 const PRELUDE: &str = r#"
 (() => {
   const { __call: call, __log: log, __done: done, __now: NOW } = globalThis;
-  const { __files_list: listed, __files_text: ftext, __files_open: fopen, __files_next: fnext, __files_close: fclose, __files_show: fshow } = globalThis;
+  const { __files_list: listed, __files_text: ftext, __files_open: fopen, __files_next: fnext, __files_close: fclose, __files_show: fshow, __files_sheets: fsheets, __no_file: noFile } = globalThis;
   let seed = globalThis.__seed;
-  for (const k of ["__call", "__log", "__done", "__now", "__seed", "__files_list", "__files_text", "__files_open", "__files_next", "__files_close", "__files_show"]) delete globalThis[k];
+  for (const k of ["__call", "__log", "__done", "__now", "__seed", "__files_list", "__files_text", "__files_open", "__files_next", "__files_close", "__files_show", "__files_sheets", "__no_file"]) delete globalThis[k];
   const answered = (r) => { const a = JSON.parse(r); if ("error" in a) throw new Error(a.error); return a.value; };
   const known = JSON.parse(listed);
   const idOf = (file) => String(file !== null && typeof file === "object" ? file.id : file);
@@ -91,7 +92,7 @@ const PRELUDE: &str = r#"
     stat: (file) => {
       const id = idOf(file);
       const f = known.find((f) => f.id === id);
-      if (!f) throw new Error(`There is no file "${id}".`);
+      if (!f) throw new Error(noFile(id));
       return { ...f };
     },
     text: async (file) => answered(ftext(idOf(file))),
@@ -100,6 +101,8 @@ const PRELUDE: &str = r#"
     jsonl: (id, options) => stream(id, "jsonl", options),
     csv: (id, options) => stream(id, "csv", options),
     chunks: (id, options) => stream(id, "chunks", options),
+    xlsx: (id, options) => stream(id, "xlsx", options),
+    sheets: async (file) => answered(fsheets(idOf(file))),
   });
   const parse = (s) => { try { return JSON.parse(s); } catch { return s; } };
   const invoke = (name, args) => {
@@ -350,6 +353,23 @@ fn execute(
         )?;
         let f = files.clone();
         globals.set(
+            "__files_sheets",
+            Function::new(ctx.clone(), move |id: String| {
+                answer(
+                    f.borrow_mut()
+                        .sheets(&id)
+                        .map(|s| serde_json::Value::from(s).to_string()),
+                )
+            })?,
+        )?;
+        globals.set(
+            "__no_file",
+            Function::new(ctx.clone(), |id: String| {
+                substructure_session::prompts::codemode::files::no_file(&id)
+            })?,
+        )?;
+        let f = files.clone();
+        globals.set(
             "__files_close",
             Function::new(ctx.clone(), move |stream: u32| f.borrow_mut().close(stream))?,
         )?;
@@ -412,7 +432,7 @@ fn exception(ctx: &rquickjs::Ctx<'_>) -> End {
         .ok()
         .flatten()
         .map(|s| s.to_string().unwrap_or_default())
-        .unwrap_or_else(|| "The script threw.".to_string());
+        .unwrap_or_else(|| prompts::THREW.to_string());
     raised(text, None)
 }
 
@@ -449,21 +469,21 @@ mod tests {
     }
 
     /// Runs `code` with `files` to read.
-    fn with_files(code: &str, files: &[(&str, &str)]) -> Ran {
+    fn with_files<B: AsRef<[u8]>>(code: &str, files: &[(&str, B)]) -> Ran {
         let mut s = script(code, vec![]);
         s.files = files
             .iter()
             .map(|(id, text)| crate::codemode::ScriptFile {
                 id: id.to_string(),
                 mime: "text/plain".to_string(),
-                size: text.len() as u64,
+                size: text.as_ref().len() as u64,
                 skill: None,
             })
             .collect();
         let host = crate::codemode::files::MemoryFiles(
             files
                 .iter()
-                .map(|(id, text)| (id.to_string(), text.as_bytes().to_vec()))
+                .map(|(id, text)| (id.to_string(), text.as_ref().to_vec()))
                 .collect(),
         );
         engine::run(&s, Box::new(host))
@@ -497,6 +517,36 @@ mod tests {
     }
 
     #[test]
+    fn a_script_lists_sheets_and_sums_an_xlsx() {
+        let mut book = rust_xlsxwriter::Workbook::new();
+        book.add_worksheet().set_name("Notes").unwrap();
+        let sales = book.add_worksheet().set_name("Sales").unwrap();
+        sales.write_string(0, 0, "region").unwrap();
+        sales.write_string(0, 1, "amount").unwrap();
+        for i in 0..3_000u32 {
+            sales
+                .write_string(i + 1, 0, ["EU", "US"][i as usize % 2])
+                .unwrap();
+            sales.write_number(i + 1, 1, i as f64).unwrap();
+        }
+        let bytes = book.save_to_buffer().unwrap();
+        let code = "const sheets = await files.sheets('b.xlsx');\n\
+            const t = {};\n\
+            for await (const r of files.xlsx('b.xlsx', { sheet: sheets[1] })) t[r.region] = (t[r.region] ?? 0) + r.amount;\n\
+            return [sheets, t];";
+        let ran = with_files(code, &[("b.xlsx", bytes)]);
+        let sum = |k: u32| (0..3_000u32).filter(|i| i % 2 == k).sum::<u32>();
+        assert_eq!(
+            ran.step,
+            returned(&format!(
+                "[[\"Notes\",\"Sales\"],{{\"EU\":{},\"US\":{}}}]",
+                sum(0),
+                sum(1)
+            ))
+        );
+    }
+
+    #[test]
     fn a_script_reads_lines_text_and_stops_early() {
         let log: String = (0..10_000).map(|i| format!("line {i}\n")).collect();
         let code = "const first = [];\n\
@@ -505,7 +555,7 @@ mod tests {
             for await (const l of files.lines('app.log', { limit: 1 })) few.push(l);\n\
             const text = await files.text('note.txt');\n\
             return [first, few, text, files.stat('note.txt').size];";
-        let ran = with_files(code, &[("app.log", &log), ("note.txt", "hi")]);
+        let ran = with_files(code, &[("app.log", log.as_str()), ("note.txt", "hi")]);
         assert_eq!(
             ran.step,
             returned(r#"[["line 0","line 1"],["line 0"],"hi",2]"#)
@@ -842,6 +892,32 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_call_leaves_the_next_call_its_record() {
+        let code =
+            "try { await tools.a({ s: 'x'.repeat(2000) }); } catch {} return await tools.b({});";
+        let mut first = script(code, vec![]);
+        first.limits.call_arguments = 1 << 10;
+        assert!(matches!(run(&first), Step::Calls(c) if c.len() == 1 && c[0].name == "b"));
+        let mut second = script(code, vec![record("b", "{}", true, "2")]);
+        second.limits.call_arguments = 1 << 10;
+        assert_eq!(run(&second), returned("2"));
+    }
+
+    #[test]
+    fn calls_one_step_asks_for_share_a_limit() {
+        let code = "const s = 'x'.repeat(600); await Promise.all([tools.a({ s }), tools.b({ s }), tools.c({ s })]);";
+        let mut limited = script(code, vec![]);
+        limited.limits.step_arguments = 1 << 10;
+        let step = run(&limited);
+        assert!(
+            matches!(&step, Step::Failed(t) if t.contains("came to 1.8 KiB together, over the 1 KiB one step takes")),
+            "{step:?}"
+        );
+        limited.limits.step_arguments = 2 << 10;
+        assert!(matches!(run(&limited), Step::Calls(c) if c.len() == 3));
+    }
+
+    #[test]
     fn arguments_past_the_limit_throw() {
         let mut limited = script(
             "try { await tools.a({ s: 'x'.repeat(2000) }); } catch (e) { return e.message; }",
@@ -850,7 +926,13 @@ mod tests {
         limited.limits.arguments = 1000;
         let step = run(&limited);
         assert!(
-            matches!(&step, Step::Done(t) if t.contains("arguments passed")),
+            matches!(&step, Step::Done(t) if t.contains("came to 2 KiB in all, over the 1000 bytes a script takes")),
+            "{step:?}"
+        );
+        limited.limits.call_arguments = 1 << 10;
+        let step = run(&limited);
+        assert!(
+            matches!(&step, Step::Done(t) if t.contains("Arguments to `a` are 2 KiB, over the 1 KiB one call takes.")),
             "{step:?}"
         );
     }

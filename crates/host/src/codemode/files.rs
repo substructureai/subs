@@ -3,10 +3,13 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::rc::Rc;
 
+use calamine::{DataRef, Reader as _, SheetType, Xlsx, XlsxCellReader, XlsxError};
+
 use super::{Limit, Script, ScriptFile, Shown};
+use substructure_session::prompts::codemode::files as prompts;
 
 /// Bytes read from the runner at once.
 const CHUNK: u64 = 256 << 10;
@@ -36,7 +39,7 @@ pub struct NoFiles;
 
 impl Host for NoFiles {
     fn read(&mut self, file: &str, _: u64, _: u64) -> Result<Vec<u8>, FileError> {
-        Err(FileError::Missing(format!("There is no file \"{file}\".")))
+        Err(FileError::Missing(prompts::no_file(file)))
     }
 }
 
@@ -48,7 +51,7 @@ impl Host for MemoryFiles {
         let bytes = self
             .0
             .get(file)
-            .ok_or_else(|| FileError::Missing(format!("There is no file \"{file}\".")))?;
+            .ok_or_else(|| FileError::Missing(prompts::no_file(file)))?;
         let start = (offset as usize).min(bytes.len());
         let end = (start + len as usize).min(bytes.len());
         Ok(bytes[start..end].to_vec())
@@ -67,10 +70,7 @@ impl Reader {
     fn read(&mut self, file: &str, offset: u64, len: u64) -> io::Result<Vec<u8>> {
         if len > self.left {
             self.limited = true;
-            return Err(io::Error::other(
-                "The script read its limit of file bytes for this run. Read less, or stop \
-                 early with `limit`.",
-            ));
+            return Err(io::Error::other(prompts::READ_LIMIT));
         }
         let bytes = self.host.read(file, offset, len).map_err(|e| match e {
             FileError::Missing(m) => io::Error::new(io::ErrorKind::NotFound, m),
@@ -120,21 +120,66 @@ impl Read for Source {
     }
 }
 
+impl Seek for Source {
+    fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+        let start = self.offset - self.buf.len() as u64;
+        let target = match to {
+            SeekFrom::Start(n) => Some(n),
+            SeekFrom::End(d) => self.size.checked_add_signed(d),
+            SeekFrom::Current(d) => (start + self.at as u64).checked_add_signed(d),
+        }
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "seek before the start"))?;
+        if (start..=self.offset).contains(&target) {
+            self.at = (target - start) as usize;
+        } else {
+            self.buf.clear();
+            self.at = 0;
+            self.offset = target;
+        }
+        Ok(target)
+    }
+}
+
+/// A worksheet's cells, read in order from the workbook that holds them.
+#[ouroboros::self_referencing]
+struct Sheet {
+    book: Xlsx<Source>,
+    #[borrows(mut book)]
+    #[not_covariant]
+    cells: XlsxCellReader<'this, Source>,
+}
+
 /// How a stream reads its file.
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 #[serde(tag = "format", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Format {
-    Lines {},
-    Jsonl {},
+    Lines {
+        #[serde(default)]
+        offset: u64,
+    },
+    Jsonl {
+        #[serde(default)]
+        offset: u64,
+    },
     Csv {
         #[serde(default = "yes")]
         header: bool,
         #[serde(default = "comma")]
         delimiter: char,
+        #[serde(default)]
+        offset: u64,
     },
     Chunks {
         #[serde(default = "chunk")]
         size: usize,
+        #[serde(default)]
+        offset: u64,
+    },
+    Xlsx {
+        #[serde(default)]
+        sheet: Option<String>,
+        #[serde(default = "yes")]
+        header: bool,
         #[serde(default)]
         offset: u64,
     },
@@ -167,10 +212,23 @@ enum Decoder {
         size: usize,
         carry: Vec<u8>,
     },
+    Xlsx {
+        rows: Rows,
+        header: Option<Vec<String>>,
+    },
+}
+
+/// A worksheet's rows that have a value.
+struct Rows {
+    sheet: Box<Sheet>,
+    first: u32,
+    pending: Option<((u32, u32), serde_json::Value)>,
+    ended: bool,
 }
 
 struct Stream {
     decoder: Decoder,
+    skip: u64,
     left: Option<u64>,
 }
 
@@ -222,10 +280,7 @@ impl Files {
     fn file(&self, id: &str) -> Result<&ScriptFile, String> {
         self.files.iter().find(|f| f.id == id).ok_or_else(|| {
             let ids: Vec<&str> = self.files.iter().map(|f| f.id.as_str()).collect();
-            match ids.is_empty() {
-                true => format!("There is no file \"{id}\". The conversation has no files."),
-                false => format!("There is no file \"{id}\". Files: {}.", ids.join(", ")),
-            }
+            prompts::no_file_of(id, &ids)
         })
     }
 
@@ -245,7 +300,7 @@ impl Files {
     pub fn show(&mut self, id: &str) -> Result<(), String> {
         let file = self.file(id)?.clone();
         if self.shown.len() >= self.max_shown {
-            return Err(format!("A script shows at most {} files.", self.max_shown));
+            return Err(prompts::shown_files(self.max_shown));
         }
         let media = ["image/", "audio/", "video/"]
             .iter()
@@ -253,11 +308,10 @@ impl Files {
             || file.mime == "application/pdf";
         if media {
             if file.size > self.media_left {
-                return Err(format!(
-                    "\"{id}\" is {} KiB, and the script may show {} KiB more of media. Show \
-                     fewer or smaller files.",
+                return Err(prompts::shown_media(
+                    id,
                     file.size >> 10,
-                    self.media_left >> 10
+                    self.media_left >> 10,
                 ));
             }
             self.media_left -= file.size;
@@ -265,11 +319,10 @@ impl Files {
             return Ok(());
         }
         if file.size > self.shown_left {
-            return Err(format!(
-                "\"{id}\" is {} KiB, and the script may show {} KiB more of file text. Read it \
-                 with `files.lines` or `files.csv`, and print what matters.",
+            return Err(prompts::shown_text(
+                id,
                 file.size >> 10,
-                self.shown_left >> 10
+                self.shown_left >> 10,
             ));
         }
         let mut bytes = Vec::new();
@@ -279,7 +332,7 @@ impl Files {
         let text = String::from_utf8(bytes)
             .ok()
             .filter(|t| !t.contains('\0'))
-            .ok_or_else(|| format!("\"{id}\" is {}, not text or media.", file.mime))?;
+            .ok_or_else(|| prompts::not_shown(id, &file.mime))?;
         self.shown_left -= text.len() as u64;
         self.shown.push(Shown::Text {
             file: file.id,
@@ -297,11 +350,10 @@ impl Files {
     pub fn text(&mut self, id: &str) -> Result<String, String> {
         let file = self.file(id)?.clone();
         if file.size > self.text_cap {
-            return Err(format!(
-                "\"{id}\" is {} KiB, over the {} KiB `files.text` takes. Read it with \
-                 `files.lines`, `files.csv` or `files.chunks`.",
+            return Err(prompts::too_big_for_text(
+                id,
                 file.size >> 10,
-                self.text_cap >> 10
+                self.text_cap >> 10,
             ));
         }
         let mut bytes = Vec::new();
@@ -309,6 +361,16 @@ impl Files {
             .read_to_end(&mut bytes)
             .map_err(|e| e.to_string())?;
         Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    fn book(&self, file: &ScriptFile) -> Result<Xlsx<Source>, String> {
+        Xlsx::new(self.source(file, 0)).map_err(|e| xlsx_error(e).to_string())
+    }
+
+    /// The names of a workbook's worksheets, in order.
+    pub fn sheets(&mut self, id: &str) -> Result<Vec<String>, String> {
+        let file = self.file(id)?.clone();
+        Ok(worksheets(&self.book(&file)?))
     }
 
     /// Opens a stream as `options` says: its `format`, the format's own
@@ -321,37 +383,78 @@ impl Files {
             .and_then(|o| o.remove("limit"))
             .and_then(|l| l.as_u64());
         let format = serde_json::from_value(options)
-            .map_err(|e| format!("The options for \"{id}\" are not right: {e}"))?;
+            .map_err(|e| prompts::bad_options(id, &e.to_string()))?;
         self.open(id, format, limit)
     }
 
     pub fn open(&mut self, id: &str, format: Format, limit: Option<u64>) -> Result<u32, String> {
         if self.streams.len() >= self.max_streams {
-            return Err(format!(
-                "A script can have {} files open at once. Finish or `break` out of one first.",
-                self.max_streams
-            ));
+            return Err(prompts::too_many_open(self.max_streams));
         }
         let file = self.file(id)?.clone();
-        let decoder = match format {
-            Format::Lines {} | Format::Jsonl {} => Decoder::Lines {
-                lines: BufReader::new(self.source(&file, 0)),
-                json: format == Format::Jsonl {},
-                number: 0,
-            },
-            Format::Csv { header, delimiter } => Decoder::Csv {
-                rows: csv::ReaderBuilder::new()
-                    .has_headers(false)
-                    .flexible(true)
-                    .delimiter(u8::try_from(delimiter).unwrap_or(b','))
-                    .from_reader(self.source(&file, 0)),
-                header: header.then(Vec::new),
-            },
-            Format::Chunks { size, offset } => Decoder::Chunks {
-                source: self.source(&file, offset),
-                size: size.clamp(1, CHUNK as usize * 4),
-                carry: Vec::new(),
-            },
+        let (decoder, skip) = match format {
+            Format::Lines { offset } | Format::Jsonl { offset } => (
+                Decoder::Lines {
+                    lines: BufReader::new(self.source(&file, 0)),
+                    json: matches!(format, Format::Jsonl { .. }),
+                    number: 0,
+                },
+                offset,
+            ),
+            Format::Csv {
+                header,
+                delimiter,
+                offset,
+            } => (
+                Decoder::Csv {
+                    rows: csv::ReaderBuilder::new()
+                        .has_headers(false)
+                        .flexible(true)
+                        .delimiter(u8::try_from(delimiter).unwrap_or(b','))
+                        .from_reader(self.source(&file, 0)),
+                    header: header.then(Vec::new),
+                },
+                offset,
+            ),
+            Format::Chunks { size, offset } => (
+                Decoder::Chunks {
+                    source: self.source(&file, offset),
+                    size: size.clamp(1, CHUNK as usize * 4),
+                    carry: Vec::new(),
+                },
+                0,
+            ),
+            Format::Xlsx {
+                sheet,
+                header,
+                offset,
+            } => {
+                let book = self.book(&file)?;
+                let names = worksheets(&book);
+                let name = match sheet {
+                    Some(name) if names.contains(&name) => name,
+                    Some(name) => return Err(prompts::no_sheet(id, &name, &names)),
+                    None => names
+                        .first()
+                        .cloned()
+                        .ok_or_else(|| prompts::no_sheets(id))?,
+                };
+                let sheet = Sheet::try_new(book, |book| book.worksheet_cells_reader(&name))
+                    .map_err(|e| xlsx_error(e).to_string())?;
+                let first = sheet.with_cells(|cells| cells.dimensions().start.1);
+                (
+                    Decoder::Xlsx {
+                        rows: Rows {
+                            sheet: Box::new(sheet),
+                            first,
+                            pending: None,
+                            ended: false,
+                        },
+                        header: header.then(Vec::new),
+                    },
+                    offset,
+                )
+            }
         };
         let stream = self.next;
         self.next += 1;
@@ -359,6 +462,7 @@ impl Files {
             stream,
             Stream {
                 decoder,
+                skip,
                 left: limit,
             },
         );
@@ -370,6 +474,9 @@ impl Files {
         let Some(s) = self.streams.get_mut(&stream) else {
             return Ok(None);
         };
+        while s.skip > 0 && s.decoder.skip().map_err(|e| e.to_string())? {
+            s.skip -= 1;
+        }
         let mut items = Vec::new();
         while items.len() < BATCH && s.left != Some(0) {
             let Some(item) = s.decoder.next().map_err(|e| e.to_string())? else {
@@ -391,6 +498,34 @@ impl Files {
 }
 
 impl Decoder {
+    /// Passes over the next record, as `next` counts them, without building
+    /// it. False at the end.
+    fn skip(&mut self) -> io::Result<bool> {
+        match self {
+            Decoder::Lines {
+                lines,
+                json,
+                number,
+            } => loop {
+                let Some(line) = read_line(lines, *number + 1)? else {
+                    return Ok(false);
+                };
+                *number += 1;
+                if !*json || !line.trim_ascii().is_empty() {
+                    return Ok(true);
+                }
+            },
+            Decoder::Csv { rows, header } => {
+                if !read_header(rows, header)? {
+                    return Ok(false);
+                }
+                rows.read_byte_record(&mut csv::ByteRecord::new())
+                    .map_err(csv_error)
+            }
+            Decoder::Chunks { .. } | Decoder::Xlsx { .. } => Ok(self.next()?.is_some()),
+        }
+    }
+
     fn next(&mut self) -> io::Result<Option<serde_json::Value>> {
         use serde_json::Value;
         loop {
@@ -409,23 +544,18 @@ impl Decoder {
                         false => Ok(Some(Value::String(text.into_owned()))),
                         true if text.trim().is_empty() => continue,
                         true => serde_json::from_str(&text).map(Some).map_err(|e| {
-                            io::Error::other(format!("Line {number} is not JSON: {e}"))
+                            io::Error::other(prompts::not_json(*number, &e.to_string()))
                         }),
                     };
                 }
                 Decoder::Csv { rows, header } => {
-                    let mut record = csv::StringRecord::new();
-                    if !rows.read_record(&mut record).map_err(csv_error)? {
+                    if !read_header(rows, header)? {
                         return Ok(None);
                     }
-                    if record.as_slice().len() > RECORD {
-                        return Err(too_long("Row", record.position().map_or(0, |p| p.line())));
-                    }
+                    let Some(record) = read_row(rows)? else {
+                        return Ok(None);
+                    };
                     return Ok(Some(match header {
-                        Some(names) if names.is_empty() => {
-                            *names = record.iter().map(str::to_string).collect();
-                            continue;
-                        }
                         Some(names) => Value::Object(
                             names
                                 .iter()
@@ -463,9 +593,168 @@ impl Decoder {
                         String::from_utf8_lossy(&bytes).into_owned(),
                     )));
                 }
+                Decoder::Xlsx { rows, header } => {
+                    if header.as_ref().is_some_and(Vec::is_empty) {
+                        let Some(row) = rows.next()? else {
+                            return Ok(None);
+                        };
+                        *header = Some(
+                            row.into_iter()
+                                .enumerate()
+                                .map(|(i, v)| match v {
+                                    Value::Null => column(rows.first + i as u32),
+                                    Value::String(s) => s,
+                                    v => v.to_string(),
+                                })
+                                .collect(),
+                        );
+                    }
+                    let Some(row) = rows.next()? else {
+                        return Ok(None);
+                    };
+                    return Ok(Some(match header {
+                        Some(names) => Value::Object(
+                            names
+                                .iter()
+                                .cloned()
+                                .zip(row.into_iter().chain(std::iter::repeat(Value::Null)))
+                                .collect(),
+                        ),
+                        None => Value::Array(row),
+                    }));
+                }
             }
         }
     }
+}
+
+impl Rows {
+    /// The next row, its cells from column `first` on and `null` where a
+    /// cell is empty.
+    fn next(&mut self) -> io::Result<Option<Vec<serde_json::Value>>> {
+        let mut row = Vec::new();
+        let mut at = None;
+        loop {
+            let cell = match self.pending.take() {
+                Some(cell) => Some(cell),
+                None if self.ended => None,
+                None => self
+                    .sheet
+                    .with_cells_mut(|cells| {
+                        cells.next_cell().map(|cell| {
+                            cell.map(|cell| (cell.get_position(), cell_value(cell.get_value())))
+                        })
+                    })
+                    .map_err(xlsx_error)?,
+            };
+            let Some(((r, c), value)) = cell else {
+                self.ended = true;
+                break;
+            };
+            if value.is_null() {
+                continue;
+            }
+            match at {
+                Some(a) if a != r => {
+                    self.pending = Some(((r, c), value));
+                    break;
+                }
+                _ => at = Some(r),
+            }
+            let i = c.saturating_sub(self.first) as usize;
+            if row.len() <= i {
+                row.resize(i + 1, serde_json::Value::Null);
+            }
+            row[i] = value;
+        }
+        Ok(at.map(|_| row))
+    }
+}
+
+fn cell_value(data: &DataRef<'_>) -> serde_json::Value {
+    use serde_json::Value;
+    let number = |f: f64| serde_json::Number::from_f64(f).map_or(Value::Null, Value::Number);
+    match data {
+        DataRef::Int(n) => Value::from(*n),
+        DataRef::Float(f) => number(*f),
+        DataRef::String(s) => Value::String(s.clone()),
+        DataRef::SharedString(s) => Value::String(s.to_string()),
+        DataRef::Bool(b) => Value::Bool(*b),
+        DataRef::DateTime(d) => match d.as_datetime().filter(|_| d.is_datetime()) {
+            Some(t) if t.time() == chrono::NaiveTime::MIN => {
+                Value::String(t.format("%Y-%m-%d").to_string())
+            }
+            Some(t) => Value::String(t.format("%Y-%m-%dT%H:%M:%S%.f").to_string()),
+            None => number(d.as_f64()),
+        },
+        DataRef::DateTimeIso(s) | DataRef::DurationIso(s) => Value::String(s.clone()),
+        DataRef::Error(e) => Value::String(e.to_string()),
+        DataRef::Empty => Value::Null,
+    }
+}
+
+/// A column's letters: 0 is `A`, 26 is `AA`.
+fn column(mut n: u32) -> String {
+    let mut letters = Vec::new();
+    loop {
+        letters.push((b'A' + (n % 26) as u8) as char);
+        if n < 26 {
+            break;
+        }
+        n = n / 26 - 1;
+    }
+    letters.iter().rev().collect()
+}
+
+fn worksheets(book: &Xlsx<Source>) -> Vec<String> {
+    book.sheets_metadata()
+        .iter()
+        .filter(|s| s.typ == SheetType::WorkSheet)
+        .map(|s| s.name.clone())
+        .collect()
+}
+
+/// A read's own error as it is; anything else as a workbook that does not read.
+fn xlsx_error(e: XlsxError) -> io::Error {
+    let mut source: Option<&dyn std::error::Error> = Some(&e);
+    while let Some(s) = source {
+        if let Some(io) = s
+            .downcast_ref::<io::Error>()
+            .filter(|io| matches!(io.kind(), io::ErrorKind::Other | io::ErrorKind::NotFound))
+        {
+            return io::Error::new(io.kind(), io.to_string());
+        }
+        source = s.source();
+    }
+    io::Error::other(prompts::bad_xlsx(&e.to_string()))
+}
+
+/// Reads the header into `header` the first time; false at the end.
+fn read_header(
+    rows: &mut csv::Reader<Source>,
+    header: &mut Option<Vec<String>>,
+) -> io::Result<bool> {
+    match header {
+        Some(names) if names.is_empty() => match read_row(rows)? {
+            Some(record) => {
+                *names = record.iter().map(str::to_string).collect();
+                Ok(true)
+            }
+            None => Ok(false),
+        },
+        _ => Ok(true),
+    }
+}
+
+fn read_row(rows: &mut csv::Reader<Source>) -> io::Result<Option<csv::StringRecord>> {
+    let mut record = csv::StringRecord::new();
+    if !rows.read_record(&mut record).map_err(csv_error)? {
+        return Ok(None);
+    }
+    if record.as_slice().len() > RECORD {
+        return Err(too_long("Row", record.position().map_or(0, |p| p.line())));
+    }
+    Ok(Some(record))
 }
 
 /// The next line without its line end, or `None` at the end. A line over
@@ -500,10 +789,7 @@ fn read_line(lines: &mut BufReader<Source>, number: u64) -> io::Result<Option<Ve
 }
 
 fn too_long(what: &str, number: u64) -> io::Error {
-    io::Error::other(format!(
-        "{what} {number} is over {} MiB. Read the file with `files.chunks`.",
-        RECORD >> 20
-    ))
+    io::Error::other(prompts::too_long(what, number, RECORD >> 20))
 }
 
 fn read_full(source: &mut Source, buf: &mut [u8]) -> io::Result<usize> {
@@ -518,7 +804,7 @@ fn read_full(source: &mut Source, buf: &mut [u8]) -> io::Result<usize> {
 }
 
 fn csv_error(e: csv::Error) -> io::Error {
-    let message = format!("The CSV could not be read: {e}.");
+    let message = prompts::bad_csv(&e.to_string());
     match e.into_kind() {
         csv::ErrorKind::Io(e) => e,
         _ => io::Error::other(message),
@@ -530,7 +816,7 @@ mod tests {
     use super::*;
     use crate::codemode::{Language, Limits, VERSION};
 
-    fn files(contents: &[(&str, &str)], limits: Limits) -> Files {
+    fn files<B: AsRef<[u8]>>(contents: &[(&str, B)], limits: Limits) -> Files {
         let script = Script {
             version: VERSION,
             language: Language::Javascript,
@@ -547,7 +833,7 @@ mod tests {
                 .map(|(id, text)| ScriptFile {
                     id: id.to_string(),
                     mime: "text/plain".to_string(),
-                    size: text.len() as u64,
+                    size: text.as_ref().len() as u64,
                     skill: None,
                 })
                 .collect(),
@@ -556,7 +842,7 @@ mod tests {
         let host = MemoryFiles(
             contents
                 .iter()
-                .map(|(id, text)| (id.to_string(), text.as_bytes().to_vec()))
+                .map(|(id, text)| (id.to_string(), text.as_ref().to_vec()))
                 .collect(),
         );
         Files::new(&script, Box::new(host))
@@ -577,7 +863,7 @@ mod tests {
             .open_with("a.csv", r#"{"format":"csv","delimeter":";"}"#)
             .unwrap_err();
         assert!(
-            error.contains("expected `header` or `delimiter`"),
+            error.contains("expected one of `header`, `delimiter`, `offset`"),
             "{error}"
         );
     }
@@ -595,6 +881,7 @@ mod tests {
                 Format::Csv {
                     header: true,
                     delimiter: ',',
+                    offset: 0,
                 },
                 None,
             )
@@ -607,12 +894,54 @@ mod tests {
     }
 
     #[test]
+    fn an_offset_skips_records_after_the_header() {
+        let text: String = std::iter::once("n,sq\n".to_string())
+            .chain((0..30_000).map(|i| format!("{i},{}\n", i * i)))
+            .collect();
+        let jsonl = format!("\n{{\"n\":0}}\n\n{{\"n\":1}}\n{{\"n\":2}}\n");
+        let mut f = files(&[("sq.csv", &text), ("e.jsonl", &jsonl)], Limits::default());
+
+        let rows = f
+            .open_with("sq.csv", r#"{"format":"csv","offset":25000,"limit":2}"#)
+            .unwrap();
+        let rows = all(&mut f, rows);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["n"], "25000");
+        assert_eq!(rows[1]["n"], "25001");
+
+        let lines = f
+            .open_with("sq.csv", r#"{"format":"lines","offset":1}"#)
+            .unwrap();
+        assert_eq!(
+            f.next(lines).unwrap().unwrap().split('"').nth(1),
+            Some("0,0")
+        );
+
+        let events = f
+            .open_with("e.jsonl", r#"{"format":"jsonl","offset":1}"#)
+            .unwrap();
+        assert_eq!(
+            all(&mut f, events),
+            [serde_json::json!({"n":1}), serde_json::json!({"n":2})]
+        );
+
+        let past = f
+            .open_with("sq.csv", r#"{"format":"csv","offset":40000}"#)
+            .unwrap();
+        assert!(all(&mut f, past).is_empty());
+    }
+
+    #[test]
     fn lines_and_json_lines_split_where_chunks_end() {
         let text: String = (0..50_000).map(|i| format!("{{\"n\":{i}}}\n")).collect();
         let mut f = files(&[("e.jsonl", &text)], Limits::default());
-        let lines = f.open("e.jsonl", Format::Lines {}, Some(3)).unwrap();
+        let lines = f
+            .open("e.jsonl", Format::Lines { offset: 0 }, Some(3))
+            .unwrap();
         assert_eq!(all(&mut f, lines), ["{\"n\":0}", "{\"n\":1}", "{\"n\":2}"]);
-        let events = f.open("e.jsonl", Format::Jsonl {}, None).unwrap();
+        let events = f
+            .open("e.jsonl", Format::Jsonl { offset: 0 }, None)
+            .unwrap();
         let events = all(&mut f, events);
         assert_eq!(events.len(), 50_000);
         assert_eq!(events[49_999]["n"], 49_999);
@@ -622,12 +951,16 @@ mod tests {
     fn blank_lines_and_long_lines_are_handled_without_recursing() {
         let blanks = format!("{}{{\"n\":1}}\n", "\n".repeat(200_000));
         let mut f = files(&[("e.jsonl", &blanks)], Limits::default());
-        let stream = f.open("e.jsonl", Format::Jsonl {}, None).unwrap();
+        let stream = f
+            .open("e.jsonl", Format::Jsonl { offset: 0 }, None)
+            .unwrap();
         assert_eq!(all(&mut f, stream), [serde_json::json!({ "n": 1 })]);
 
         let long = "x".repeat(RECORD + 10);
         let mut f = files(&[("one.txt", &long)], Limits::default());
-        let stream = f.open("one.txt", Format::Lines {}, None).unwrap();
+        let stream = f
+            .open("one.txt", Format::Lines { offset: 0 }, None)
+            .unwrap();
         let error = f.next(stream).unwrap_err();
         assert!(error.contains("Line 1 is over 4 MiB"), "{error}");
     }
@@ -663,7 +996,9 @@ mod tests {
                 ..Limits::default()
             },
         );
-        let stream = f.open("big.txt", Format::Lines {}, None).unwrap();
+        let stream = f
+            .open("big.txt", Format::Lines { offset: 0 }, None)
+            .unwrap();
         let mut error = None;
         for _ in 0..10_000 {
             match f.next(stream) {
@@ -682,8 +1017,103 @@ mod tests {
     #[test]
     fn an_unknown_file_names_the_files_there_are() {
         let mut f = files(&[("a.csv", "x")], Limits::default());
-        let error = f.open("b.csv", Format::Lines {}, None).unwrap_err();
+        let error = f
+            .open("b.csv", Format::Lines { offset: 0 }, None)
+            .unwrap_err();
         assert!(error.contains("Files: a.csv"), "{error}");
         assert!(f.text("a.csv").is_ok());
+    }
+
+    fn workbook() -> Vec<u8> {
+        use rust_xlsxwriter::{ExcelDateTime, Format, Workbook};
+        let mut book = Workbook::new();
+        let summary = book.add_worksheet().set_name("Summary").unwrap();
+        summary.write_string(1, 1, "total").unwrap();
+        summary.write_number(1, 3, 42.5).unwrap();
+        summary.write_string(3, 2, "after a blank row").unwrap();
+        let day = Format::new().set_num_format("yyyy-mm-dd");
+        let sales = book.add_worksheet().set_name("Sales").unwrap();
+        for (c, name) in ["region", "amount", "", "day"].iter().enumerate() {
+            sales.write_string(0, c as u16, *name).unwrap();
+        }
+        for i in 0..1_000u32 {
+            let r = i + 1;
+            sales
+                .write_string(r, 0, ["EU", "US", "APAC"][i as usize % 3])
+                .unwrap();
+            if i != 5 {
+                sales.write_number(r, 1, i as f64).unwrap();
+            }
+            sales.write_boolean(r, 2, i % 2 == 0).unwrap();
+            let date = ExcelDateTime::from_ymd(2024, 3, 1).unwrap();
+            sales.write_datetime_with_format(r, 3, &date, &day).unwrap();
+        }
+        book.save_to_buffer().unwrap()
+    }
+
+    #[test]
+    fn xlsx_rows_come_back_typed_and_keyed_by_the_header() {
+        let book = workbook();
+        let mut f = files(&[("book.xlsx", book.as_slice())], Limits::default());
+        assert_eq!(f.sheets("book.xlsx").unwrap(), ["Summary", "Sales"]);
+
+        let stream = f
+            .open_with("book.xlsx", r#"{"format":"xlsx","sheet":"Sales"}"#)
+            .unwrap();
+        let rows = all(&mut f, stream);
+        assert_eq!(rows.len(), 1_000);
+        assert_eq!(rows[0]["region"], "EU");
+        assert_eq!(rows[0]["amount"].as_f64(), Some(0.0));
+        assert_eq!(rows[0]["C"], true);
+        assert_eq!(rows[0]["day"], "2024-03-01");
+        assert_eq!(rows[5]["amount"], serde_json::Value::Null);
+        assert_eq!(rows[999]["amount"].as_f64(), Some(999.0));
+
+        let stream = f
+            .open_with(
+                "book.xlsx",
+                r#"{"format":"xlsx","sheet":"Sales","offset":600,"limit":2}"#,
+            )
+            .unwrap();
+        let rows = all(&mut f, stream);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["amount"].as_f64(), Some(600.0));
+    }
+
+    #[test]
+    fn xlsx_rows_without_a_header_start_at_the_first_column_used() {
+        let book = workbook();
+        let mut f = files(&[("book.xlsx", book.as_slice())], Limits::default());
+        let stream = f
+            .open_with("book.xlsx", r#"{"format":"xlsx","header":false}"#)
+            .unwrap();
+        assert_eq!(
+            serde_json::Value::Array(all(&mut f, stream)).to_string(),
+            r#"[["total",null,42.5],[null,"after a blank row"]]"#
+        );
+    }
+
+    #[test]
+    fn a_bad_sheet_or_workbook_says_what_is_wrong() {
+        let book = workbook();
+        let mut f = files(
+            &[("book.xlsx", book.as_slice()), ("a.csv", b"x\n1\n")],
+            Limits::default(),
+        );
+        let error = f
+            .open_with("book.xlsx", r#"{"format":"xlsx","sheet":"Costs"}"#)
+            .unwrap_err();
+        assert!(error.contains("Sheets: Summary, Sales."), "{error}");
+        let error = f.open_with("a.csv", r#"{"format":"xlsx"}"#).unwrap_err();
+        assert!(error.contains("could not be read as xlsx"), "{error}");
+    }
+
+    #[test]
+    fn columns_are_named_by_their_letters() {
+        assert_eq!(column(0), "A");
+        assert_eq!(column(25), "Z");
+        assert_eq!(column(26), "AA");
+        assert_eq!(column(701), "ZZ");
+        assert_eq!(column(702), "AAA");
     }
 }

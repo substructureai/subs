@@ -145,12 +145,18 @@ The engine:
 - stops the model calls and tools that the engine runs;
 - ends each open tool call with the result `cancelled: the turn ended`. A
   worker that runs its own call is not told. Its later result is refused;
-- cancels the subagents of the run, and their subagents;
-- drops the decisions that wait, the turns that wait with `queue`, and the
-  client actions that wait;
+- cancels the subagents of the run, and their subagents. A subagent drops the
+  messages that wait for its turn;
+- drops the decisions of the run;
 - ends each open interrupt with `session.interrupt_resumed` and the payload
   `{ "status": "cancelled" }`;
 - ends the turn with `turn.completed` and the error code `cancelled`.
+
+The messages and client actions that wait for a turn run next, in the order
+they arrived. A message sent with `queue: "join"` opens its `next_turn_id`. So
+to redirect an agent, send the correction with `queue: "join"`, then cancel.
+Add `?drop_queued=true` to drop them instead. Each `decision.dropped` event
+names the ids of the messages that it held.
 
 The session stays usable. The next message starts a new turn. A session with no
 run is not changed.

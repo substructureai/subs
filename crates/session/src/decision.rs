@@ -114,6 +114,8 @@ pub enum Trigger {
         turn_id: Option<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         merge: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        join: bool,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         metadata: BTreeMap<String, String>,
     },
@@ -258,10 +260,10 @@ pub fn spare_turn_id(decision_id: &str) -> String {
 
 impl Trigger {
     pub fn own_turn(&self, decision_id: &str, phase: &TurnPhase) -> Option<String> {
-        match (self, phase) {
-            (Trigger::ClientAction { turn_id, .. }, TurnPhase::Idle) => Some(
+        match (self.joining_turn_id()?, phase) {
+            (turn_id, TurnPhase::Idle) => Some(
                 turn_id
-                    .clone()
+                    .map(str::to_string)
                     .unwrap_or_else(|| spare_turn_id(decision_id)),
             ),
             _ => None,
@@ -269,12 +271,30 @@ impl Trigger {
     }
 
     pub fn owns_turn(&self, decision_id: &str, turn_id: &str) -> bool {
+        self.joining_turn_id()
+            .is_some_and(|opened| opened == Some(turn_id) || turn_id == spare_turn_id(decision_id))
+    }
+
+    /// Runs in the turn it finds, or opens the turn it holds.
+    pub fn joining_turn_id(&self) -> Option<Option<&str>> {
         match self {
-            Trigger::ClientAction {
-                turn_id: opened, ..
-            } => opened.as_deref() == Some(turn_id) || turn_id == spare_turn_id(decision_id),
-            _ => false,
+            Trigger::ClientAction { turn_id, .. }
+            | Trigger::ClientMessage {
+                turn_id,
+                join: true,
+                ..
+            } => Some(turn_id.as_deref()),
+            _ => None,
         }
+    }
+
+    pub fn is_join(&self) -> bool {
+        matches!(self, Trigger::ClientMessage { join: true, .. })
+    }
+
+    /// Work the running turn waits for before it ends.
+    pub fn is_turn_work(&self) -> bool {
+        self.deferred_turn_id().is_none() && self.joining_turn_id().is_none()
     }
 
     pub fn turn_metadata(&self) -> BTreeMap<String, String> {
@@ -288,7 +308,11 @@ impl Trigger {
 
     pub fn deferred_turn_id(&self) -> Option<&str> {
         match self {
-            Trigger::ClientMessage { turn_id, .. } => turn_id.as_deref(),
+            Trigger::ClientMessage {
+                turn_id,
+                join: false,
+                ..
+            } => turn_id.as_deref(),
             Trigger::SubagentNotice { turn_id, .. } => Some(turn_id),
             _ => None,
         }

@@ -205,6 +205,11 @@ impl Session {
                     outside.load(store, state, id)?;
                 }
             }
+            CommandPayload::SendMessage { message, .. } => {
+                if let Some(id) = message.id.as_deref() {
+                    outside.mark(store, state, id)?;
+                }
+            }
             CommandPayload::SubmitClientPayload { payload, .. } => {
                 let ids: Vec<&str> = match payload {
                     ClientPayload::Message(m) => m.message.id.as_deref().into_iter().collect(),

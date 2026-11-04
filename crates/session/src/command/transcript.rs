@@ -8,7 +8,7 @@ use crate::ids::Ids;
 use crate::protocol::StoredResult;
 use crate::protocol::{
     ClientAppend, ClientContext, ClientMessage, ClientMessages, ClientPayload, Content,
-    DraftMessage, EffectStatus, NewMessage, Role,
+    DraftMessage, EffectStatus, NewMessage, QueueMode, Role,
 };
 use crate::reconcile::{landing_leaf, plan_reconcile};
 use crate::state::{EffectKind, SessionState};
@@ -138,7 +138,7 @@ impl SessionState {
         payload: ClientPayload,
         caller: &Caller,
         turn_id: Option<String>,
-        merge: bool,
+        mode: QueueMode,
         metadata: BTreeMap<String, String>,
     ) -> Result<(Vec<EventPayload>, Option<String>), SessionError> {
         self.ensure_owns_session(caller)?;
@@ -159,7 +159,7 @@ impl SessionState {
                         vec![message],
                         ClientContext::default(),
                         turn_id,
-                        merge,
+                        mode,
                         metadata,
                     );
                     events.extend(queued);
@@ -181,7 +181,7 @@ impl SessionState {
                     events.push(decision_queued(ids, Trigger::SessionStart));
                 }
                 let (queued, waiting) =
-                    self.client_turn(ids, messages, client, turn_id, merge, metadata);
+                    self.client_turn(ids, messages, client, turn_id, mode, metadata);
                 events.extend(queued);
                 Ok((events, waiting))
             }
@@ -213,18 +213,36 @@ impl SessionState {
         messages: Vec<DraftMessage>,
         client: ClientContext,
         turn_id: Option<String>,
-        merge: bool,
+        mode: QueueMode,
         metadata: BTreeMap<String, String>,
     ) -> (Vec<EventPayload>, Option<String>) {
-        let waiting = merge.then(|| self.waiting_merge()).flatten();
+        let join = mode == QueueMode::Join;
+        let (waiting, messages) = match mode {
+            QueueMode::Merge => (self.waiting_merge(), messages),
+            QueueMode::Join => (
+                self.waiting_join(),
+                messages
+                    .into_iter()
+                    .filter(|m| {
+                        m.id.as_deref()
+                            .is_none_or(|id| !self.has_node(id) && !self.holds_message(id))
+                    })
+                    .collect(),
+            ),
+            QueueMode::Refuse | QueueMode::Turn => (None, messages),
+        };
         let Some(waiting) = waiting else {
+            if join && messages.is_empty() {
+                return (Vec::new(), None);
+            }
             let queued = vec![decision_queued(
                 ids,
                 Trigger::ClientMessage {
                     messages,
                     client,
                     turn_id: turn_id.clone(),
-                    merge,
+                    merge: mode == QueueMode::Merge,
+                    join,
                     metadata,
                 },
             )];

@@ -195,13 +195,13 @@ mod files {
     use subs::codemode::ScriptFile;
     use subs::runtime::blob::{BlobError, BlobRef, BlobStore, MemoryBlobStore, NewBlob};
 
-    async fn put(store: &MemoryBlobStore, tenant: &str, text: &str) -> BlobRef {
+    async fn put(store: &MemoryBlobStore, tenant: &str, text: impl AsRef<[u8]>) -> BlobRef {
         store
             .put(NewBlob {
                 tenant_id: tenant.to_string(),
                 mime: "text/csv".to_string(),
                 name: None,
-                bytes: text.as_bytes().to_vec(),
+                bytes: text.as_ref().to_vec(),
             })
             .await
             .unwrap()
@@ -256,6 +256,33 @@ mod files {
             Step::Done(format!("Script finished.\nReturned:\n[20000,{total}]"))
         );
         assert_eq!(ran.stats.file_bytes, csv.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn a_sandboxed_script_streams_an_xlsx_through_its_runner() {
+        let store = Arc::new(MemoryBlobStore::new());
+        let mut book = rust_xlsxwriter::Workbook::new();
+        let sheet = book.add_worksheet();
+        sheet.write_string(0, 0, "amount").unwrap();
+        for i in 0..20_000u32 {
+            sheet.write_number(i + 1, 0, i as f64).unwrap();
+        }
+        let sales = put(&store, "t1", book.save_to_buffer().unwrap()).await;
+        let code = "let n = 0, total = 0;\n\
+            for await (const r of files.xlsx('sales.xlsx')) { n++; total += r.amount; }\n\
+            return [n, total];";
+        let ran = runner()
+            .run(
+                reading(code, &[("sales.xlsx", &sales)]),
+                grant(store, &[("sales.xlsx", &sales)]),
+            )
+            .await
+            .unwrap();
+        let total: u64 = (0..20_000).sum();
+        assert_eq!(
+            ran.step,
+            Step::Done(format!("Script finished.\nReturned:\n[20000,{total}]"))
+        );
     }
 
     #[tokio::test]

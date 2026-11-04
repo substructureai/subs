@@ -140,9 +140,14 @@ pub async fn cancel_session(
     State(state): State<WorkerHttpState>,
     Extension(caller): Extension<Caller>,
     Path(session_id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<crate::transport::http::CancelParams>,
 ) -> Response {
     let span = SpanContext::root().child("machine_cancel");
-    match state.runtime.cancel_session(session_id, caller, span).await {
+    match state
+        .runtime
+        .cancel_session(session_id, caller, params.drop_queued, span)
+        .await
+    {
         Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
         Err(e) => {
             let (status, message) = runtime_error_status(&e);
@@ -319,6 +324,7 @@ pub async fn submit_client_payload(
                 session_id: output.session_id,
                 turn_id: output.turn_id,
                 queued: output.queued,
+                next_turn_id: output.next_turn_id,
             }),
         )
             .into_response(),

@@ -200,7 +200,7 @@ fn paths(cfg: &project_config::ProjectConfig) -> Vec<SecretPath> {
 }
 
 fn declared(cfg: &project_config::ProjectConfig) -> String {
-    crate::copy::declared(paths(cfg).iter().map(SecretPath::to_string))
+    crate::prompts::declared(paths(cfg).iter().map(SecretPath::to_string))
 }
 
 fn open_store(cfg: &project_config::ProjectConfig) -> Result<SqliteSecretStore> {

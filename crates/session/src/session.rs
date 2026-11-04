@@ -213,6 +213,7 @@ impl Session {
                 seq: session.seq,
                 turn_id: None,
                 queued: false,
+                next_turn_id: None,
             });
             Ok((session.woken(now), accepted))
         })?;
@@ -297,12 +298,14 @@ impl Session {
         let (state, events, result) = match working.run(command.payload.clone(), &command.caller) {
             Ok(()) => {
                 let waiting = working.waiting_turn().map(str::to_string);
+                let next_turn_id = working.joining_turn().map(str::to_string);
                 let (state, emitted) = working.finish();
                 let events = self.stamp(emitted, &command.span, now, Some(&command.id));
                 let accepted = Ok(Accepted {
                     seq: self.seq + events.len() as u64,
                     queued: waiting.is_some(),
                     turn_id: waiting.or_else(|| state.turn_id().map(str::to_string)),
+                    next_turn_id,
                 });
                 (Some(state), events, accepted)
             }

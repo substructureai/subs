@@ -41,6 +41,7 @@ pub struct ExecuteInput {
 pub struct ExecuteOutput {
     pub turn_id: Option<String>,
     pub queued: bool,
+    pub next_turn_id: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -70,6 +71,7 @@ pub async fn execute(
         Ok(accepted) => Ok(ExecuteOutput {
             turn_id: accepted.turn_id,
             queued: accepted.queued,
+            next_turn_id: accepted.next_turn_id,
         }),
         Err(rejected) => Err(ExecuteError::Command(rejected.error)),
     }

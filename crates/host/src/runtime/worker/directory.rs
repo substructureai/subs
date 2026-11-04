@@ -20,6 +20,8 @@ pub enum Hosting {
 pub struct WorkerBlock {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compress: Option<crate::transport::compress::Compress>,
 }
 
 #[derive(Debug, Clone)]
@@ -31,7 +33,11 @@ pub struct AgentEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Route {
-    Worker { id: String, url: String },
+    Worker {
+        id: String,
+        url: String,
+        compress: Option<crate::transport::compress::Compress>,
+    },
     Engine,
 }
 
@@ -86,7 +92,7 @@ impl TenantDirectory {
                 return Err(format!(
                     "no [agent.{agent_id}], no worker on the session, and no config on the \
                      session. Declared agents: {}",
-                    crate::copy::declared(self.agent_ids())
+                    crate::prompts::declared(self.agent_ids())
                 ))
             }
         };
@@ -103,7 +109,11 @@ impl TenantDirectory {
                 "[worker.{worker_id}] has no `url` and the session brought none"
             ));
         };
-        Ok(Route::Worker { id: worker_id, url })
+        Ok(Route::Worker {
+            id: worker_id,
+            url,
+            compress: block.compress,
+        })
     }
 }
 
@@ -277,9 +287,10 @@ mod tests {
                     "triage".to_string(),
                     WorkerBlock {
                         url: Some("https://triage.internal/agent".to_string()),
+                        compress: None,
                     },
                 ),
-                ("customers".to_string(), WorkerBlock { url: None }),
+                ("customers".to_string(), WorkerBlock::default()),
             ]),
             Some("customers".to_string()),
         )
@@ -298,6 +309,7 @@ mod tests {
             worker: None,
             calls: Vec::new(),
             pending_calls: 0,
+            joining: false,
             transcript: Vec::new(),
             ancestry: Vec::new(),
             span: SpanContext::root(),
@@ -491,6 +503,7 @@ mod tests {
             Ok(Route::Worker {
                 id: "triage".to_string(),
                 url: "https://triage.internal/agent".to_string(),
+                compress: None,
             })
         );
     }
@@ -510,6 +523,7 @@ mod tests {
             Ok(Route::Worker {
                 id: "customers".to_string(),
                 url: "https://brought.test".to_string(),
+                compress: None,
             }),
             "the session's address wins over the agent's hosting"
         );
@@ -546,7 +560,7 @@ mod tests {
         assert!(d.tenant("default").await.default_worker.is_none());
         assert!(d.tenants().await.is_empty());
         assert_eq!(
-            crate::copy::declared(d.tenant("default").await.agent_ids()),
+            crate::prompts::declared(d.tenant("default").await.agent_ids()),
             "none"
         );
     }

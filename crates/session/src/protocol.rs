@@ -476,10 +476,7 @@ pub enum PromptPart {
 
 impl PromptPart {
     pub fn link_text(uri: &str, name: Option<&str>) -> String {
-        match name {
-            Some(name) => format!("{name}: {uri}"),
-            None => uri.to_string(),
-        }
+        crate::prompts::answers::link(name, uri)
     }
 }
 
@@ -2308,6 +2305,7 @@ pub enum QueueMode {
     Refuse,
     Turn,
     Merge,
+    Join,
 }
 
 impl QueueMode {
@@ -2336,6 +2334,7 @@ enum QueueWire {
 #[serde(rename_all = "lowercase")]
 enum QueueWord {
     Merge,
+    Join,
 }
 
 impl From<Option<QueueWire>> for QueueMode {
@@ -2344,6 +2343,7 @@ impl From<Option<QueueWire>> for QueueMode {
             None => QueueMode::Refuse,
             Some(QueueWire::Hold(hold)) => hold.into(),
             Some(QueueWire::Mode(QueueWord::Merge)) => QueueMode::Merge,
+            Some(QueueWire::Mode(QueueWord::Join)) => QueueMode::Join,
         }
     }
 }
@@ -2354,6 +2354,7 @@ impl From<QueueMode> for QueueWire {
             QueueMode::Refuse => QueueWire::Hold(false),
             QueueMode::Turn => QueueWire::Hold(true),
             QueueMode::Merge => QueueWire::Mode(QueueWord::Merge),
+            QueueMode::Join => QueueWire::Mode(QueueWord::Join),
         }
     }
 }
@@ -2365,10 +2366,10 @@ impl JsonSchema for QueueMode {
 
     fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
         schemars::json_schema!({
-            "description": "What a message does while a turn runs. `false` or `null` refuses it. `true` holds it for a turn of its own. `\"merge\"` adds it to the turn waiting last when that turn also merges, so messages sent during a turn become one turn.",
+            "description": "What a message does while a turn runs. `false` or `null` refuses it. `true` holds it for a turn of its own. `\"merge\"` adds it to the turn waiting last when that turn also merges, so messages sent during a turn become one turn. `\"join\"` adds it to the running turn, which sees it at its next model call.",
             "anyOf": [
                 { "type": "boolean" },
-                { "title": "QueueWord", "type": "string", "enum": ["merge"] },
+                { "title": "QueueWord", "type": "string", "enum": ["merge", "join"] },
                 { "type": "null" }
             ]
         })
@@ -2583,6 +2584,10 @@ pub enum DecisionTrigger {
         /// Inputs the client declared on its run. The engine adds
         /// `client.tools` to the proposed config.
         client: ClientContext,
+        /// The new messages were sent with `queue: "join"`, and join the
+        /// running turn.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        join: bool,
     },
     #[serde(rename = "client.action")]
     ClientAction {
@@ -2994,6 +2999,10 @@ pub struct DecisionRequest<'a> {
     pub calls: &'a [Effect],
     /// Count of in-flight `tool_call`/`subagent` calls.
     pub pending_calls: usize,
+    /// A message waits to join the turn. Its decision calls the model next,
+    /// so do not call the model or end the turn.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub joining: bool,
     pub messages: &'a [Message],
     pub ancestry: &'a [String],
     pub attempts: u32,
@@ -3023,14 +3032,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn queue_reads_a_flag_or_merge() {
+    fn queue_reads_a_flag_or_a_word() {
         let read = |v: Value| serde_json::from_value::<QueueMode>(v).ok();
         assert_eq!(read(serde_json::json!(false)), Some(QueueMode::Refuse));
         assert_eq!(read(serde_json::json!(null)), Some(QueueMode::Refuse));
         assert_eq!(read(serde_json::json!(true)), Some(QueueMode::Turn));
         assert_eq!(read(serde_json::json!("merge")), Some(QueueMode::Merge));
+        assert_eq!(read(serde_json::json!("join")), Some(QueueMode::Join));
         assert_eq!(read(serde_json::json!("later")), None);
-        for mode in [QueueMode::Refuse, QueueMode::Turn, QueueMode::Merge] {
+        for mode in [
+            QueueMode::Refuse,
+            QueueMode::Turn,
+            QueueMode::Merge,
+            QueueMode::Join,
+        ] {
             assert_eq!(read(serde_json::to_value(mode).unwrap()), Some(mode));
         }
     }

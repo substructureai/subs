@@ -359,7 +359,8 @@ impl Session {
                 .subagent(&v.id)
                 .map(|sa| Mail {
                     to: sa.session_id.clone(),
-                    command: self.caused_by(event, CommandPayload::CancelSession),
+                    command: self
+                        .caused_by(event, CommandPayload::CancelSession { drop_queued: true }),
                 })
                 .into_iter()
                 .collect(),

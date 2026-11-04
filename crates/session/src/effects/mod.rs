@@ -77,9 +77,7 @@ impl From<SettleError> for Outcome {
     }
 }
 
-pub const DEADLINE: &str = "deadline exceeded";
-pub const QUEUED: &str = "deadline exceeded while queued";
-pub const RUN: &str = "deadline exceeded while running";
+pub use crate::prompts::errors::{DEADLINE, DEADLINE_QUEUED as QUEUED, DEADLINE_RUN as RUN};
 
 pub trait KindSpec: Sync {
     fn kind(&self) -> EffectKind;

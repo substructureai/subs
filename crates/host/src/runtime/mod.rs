@@ -74,8 +74,8 @@ pub struct RuntimeConfig {
     pub script_runner: Arc<dyn crate::codemode::ScriptRunner>,
     /// Scripts that run at once.
     pub script_slots: usize,
-    /// What a script may use.
-    pub script_limits: crate::codemode::Limits,
+    /// What a tenant's scripts may use.
+    pub script_limits: Arc<dyn crate::codemode::LimitsResolver>,
     /// How long a script step may wait for a slot, or for a runner to take it.
     pub script_wait: std::time::Duration,
     /// A disk cache in front of the blob store that scripts read files from.
@@ -98,7 +98,9 @@ impl Default for RuntimeConfig {
             send_timeout: sessions::DEFAULT_SEND_TIMEOUT,
             script_runner: Arc::new(crate::codemode::ProcessRunner::current()),
             script_slots: std::thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 8)),
-            script_limits: crate::codemode::Limits::default(),
+            script_limits: Arc::new(crate::codemode::FixedLimits(
+                crate::codemode::Limits::default(),
+            )),
             script_wait: std::time::Duration::from_secs(60),
             script_blob_cache: None,
         }
@@ -173,6 +175,8 @@ pub struct SubmitClientPayloadOutput {
     pub turn_id: String,
 
     pub queued: bool,
+
+    pub next_turn_id: Option<String>,
 }
 
 pub struct HandleClientInput {
@@ -190,6 +194,8 @@ pub struct ClientInputOutput {
     pub turn_id: String,
 
     pub queued: bool,
+
+    pub next_turn_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -386,10 +392,11 @@ impl Runtime {
         )
         .await;
 
-        let (effective_turn_id, queued) = match send_result {
+        let (effective_turn_id, queued, next_turn_id) = match send_result {
             Ok(out) => (
                 out.turn_id.unwrap_or(turn_id),
                 out.queued && !input.continue_turn,
+                out.next_turn_id,
             ),
 
             Err(ExecuteError::Command(e @ SessionError::TurnAlreadyActive { .. })) if action => {
@@ -402,10 +409,10 @@ impl Runtime {
                         self.active_turn_id(&caller, &session_id).await,
                         Ok(active) if active == held
                     );
-                (held, queued)
+                (held, queued, None)
             }
             Err(ExecuteError::Command(SessionError::TurnAlreadyCompleted { turn_id })) => {
-                (turn_id, false)
+                (turn_id, false, None)
             }
             Err(e) => return Err(e.into()),
         };
@@ -414,6 +421,7 @@ impl Runtime {
             session_id,
             turn_id: effective_turn_id,
             queued,
+            next_turn_id,
         })
     }
 
@@ -526,6 +534,7 @@ impl Runtime {
                     session_id,
                     turn_id,
                     queued: false,
+                    next_turn_id: None,
                 });
             }
             ClientInput::ToolResult {
@@ -600,6 +609,7 @@ impl Runtime {
             session_id: out.session_id,
             turn_id: out.turn_id,
             queued: out.queued,
+            next_turn_id: out.next_turn_id,
         })
     }
 
@@ -627,6 +637,7 @@ impl Runtime {
             session_id,
             turn_id,
             queued: false,
+            next_turn_id: None,
         })
     }
 
@@ -856,6 +867,7 @@ impl Runtime {
         &self,
         session_id: String,
         caller: Caller,
+        drop_queued: bool,
         span: SpanContext,
     ) -> Result<(), RuntimeError> {
         execute(
@@ -864,7 +876,7 @@ impl Runtime {
                 id: None,
                 session_id,
                 caller,
-                command: CommandPayload::CancelSession,
+                command: CommandPayload::CancelSession { drop_queued },
                 span,
             },
         )

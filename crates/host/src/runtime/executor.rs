@@ -479,6 +479,7 @@ mod tests {
                 seq: 1,
                 turn_id: None,
                 queued: false,
+                next_turn_id: None,
             }))
         }
 

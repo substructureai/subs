@@ -50,6 +50,7 @@ pub async fn client_input(
                 session_id: output.session_id,
                 turn_id: output.turn_id,
                 queued: output.queued,
+                next_turn_id: output.next_turn_id,
             }),
         )
             .into_response(),
@@ -93,9 +94,14 @@ pub async fn cancel_session(
     State(state): State<ClientHttpState>,
     Extension(caller): Extension<Caller>,
     Path(session_id): Path<String>,
+    Query(params): Query<crate::transport::http::CancelParams>,
 ) -> Response {
     let span = crate::span::SpanContext::root().child("client_cancel");
-    match state.runtime.cancel_session(session_id, caller, span).await {
+    match state
+        .runtime
+        .cancel_session(session_id, caller, params.drop_queued, span)
+        .await
+    {
         Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
         Err(e) => runtime_error_response(e),
     }

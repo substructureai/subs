@@ -30,30 +30,41 @@ pub struct Limits {
     pub calls: u32,
     /// Bytes of results the script may read, over all its calls. Parsed JSON
     /// takes about seven times its size in heap, so keep it under `memory / 8`.
+    #[serde(deserialize_with = "crate::size::bytes")]
     pub results: usize,
     /// Bytes of arguments over the whole script.
+    #[serde(deserialize_with = "crate::size::bytes")]
     pub arguments: usize,
     /// Bytes of arguments in one call.
+    #[serde(deserialize_with = "crate::size::bytes")]
     pub call_arguments: usize,
+    /// Bytes of arguments in the calls one step asks for, together.
+    #[serde(deserialize_with = "crate::size::bytes")]
+    pub step_arguments: usize,
     /// Bytes of heap in one run.
+    #[serde(deserialize_with = "crate::size::bytes")]
     pub memory: usize,
     /// Milliseconds of CPU in one run.
     pub compute_ms: u64,
     /// Milliseconds of CPU over all of a script's runs.
     pub total_compute_ms: u64,
     /// Bytes of files one run may read.
+    #[serde(deserialize_with = "crate::size::bytes")]
     pub file_bytes: u64,
     /// Bytes of files over all of a script's runs. Each run reads its files
     /// again, so this pays for every pass.
+    #[serde(deserialize_with = "crate::size::bytes")]
     pub total_file_bytes: u64,
     /// Files open at once.
     pub streams: u32,
     /// Files a script shows the model.
     pub shown_files: usize,
     /// Bytes of file text a script shows the model.
+    #[serde(deserialize_with = "crate::size::bytes")]
     pub shown: usize,
     /// Bytes of media files a script shows the model. Bytes stand in for the
     /// tokens they cost: a PDF's pages and audio's length grow with them.
+    #[serde(deserialize_with = "crate::size::bytes")]
     pub shown_media: u64,
 }
 
@@ -62,11 +73,12 @@ impl Default for Limits {
         Limits {
             calls: 1_000,
             results: 8 << 20,
-            arguments: 32 << 20,
-            call_arguments: 256 << 10,
-            memory: 96 << 20,
-            compute_ms: 500,
-            total_compute_ms: 10_000,
+            arguments: 64 << 20,
+            call_arguments: 4 << 20,
+            step_arguments: 8 << 20,
+            memory: 256 << 20,
+            compute_ms: 5_000,
+            total_compute_ms: 120_000,
             file_bytes: 64 << 20,
             total_file_bytes: 512 << 20,
             streams: 4,
@@ -82,13 +94,7 @@ impl Default for Limits {
 /// session sets it, not the runtime.
 pub const OUTPUT: usize = 24 << 10;
 
-pub fn spent(results: usize) -> String {
-    format!(
-        "The script's results passed {} MiB. Ask each call for less, or split the work over \
-         several run_code calls.",
-        results >> 20
-    )
-}
+pub use crate::prompts::codemode::spent;
 
 fn output() -> usize {
     OUTPUT

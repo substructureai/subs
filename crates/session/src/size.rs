@@ -38,14 +38,27 @@ pub enum Wire {
     Text(String),
 }
 
-pub fn de<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
-    match Option::<Wire>::deserialize(d)? {
-        None => Ok(None),
-        Some(Wire::Bytes(n)) => Ok(Some(n)),
-        Some(Wire::Text(t)) => parse(&t)
-            .map(Some)
-            .ok_or_else(|| serde::de::Error::custom(format!("`{t}` is not a size"))),
+impl Wire {
+    fn bytes<E: serde::de::Error>(self) -> Result<u64, E> {
+        match self {
+            Wire::Bytes(n) => Ok(n),
+            Wire::Text(t) => parse(&t).ok_or_else(|| E::custom(format!("`{t}` is not a size"))),
+        }
     }
+}
+
+pub fn de<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    Option::<Wire>::deserialize(d)?.map(Wire::bytes).transpose()
+}
+
+/// A size that must be there, as `de` reads one.
+pub fn bytes<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: TryFrom<u64>,
+{
+    let n = Wire::deserialize(d)?.bytes()?;
+    T::try_from(n).map_err(|_| serde::de::Error::custom(format!("{n} bytes is too large")))
 }
 
 #[cfg(test)]

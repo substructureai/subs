@@ -155,7 +155,9 @@ pub async fn answer_locally(
         Some(file) => match read_text(&file, blobs).await {
             Ok(text) => Some(text),
             Err(BlobError::NotFound) => {
-                return Ok(Some(StoredResult::error("This file is no longer stored.")))
+                return Ok(Some(StoredResult::error(
+                    crate::prompts::errors::SKILL_FILE_GONE,
+                )))
             }
             Err(e) => return Err(e.to_string()),
         },

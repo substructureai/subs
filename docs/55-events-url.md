@@ -114,7 +114,9 @@ after a restart. It can arrive before the logged events around it.
 ## Verify the signature
 
 Each POST carries `X-Substructure-Signature: sha256=<hex>`, an HMAC-SHA256 of
-the body, the same as a worker's request. Print the secret:
+the body, the same as a worker's request. With `compress = "gzip"` on the
+`[events.<id>]` block, each body is gzipped with `Content-Encoding: gzip`, and
+the signature covers the bytes as sent. Print the secret:
 
 ```sh
 subs secret events.app

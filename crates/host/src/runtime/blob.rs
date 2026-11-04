@@ -115,7 +115,7 @@ pub async fn intern_uri(uri: &str, blobs: &dyn BlobStore, tenant_id: &str) -> Op
 
 fn unkept(what: &str, mime: &str) -> StoredContent {
     StoredContent::Text {
-        text: format!("[{what} {} content]", essence(mime)),
+        text: crate::prompts::answers::media_not_kept(what, essence(mime)),
     }
 }
 
@@ -647,7 +647,7 @@ mod tests {
         let StoredContent::Blob { uri: after } = &result.content[0] else {
             panic!("a blob block");
         };
-        assert_ne!(*after, uri, "each put mints its own id");
+        assert_eq!(*after, uri, "the same bytes are the same blob");
         assert_eq!(
             blobs
                 .get(&BlobRef::parse(after).expect("a ref"))

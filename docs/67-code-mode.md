@@ -175,8 +175,13 @@ return totals;
 | `files.lines(id)` | Lines, without their line ends |
 | `files.jsonl(id)` | One JSON value per line |
 | `files.chunks(id, { size, offset })` | Text in pieces of about `size` bytes, from byte `offset` |
+| `files.xlsx(id, { sheet, header })` | Rows of an xlsx sheet, the first by default, like `files.csv`. Numbers and booleans stay as they are, dates become ISO strings, and empty cells are `null` |
+| `await files.sheets(id)` | The names of an xlsx file's worksheets |
 
-Each stream takes `{ limit }`, a count of records, and `break` ends it. The
+Each stream takes `{ limit, offset }`, counts of records to read and to skip,
+and `break` ends it. A CSV or xlsx header, blank JSON lines and empty sheet
+rows are not counted.
+`files.chunks` counts its `offset` in bytes. The
 files are the attachments on the branch where `run_code` was called.
 
 The script's process decodes the files, so decoding counts toward its CPU and
@@ -265,8 +270,8 @@ language it does not run is tried again elsewhere.
 
 ## Limits
 
-A script has no network, file system, timer or module. The engine sets these
-limits with `RuntimeConfig::script_limits`, and a runner holds each script to
+A script has no network, file system, timer or module. The engine asks
+`RuntimeConfig::script_limits` for a tenant's limits at each step, and a runner holds each script to
 them. An error names the limit that was met and what to do. The 24 KiB of text a
 run sends back is not among them: the model is told it, so the session sets it.
 Files a script shows have their own budget, `shown` and `shown_media`.
@@ -275,11 +280,12 @@ Files a script shows have their own budget, `shown` and `shown_media`.
 |---|---|---|
 | `calls` | 1,000 | Calls over the whole script |
 | `results` | 8 MiB | Results the script reads, over all its calls |
-| `arguments` | 32 MiB | Arguments over the whole script |
-| `call_arguments` | 256 KiB | Arguments in one call |
-| `memory` | 96 MiB | JavaScript heap in one run |
-| `compute_ms` | 500 | CPU in one run |
-| `total_compute_ms` | 10,000 | CPU over all of a script's runs |
+| `arguments` | 64 MiB | Arguments over the whole script |
+| `call_arguments` | 4 MiB | Arguments in one call |
+| `step_arguments` | 8 MiB | Arguments of the calls one step asks for, together |
+| `memory` | 256 MiB | JavaScript heap in one run |
+| `compute_ms` | 5,000 | CPU in one run |
+| `total_compute_ms` | 120,000 | CPU over all of a script's runs |
 | `file_bytes` | 64 MiB | File bytes one run reads |
 | `total_file_bytes` | 512 MiB | File bytes over all of a script's runs |
 | `streams` | 4 | Files open at once |
@@ -287,10 +293,22 @@ Files a script shows have their own budget, `shown` and `shown_media`.
 | `shown` | 64 KiB | File text the script shows the model |
 | `shown_media` | 2 MiB | Media files the script shows the model |
 
+`subs.toml` sets them in a `[codemode.limits]` table. Sizes take bytes or a
+word such as `"4mb"`, and a limit left out keeps its default:
+
+```toml
+[codemode.limits]
+call_arguments = "4mb"
+memory = "512mb"
+compute_ms = 5000
+```
+
+The runner's process heap is twice `memory`, and at least 512 MiB.
+
 A run reads the script, the results its calls already returned, and the files
 it asks for, and stops at the first call with no result. Time spent waiting on
 file reads does not count toward its deadline. So a run is quick, and a
-run that needs more than half a second of CPU is almost always a runaway. A
+run that needs more than five seconds of CPU is almost always a runaway. A
 script resumes from the start after its calls finish, so work done before a
 call counts against each run and against the whole budget. A run's process is
 stopped three times its CPU allowance and one second after it starts, and the

@@ -101,6 +101,8 @@ pub enum EventPayload {
     SessionDone(SessionDone),
     #[serde(rename = "turn.started")]
     TurnStarted(TurnStarted),
+    #[serde(rename = "turn.joined")]
+    TurnJoined(TurnJoined),
     #[serde(rename = "turn.completed")]
     TurnCompleted(TurnCompleted),
     #[serde(rename = "work.unsent")]
@@ -599,6 +601,17 @@ pub struct TurnStarted {
     pub metadata: BTreeMap<String, String>,
 }
 
+/// Messages sent with `queue: "join"` run in the running turn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnJoined {
+    pub turn_id: String,
+    /// The turn the messages would have opened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnCompleted {
     pub turn_id: String,
@@ -647,6 +660,9 @@ pub struct DecisionQueued {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecisionDropped {
     pub id: String,
+    /// The ids of the client messages the decision held.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

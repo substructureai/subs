@@ -10,6 +10,7 @@ use super::confine::{self, Denial};
 use super::engine::{languages, run};
 use super::files::{FileError, Host};
 use super::{Language, Ran, Script, Step, OLDEST, VERSION};
+use substructure_session::prompts::codemode as prompts;
 
 /// The argument that makes a binary a runner process.
 pub const ARG: &str = "__sandbox";
@@ -18,7 +19,7 @@ pub const PROBE_LOCK: &str = "probe-lock";
 
 /// Sets the process's heap cap: `data=<MiB>`.
 pub const DATA: &str = "data=";
-pub const DATA_MIB: u64 = 256;
+pub const DATA_MIB: u64 = 512;
 
 /// The first line a runner process writes.
 #[derive(Serialize, Deserialize)]
@@ -57,7 +58,7 @@ struct PipeHost;
 
 impl Host for PipeHost {
     fn read(&mut self, file: &str, offset: u64, len: u64) -> Result<Vec<u8>, FileError> {
-        let gone = || FileError::Missing("The runner did not answer.".to_string());
+        let gone = || FileError::Missing(prompts::RUNNER_GONE.to_string());
         let request = Request::Read {
             file: file.to_string(),
             offset,
@@ -145,7 +146,7 @@ fn main(args: Vec<OsString>) -> ! {
             run(&script, Box::new(PipeHost))
         }
         Err(e) => Ran {
-            step: Step::Failed(format!("The runner could not read the script: {e}")),
+            step: Step::Failed(prompts::unreadable_script(&e.to_string())),
             stats: Default::default(),
             shown: Vec::new(),
         },

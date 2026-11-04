@@ -586,6 +586,7 @@ pub struct WaitingMerge<'a> {
 pub enum DecisionPark<'a> {
     Interrupt(&'a OpenInterrupt),
     Turn(&'a str),
+    Work(EffectKind, &'a str),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1732,6 +1733,7 @@ impl SessionState {
                 self.dequeue(EffectKind::Subagent, &payload.id);
             }
             EventPayload::ChannelsUpdated(_) => {}
+            EventPayload::TurnJoined(p) => self.turn_metadata.extend(p.metadata.clone()),
             EventPayload::TurnStarted(p) => {
                 self.phase = TurnPhase::Active {
                     turn_id: p.turn_id.clone(),
@@ -1943,9 +1945,14 @@ impl SessionState {
         if let Some(interrupt) = self.decision_park_interrupt(trigger) {
             return Some(DecisionPark::Interrupt(interrupt));
         }
-        if let (Trigger::ClientAction { .. }, Some(end)) = (trigger, self.phase.finalizing()) {
+        if let (Some(_), Some(end)) = (trigger.joining_turn_id(), self.phase.finalizing()) {
             if !self.head_parked() {
                 return Some(DecisionPark::Turn(&end.turn_id));
+            }
+        }
+        if trigger.is_join() && self.phase.active_turn_id().is_some() {
+            if let Some((kind, id)) = self.open_work().into_iter().next() {
+                return Some(DecisionPark::Work(kind, id));
             }
         }
         match (trigger.deferred_turn_id(), self.phase.turn_id()) {
@@ -1988,6 +1995,38 @@ impl SessionState {
                 }),
                 _ => None,
             })
+    }
+
+    pub fn waiting_join(&self) -> Option<WaitingMerge<'_>> {
+        let first = self
+            .queued_decisions()
+            .into_iter()
+            .find(|e| e.decision().is_some_and(|d| d.trigger.is_join()))?;
+        match &first.decision()?.trigger {
+            Trigger::ClientMessage {
+                messages,
+                client,
+                turn_id: Some(turn_id),
+                ..
+            } => Some(WaitingMerge {
+                decision_id: &first.id,
+                messages,
+                client,
+                turn_id,
+            }),
+            _ => None,
+        }
+    }
+
+    pub fn holds_message(&self, id: &str) -> bool {
+        self.effects_of(EffectKind::Decision)
+            .filter(|e| e.tracking.is_unsettled())
+            .filter_map(|e| match &e.decision()?.trigger {
+                Trigger::ClientMessage { messages, .. } => Some(messages),
+                _ => None,
+            })
+            .flatten()
+            .any(|m| m.id.as_deref() == Some(id))
     }
 
     pub fn waiting_merge(&self) -> Option<WaitingMerge<'_>> {
@@ -2146,7 +2185,7 @@ impl SessionState {
         if *target == ConnectorTarget::Locked {
             return Some(StoredResult::error(
                 at.locked_fault(&tc.name)
-                    .unwrap_or_else(|| crate::copy::CALL_NOT_ROUTED.to_string()),
+                    .unwrap_or_else(|| crate::prompts::errors::CALL_NOT_ROUTED.to_string()),
             ));
         }
         if let ConnectorTarget::Refused { reason } = target {
@@ -2616,7 +2655,7 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
 
     pub fn locked_fault(&self, named: &str) -> Option<String> {
         let locked = self.locked_tools();
-        Some(crate::copy::locked(named, locked.get(named)?))
+        Some(crate::prompts::errors::locked(named, locked.get(named)?))
     }
 
     pub fn connection_summary(&self, path: &ConnectionPath) -> Option<String> {
@@ -2709,7 +2748,7 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
             .to_string();
 
         if named == CALL_TOOL {
-            return Some(crate::copy::CALL_TOOL_IN_CALL.to_string());
+            return Some(crate::prompts::errors::call_tool_in_call());
         }
         if let Some(fault) = self.locked_fault(&named) {
             return Some(fault);
@@ -2727,12 +2766,16 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
                 .as_ref()
                 .map(|c| self.unavailable_connector_paths(c))
                 .unwrap_or_default();
-            return Some(crate::copy::no_such_tool(&named, &near, &unavailable));
+            return Some(crate::prompts::errors::no_such_tool(
+                &named,
+                &near,
+                &unavailable,
+            ));
         };
         let input = target.input();
         let fault = match raw.get("arguments") {
-            Some(_) => crate::copy::bad_arguments,
-            None => crate::copy::no_arguments,
+            Some(_) => crate::prompts::errors::bad_arguments,
+            None => crate::prompts::errors::no_arguments,
         };
         classify_arguments(&inner_arguments(&raw), input.as_ref())
             .error()

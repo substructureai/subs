@@ -1,5 +1,6 @@
 use crate::cx::Cx;
 use crate::ids::Ids;
+use crate::prompts::errors;
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
@@ -13,7 +14,7 @@ use crate::protocol::{
 use crate::state::{json_to_string, EffectKind, SessionState};
 use crate::Caller;
 
-pub const DETACHED_STARTED: &str = "working detached; the result arrives as a later message";
+pub use crate::prompts::answers::DETACHED_STARTED;
 
 pub struct SubagentSpec;
 
@@ -115,9 +116,7 @@ fn withdraw_notice(state: &Cx<'_>, session_id: &str) -> Vec<EventPayload> {
     if !prior.sessions.iter().any(|s| s == session_id) {
         return Vec::new();
     }
-    let mut events = vec![EventPayload::DecisionDropped(DecisionDropped {
-        id: prior.decision_id.to_string(),
-    })];
+    let mut events = vec![state.decision_dropped(prior.decision_id)];
     let (messages, sessions): (Vec<DraftMessage>, Vec<String>) = prior
         .messages
         .iter()
@@ -189,7 +188,7 @@ pub fn request(
         let limit = config.depth_limit();
         return answer(ErrorInfo::new(
             ErrorCode::BudgetExceeded,
-            format!("subagent depth limit reached: max_subagent_depth is {limit}"),
+            errors::subagent_depth(limit),
         ));
     }
     if let Some(named) = spawn.session_id.as_deref() {
@@ -197,16 +196,13 @@ pub fn request(
             None => {
                 return answer(ErrorInfo::new(
                     ErrorCode::Unroutable,
-                    format!("`{named}` names no session this agent delegated to"),
+                    errors::no_such_subagent_session(named),
                 ))
             }
             Some(sa) if !spawn.agent_id.is_empty() && sa.agent_id != spawn.agent_id => {
                 return answer(ErrorInfo::new(
                     ErrorCode::Unroutable,
-                    format!(
-                        "`{named}` is a session of `{}`, not of `{}`",
-                        sa.agent_id, spawn.agent_id
-                    ),
+                    errors::subagent_session_of(named, &sa.agent_id, &spawn.agent_id),
                 ))
             }
             Some(_) => {}
@@ -215,10 +211,7 @@ pub fn request(
     if state.subagent_awaiting(&session_id).is_some() {
         return answer(ErrorInfo::new(
             ErrorCode::Unroutable,
-            format!(
-                "{} is already answering; wait for its result",
-                spawn.agent_id
-            ),
+            errors::subagent_busy(&spawn.agent_id),
         ));
     }
     let requested = spawn.mode.unwrap_or_default();
@@ -236,7 +229,7 @@ pub fn request(
         else {
             return answer(ErrorInfo::new(
                 ErrorCode::Unroutable,
-                "`wait` needs a `session` from an earlier detached call".to_string(),
+                errors::WAIT_NEEDS_SESSION.to_string(),
             ));
         };
         let agent_id = sa.agent_id.clone();
@@ -280,10 +273,7 @@ pub fn request(
     {
         return answer(ErrorInfo::new(
             ErrorCode::Unroutable,
-            format!(
-                "{} is still working detached; wait for its result, or start a fresh session",
-                spawn.agent_id
-            ),
+            errors::subagent_detached(&spawn.agent_id),
         ));
     }
     Ok(vec![EventPayload::SubagentRequested(SubagentRequested {
@@ -334,16 +324,14 @@ pub fn notice(session_id: &str, agent_id: &str, completed: &SubagentTurnComplete
         Some(e) => e.message.clone(),
         None => json_to_string(&completed.data),
     };
-    let attr = match completed.error.is_some() {
-        true => " error=\"true\"",
-        false => "",
-    };
     DraftMessage {
         id: None,
         role: Role::User,
-        content: Some(Content::Text(format!(
-            "<subagent_result agent=\"{agent_id}\" session=\"{session_id}\"{attr}>\n{body}\n\
-             </subagent_result>"
+        content: Some(Content::Text(crate::prompts::context::subagent_result(
+            agent_id,
+            session_id,
+            completed.error.is_some(),
+            &body,
         ))),
         tool_calls: None,
         tool_call_id: None,

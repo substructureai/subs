@@ -155,7 +155,7 @@ async fn local_cancel(session_id: &str, db: &str) -> Result<()> {
             id: None,
             session_id: session_id.to_string(),
             caller: caller(),
-            command: CommandPayload::CancelSession,
+            command: CommandPayload::CancelSession { drop_queued: false },
             span: crate::span::SpanContext::root().child("cli_cancel"),
         },
     )

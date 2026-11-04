@@ -41,4 +41,5 @@ console = "0.16.4"
 inquire = { version = "0.9", default-features = false, features = ["crossterm"] }
 
 [dev-dependencies]
+rust_xlsxwriter = { version = "0.102", default-features = false }
 tempfile = "3"

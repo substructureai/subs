@@ -46,6 +46,8 @@ pub struct WorkerDecisionRequest {
     pub calls: Vec<Effect>,
     #[serde(default)]
     pub pending_calls: usize,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub joining: bool,
 
     #[serde(default, rename = "messages")]
     pub transcript: Vec<Message>,
@@ -83,6 +85,7 @@ impl<'a> From<&'a WorkerDecisionRequest> for DecisionRequest<'a> {
             worker: &r.worker,
             calls: &r.calls,
             pending_calls: r.pending_calls,
+            joining: r.joining,
             messages: &r.transcript,
             ancestry: &r.ancestry,
             attempts: r.attempts,
@@ -108,6 +111,12 @@ impl Session {
             .find(|d| d.decision_id == decision_id)?;
         let worker_decision = self.state.worker_decision(decision_id)?;
         let mut trigger = worker_decision.trigger.clone();
+        if let Trigger::ClientMessage { join, .. } = &mut trigger {
+            *join &= !worker_decision
+                .turn
+                .as_ref()
+                .is_some_and(|t| worker_decision.trigger.owns_turn(decision_id, &t.id));
+        }
         let worker = self.state.worker.clone();
         let at = self.state.at(meta.head_id.as_deref()).until(seq);
         let message_tree = at.message_tree();
@@ -150,6 +159,7 @@ impl Session {
             worker,
             calls: meta.calls.clone(),
             pending_calls,
+            joining: self.state.waiting_join().is_some(),
             transcript,
             ancestry: meta.ancestry.clone(),
             span: span.clone(),
@@ -175,6 +185,7 @@ impl Session {
 fn appended_transcript(
     messages: Vec<DraftMessage>,
     client: ClientContext,
+    join: bool,
     active_path: &[Message],
     tree: &MessageTree,
 ) -> DecisionTrigger {
@@ -195,6 +206,7 @@ fn appended_transcript(
         messages: view,
         new_from,
         client,
+        join,
     }
 }
 
@@ -208,10 +220,13 @@ pub fn wire_trigger(
     let trigger = match trigger {
         Trigger::SessionStart => DecisionTrigger::SessionStart,
         Trigger::ClientMessage {
-            messages, client, ..
-        } => appended_transcript(messages, client, active_path, tree),
+            messages,
+            client,
+            join,
+            ..
+        } => appended_transcript(messages, client, join, active_path, tree),
         Trigger::SubagentNotice { messages, .. } => {
-            appended_transcript(messages, ClientContext::default(), active_path, tree)
+            appended_transcript(messages, ClientContext::default(), false, active_path, tree)
         }
         Trigger::ClientTranscript {
             messages, client, ..
@@ -223,6 +238,7 @@ pub fn wire_trigger(
                 messages,
                 new_from,
                 client,
+                join: false,
             }
         }
         Trigger::ClientAction { name, args, .. } => DecisionTrigger::ClientAction { name, args },

@@ -31,7 +31,7 @@ impl InterruptKind for Approval {
         let config = config.as_ref();
         let connector_tools = p.state.connector_tools().tools;
         let connector_tools = connector_tools.as_slice();
-        let pending_calls = p.pending_calls;
+        let pending_calls = p.waiting_calls();
         if let Some((parent, _)) = p.state.state().script_ask(tail) {
             let asked = p.state.state().script_asked(parent);
             return Some(script_resumed(
@@ -44,7 +44,7 @@ impl InterruptKind for Approval {
         }
         let Some((at, call)) = asked_about(tail, transcript, dispatched) else {
             return Some(match config {
-                Some(c) => resumed(transcript, c),
+                Some(c) => resumed(transcript, c, p.joining()),
                 None => DecisionResponse {
                     messages: recorded(transcript),
                     ..Default::default()
@@ -149,7 +149,7 @@ fn script_resumed(
             .map(|c| DecisionAction::ToolError {
                 id: Some(c.id.clone()),
                 attempt: None,
-                error: format!("A person declined `{}`.", c.function.name),
+                error: crate::prompts::errors::script_call_declined(&c.function.name),
                 retryable: false,
                 code: None,
                 detail: None,
@@ -168,11 +168,7 @@ fn refusal(call: &ToolCall) -> DraftMessage {
     DraftMessage {
         id: None,
         role: Role::Tool,
-        content: Some(Content::Text(
-            "A person declined this call. Do not try it again; \
-             say what you were going to do and why it stopped."
-                .to_string(),
-        )),
+        content: Some(Content::Text(crate::prompts::errors::DECLINED.to_string())),
         tool_calls: None,
         tool_call_id: Some(call.id.clone()),
         name: Some(call.function.name.clone()),

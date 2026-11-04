@@ -33,7 +33,7 @@ fn key_is_a_variable(block: &str, config: &ProjectConfig, verb: &str) -> Result<
     let Some(spec) = config.system1.get(block) else {
         bail!(
             "no [system1.{block}] in subs.toml. Declared: {}",
-            crate::copy::declared(config.system1.keys())
+            crate::prompts::declared(config.system1.keys())
         );
     };
     let Some(var) = spec.api_key_env() else {

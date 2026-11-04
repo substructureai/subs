@@ -1725,6 +1725,10 @@
         "identity": {
           "$ref": "#/$defs/WorkerIdentity"
         },
+        "joining": {
+          "description": "A message waits to join the turn. Its decision calls the model next,\nso do not call the model or end the turn.",
+          "type": "boolean"
+        },
         "messages": {
           "items": {
             "$ref": "#/$defs/Message"
@@ -1855,6 +1859,10 @@
             "client": {
               "$ref": "#/$defs/ClientContext",
               "description": "Inputs the client declared on its run. The engine adds\n`client.tools` to the proposed config."
+            },
+            "join": {
+              "description": "The new messages were sent with `queue: \"join\"`, and join the\nrunning turn.",
+              "type": "boolean"
             },
             "messages": {
               "items": {
@@ -3387,7 +3395,8 @@
         },
         {
           "enum": [
-            "merge"
+            "merge",
+            "join"
           ],
           "title": "QueueWord",
           "type": "string"
@@ -3396,7 +3405,7 @@
           "type": "null"
         }
       ],
-      "description": "What a message does while a turn runs. `false` or `null` refuses it. `true` holds it for a turn of its own. `\"merge\"` adds it to the turn waiting last when that turn also merges, so messages sent during a turn become one turn."
+      "description": "What a message does while a turn runs. `false` or `null` refuses it. `true` holds it for a turn of its own. `\"merge\"` adds it to the turn waiting last when that turn also merges, so messages sent during a turn become one turn. `\"join\"` adds it to the running turn, which sees it at its next model call."
     },
     "Reasoning": {
       "additionalProperties": false,

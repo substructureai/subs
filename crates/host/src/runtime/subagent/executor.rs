@@ -47,7 +47,7 @@ async fn open(
     match send_message(store, tenant_id, child_session_id, &id, message, span).await {
         Ok(_) => Outcome::SubagentStarted,
         Err(err) => SettleError::new(
-            ErrorInfo::internal(format!("failed to send the child's opening message: {err}")),
+            ErrorInfo::internal(crate::prompts::errors::child_not_messaged(&err.to_string())),
             false,
         )
         .into(),
@@ -98,7 +98,7 @@ async fn cancel_child(
             caller: Caller::System {
                 tenant_id: tenant_id.to_string(),
             },
-            command: CommandPayload::CancelSession,
+            command: CommandPayload::CancelSession { drop_queued: true },
             span: span.child("cancel_subagent"),
         },
     )
@@ -173,7 +173,7 @@ async fn handle_task(
             .await
         }
         Err(err) => SettleError::new(
-            ErrorInfo::internal(format!("failed to create child session: {err}")),
+            ErrorInfo::internal(crate::prompts::errors::child_not_created(&err.to_string())),
             false,
         )
         .into(),
@@ -224,13 +224,14 @@ mod tests {
             session_id: &str,
             command: substructure_session::Command,
         ) -> Result<substructure_session::CommandResult, substructure_session::Error> {
-            if matches!(command.payload, CommandPayload::CancelSession) {
+            if matches!(command.payload, CommandPayload::CancelSession { .. }) {
                 self.cancelled.lock().unwrap().push(session_id.to_string());
             }
             Ok(Ok(substructure_session::Accepted {
                 seq: 1,
                 turn_id: None,
                 queued: false,
+                next_turn_id: None,
             }))
         }
 

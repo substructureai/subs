@@ -59,6 +59,9 @@ pub struct Accepted {
     pub turn_id: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub queued: bool,
+    /// The turn a joining message opens when `turn_id` ends before it joins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_turn_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

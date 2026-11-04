@@ -6,6 +6,7 @@ pub mod files;
 mod process;
 mod quickjs;
 pub mod replay;
+mod tenant_limits;
 
 pub use admission::{Admission, Ticket};
 pub use child::{dispatch, ARG, PROBE, PROBE_LOCK};
@@ -14,12 +15,14 @@ pub use substructure_session::codemode::{
     spent, supports, Language, Limit, Limits, Ran, Script, ScriptCall, ScriptFile, ScriptRecord,
     Shown, Stats, Step, OLDEST, OUTPUT, VERSION,
 };
+pub use tenant_limits::{FixedLimits, LimitsResolver};
 
 use std::collections::BTreeMap;
 use substructure_session::command::{CommandPayload, Outcome, SettleError};
 
 use substructure_session::blob::BlobRef;
 use substructure_session::codemode::StoredFile;
+use substructure_session::prompts::codemode as prompts;
 use substructure_session::protocol::{ErrorCode, ErrorInfo, StoredContent, StoredResult};
 use substructure_session::state::EffectKind;
 
@@ -47,12 +50,12 @@ pub fn settle(
             for shown in ran.shown {
                 result.content.extend(match shown {
                     Shown::Text { file, text } => vec![StoredContent::Text {
-                        text: format!("[file {file}]\n{text}"),
+                        text: format!("{}\n{text}", prompts::shown_file(&file)),
                     }],
                     Shown::File { file } => match files.get(&file) {
                         Some(blob) => vec![
                             StoredContent::Text {
-                                text: format!("[file {file}]"),
+                                text: prompts::shown_file(&file),
                             },
                             StoredContent::Blob { uri: blob.uri() },
                         ],

@@ -4,7 +4,8 @@ use crate::state::SessionStatus;
 use std::collections::HashMap;
 
 use crate::protocol::{
-    ClientAppend, ClientMessage, ClientMessages, DeferTools, McpAnnounce, NewMessage,
+    ClientAppend, ClientContext, ClientMessage, ClientMessages, DeferTools, McpAnnounce,
+    NewMessage, Role,
 };
 use crate::reconcile::plan_reconcile;
 use chrono::Utc;
@@ -1012,7 +1013,11 @@ fn send_message_wakes_a_decision() {
 #[test]
 fn cancelling_an_idle_session_does_nothing() {
     let mut agg = create_session("sess-1", "tenant-a", "user-1");
-    let events = dispatch(&mut agg, CommandPayload::CancelSession, &system());
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::CancelSession { drop_queued: false },
+        &system(),
+    );
     assert!(events.is_empty(), "got {events:?}");
 }
 
@@ -1023,7 +1028,7 @@ fn cancelling_ends_the_run_and_keeps_the_session() {
 
     let events = dispatch(
         &mut agg,
-        CommandPayload::CancelSession,
+        CommandPayload::CancelSession { drop_queued: true },
         &frontend_caller("tenant-a", "user-1"),
     );
     assert!(matches!(
@@ -1084,7 +1089,7 @@ fn cancelling_resolves_the_open_interrupts_as_cancelled() {
 
     let events = dispatch(
         &mut agg,
-        CommandPayload::CancelSession,
+        CommandPayload::CancelSession { drop_queued: false },
         &frontend_caller("tenant-a", "user-1"),
     );
     let resumed = events.iter().find_map(|e| match e {
@@ -1104,7 +1109,7 @@ fn only_the_owner_cancels_from_a_client() {
     let agg = session_mid_turn();
     let err = agg
         .try_handle(
-            CommandPayload::CancelSession,
+            CommandPayload::CancelSession { drop_queued: false },
             &frontend_caller("tenant-a", "user-2"),
         )
         .expect_err("a stranger is refused");
@@ -2925,7 +2930,11 @@ fn cancelling_voids_a_running_subagent() {
         EffectStatus::Running
     );
 
-    let events = dispatch(&mut agg, CommandPayload::CancelSession, &system());
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::CancelSession { drop_queued: false },
+        &system(),
+    );
     assert!(
         events.iter().any(|e| matches!(
             e,
@@ -4974,7 +4983,7 @@ fn cancel_voids_pending_effects() {
 
     let events = dispatch(
         &mut agg,
-        CommandPayload::CancelSession,
+        CommandPayload::CancelSession { drop_queued: false },
         &Caller::System {
             tenant_id: "tenant-a".to_string(),
         },
@@ -4994,7 +5003,7 @@ fn cancel_voids_pending_effects() {
 
     let again = dispatch(
         &mut agg,
-        CommandPayload::CancelSession,
+        CommandPayload::CancelSession { drop_queued: false },
         &Caller::System {
             tenant_id: "tenant-a".to_string(),
         },
@@ -11367,6 +11376,7 @@ fn wake_promotes_a_queued_decision_on_an_unparked_branch() {
                 client: ClientContext::default(),
                 turn_id: None,
                 merge: false,
+                join: false,
                 metadata: Default::default(),
             },
         })],
@@ -11903,11 +11913,36 @@ fn a_failed_turn_does_not_un_ask_the_turn_queued_behind_it() {
 }
 
 #[test]
-fn cancelling_never_starts_a_queued_turn() {
+fn cancelling_runs_the_turn_queued_behind_it() {
     let mut agg = session_mid_turn();
     submit_queued(&mut agg, "and another thing", "turn-2").expect("queued submit");
 
-    let events = dispatch(&mut agg, CommandPayload::CancelSession, &system());
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::CancelSession { drop_queued: false },
+        &system(),
+    );
+    assert_eq!(
+        turn_completed(&events).map(|tc| tc.turn_id.as_str()),
+        Some("turn-1")
+    );
+    assert_eq!(
+        started_turns(&events),
+        vec!["turn-2"],
+        "the queued question still gets asked; got {events:?}"
+    );
+}
+
+#[test]
+fn cancelling_with_drop_queued_never_starts_a_queued_turn() {
+    let mut agg = session_mid_turn();
+    submit_queued(&mut agg, "and another thing", "turn-2").expect("queued submit");
+
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::CancelSession { drop_queued: true },
+        &system(),
+    );
     assert!(
         started_turns(&events).is_empty(),
         "cancellation is terminal; got {events:?}"
@@ -12671,7 +12706,11 @@ fn an_open_system1_call_holds_the_turn_until_done_voids_it() {
 fn cancelling_voids_an_open_system1_call() {
     let mut agg = session_mid_turn();
     decide(&mut agg, vec![system1_call("s1-1")]);
-    let events = dispatch(&mut agg, CommandPayload::CancelSession, &system());
+    let events = dispatch(
+        &mut agg,
+        CommandPayload::CancelSession { drop_queued: false },
+        &system(),
+    );
     assert!(
         events.iter().any(|e| matches!(
             e,
@@ -14216,7 +14255,7 @@ fn cancelling_voids_a_script_and_its_calls() {
     let child = coding_turn(&mut agg);
     let events = dispatch(
         &mut agg,
-        CommandPayload::CancelSession,
+        CommandPayload::CancelSession { drop_queued: false },
         &frontend_caller("tenant-a", "user-1"),
     );
     assert_script_gone(&mut agg, &events, &child);

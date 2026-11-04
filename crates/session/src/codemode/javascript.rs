@@ -4,58 +4,19 @@ use std::collections::BTreeSet;
 
 use super::typescript::{is_identifier, render_json_schema_to_typescript};
 use super::Dialect;
-use crate::protocol::{LlmTool, TOOL_SEARCH};
+use crate::prompts::codemode::javascript as prompts;
+use crate::protocol::LlmTool;
 
 pub const DIALECT: Dialect = Dialect {
-    code: "JavaScript: the body of an async function.",
+    code: prompts::CODE,
     describe,
     declare: declaration,
     fence: "ts",
 };
 
-const INTRO: &str = "Run JavaScript code to orchestrate tool calls: chain them, run them at once, \
-and filter large results before you read them.
-- `code` is the body of an async function. All tools are on the global `tools` object. Call one \
-by its exact name: `await tools.<name>(args)`, or `tools[\"<name>\"](args)` when the name is not \
-an identifier. A call returns the tool's result, parsed when it is JSON.
-- One call: `const issue = await tools.get_issue({ id: 7 }); return issue.title;`
-- Calls at once: `const [a, b] = await Promise.all([tools.get_issue({ id: 1 }), \
-tools.get_issue({ id: 2 })]);`. A call that fails throws an `Error` with the tool's message; use \
-`Promise.allSettled` so that one failure does not lose the rest.
-- You see what the script logs and returns: strings as they are, objects as JSON. Past {output} \
-KiB, the sandbox cuts the middle.
-- A script runs again from the start each time its calls finish, and gets their results without \
-calling again. Work before a call is done again on each run. A script has limits on calls, \
-results, memory and compute; an error names the limit and what to do.
-- Files in the conversation show as `[attachment <id> …]` lines. Read one by its id with \
-`await files.text(id)`, or stream it with `for await (const row of files.csv(id))`. \
-`files.lines`, `files.jsonl` and `files.chunks` stream too. Each stream takes `{ limit }`, \
-`files.csv` also `{ header, delimiter }`, and `files.chunks` also `{ size, offset }`. \
-`files.list()` lists the files.
-- `files.show(id)` puts a file in front of you when the script returns: an image, PDF, audio or \
-video as itself, any other file as its text.
-- Load a skill with `console.log(await tools.skill({ name }))`, and several with \
-`for (const s of await Promise.all([tools.skill({ name: \"a\" }), tools.skill({ name: \"b\" })])) \
-console.log(s);`. Log each answer whole: it holds the skill's instructions and the declarations \
-of the tools it brings, which you can call in your next script. Read the files it mentions with \
-`files.text`, by their path under the skill's base directory.
-- There is no network, file system, timer or module. No state persists between scripts. \
-`Date` and `Math.random` stay the same for the whole run.
-- A call that needs approval waits for a person, and a client tool waits for the client. A \
-subagent call returns `{ session, result }`: its answer, and the session to pass as `session` \
-to continue it.";
-
 fn describe(tools: &[&LlmTool]) -> String {
     let budget = Budget::split(tools);
-    let mut sections = vec![
-        INTRO.replace("{output}", &(super::OUTPUT >> 10).to_string()),
-        format!(
-            "Find tools that are not declared here, and skills, with \
-             `await tools.{TOOL_SEARCH}({{ query }})`, or name tools exactly to get just their \
-             declarations. It answers with text that is already short: log it with \
-             `console.log` as it is, then call the tools in your next script."
-        ),
-    ];
+    let mut sections = vec![prompts::intro(super::OUTPUT >> 10), prompts::find()];
     if !budget.declared.is_empty() {
         sections.push(format!(
             "```ts\n{}declare const tools: {{\n{}\n}};\n```",
