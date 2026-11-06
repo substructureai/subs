@@ -600,15 +600,6 @@ class QueueMode(RootModel[bool | QueueMode1 | None]):
     ]
 
 
-class ReasoningEffort(Enum):
-    xhigh = 'xhigh'
-    high = 'high'
-    medium = 'medium'
-    low = 'low'
-    minimal = 'minimal'
-    none = 'none'
-
-
 class ReasoningProvider(Enum):
     anthropic = 'anthropic'
     openai = 'openai'
@@ -1432,7 +1423,7 @@ class ReasoningConfig(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
     )
-    effort: ReasoningEffort | None = None
+    effort: str | None = None
     enabled: bool | None = None
     exclude: bool | None = None
     max_tokens: Annotated[int | None, Field(ge=0)] = None
@@ -1650,7 +1641,7 @@ class AgentConfig(BaseModel):
         ),
     ] = None
     effort: Annotated[
-        ReasoningEffort | None,
+        str | None,
         Field(
             description="How hard the model thinks. Unset leaves the provider's own default."
         ),

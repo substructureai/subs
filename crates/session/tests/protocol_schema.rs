@@ -84,7 +84,6 @@ fn protocol_schema() -> serde_json::Value {
         p::LlmTool,
         p::LlmRequest,
         p::ReasoningConfig,
-        p::ReasoningEffort,
         p::ResponseImage,
         p::LlmResponse,
         p::ErrorCode,

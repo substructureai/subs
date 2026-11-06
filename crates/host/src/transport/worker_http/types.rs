@@ -179,10 +179,7 @@ mod tests {
         let req: SubmitClientPayloadRequest =
             serde_json::from_str(body).expect("the submit deserializes");
         let agent = req.agent.expect("agent is read");
-        assert_eq!(
-            agent.effort,
-            Some(Some(crate::protocol::ReasoningEffort::High))
-        );
+        assert_eq!(agent.effort, Some(Some("high".into())));
         assert_eq!(agent.model, None, "a patch need not name a model");
     }
 

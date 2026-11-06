@@ -158,7 +158,7 @@ tool = { max_attempts = 3 }
 | `llm` | string | required with config | The `[llm.<id>]` block. |
 | `model` | string | required with config | The model. |
 | `system` | string | none | The system prompt. |
-| `effort` | string | the provider's own | How hard the model thinks: `xhigh`, `high`, `medium`, `low`, `minimal`, or `none`. |
+| `effort` | string | the provider's own | How hard the model thinks, such as `max`, `high` or `low`. Sent to the provider as written. |
 | `description` | string | none | What this agent does, shown to a parent that calls it. |
 | `mcp` | list | none | Connections this agent draws tools from. See [`mcp` and `plugins` entries](#mcp-and-plugins-entries). |
 | `plugins` | list | none | Plugins this agent uses. See [`mcp` and `plugins` entries](#mcp-and-plugins-entries). |

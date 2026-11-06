@@ -47,15 +47,11 @@
           "description": "Defer every tool this agent offers, whatever its source. A tool or a\nconnection overrides this with its own `defer`. Absent, the agent defers\nnothing; a connection can still defer on its own."
         },
         "effort": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ReasoningEffort"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "How hard the model thinks. Unset leaves the provider's own default."
+          "description": "How hard the model thinks. Unset leaves the provider's own default.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "llm": {
           "description": "The `[llm.*]` block this agent's calls run on.",
@@ -3435,13 +3431,9 @@
       "additionalProperties": false,
       "properties": {
         "effort": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ReasoningEffort"
-            },
-            {
-              "type": "null"
-            }
+          "type": [
+            "string",
+            "null"
           ]
         },
         "enabled": {
@@ -3467,18 +3459,6 @@
       },
       "title": "ReasoningConfig",
       "type": "object"
-    },
-    "ReasoningEffort": {
-      "enum": [
-        "xhigh",
-        "high",
-        "medium",
-        "low",
-        "minimal",
-        "none"
-      ],
-      "title": "ReasoningEffort",
-      "type": "string"
     },
     "ReasoningProvider": {
       "description": "Which provider wrote the blocks. They go back only to that provider.\nAnthropic rejects blocks it did not sign.",

@@ -296,7 +296,7 @@ export interface AgentConfig {
     /**
      * How hard the model thinks. Unset leaves the provider's own default.
      */
-    effort?: ReasoningEffort | null;
+    effort?: null | string;
     /**
      * The `[llm.*]` block this agent's calls run on.
      */
@@ -461,8 +461,6 @@ export type SkillListing = "list" | "search";
  * search is enough to make a call.
  */
 export type DeferToolsStrategy = "search";
-
-export type ReasoningEffort = "xhigh" | "high" | "medium" | "low" | "minimal" | "none";
 
 /**
  * An MCP server the agent draws tools from. `id` names an `[mcp.*]`
@@ -1020,7 +1018,7 @@ export interface NoulCriteria {
 export type QuestionType = "noul" | "choice" | "score" | "box";
 
 export interface ReasoningConfig {
-    effort?: ReasoningEffort | null;
+    effort?: null | string;
     enabled?: boolean | null;
     exclude?: boolean | null;
     max_tokens?: number | null;

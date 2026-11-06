@@ -11,8 +11,8 @@ use crate::llm::{CallContext, LlmCallError, LlmCallable, LlmProviderTrait};
 use crate::mime;
 use crate::protocol::{
     AudioData, ContentPart, DeferToolsStrategy, ErrorCode, LlmResponse, LlmTool, PromptContent,
-    PromptMessage, PromptPart, PromptRequest, Reasoning, ReasoningEffort, ReasoningProvider, Role,
-    SessionOwner, StreamDelta, ToolCall, ToolCallChunk, ToolCallFunction, Usage,
+    PromptMessage, PromptPart, PromptRequest, Reasoning, ReasoningProvider, Role, SessionOwner,
+    StreamDelta, ToolCall, ToolCallChunk, ToolCallFunction, Usage,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -55,7 +55,7 @@ struct WireBody<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_completion_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_effort: Option<&'static str>,
+    reasoning_effort: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -247,17 +247,6 @@ fn cache_key(session_id: &str) -> Option<&str> {
     })
 }
 
-fn effort_str(e: ReasoningEffort) -> &'static str {
-    match e {
-        ReasoningEffort::Xhigh => "xhigh",
-        ReasoningEffort::High => "high",
-        ReasoningEffort::Medium => "medium",
-        ReasoningEffort::Low => "low",
-        ReasoningEffort::Minimal => "minimal",
-        ReasoningEffort::None => "none",
-    }
-}
-
 fn digits(s: &str) -> (&str, &str) {
     s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()))
 }
@@ -318,11 +307,7 @@ impl<'a> WireBody<'a> {
         stream: Option<bool>,
         cache: CacheOpts<'a>,
     ) -> Self {
-        let reasoning_effort = request
-            .reasoning
-            .as_ref()
-            .and_then(|r| r.effort)
-            .map(effort_str);
+        let reasoning_effort = request.reasoning.as_ref().and_then(|r| r.effort.as_deref());
 
         let reasoning = reasoning_effort.is_some() || is_reasoning_model(&request.model);
         let sampling_back =
@@ -983,7 +968,7 @@ mod tests {
     fn reasoning_model_strips_temperature_and_maps_effort() {
         let mut r = req("gpt-5.5");
         r.reasoning = Some(ReasoningConfig {
-            effort: Some(ReasoningEffort::High),
+            effort: Some("high".into()),
             max_tokens: None,
             exclude: None,
             enabled: None,
@@ -1057,7 +1042,7 @@ mod tests {
     fn no_effort_hands_temperature_back_where_the_model_reads_it() {
         let mut r = req("gpt-5.1");
         r.reasoning = Some(ReasoningConfig {
-            effort: Some(ReasoningEffort::None),
+            effort: Some("none".into()),
             max_tokens: None,
             exclude: None,
             enabled: None,
@@ -1075,7 +1060,7 @@ mod tests {
         for model in ["gpt-5", "o3"] {
             let mut r = req(model);
             r.reasoning = Some(ReasoningConfig {
-                effort: Some(ReasoningEffort::None),
+                effort: Some("none".into()),
                 max_tokens: None,
                 exclude: None,
                 enabled: None,

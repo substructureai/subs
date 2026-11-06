@@ -9,7 +9,6 @@ use crate::connectors::registry::{
 };
 use crate::plugins::{BundleServer, PluginBundle, SKILLS_BUNDLE};
 use crate::prompts::declared;
-use crate::protocol::ReasoningEffort;
 use crate::protocol::{
     AgentConfig, AgentPlugin, AgentSkill, AgentTool, Approve, ConnectorProtocol, ContextConfig,
     DeferTools, Handler, LlmFormat, McpAnnounce, McpAuthFailure, McpServer, McpToolSyncFailure,
@@ -520,7 +519,7 @@ pub struct AgentSection {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub effort: Option<ReasoningEffort>,
+    pub effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry: Option<RetryConfig>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -584,7 +583,7 @@ impl AgentSection {
             llm: self.llm.clone(),
             model: self.model.clone()?,
             system: self.system.clone(),
-            effort: self.effort,
+            effort: self.effort.clone(),
             retry: self.retry.clone().map(Box::new),
             tools: self.tools.clone(),
             subagents: self.to_subagents(manifest),
@@ -2356,16 +2355,16 @@ type = "anthropic"
 [agent.support]
 llm = "claude"
 model = "m"
-effort = "high"
+effort = "max"
 "#,
         )
         .unwrap();
         m.validate().unwrap();
         let config = m.agents()["support"].config.clone().expect("seeded");
-        assert_eq!(config.effort, Some(ReasoningEffort::High));
+        assert_eq!(config.effort.as_deref(), Some("max"));
         assert_eq!(
-            config.reasoning().and_then(|r| r.effort),
-            Some(ReasoningEffort::High)
+            config.reasoning().and_then(|r| r.effort).as_deref(),
+            Some("max")
         );
     }
 

@@ -303,7 +303,7 @@ fn agent_rows(
         rows.push(("llm", named));
     }
     if let Some(effort) = &agent.effort {
-        rows.push(("effort", format!("{effort:?}").to_lowercase()));
+        rows.push(("effort", effort.clone()));
     }
     if let Some(worker) = &agent.worker {
         let shown = match cfg.worker.get(worker).and_then(|w| w.url.clone()) {

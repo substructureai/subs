@@ -931,7 +931,7 @@ pub struct AgentConfig {
     pub system: Option<String>,
     /// How hard the model thinks. Unset leaves the provider's own default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effort: Option<ReasoningEffort>,
+    pub effort: Option<String>,
     /// Boxed. Five per-kind overrides are too many bytes to carry inline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry: Option<Box<RetryConfig>>,
@@ -1007,7 +1007,7 @@ pub struct AgentConfigPatch {
         deserialize_with = "present",
         skip_serializing_if = "Option::is_none"
     )]
-    pub effort: Option<Option<ReasoningEffort>>,
+    pub effort: Option<Option<String>>,
     #[serde(
         default,
         deserialize_with = "present",
@@ -1225,7 +1225,7 @@ impl McpAnnounce {
 
 impl AgentConfig {
     pub fn reasoning(&self) -> Option<ReasoningConfig> {
-        self.effort.map(|effort| ReasoningConfig {
+        self.effort.clone().map(|effort| ReasoningConfig {
             effort: Some(effort),
             ..Default::default()
         })
@@ -1880,25 +1880,13 @@ impl DeferToolsStrategy {
 #[schemars(title = "ReasoningConfig")]
 pub struct ReasoningConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effort: Option<ReasoningEffort>,
+    pub effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclude: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-#[schemars(title = "ReasoningEffort")]
-pub enum ReasoningEffort {
-    Xhigh,
-    High,
-    Medium,
-    Low,
-    Minimal,
-    None,
 }
 
 /// An image returned by the model in the response.
@@ -3115,7 +3103,7 @@ mod tests {
             llm: Some("openrouter".into()),
             model: "deepseek".into(),
             system: Some("be brief".into()),
-            effort: Some(ReasoningEffort::Low),
+            effort: Some("low".into()),
             ..Default::default()
         }
     }
@@ -3126,7 +3114,7 @@ mod tests {
             .unwrap()
             .apply(base());
         assert_eq!(config.model, "haiku");
-        assert_eq!(config.effort, Some(ReasoningEffort::High));
+        assert_eq!(config.effort.as_deref(), Some("high"));
         assert_eq!(config.llm.as_deref(), Some("openrouter"));
         assert_eq!(config.system.as_deref(), Some("be brief"));
     }

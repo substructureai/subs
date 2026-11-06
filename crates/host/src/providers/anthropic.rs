@@ -12,8 +12,8 @@ use crate::llm::{CallContext, LlmCallError, LlmCallable, LlmProviderTrait};
 use crate::mime;
 use crate::protocol::{
     DeferToolsStrategy, ErrorCode, LlmResponse, PromptContent, PromptPart, PromptRequest,
-    Reasoning, ReasoningEffort, ReasoningProvider, Role, SessionOwner, StreamDelta, ToolCall,
-    ToolCallChunk, ToolCallFunction, Usage,
+    Reasoning, ReasoningProvider, Role, SessionOwner, StreamDelta, ToolCall, ToolCallChunk,
+    ToolCallFunction, Usage,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -175,45 +175,36 @@ enum ImageSource {
 struct Thinking {
     #[serde(rename = "type")]
     thinking_type: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    budget_tokens: Option<u64>,
 }
 
 #[derive(Serialize)]
 struct OutputConfig {
-    effort: &'static str,
+    effort: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Capabilities {
     sampling: bool,
-    effort: bool,
-    xhigh: bool,
     adaptive: bool,
     thinks_unasked: bool,
     thinks_always: bool,
 }
 
 impl Capabilities {
-    const ALWAYS: Self = Self::new(false, true, true, true, true, true);
-    const DEFAULT_ON: Self = Self::new(false, true, true, true, true, false);
-    const CURRENT: Self = Self::new(false, true, true, true, false, false);
-    const NO_XHIGH: Self = Self::new(true, true, false, true, false, false);
-    const EFFORT_ONLY: Self = Self::new(true, true, false, false, false, false);
-    const LEGACY: Self = Self::new(true, false, false, false, false, false);
+    const ALWAYS: Self = Self::new(false, true, true, true);
+    const DEFAULT_ON: Self = Self::new(false, true, true, false);
+    const CURRENT: Self = Self::new(false, true, false, false);
+    const SAMPLING: Self = Self::new(true, true, false, false);
+    const LEGACY: Self = Self::new(true, false, false, false);
 
     const fn new(
         sampling: bool,
-        effort: bool,
-        xhigh: bool,
         adaptive: bool,
         thinks_unasked: bool,
         thinks_always: bool,
     ) -> Self {
         Self {
             sampling,
-            effort,
-            xhigh,
             adaptive,
             thinks_unasked,
             thinks_always,
@@ -234,12 +225,12 @@ const GENERATIONS: &[Generation] = &[
     Generation { family: "mythos", since: (0, 0), output: 128_000, caps: Capabilities::ALWAYS },
     Generation { family: "opus",   since: (5, 0), output: 128_000, caps: Capabilities::DEFAULT_ON },
     Generation { family: "opus",   since: (4, 7), output: 128_000, caps: Capabilities::CURRENT },
-    Generation { family: "opus",   since: (4, 6), output: 128_000, caps: Capabilities::NO_XHIGH },
-    Generation { family: "opus",   since: (4, 5), output:  64_000, caps: Capabilities::EFFORT_ONLY },
+    Generation { family: "opus",   since: (4, 6), output: 128_000, caps: Capabilities::SAMPLING },
+    Generation { family: "opus",   since: (4, 5), output:  64_000, caps: Capabilities::LEGACY },
     Generation { family: "opus",   since: (4, 1), output:  32_000, caps: Capabilities::LEGACY },
     Generation { family: "opus",   since: (0, 0), output:  32_000, caps: Capabilities::LEGACY },
     Generation { family: "sonnet", since: (5, 0), output: 128_000, caps: Capabilities::DEFAULT_ON },
-    Generation { family: "sonnet", since: (4, 6), output: 128_000, caps: Capabilities::NO_XHIGH },
+    Generation { family: "sonnet", since: (4, 6), output: 128_000, caps: Capabilities::SAMPLING },
     Generation { family: "sonnet", since: (0, 0), output:  64_000, caps: Capabilities::LEGACY },
     Generation { family: "haiku",  since: (4, 5), output:  64_000, caps: Capabilities::LEGACY },
     Generation { family: "haiku",  since: (0, 0), output:   4_096, caps: Capabilities::LEGACY },
@@ -276,58 +267,20 @@ fn version(model: &str, family: &str) -> Option<(u32, u32)> {
     Some((major, minor))
 }
 
-fn anthropic_effort(e: ReasoningEffort, xhigh: bool) -> &'static str {
-    match e {
-        ReasoningEffort::Xhigh if xhigh => "xhigh",
-        ReasoningEffort::Xhigh | ReasoningEffort::High => "high",
-        ReasoningEffort::Medium => "medium",
-        ReasoningEffort::Low | ReasoningEffort::Minimal | ReasoningEffort::None => "low",
-    }
-}
-
-fn legacy_budget(e: ReasoningEffort, max_tokens: u64) -> Option<u64> {
-    const MIN_BUDGET: u64 = 1024;
-
-    let want = match e {
-        ReasoningEffort::Xhigh | ReasoningEffort::High => 24_000,
-        ReasoningEffort::Medium => 8_000,
-        ReasoningEffort::Low | ReasoningEffort::Minimal | ReasoningEffort::None => MIN_BUDGET,
-    };
-    let ceiling = max_tokens.saturating_sub(MIN_BUDGET);
-    (ceiling >= MIN_BUDGET).then(|| want.min(ceiling))
-}
-
-fn reasoning_fields(
-    model: &str,
-    effort: Option<ReasoningEffort>,
-    max_tokens: u64,
-) -> (Option<Thinking>, Option<OutputConfig>) {
+fn reasoning_fields(model: &str, effort: Option<&str>) -> (Option<Thinking>, Option<OutputConfig>) {
     let caps = capabilities(model);
-    let effort = match effort {
-        None | Some(ReasoningEffort::None) => {
-            let thinking = (caps.thinks_unasked && !caps.thinks_always).then_some(Thinking {
-                thinking_type: "disabled",
-                budget_tokens: None,
-            });
-            return (thinking, None);
-        }
-        Some(e) => e,
+    let Some(effort) = effort else {
+        let thinking = (caps.thinks_unasked && !caps.thinks_always).then_some(Thinking {
+            thinking_type: "disabled",
+        });
+        return (thinking, None);
     };
-
-    let output_config = caps.effort.then(|| OutputConfig {
-        effort: anthropic_effort(effort, caps.xhigh),
+    let thinking = caps.adaptive.then_some(Thinking {
+        thinking_type: "adaptive",
     });
-    let thinking = if caps.adaptive {
-        Some(Thinking {
-            thinking_type: "adaptive",
-            budget_tokens: None,
-        })
-    } else {
-        legacy_budget(effort, max_tokens).map(|budget| Thinking {
-            thinking_type: "enabled",
-            budget_tokens: Some(budget),
-        })
-    };
+    let output_config = Some(OutputConfig {
+        effort: effort.to_string(),
+    });
     (thinking, output_config)
 }
 
@@ -539,8 +492,7 @@ fn build_body(
     );
     let (thinking, output_config) = reasoning_fields(
         &request.model,
-        request.reasoning.as_ref().and_then(|r| r.effort),
-        max_tokens,
+        request.reasoning.as_ref().and_then(|r| r.effort.as_deref()),
     );
 
     AnthropicBody {
@@ -1667,7 +1619,7 @@ mod tests {
         ]);
         r.max_completion_tokens = Some(1000);
         r.reasoning = Some(ReasoningConfig {
-            effort: Some(ReasoningEffort::High),
+            effort: Some("high".into()),
             max_tokens: None,
             exclude: None,
             enabled: None,
@@ -1694,28 +1646,23 @@ mod tests {
         assert!(v.get("system").is_none());
     }
 
-    fn reasoning(
-        model: &str,
-        effort: Option<ReasoningEffort>,
-        max_tokens: u64,
-    ) -> (serde_json::Value, serde_json::Value) {
-        let (thinking, output_config) = reasoning_fields(model, effort, max_tokens);
+    fn reasoning(model: &str, effort: Option<&str>) -> (serde_json::Value, serde_json::Value) {
+        let (thinking, output_config) = reasoning_fields(model, effort);
         (
             serde_json::to_value(thinking).unwrap(),
             serde_json::to_value(output_config).unwrap(),
         )
     }
 
-    const HIGH: Option<ReasoningEffort> = Some(ReasoningEffort::High);
-    const XHIGH: Option<ReasoningEffort> = Some(ReasoningEffort::Xhigh);
+    const XHIGH: Option<&str> = Some("xhigh");
 
     #[test]
     fn a_model_this_build_does_not_know_reads_as_the_current_generation() {
-        let (thinking, config) = reasoning("claude-next-ultra", XHIGH, 64_000);
+        let (thinking, config) = reasoning("claude-next-ultra", XHIGH);
         assert_eq!(thinking["type"], "adaptive");
         assert_eq!(config["effort"], "xhigh");
 
-        let (thinking, config) = reasoning("claude-next-ultra", None, 64_000);
+        let (thinking, config) = reasoning("claude-next-ultra", None);
         assert!(thinking.is_null());
         assert!(config.is_null());
     }
@@ -1723,7 +1670,7 @@ mod tests {
     #[test]
     fn a_model_that_thinks_unasked_is_asked_to_stop() {
         for model in ["claude-opus-5", "claude-sonnet-5"] {
-            let (thinking, config) = reasoning(model, None, 64_000);
+            let (thinking, config) = reasoning(model, None);
             assert_eq!(thinking["type"], "disabled", "{model}");
             assert!(config.is_null(), "{model}");
         }
@@ -1732,52 +1679,27 @@ mod tests {
     #[test]
     fn a_model_that_always_thinks_is_never_asked_to_stop() {
         for model in ["claude-fable-5", "claude-mythos-5"] {
-            let (thinking, _) = reasoning(model, None, 64_000);
+            let (thinking, _) = reasoning(model, None);
             assert!(thinking.is_null(), "{model} rejects an explicit disabled");
         }
     }
 
     #[test]
-    fn xhigh_falls_to_high_on_a_model_that_predates_it() {
-        assert_eq!(
-            reasoning("claude-opus-4-8", XHIGH, 64_000).1["effort"],
-            "xhigh"
-        );
-        assert_eq!(
-            reasoning("claude-opus-4-7", XHIGH, 64_000).1["effort"],
-            "xhigh"
-        );
-        assert_eq!(
-            reasoning("claude-opus-4-6", XHIGH, 64_000).1["effort"],
-            "high"
-        );
-        assert_eq!(
-            reasoning("claude-sonnet-4-6", XHIGH, 64_000).1["effort"],
-            "high"
-        );
+    fn effort_goes_to_the_model_as_written() {
+        for model in ["claude-opus-5", "claude-opus-4-6", "claude-haiku-4-5"] {
+            for effort in ["max", "xhigh", "none", "anything"] {
+                assert_eq!(
+                    reasoning(model, Some(effort)).1["effort"],
+                    effort,
+                    "{model}"
+                );
+            }
+        }
     }
 
     #[test]
-    fn a_model_before_adaptive_thinking_takes_a_budget() {
-        let (thinking, config) = reasoning("claude-sonnet-4-5", HIGH, 64_000);
-        assert_eq!(thinking["type"], "enabled");
-        assert_eq!(thinking["budget_tokens"], 24_000);
-        assert!(config.is_null());
-
-        let (thinking, config) = reasoning("claude-opus-4-5", HIGH, 64_000);
-        assert_eq!(thinking["type"], "enabled");
-        assert_eq!(config["effort"], "high");
-
-        let (_, config) = reasoning("claude-haiku-4-5", HIGH, 64_000);
-        assert!(config.is_null());
-    }
-
-    #[test]
-    fn a_budget_leaves_the_answer_room() {
-        let (thinking, _) = reasoning("claude-sonnet-4-5", HIGH, 4096);
-        assert_eq!(thinking["budget_tokens"], 3072);
-
-        let (thinking, _) = reasoning("claude-sonnet-4-5", HIGH, 2000);
+    fn a_model_before_adaptive_thinking_is_sent_no_thinking() {
+        let (thinking, _) = reasoning("claude-sonnet-4-5", Some("high"));
         assert!(thinking.is_null());
     }
 
@@ -1815,16 +1737,10 @@ mod tests {
     }
 
     #[test]
-    fn a_held_ceiling_is_what_the_budget_comes_out_of() {
+    fn a_held_ceiling_is_sent_as_max_tokens() {
         let mut r = req(vec![msg(Role::User, Some("hi"))]);
         r.model = "claude-haiku-4-5".to_string();
         r.max_completion_tokens = Some(128_000);
-        r.reasoning = Some(ReasoningConfig {
-            effort: Some(ReasoningEffort::High),
-            max_tokens: None,
-            exclude: None,
-            enabled: None,
-        });
         let v = serde_json::to_value(build_body(
             &r,
             4096,
@@ -1834,8 +1750,6 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(v["max_tokens"], 64_000);
-        assert_eq!(v["thinking"]["type"], "enabled");
-        assert_eq!(v["thinking"]["budget_tokens"], 24_000);
     }
 
     #[test]
@@ -1851,9 +1765,8 @@ mod tests {
             "a gateway prefix does not hide the version"
         );
 
-        let (thinking, config) = reasoning("claude-opus-4-20250514", HIGH, 64_000);
-        assert_eq!(thinking["type"], "enabled");
-        assert!(config.is_null());
+        let (thinking, _) = reasoning("claude-opus-4-20250514", Some("high"));
+        assert!(thinking.is_null());
     }
 
     #[test]

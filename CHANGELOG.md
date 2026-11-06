@@ -9,6 +9,10 @@ The `@substructure.ai/cli` package and the `subs`, `substructure-host` and
 
 ## [Unreleased]
 
+### Changed
+
+- The engine now sends `effort` to the provider as written. Before, it changed some values for some models.
+
 ## [0.10.4] - 2026-11-04
 
 ### Added

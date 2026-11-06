@@ -483,7 +483,7 @@ type AgentConfig = {
     model: string               // the only required field
     llm?: string                // the [llm.<id>] block calls run on
     system?: string
-    effort?: "xhigh" | "high" | "medium" | "low" | "minimal" | "none"
+    effort?: string              // sent to the provider as written
     retry?: RetryConfig
     tools?: AgentTool[]
     subagents?: Subagent[]
@@ -703,7 +703,7 @@ type LlmTool = {
 }
 
 type ReasoningConfig = {
-    effort?: "xhigh" | "high" | "medium" | "low" | "minimal" | "none"
+    effort?: string              // sent to the provider as written
     max_tokens?: number
     exclude?: boolean
     enabled?: boolean
