@@ -9,6 +9,8 @@ The `@substructure.ai/cli` package and the `subs`, `substructure-host` and
 
 ## [Unreleased]
 
+## [0.10.5] - 2026-11-06
+
 ### Changed
 
 - The engine now sends `effort` to the provider as written. Before, it changed some values for some models.
@@ -387,7 +389,8 @@ The `@substructure.ai/cli` package and the `subs`, `substructure-host` and
 - The changelog starts again at this release. For the changes before it, refer
   to the git history.
 
-[Unreleased]: https://github.com/substructureai/substructure/compare/v0.10.4...HEAD
+[Unreleased]: https://github.com/substructureai/substructure/compare/v0.10.5...HEAD
+[0.10.5]: https://github.com/substructureai/substructure/compare/v0.10.4...v0.10.5
 [0.10.4]: https://github.com/substructureai/substructure/compare/v0.10.3...v0.10.4
 [0.10.3]: https://github.com/substructureai/substructure/compare/v0.10.2...v0.10.3
 [0.10.2]: https://github.com/substructureai/substructure/compare/v0.10.1...v0.10.2
