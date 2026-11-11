@@ -9,6 +9,10 @@ The `@substructure.ai/cli` package and the `subs`, `substructure-host` and
 
 ## [Unreleased]
 
+### Fixed
+
+- A new turn now keeps the plugin catalog, skill listings and server announcements an earlier turn gave the model. Before, the model lost them after the first turn, and the prompt cache broke at the start of each new turn. A call held at the context limit and sent again keeps them too. Each branch keeps what it was told.
+
 ## [0.10.5] - 2026-11-06
 
 ### Changed

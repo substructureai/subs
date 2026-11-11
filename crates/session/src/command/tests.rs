@@ -25,6 +25,16 @@ use crate::span::SpanContext;
 use crate::Caller;
 use crate::{CommitContext, Session};
 
+/// The context call `id` placed, as the tree records it.
+fn placed_by(agg: &Session, id: &str) -> Vec<crate::prompt_context::Placed> {
+    agg.state
+        .context_versions
+        .iter()
+        .filter(|v| v.value.call == id)
+        .map(|v| v.value.clone())
+        .collect()
+}
+
 fn dispatch(agg: &mut Session, cmd: CommandPayload, caller: &Caller) -> Vec<EventPayload> {
     let now = Utc::now();
     let events = agg.handle(cmd, caller, now).expect("setup command failed");
@@ -8139,9 +8149,132 @@ fn a_connection_is_announced_once_in_the_system_prefix() {
     assert!(text.contains("\"tools\":1"), "and how many it has: {text}");
 
     let second = call(&mut agg, "call-2");
+    assert_eq!(
+        serde_json::to_value(&second).unwrap(),
+        serde_json::to_value(&first).unwrap(),
+        "a later prompt carries the announcement the earlier call made, as it was made"
+    );
     assert!(
-        second.is_empty(),
-        "a server is announced once, and the record is on the earlier call: {second:?}"
+        placed_by(&agg, "call-2").is_empty(),
+        "a server is announced once, and the record is on the earlier call"
+    );
+}
+
+/// Sends call `id` at the head with `path` as its request; the prompt it sent.
+fn send_at_head(agg: &mut Session, id: &str, path: Vec<DraftMessage>) -> Vec<Message> {
+    dispatch(
+        agg,
+        CommandPayload::RequestLlmCall {
+            llm: "claude".to_string(),
+            call_id: id.to_string(),
+            request: request_with(path),
+            stream: false,
+            retry: RetryPolicy::no_retry(),
+            handler: LlmHandler::Server,
+            format: None,
+        },
+        &system(),
+    );
+    agg.state.llm_call(id).unwrap().prompt.clone()
+}
+
+fn context_ids(prompt: &[Message]) -> Vec<String> {
+    prompt
+        .iter()
+        .filter(|m| m.id.contains("-ctx-"))
+        .map(|m| m.id.clone())
+        .collect()
+}
+
+fn starts_with(prompt: &[Message], prefix: &[Message]) -> bool {
+    prompt.len() >= prefix.len()
+        && serde_json::to_value(&prompt[..prefix.len()]).unwrap()
+            == serde_json::to_value(prefix).unwrap()
+}
+
+#[test]
+fn context_follows_the_branch_a_prompt_is_on() {
+    let mut agg = session_with_searched_connector("sentry", &["search_issues"]);
+    let u1 = node_msg("u1", Role::User, "hi");
+    let a1 = node_msg("a1", Role::Assistant, "hello");
+    let u2 = node_msg("u2", Role::User, "more");
+
+    let d = open_decision(&mut agg, "hi");
+    submit_state(&mut agg, d, vec![u1.clone()], None);
+    let first = send_at_head(&mut agg, "call-1", vec![u1.clone()]);
+    assert_eq!(context_ids(&first), ["call-1-ctx-mcp.sentry"]);
+
+    let d = open_decision(&mut agg, "more");
+    submit_state(&mut agg, d, vec![u1.clone(), a1.clone(), u2.clone()], None);
+    let second = send_at_head(&mut agg, "call-2", vec![u1.clone(), a1.clone(), u2.clone()]);
+    assert!(
+        starts_with(&second, &first),
+        "the next turn reads the last call's prompt first: {second:?}"
+    );
+
+    let d = open_decision(&mut agg, "start over");
+    let x1 = node_msg("x1", Role::User, "start over");
+    submit_state(&mut agg, d, vec![x1.clone()], None);
+    assert!(!agg.state.has_node("u1"), "the first branch is unloaded");
+    let other = send_at_head(&mut agg, "call-3", vec![x1]);
+    assert_eq!(
+        context_ids(&other),
+        ["call-3-ctx-mcp.sentry"],
+        "a branch that never heard the announcement is told it, not handed the other branch's"
+    );
+
+    let d = open_decision(&mut agg, "back");
+    let u3 = node_msg("u3", Role::User, "back");
+    submit_state(
+        &mut agg,
+        d,
+        vec![u1.clone(), a1.clone(), u2.clone(), u3.clone()],
+        None,
+    );
+    assert!(agg.state.has_node("u1"), "the first branch is loaded again");
+    let back = send_at_head(&mut agg, "call-4", vec![u1, a1, u2, u3]);
+    assert_eq!(
+        context_ids(&back),
+        ["call-1-ctx-mcp.sentry"],
+        "returning to a branch returns to what it was told"
+    );
+    assert!(
+        starts_with(&back, &second),
+        "and to the prefix its last call sent: {back:?}"
+    );
+    assert!(
+        placed_by(&agg, "call-4").is_empty(),
+        "nothing is told twice"
+    );
+}
+
+#[test]
+fn a_fork_after_the_context_was_placed_keeps_it() {
+    let mut agg = session_with_searched_connector("sentry", &["search_issues"]);
+    let u1 = node_msg("u1", Role::User, "hi");
+    let a1 = node_msg("a1", Role::Assistant, "hello");
+
+    let d = open_decision(&mut agg, "hi");
+    submit_state(&mut agg, d, vec![u1.clone()], None);
+    let first = send_at_head(&mut agg, "call-1", vec![u1.clone()]);
+
+    let d = open_decision(&mut agg, "more");
+    let u2 = node_msg("u2", Role::User, "more");
+    submit_state(&mut agg, d, vec![u1.clone(), a1.clone(), u2.clone()], None);
+    send_at_head(&mut agg, "call-2", vec![u1.clone(), a1.clone(), u2]);
+
+    let d = open_decision(&mut agg, "instead");
+    let z2 = node_msg("z2", Role::User, "instead");
+    submit_state(&mut agg, d, vec![u1.clone(), a1.clone(), z2.clone()], None);
+    assert!(!agg.state.has_node("u2"), "the sibling is unloaded");
+    let fork = send_at_head(&mut agg, "call-3", vec![u1, a1, z2]);
+    assert!(
+        starts_with(&fork, &first),
+        "the shared prefix keeps the context it was given: {fork:?}"
+    );
+    assert!(
+        placed_by(&agg, "call-3").is_empty(),
+        "nothing is told twice"
     );
 }
 
@@ -12333,9 +12466,14 @@ fn the_catalog_rides_the_first_prompt_once() {
     assert!(text.contains("Fill out PDF forms."), "{text}");
 
     let second = prompt(&mut agg, "call-2");
+    assert_eq!(
+        serde_json::to_value(&second).unwrap(),
+        serde_json::to_value(&first).unwrap(),
+        "a later prompt carries the catalog the earlier call wrote, as it was written"
+    );
     assert!(
-        second.is_empty(),
-        "a plugin is cataloged once per path: {second:?}"
+        placed_by(&agg, "call-2").is_empty(),
+        "a plugin is cataloged once per path"
     );
 }
 
@@ -12981,12 +13119,14 @@ fn an_agents_own_skill_is_listed_once_and_answered_from_the_skills_bundle() {
         .collect();
     assert_eq!(listed.len(), 1, "one entry for the skill: {listed:?}");
     dispatched_tools(&mut agg, "call-2");
+    let second = agg.state.llm_call("call-2").expect("the call");
+    assert_eq!(
+        serde_json::to_value(&second.prompt).unwrap(),
+        serde_json::to_value(&agg.state.llm_call("call-1").expect("the call").prompt).unwrap(),
+        "a later prompt carries the entry as the earlier call wrote it"
+    );
     assert!(
-        agg.state
-            .llm_call("call-2")
-            .expect("the call")
-            .prompt
-            .is_empty(),
+        placed_by(&agg, "call-2").is_empty(),
         "an entry is written once"
     );
 
@@ -13919,8 +14059,15 @@ fn code_mode_lists_each_skill_with_its_tools_once_in_the_conversation() {
             .is_some(),
         "the next call dispatches"
     );
+    assert_eq!(
+        catalog(&agg, "call-2"),
+        first,
+        "the next call still reads what the first was told"
+    );
     assert!(
-        catalog(&agg, "call-2").is_empty(),
+        placed_by(&agg, "call-2")
+            .iter()
+            .all(|p| !p.content.contains("in `run_code`")),
         "what was told is not told again"
     );
 }
