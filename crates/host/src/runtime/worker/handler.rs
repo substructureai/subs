@@ -472,6 +472,7 @@ mod tests {
         dispatch(
             &mut agg,
             CommandPayload::RequestLlmCall {
+                source: Default::default(),
                 llm: "claude".to_string(),
                 call_id: "call-1".to_string(),
                 request: LlmRequest {

@@ -787,7 +787,7 @@
         "oneOf": [
           {
             "additionalProperties": false,
-            "description": "A flat LLM request. Every field is optional.\n\nWithout `id`, the engine mints one, and it becomes the assistant node's\nid. A field left out comes from the agent config, then from the engine's\ndefault. Without `messages`, the request carries the config's system\nmessage and the decision's view. Given `messages`, no system message is\nadded.",
+            "description": "A flat LLM request. Every field is optional.\n\nWithout `id`, the engine mints one, and it becomes the assistant node's\nid. A field left out comes from the agent config, then from the engine's\ndefault. Without `messages`, the engine builds the prompt from the\nconversation: the config's system message, the decision's view, and\nthe context the engine adds. Given `messages`, the engine sends them as\nwritten.",
             "properties": {
               "id": {
                 "type": [

@@ -2740,9 +2740,10 @@ pub enum DecisionAction {
     ///
     /// Without `id`, the engine mints one, and it becomes the assistant node's
     /// id. A field left out comes from the agent config, then from the engine's
-    /// default. Without `messages`, the request carries the config's system
-    /// message and the decision's view. Given `messages`, no system message is
-    /// added.
+    /// default. Without `messages`, the engine builds the prompt from the
+    /// conversation: the config's system message, the decision's view, and
+    /// the context the engine adds. Given `messages`, the engine sends them as
+    /// written.
     #[serde(rename = "llm.call")]
     CallLlm {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3018,6 +3019,33 @@ impl LlmTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_llm_call_with_null_messages_has_none() {
+        let read = |v: Value| match serde_json::from_value::<DecisionAction>(v).unwrap() {
+            DecisionAction::CallLlm { messages, .. } => messages,
+            other => panic!("an llm.call: {other:?}"),
+        };
+        assert!(read(serde_json::json!({ "type": "llm.call" })).is_none());
+        assert!(
+            read(serde_json::json!({ "type": "llm.call", "messages": null })).is_none(),
+            "a typed worker that echoes an absent field as null leaves it out"
+        );
+        let out = serde_json::to_value(DecisionAction::CallLlm {
+            id: None,
+            llm: None,
+            model: None,
+            messages: None,
+            tools: None,
+            temperature: None,
+            max_completion_tokens: None,
+            reasoning: None,
+            stream: None,
+            retry: None,
+        })
+        .unwrap();
+        assert_eq!(out, serde_json::json!({ "type": "llm.call" }));
+    }
 
     #[test]
     fn queue_reads_a_flag_or_a_word() {

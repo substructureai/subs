@@ -343,6 +343,7 @@ mod tests {
             id,
             tracking(status),
             EffectPayload::LlmCall(LlmCallState {
+                source: Default::default(),
                 defer_tools_strategy: Default::default(),
                 context_ids: Vec::new(),
                 sent_tools: None,

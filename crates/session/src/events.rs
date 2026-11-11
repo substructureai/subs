@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use super::decision::{LlmHandler, ToolHandler, Trigger};
+use super::decision::{LlmHandler, PromptSource, ToolHandler, Trigger};
 use crate::connectors::ConnectionPath;
 use crate::connectors::{AuthNeed, RemoteTool};
 pub use crate::protocol::EffectKind;
@@ -138,6 +138,8 @@ pub struct ContextLimited {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<u64>,
     pub call: HeldCall,
+    #[serde(default)]
+    pub source: PromptSource,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -261,7 +263,11 @@ pub struct LlmCallRequested {
     pub id: String,
     pub attempt: u32,
     pub llm: String,
+    /// A tree call's `messages` are empty: its prompt is built when it is
+    /// sent.
     pub request: LlmRequest,
+    #[serde(default)]
+    pub source: PromptSource,
     pub stream: bool,
     pub retry: RetryPolicy,
     #[serde(default)]
@@ -276,6 +282,9 @@ pub struct LlmCallRequested {
 pub struct LlmCallDispatched {
     pub id: String,
     pub attempt: u32,
+    /// A hash of the prompt sent, ids left out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -57,6 +57,33 @@ pub enum LlmHandler {
     Worker,
 }
 
+/// Where a model call's prompt comes from.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PromptSource {
+    /// Built from the conversation up to `at` when the call is sent. `at` is
+    /// the head when the call is requested.
+    Tree {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at: Option<String>,
+    },
+    /// Sent as written.
+    Explicit,
+    /// Recorded before calls named their source.
+    #[default]
+    Legacy,
+}
+
+impl PromptSource {
+    pub fn tree() -> Self {
+        Self::Tree { at: None }
+    }
+
+    pub fn is_tree(&self) -> bool {
+        matches!(self, Self::Tree { .. })
+    }
+}
+
 impl From<ToolHandler> for Handler {
     fn from(h: ToolHandler) -> Self {
         match h {
@@ -412,6 +439,8 @@ pub enum Action {
         id: String,
         llm: String,
         request: LlmRequest,
+        #[serde(default)]
+        source: PromptSource,
         #[serde(default)]
         stream: bool,
         #[serde(default = "RetryPolicy::no_retry")]

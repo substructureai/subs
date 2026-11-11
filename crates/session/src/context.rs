@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 
+use crate::decision::PromptSource;
 use crate::events::ContextLimited;
 use crate::prompts::context as prompts;
 use crate::protocol::{
@@ -105,7 +106,27 @@ pub fn strategy(config: Option<&AgentConfig>, kind: ContextStrategyKind) -> Cont
         })
 }
 
-pub fn limit(state: &SessionState, call: &HeldCall, now: DateTime<Utc>) -> Option<ContextLimited> {
+/// `call` with the prompt it would send now. A tree call arrives without one.
+fn held(state: &SessionState, call: &HeldCall, source: &PromptSource) -> HeldCall {
+    if !source.is_tree() {
+        return call.clone();
+    }
+    let out = state.at_head().outgoing(&call.id, source, &[], &[]);
+    HeldCall {
+        request: LlmRequest {
+            messages: out.prompt.into_iter().map(DraftMessage::from).collect(),
+            ..call.request.clone()
+        },
+        ..call.clone()
+    }
+}
+
+pub fn limit(
+    state: &SessionState,
+    call: &HeldCall,
+    source: &PromptSource,
+    now: DateTime<Utc>,
+) -> Option<ContextLimited> {
     let passes = state
         .limited
         .as_ref()
@@ -118,6 +139,7 @@ pub fn limit(state: &SessionState, call: &HeldCall, now: DateTime<Utc>) -> Optio
     let context = context_of(config.as_ref())?;
     let path = at.transcript();
     let window = context.window;
+    let call = held(state, call, source);
     let tokens = read_tokens(state, &call.request);
     let idle_for = match (state.turn_called, state.last_turn_at) {
         (false, Some(at)) => Some(u64::try_from((now - at).num_seconds()).unwrap_or_default()),
@@ -131,6 +153,7 @@ pub fn limit(state: &SessionState, call: &HeldCall, now: DateTime<Utc>) -> Optio
             tokens,
             window,
             call: call.clone(),
+            source: source.clone(),
         })
     })
 }
@@ -158,6 +181,7 @@ pub fn overflow(state: &SessionState, id: &str) -> Option<ContextLimited> {
             request,
             stream: call.stream,
         },
+        source: call.source.clone(),
     })
 }
 
@@ -312,23 +336,32 @@ pub fn summary_call(
     })
 }
 
-pub fn reissue(call: &HeldCall, view: Option<Vec<DraftMessage>>) -> DecisionAction {
+/// The held call again, on `view` when the history was replaced. A tree call
+/// stays one: it reads the history as it is then.
+pub fn reissue(
+    call: &HeldCall,
+    source: &PromptSource,
+    view: Option<Vec<DraftMessage>>,
+) -> DecisionAction {
     let request = &call.request;
-    let messages = match view {
-        Some(view) => request
-            .messages
-            .iter()
-            .take_while(|m| m.role == Role::System)
-            .cloned()
-            .chain(view)
-            .collect(),
-        None => request.messages.clone(),
+    let messages = match (source, view) {
+        (PromptSource::Tree { .. }, _) => None,
+        (_, Some(view)) => Some(
+            request
+                .messages
+                .iter()
+                .take_while(|m| m.role == Role::System)
+                .cloned()
+                .chain(view)
+                .collect(),
+        ),
+        (_, None) => Some(request.messages.clone()),
     };
     DecisionAction::CallLlm {
         id: Some(call.id.clone()),
         llm: Some(call.llm.clone()),
         model: Some(request.model.clone()),
-        messages: Some(messages),
+        messages,
         tools: request.tools.clone(),
         temperature: request.temperature,
         max_completion_tokens: request.max_completion_tokens,

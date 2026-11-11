@@ -323,7 +323,7 @@ type Action =
           id?: string             // missing field from the agent config, then
           llm?: string            // from its own defaults
           model?: string
-          messages?: DraftMessage[]  // set these and the engine adds no system prompt
+          messages?: DraftMessage[]  // set these and the engine sends them as written
           tools?: LlmTool[]
           temperature?: number
           max_completion_tokens?: number
@@ -409,6 +409,18 @@ type Action =
 
 `{ "type": "llm.call" }` on its own prompts the model with the agent's config
 over the current conversation.
+
+Leave `messages` out and the engine builds the prompt from the conversation when
+it sends the call: the config's system message, the active path, and the context
+that the engine adds, such as the plugin catalog, the skill listings and the
+server announcements. Each of those stays where the model first read it, so a
+later call starts with the same prompt. A `proposed` call has no `messages`.
+Return it as it is.
+
+Set `messages` and your worker owns the prompt. The engine sends it as written.
+It adds no system message and no context, and the call does not count as telling
+the conversation anything. Use it for a call beside the conversation, such as
+one that writes a title.
 
 `llm.call` takes an `llm` to send one call to another block. The config stays as
 it is. See [LLMs](./70-llms.md).

@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::decision::{LlmHandler, ToolHandler, Trigger};
+use super::decision::{LlmHandler, PromptSource, ToolHandler, Trigger};
 use super::events::*;
 use super::prompt_context;
 use super::tool_contract::classify_arguments;
@@ -379,6 +379,8 @@ pub struct LastRead {
 pub struct Limited {
     pub reason: ContextReason,
     pub call: HeldCall,
+    #[serde(default)]
+    pub source: PromptSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -393,8 +395,11 @@ impl Limited {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmCallState {
+    /// What the model read. A tree call's is empty until it is sent.
     #[serde(default)]
     pub prompt: Vec<Message>,
+    #[serde(default)]
+    pub source: PromptSource,
     pub llm: String,
     pub spec: LlmCallSpec,
     pub stream: bool,
@@ -404,6 +409,7 @@ pub struct LlmCallState {
     pub format: Option<LlmFormat>,
     #[serde(default)]
     pub defer_tools_strategy: DeferToolsStrategy,
+    /// The contexts a legacy call placed. The tree records the rest.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context_ids: Vec<String>,
     /// The tools the model gets, set at dispatch from `spec.tools`, which
@@ -413,7 +419,7 @@ pub struct LlmCallState {
 }
 
 impl LlmCallState {
-    /// What call `id` placed, read back from its prompt, for a call sent
+    /// What legacy call `id` placed, read back from its prompt, for a call sent
     /// before context was recorded on the tree. Its own system and own
     /// context messages are there; inline context it appended cannot be told
     /// apart and is not returned.
@@ -444,6 +450,7 @@ impl LlmCallState {
                     placement,
                     content,
                     after,
+                    ids: Vec::new(),
                 })
             })
             .collect()
@@ -595,6 +602,17 @@ pub type AgentVersion = Versioned<AgentConfig>;
 
 /// Context a call placed, anchored where the call was made.
 pub type ContextVersion = Versioned<prompt_context::Placed>;
+
+/// A prompt about to be sent.
+#[derive(Debug, Clone)]
+pub struct Outgoing {
+    /// Where the call reads from.
+    pub node: Option<String>,
+    pub prompt: Vec<Message>,
+    /// The context this send places.
+    pub placed: Vec<prompt_context::Placed>,
+    context_ids: Vec<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenInterrupt {
@@ -1200,8 +1218,12 @@ impl SessionState {
         let spec = LlmCallSpec::from(&payload.request);
         if let Some(existing) = self.effect_mut(EffectKind::LlmCall, &payload.id) {
             existing.tracking.requeue();
+            if let PromptSource::Tree { at } = &payload.source {
+                existing.anchor = at.clone();
+            }
             if let Some(call) = existing.llm_mut() {
                 call.prompt = prompt;
+                call.source = payload.source.clone();
                 call.llm = payload.llm.clone();
                 call.spec = spec;
                 call.stream = payload.stream;
@@ -1216,6 +1238,7 @@ impl SessionState {
                 EffectTracking::new_queued(payload.retry.clone()),
                 EffectPayload::LlmCall(LlmCallState {
                     prompt,
+                    source: payload.source.clone(),
                     llm: payload.llm.clone(),
                     spec,
                     stream: payload.stream,
@@ -1234,23 +1257,41 @@ impl SessionState {
         self.enqueue(ctx.sequence, EffectKind::LlmCall, &payload.id);
     }
 
+    /// The prompt call `id` sends from the state as it stands, and the context
+    /// that send places. Every prompt comes from here.
+    pub fn outgoing(&self, id: &str) -> Option<Outgoing> {
+        let effect = self.effect(EffectKind::LlmCall, id)?;
+        let call = effect.llm()?;
+        let node = match &call.source {
+            PromptSource::Tree { at } => at.clone(),
+            _ => effect.anchor.clone().or_else(|| self.head_id.clone()),
+        };
+        Some(
+            self.at(node.as_deref())
+                .outgoing(id, &call.source, &call.prompt, &call.context_ids),
+        )
+    }
+
     fn apply_llm_dispatched(&mut self, payload: &LlmCallDispatched, ctx: &ApplyContext) {
-        let node = self
-            .effect(EffectKind::LlmCall, &payload.id)
-            .and_then(|e| e.anchor.clone())
-            .or_else(|| self.head_id.clone());
-        let summary = self.is_summary_call(&payload.id);
-        let at = self.at(node.as_deref());
+        let Some(out) = self.outgoing(&payload.id) else {
+            self.dequeue(EffectKind::LlmCall, &payload.id);
+            return;
+        };
+        if let Some(recorded) = &payload.fingerprint {
+            let built = prompt_context::fingerprint(&out.prompt);
+            if *recorded != built {
+                tracing::warn!(
+                    call_id = %payload.id,
+                    %recorded,
+                    %built,
+                    "the prompt built for a call is not the prompt it sent"
+                );
+            }
+        }
+        let at = self.at(out.node.as_deref());
         let connector_tools = at.connector_tools().tools;
         let locked = at.locked_tools();
         let run_code = at.run_code();
-        let owed = prompt_context::owed(at, &payload.id);
-        let system_open = at.system_prefix_open(&payload.id);
-        let carried = match summary {
-            true => Vec::new(),
-            false => at.placed_on_path(),
-        };
-        let mut placed = Vec::new();
         if let Some(effect) = self.effect_mut(EffectKind::LlmCall, &payload.id) {
             effect.tracking.dispatch(ctx.occurred_at);
             if let Some(call) = effect.llm_mut() {
@@ -1258,23 +1299,16 @@ impl SessionState {
                     Some(run_code) => Some(vec![run_code]),
                     None => sent_tools(call.spec.tools.clone(), &connector_tools, &locked),
                 };
-                prompt_context::carry(&mut call.prompt, &carried);
-                prompt_context::merge(
-                    &mut call.prompt,
-                    &mut call.context_ids,
-                    &mut placed,
-                    &payload.id,
-                    system_open,
-                    owed,
-                );
+                call.prompt = out.prompt;
+                call.context_ids = out.context_ids;
             }
         }
         self.context_versions
-            .extend(placed.into_iter().map(|value| Logged {
+            .extend(out.placed.into_iter().map(|value| Logged {
                 seq: ctx.sequence,
                 entry: ContextVersion {
                     value,
-                    anchor: node.clone(),
+                    anchor: out.node.clone(),
                 },
             }));
         self.dequeue(EffectKind::LlmCall, &payload.id);
@@ -1869,6 +1903,7 @@ impl SessionState {
                 self.limited = Some(Limited {
                     reason: p.reason,
                     call: p.call.clone(),
+                    source: p.source.clone(),
                     summary: None,
                     released: false,
                 });
@@ -2759,15 +2794,87 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
             .collect()
     }
 
-    pub fn context_ids_on_path(&self, exclude: &str) -> std::collections::HashSet<String> {
+    /// The contexts the path was told: what the tree records, and what its
+    /// legacy calls placed.
+    pub fn said(&self) -> std::collections::HashSet<String> {
         let path = self.path_set();
-        self.state
+        let legacy = self
+            .state
             .effects
             .values()
-            .filter(|e| e.id != exclude && SessionState::anchored_on(&path, e.anchor.as_deref()))
+            .filter(|e| SessionState::anchored_on(&path, e.anchor.as_deref()))
             .filter_map(EffectState::llm)
-            .flat_map(|call| call.context_ids.iter().cloned())
+            .flat_map(|call| call.context_ids.iter().cloned());
+        self.state
+            .context_versions
+            .iter()
+            .filter(|v| SessionState::anchored_on(&path, v.anchor.as_deref()))
+            .flat_map(|v| v.value.ids.iter().cloned())
+            .chain(legacy)
             .collect()
+    }
+
+    /// The prompt a call from `source` sends from this node. A tree call's is
+    /// the config's system message and the path, with each context the path
+    /// placed where it first went, then what is newly owed. An explicit
+    /// call's is `given`, as written. A legacy call's is `given`, with the
+    /// path's context put back.
+    pub fn outgoing(
+        &self,
+        id: &str,
+        source: &PromptSource,
+        given: &[Message],
+        applied: &[String],
+    ) -> Outgoing {
+        let node = self.node.map(str::to_string);
+        let mut out = Outgoing {
+            node,
+            prompt: given.to_vec(),
+            placed: Vec::new(),
+            context_ids: applied.to_vec(),
+        };
+        match source {
+            PromptSource::Explicit => return out,
+            PromptSource::Tree { .. } => {
+                let view: Vec<DraftMessage> = self
+                    .transcript()
+                    .into_iter()
+                    .map(DraftMessage::from)
+                    .collect();
+                let prompt = match self.resolve_agent_for() {
+                    Some(config) => config.prompt_for(&view),
+                    None => view,
+                };
+                out.prompt = prompt
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, m)| m.recorded(format!("{id}:{i}")))
+                    .collect();
+                prompt_context::restore(&mut out.prompt, &self.placed_on_path());
+                prompt_context::merge(
+                    &mut out.prompt,
+                    &mut Vec::new(),
+                    &mut out.placed,
+                    id,
+                    self.system_prefix_open(id),
+                    prompt_context::owed(*self),
+                );
+            }
+            PromptSource::Legacy => {
+                if !self.state.is_summary_call(id) {
+                    prompt_context::carry(&mut out.prompt, &self.placed_on_path());
+                }
+                prompt_context::merge(
+                    &mut out.prompt,
+                    &mut out.context_ids,
+                    &mut out.placed,
+                    id,
+                    self.system_prefix_open(id),
+                    prompt_context::owed(*self),
+                );
+            }
+        }
+        out
     }
 
     /// The context placed on the path, in the order placed. A call sent
@@ -2802,11 +2909,13 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
         placed.into_iter().map(|(_, p)| p).collect()
     }
 
+    /// No call but `exclude` has read the path's prompt yet. An explicit call
+    /// reads its own.
     pub fn system_prefix_open(&self, exclude: &str) -> bool {
         let path = self.path_set();
         !self.state.effects.values().any(|e| {
             e.id != exclude
-                && matches!(e.payload, EffectPayload::LlmCall(_))
+                && e.llm().is_some_and(|c| c.source != PromptSource::Explicit)
                 && SessionState::anchored_on(&path, e.anchor.as_deref())
                 && e.tracking.status() != EffectStatus::Queued
         })
@@ -2994,6 +3103,7 @@ mod open_llm_calls_tests {
             call_id,
             EffectTracking::new(RetryPolicy::no_retry(), Utc::now()),
             EffectPayload::LlmCall(LlmCallState {
+                source: Default::default(),
                 defer_tools_strategy: Default::default(),
                 context_ids: Vec::new(),
                 sent_tools: None,

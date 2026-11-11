@@ -2,19 +2,32 @@ use std::collections::HashSet;
 
 use super::Working;
 use crate::context;
-use crate::decision::Trigger;
+use crate::decision::{PromptSource, Trigger};
 use crate::events::*;
 use crate::ids::Ids;
 use crate::protocol::{DraftMessage, HeldCall, NewMessage, Role};
 use crate::state::SessionState;
 
 impl Working {
-    pub(super) fn held_for_room(&mut self, call: &HeldCall) -> bool {
+    /// A call held before calls named their source runs again as one of
+    /// those.
+    pub(super) fn held_source(&self, id: &str, source: PromptSource) -> PromptSource {
+        let legacy = self
+            .limited
+            .as_ref()
+            .is_some_and(|l| l.call.id == id && l.source == PromptSource::Legacy);
+        match source {
+            PromptSource::Explicit if legacy => PromptSource::Legacy,
+            source => source,
+        }
+    }
+
+    pub(super) fn held_for_room(&mut self, call: &HeldCall, source: &PromptSource) -> bool {
         if self.holds(&call.id) {
             self.emit(EventPayload::ContextKept);
             return false;
         }
-        let Some(limited) = context::limit(&self.state, call, self.now) else {
+        let Some(limited) = context::limit(&self.state, call, source, self.now) else {
             return false;
         };
         let trigger = Trigger::ContextLimit {

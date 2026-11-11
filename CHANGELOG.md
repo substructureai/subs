@@ -9,9 +9,17 @@ The `@substructure.ai/cli` package and the `subs`, `substructure-host` and
 
 ## [Unreleased]
 
+### Changed
+
+- An `llm.call` with no `messages` now gets its prompt from the conversation when the engine sends it. A `proposed` call has no `messages`.
+- An `llm.call` with `messages` is now sent as written. The engine adds no plugin catalog, skill listings or server announcements to it.
+- `llm.call.requested` now has a `source`. It says if the prompt comes from the conversation or from the worker.
+- `llm.call.dispatched` now has a `fingerprint` of the prompt that the engine sent.
+
 ### Fixed
 
 - A new turn now keeps the plugin catalog, skill listings and server announcements an earlier turn gave the model. Before, the model lost them after the first turn, and the prompt cache broke at the start of each new turn. A call held at the context limit and sent again keeps them too. Each branch keeps what it was told.
+- A call that runs again after `context.replace` now reads the plugin catalog, skill listings and server announcements one time. Before, a later call could read them two times.
 
 ## [0.10.5] - 2026-11-06
 

@@ -93,8 +93,8 @@ kind of call:
 
 | Event | Meaning |
 | --- | --- |
-| `llm.call.requested` | A call was recorded. |
-| `llm.call.dispatched` | The call went out. |
+| `llm.call.requested` | A call was recorded. `source` says where its prompt comes from: `{ kind: "tree", at }` is built from the conversation up to the node `at`, and `request.messages` is empty. `{ kind: "explicit" }` is `request.messages` as the worker wrote them. An event with no `source` is from an older engine. |
+| `llm.call.dispatched` | The call went out. `fingerprint` is a hash of the prompt it sent, with the message ids left out. |
 | `llm.call.completed` | The call returned. |
 | `llm.call.errored` | The call failed. |
 

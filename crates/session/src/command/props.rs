@@ -315,6 +315,7 @@ impl World {
         acts.into_iter()
             .map(|a| match a {
                 ActOp::CallLlm { worker } => Action::CallLlm {
+                    source: Default::default(),
                     llm: "claude".to_string(),
                     format: None,
                     id: self.mint(),

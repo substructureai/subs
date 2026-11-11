@@ -1,7 +1,7 @@
 use super::{decision_queued, fail, mismatched, void_events, KindSpec, Outcome, SettleError};
 use crate::command::SessionError;
 use crate::cx::Cx;
-use crate::decision::{LlmHandler, Trigger};
+use crate::decision::{LlmHandler, PromptSource, Trigger};
 use crate::events::*;
 use crate::protocol::{
     Content, DraftMessage, EffectStatus, ErrorCode, ErrorInfo, LlmFormat, LlmRequest, LlmResponse,
@@ -81,6 +81,9 @@ impl KindSpec for LlmSpec {
         vec![EventPayload::LlmCallDispatched(LlmCallDispatched {
             id: id.to_string(),
             attempt: effect.tracking.retry.attempts,
+            fingerprint: state
+                .outgoing(id)
+                .map(|out| crate::prompt_context::fingerprint(&out.prompt)),
         })]
     }
 
@@ -117,7 +120,11 @@ impl KindSpec for LlmSpec {
             id: id.to_string(),
             attempt: t.retry.attempts,
             llm: call.llm.clone(),
-            request: call.spec.to_request(call.prompt.clone()),
+            request: call.spec.to_request(match call.source {
+                PromptSource::Tree { .. } => Vec::new(),
+                _ => call.prompt.clone(),
+            }),
+            source: call.source.clone(),
             stream: call.stream,
             retry: t.retry_policy.clone(),
             handler: call.handler,
@@ -163,6 +170,7 @@ pub fn request(
     call_id: String,
     llm: String,
     request: LlmRequest,
+    source: PromptSource,
     stream: bool,
     retry: RetryPolicy,
     handler: LlmHandler,
@@ -183,12 +191,24 @@ pub fn request(
         );
         return Ok(Vec::new());
     }
+    let (messages, source) = match source {
+        PromptSource::Tree { .. } => (
+            Vec::new(),
+            PromptSource::Tree {
+                at: state.head_id.clone(),
+            },
+        ),
+        source => (
+            request
+                .messages
+                .into_iter()
+                .map(|m| DraftMessage::from(m.record(state.ids())))
+                .collect(),
+            source,
+        ),
+    };
     let request = LlmRequest {
-        messages: request
-            .messages
-            .into_iter()
-            .map(|m| DraftMessage::from(m.record(state.ids())))
-            .collect(),
+        messages,
         ..request
     };
     let defer_tools_strategy = state
@@ -201,6 +221,7 @@ pub fn request(
         attempt: 0,
         llm,
         request,
+        source,
         stream,
         retry,
         handler,

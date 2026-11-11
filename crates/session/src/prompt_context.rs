@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::protocol::{Content, McpAnnounce, Message, Role, StoredContent};
+use crate::protocol::{Content, DraftMessage, McpAnnounce, Message, Role, StoredContent};
 use crate::state::SessionStateAtNode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,6 +25,9 @@ pub struct Placed {
     /// For `own`, the message it followed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after: Option<String>,
+    /// The contexts it holds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -34,7 +37,7 @@ pub struct PromptContext {
     pub content: String,
 }
 
-pub type Contributor = fn(SessionStateAtNode, &str) -> Vec<PromptContext>;
+pub type Contributor = fn(SessionStateAtNode) -> Vec<PromptContext>;
 
 const CONTRIBUTORS: &[Contributor] = &[
     plugin_catalog,
@@ -43,26 +46,27 @@ const CONTRIBUTORS: &[Contributor] = &[
     announce_unavailable,
 ];
 
-pub fn owed(at: SessionStateAtNode, call_id: &str) -> Vec<PromptContext> {
+/// The contexts the path at `at` was not told yet.
+pub fn owed(at: SessionStateAtNode) -> Vec<PromptContext> {
+    let said = at.said();
     CONTRIBUTORS
         .iter()
-        .flat_map(|contribute| contribute(at, call_id))
+        .flat_map(|contribute| contribute(at))
+        .filter(|c| !said.contains(&c.id))
         .collect()
 }
 
-fn announce_servers(at: SessionStateAtNode, call_id: &str) -> Vec<PromptContext> {
+fn announce_servers(at: SessionStateAtNode) -> Vec<PromptContext> {
     let Some(config) = at.resolve_agent_for() else {
         return Vec::new();
     };
     if config.mcp_announce == McpAnnounce::Never {
         return Vec::new();
     }
-    let said = at.context_ids_on_path(call_id);
     at.state()
         .servers_for(&config)
         .into_iter()
         .map(|server| (server.path.to_string(), server))
-        .filter(|(id, _)| !said.contains(id))
         .filter_map(|(id, server)| {
             Some(PromptContext {
                 id,
@@ -73,18 +77,14 @@ fn announce_servers(at: SessionStateAtNode, call_id: &str) -> Vec<PromptContext>
         .collect()
 }
 
-fn announce_unavailable(at: SessionStateAtNode, call_id: &str) -> Vec<PromptContext> {
+fn announce_unavailable(at: SessionStateAtNode) -> Vec<PromptContext> {
     let Some(config) = at.resolve_agent_for() else {
         return Vec::new();
     };
-    let said = at.context_ids_on_path(call_id);
     let mut owed = Vec::new();
     for (path, auth) in at.unavailable_connectors(&config) {
         let reason = crate::prompts::context::unavailable_reason(auth);
         let id = format!("{path}:unavailable:{reason}");
-        if said.contains(&id) {
-            continue;
-        }
         let content = serde_json::to_string(&Unavailable {
             mcp_server: &path,
             unavailable: true,
@@ -107,18 +107,16 @@ struct Unavailable<'a> {
     reason: &'static str,
 }
 
-fn plugin_catalog(at: SessionStateAtNode, call_id: &str) -> Vec<PromptContext> {
+fn plugin_catalog(at: SessionStateAtNode) -> Vec<PromptContext> {
     let Some(config) = at.resolve_agent_for() else {
         return Vec::new();
     };
-    let said = at.context_ids_on_path(call_id);
     let code = config.codemode.is_some();
     let searched = config.searches_skills() && !code;
     config
         .plugins
         .iter()
         .map(|plugin| (plugin, format!("plugin.{}", plugin.id)))
-        .filter(|(_, id)| !said.contains(id))
         .map(|(plugin, id)| {
             let skills: Vec<SkillListing> = match searched {
                 true => Vec::new(),
@@ -156,19 +154,17 @@ fn plugin_catalog(at: SessionStateAtNode, call_id: &str) -> Vec<PromptContext> {
 
 /// One entry for each of the agent's own skills, so a skill the worker adds
 /// later lists itself without rewriting what the model has read.
-fn skill_catalog(at: SessionStateAtNode, call_id: &str) -> Vec<PromptContext> {
+fn skill_catalog(at: SessionStateAtNode) -> Vec<PromptContext> {
     let Some(config) = at.resolve_agent_for() else {
         return Vec::new();
     };
     if config.searches_skills() && config.codemode.is_none() {
         return Vec::new();
     }
-    let said = at.context_ids_on_path(call_id);
     config
         .skills
         .iter()
         .map(|skill| (skill, format!("skill.{}", skill.name)))
-        .filter(|(_, id)| !said.contains(id))
         .map(|(skill, id)| PromptContext {
             id,
             placement: Placement::System,
@@ -217,9 +213,54 @@ struct SkillListing {
     tools: Vec<String>,
 }
 
-/// Puts back each context earlier calls on the path `placed` that `prompt` no
-/// longer holds, where it first went. A prompt built afresh from the path, a
-/// new turn's or a retry's, holds none of it.
+/// Puts each context the path `placed` into `prompt`, the config's system
+/// message and the path, where it first went.
+pub fn restore(prompt: &mut Vec<Message>, placed: &[Placed]) {
+    let mut own = std::collections::HashSet::new();
+    for p in placed {
+        match p.placement {
+            Placement::System => {
+                let at = leading_system(prompt);
+                prompt.insert(at, message(&p.message, Role::System, &p.content));
+            }
+            Placement::Inline => {
+                if let Some(m) = prompt.iter_mut().find(|m| m.id == p.message) {
+                    append(m, &p.content);
+                }
+            }
+            Placement::Own => {
+                let after = p.after.as_ref();
+                let Some(i) = after.and_then(|a| prompt.iter().position(|m| &m.id == a)) else {
+                    continue;
+                };
+                let at = i
+                    + 1
+                    + prompt[i + 1..]
+                        .iter()
+                        .take_while(|m| own.contains(&m.id))
+                        .count();
+                prompt.insert(at, message(&p.message, Role::User, &p.content));
+                own.insert(p.message.clone());
+            }
+        }
+    }
+}
+
+/// A hash of `prompt` as the model reads it, ids left out.
+pub fn fingerprint(prompt: &[Message]) -> String {
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    for m in prompt {
+        let mut m = DraftMessage::from(m.clone());
+        m.id = None;
+        hasher.update(&serde_json::to_vec(&m).unwrap_or_default());
+        hasher.update(b"\n");
+    }
+    format!("{:016x}", hasher.digest())
+}
+
+/// The legacy form of `restore`, for a prompt written before calls named
+/// their source: it may hold some of `placed` already, and is searched for
+/// it.
 pub fn carry(prompt: &mut Vec<Message>, placed: &[Placed]) {
     let mut system_at = None;
     for p in placed {
@@ -291,8 +332,14 @@ pub fn merge(
             .collect::<Vec<_>>()
             .join("\n");
         let id = format!("{call_id}-ctx-{}", group[0].id);
-        placed.extend(place(prompt, call_id, id, content, placement));
-        applied.extend(group.into_iter().map(|c| c.id));
+        let ids: Vec<String> = group.into_iter().map(|c| c.id).collect();
+        placed.extend(
+            place(prompt, call_id, id, content, placement).map(|p| Placed {
+                ids: ids.clone(),
+                ..p
+            }),
+        );
+        applied.extend(ids);
     }
 }
 
@@ -341,6 +388,7 @@ fn place(
         placement,
         content,
         after,
+        ids: Vec::new(),
     })
 }
 
@@ -498,10 +546,7 @@ mod tests {
     }
 
     fn owed_ids(state: &SessionState) -> Vec<String> {
-        owed(state.at(None), "call-1")
-            .into_iter()
-            .map(|c| c.id)
-            .collect()
+        owed(state.at(None)).into_iter().map(|c| c.id).collect()
     }
 
     fn sentry() -> ConnectionPath {
@@ -558,7 +603,7 @@ mod tests {
         let state = failed_state(McpToolSyncFailure::Warn, None);
         assert_eq!(owed_ids(&state), ["mcp.sentry:unavailable:unreachable"]);
         assert_eq!(
-            owed(state.at(None), "call-1")[0].content,
+            owed(state.at(None))[0].content,
             "{\"mcp_server\":\"mcp.sentry\",\"unavailable\":true,\"reason\":\"unreachable\"}"
         );
     }
@@ -566,7 +611,7 @@ mod tests {
     #[test]
     fn the_remotes_own_error_never_reaches_the_prompt() {
         let state = failed_state(McpToolSyncFailure::Warn, None);
-        let content = &owed(state.at(None), "call-1")[0].content;
+        let content = &owed(state.at(None))[0].content;
         assert!(!content.contains("502"), "{content}");
         assert!(!content.contains("script"), "{content}");
     }
@@ -712,7 +757,7 @@ mod tests {
     fn a_plugins_settled_server_is_announced_like_any_connection() {
         let state = plugin_state(true);
         assert_eq!(owed_ids(&state), ["plugin.pdf", "plugin.pdf.mcp.renderer"]);
-        let owed = owed(state.at(None), "call-1");
+        let owed = owed(state.at(None));
         assert!(
             owed[1]
                 .content
@@ -735,7 +780,7 @@ mod tests {
     #[test]
     fn the_catalog_carries_every_skill_description() {
         let state = plugin_state(false);
-        let catalog = &owed(state.at(None), "call-1")[0].content;
+        let catalog = &owed(state.at(None))[0].content;
         assert!(catalog.matches("long long").count() >= 2, "{catalog}");
         assert!(catalog.contains("pdf:text-extraction"), "{catalog}");
     }
@@ -852,6 +897,7 @@ mod tests {
             state,
             seq,
             EventPayload::LlmCallRequested(crate::events::LlmCallRequested {
+                source: Default::default(),
                 id: id.to_string(),
                 attempt: 0,
                 llm: "claude".to_string(),
@@ -867,6 +913,7 @@ mod tests {
             state,
             seq + 1,
             EventPayload::LlmCallDispatched(crate::events::LlmCallDispatched {
+                fingerprint: None,
                 id: id.to_string(),
                 attempt: 0,
             }),
@@ -932,6 +979,47 @@ mod tests {
             2,
             "then the turn's own messages"
         );
+    }
+
+    #[test]
+    fn a_prompt_built_from_the_path_reads_what_the_last_call_sent() {
+        let (sent, placed) = first_turn();
+        let mut next = vec![
+            text("sys", Role::System, "be brief"),
+            text("u1", Role::User, "hi"),
+            text("a1", Role::Assistant, "calling"),
+            text("t1", Role::Tool, "done"),
+        ];
+        restore(&mut next, &placed);
+        assert_eq!(shape(&next), shape(&sent));
+        assert_eq!(fingerprint(&next), fingerprint(&sent));
+    }
+
+    #[test]
+    fn own_messages_after_one_message_keep_their_order() {
+        let own = |id: &str, after: &str| Placed {
+            call: "c".into(),
+            message: id.into(),
+            placement: Placement::Own,
+            content: id.into(),
+            after: Some(after.into()),
+            ids: vec![id.into()],
+        };
+        let mut prompt = vec![
+            text("t1", Role::Tool, "done"),
+            text("a2", Role::Assistant, "ok"),
+        ];
+        restore(
+            &mut prompt,
+            &[
+                own("x", "t1"),
+                own("y", "t1"),
+                own("z", "x"),
+                own("w", "gone"),
+            ],
+        );
+        let ids: Vec<&str> = prompt.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["t1", "x", "y", "z", "a2"], "in the order placed");
     }
 
     #[test]
@@ -1056,6 +1144,7 @@ mod tests {
         assert_eq!(
             placed,
             [Placed {
+                ids: vec!["a".into(), "b".into()],
                 call: "c1".into(),
                 message: "c1-ctx-a".into(),
                 placement: Placement::System,
@@ -1101,7 +1190,7 @@ mod tests {
                 anchor: None,
             }),
         );
-        let owed = owed(s.at_head(), "call-1");
+        let owed = owed(s.at_head());
         let plugin = owed
             .iter()
             .find(|c| c.id == "plugin.org")

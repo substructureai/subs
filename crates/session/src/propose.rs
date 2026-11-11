@@ -56,6 +56,11 @@ fn for_room(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionResp
     let config = p.state.resolve_agent_for();
     let config = config.as_ref();
     let summarize = || context::strategy(config, ContextStrategyKind::Summarize);
+    let source = state
+        .limited
+        .as_ref()
+        .map(|l| l.source.clone())
+        .unwrap_or_default();
     let actions = match trigger {
         DecisionTrigger::ContextLimit { strategy, call, .. } => match strategy {
             Some(ContextStrategyKind::Reset) => {
@@ -65,14 +70,14 @@ fn for_room(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionResp
                         summary: None,
                         messages: messages.clone(),
                     },
-                    context::reissue(call, Some(messages)),
+                    context::reissue(call, &source, Some(messages)),
                 ]
             }
             Some(ContextStrategyKind::Summarize) => {
                 vec![context::summary_call(config, &summarize(), &path, None)
-                    .unwrap_or_else(|| context::reissue(call, None))]
+                    .unwrap_or_else(|| context::reissue(call, &source, None))]
             }
-            _ => vec![context::reissue(call, None)],
+            _ => vec![context::reissue(call, &source, None)],
         },
         DecisionTrigger::LlmFinished {
             id,
@@ -102,7 +107,7 @@ fn for_room(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionResp
                             summary: Some(summary),
                             messages: kept,
                         },
-                        context::reissue(held, Some(view)),
+                        context::reissue(held, &source, Some(view)),
                     ]
                 }
                 None => {
@@ -112,7 +117,7 @@ fn for_room(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionResp
                             context::summary_call(config, &summarize(), &path, Some(half))
                         })
                         .flatten();
-                    vec![smaller.unwrap_or_else(|| context::reissue(held, None))]
+                    vec![smaller.unwrap_or_else(|| context::reissue(held, &source, None))]
                 }
             }
         }
@@ -281,12 +286,12 @@ pub(super) fn resumed(
         };
     }
     DecisionResponse {
-        messages: view.clone(),
+        messages: view,
         actions: vec![DecisionAction::CallLlm {
             id: None,
             llm: config.llm.clone(),
             model: Some(config.model.clone()),
-            messages: Some(config.prompt_for(&view)),
+            messages: None,
             tools: config.tools_as_llm(),
             temperature: None,
             max_completion_tokens: None,
@@ -537,12 +542,12 @@ fn client_turn(
     let merged = config.with_client_tools(&client.tools);
     let effective = merged.as_ref().unwrap_or(config);
     DecisionResponse {
-        messages: view.clone(),
+        messages: view,
         actions: vec![DecisionAction::CallLlm {
             id: None,
             llm: effective.llm.clone(),
             model: Some(effective.model.clone()),
-            messages: Some(effective.prompt_for(&view)),
+            messages: None,
             tools: effective.tools_as_llm(),
             temperature: None,
             max_completion_tokens: None,
@@ -714,25 +719,21 @@ pub(super) fn reissue(
     let effect = llm_calls.get(&transcript[assistant_at].id)?;
     let call = effect.llm()?;
 
-    let mut messages: Vec<DraftMessage> = call
-        .prompt
-        .iter()
-        .cloned()
-        .map(DraftMessage::from)
-        .collect();
-    messages.extend(
-        transcript[assistant_at..]
+    let messages = (!call.source.is_tree()).then(|| {
+        call.prompt
             .iter()
+            .chain(&transcript[assistant_at..])
             .cloned()
-            .map(DraftMessage::from),
-    );
-    messages.extend(tool_messages.iter().cloned());
+            .map(DraftMessage::from)
+            .chain(tool_messages.iter().cloned())
+            .collect()
+    });
 
     Some(DecisionAction::CallLlm {
         id: None,
         llm: Some(call.llm.clone()),
         model: Some(call.spec.model.clone()),
-        messages: Some(messages),
+        messages,
         tools: call.spec.tools.clone(),
         temperature: call.spec.temperature,
         max_completion_tokens: call.spec.max_completion_tokens,
@@ -990,6 +991,7 @@ mod tests {
             call_id,
             EffectTracking::new(RetryPolicy::no_retry(), Utc::now()),
             EffectPayload::LlmCall(LlmCallState {
+                source: Default::default(),
                 defer_tools_strategy: Default::default(),
                 context_ids: Vec::new(),
                 sent_tools: None,
@@ -1575,15 +1577,9 @@ mod tests {
                     Some(2),
                     "declared tools offered; the subagent rides with the connector tools"
                 );
-                let roles: Vec<_> = messages
-                    .as_ref()
-                    .expect("explicit prompt")
-                    .iter()
-                    .map(|m| &m.role)
-                    .collect();
                 assert!(
-                    matches!(roles[..], [Role::System, Role::User]),
-                    "prompt = system + view; got {roles:?}"
+                    messages.is_none(),
+                    "the prompt is left to the tree: config + recorded view"
                 );
             }
             other => panic!("expected one llm.call; got {other:?}"),
@@ -1610,18 +1606,10 @@ mod tests {
             "client system message not recorded"
         );
         match &p.actions[..] {
-            [DecisionAction::CallLlm { messages, .. }] => {
-                let messages = messages.as_ref().expect("explicit prompt");
-                let roles: Vec<_> = messages.iter().map(|m| &m.role).collect();
-                assert!(
-                    matches!(roles[..], [Role::System, Role::User]),
-                    "only the config system remains; got {roles:?}"
-                );
-                assert!(
-                    matches!(&messages[0].content, Some(Content::Text(t)) if t == "be terse"),
-                    "the system message is the config's"
-                );
-            }
+            [DecisionAction::CallLlm { messages, .. }] => assert!(
+                messages.is_none(),
+                "the tree holds no client system message, so only the config's is read"
+            ),
             other => panic!("expected one llm.call; got {other:?}"),
         }
     }

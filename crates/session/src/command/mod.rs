@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 
-use super::decision::{Action, LlmHandler, Trigger};
+use super::decision::{Action, LlmHandler, PromptSource, Trigger};
 use super::effects::{self, decision_queued, void_events, Settle};
 use super::events::*;
 use super::schedule::{self, ScheduleStep};
@@ -57,6 +57,8 @@ pub enum CommandPayload {
         call_id: String,
         llm: String,
         request: LlmRequest,
+        #[serde(default)]
+        source: PromptSource,
         stream: bool,
         retry: RetryPolicy,
         handler: LlmHandler,
@@ -221,6 +223,7 @@ impl Action {
                 id,
                 llm,
                 request,
+                source,
                 stream,
                 retry,
                 handler,
@@ -229,6 +232,7 @@ impl Action {
                 call_id: id,
                 llm,
                 request,
+                source,
                 stream,
                 retry,
                 handler,
@@ -1059,19 +1063,21 @@ impl Working {
                 call_id,
                 llm,
                 request,
+                source,
                 stream,
                 retry,
                 handler,
                 format,
             } => {
                 SessionState::ensure_internal(caller)?;
+                let source = self.held_source(&call_id, source);
                 let held = HeldCall {
                     id: call_id,
                     llm,
                     request,
                     stream,
                 };
-                if self.held_for_room(&held) {
+                if self.held_for_room(&held, &source) {
                     return Ok(());
                 }
                 self.try_then(|s| {
@@ -1080,6 +1086,7 @@ impl Working {
                         held.id,
                         held.llm,
                         held.request,
+                        source,
                         held.stream,
                         retry,
                         handler,

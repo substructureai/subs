@@ -41,11 +41,45 @@ fn system_message() -> DraftMessage {
     }
 }
 
+thread_local! {
+    static SOURCE: std::cell::RefCell<PromptSource> = const { std::cell::RefCell::new(PromptSource::Legacy) };
+}
+
+/// A session whose agent lists a skill, and whose calls come from `source`.
+fn skilled(source: PromptSource, strategies: Vec<ContextStrategy>) -> Trace {
+    SOURCE.set(source);
+    let mut t = Trace::create();
+    let agent = AgentConfig {
+        skills: vec![crate::protocol::AgentSkill {
+            name: "visits".to_string(),
+            description: "Who visited, and when".to_string(),
+            source: crate::protocol::SkillSource::Bundle,
+            tools: Vec::new(),
+        }],
+        ..configured(strategies)
+    };
+    t.decide_with(vec![], vec![], Some(agent));
+    t
+}
+
+/// How many of the messages call `id` read list the skill.
+fn listings(t: &Trace, id: &str) -> usize {
+    requested(t, id)
+        .iter()
+        .map(|m| m.matches("\"skill\":\"visits\"").count())
+        .sum()
+}
+
 fn reading(t: &Trace, id: &str, new: Option<DraftMessage>) -> Action {
-    let mut messages = vec![system_message()];
-    messages.extend(t.recorded());
-    messages.extend(new);
+    let source = SOURCE.with_borrow(Clone::clone);
+    let mut messages = Vec::new();
+    if !source.is_tree() {
+        messages.push(system_message());
+        messages.extend(t.recorded());
+        messages.extend(new);
+    }
     Action::CallLlm {
+        source,
         llm: "claude".to_string(),
         format: None,
         id: id.to_string(),
@@ -64,7 +98,10 @@ fn answered(t: &mut Trace, id: &str, text: &str, read: u64) {
         CommandPayload::settle(
             EffectKind::LlmCall,
             id.to_string(),
-            Some(0),
+            t.agg
+                .state
+                .tracking(EffectKind::LlmCall, id)
+                .map(|t| t.retry.attempts),
             Outcome::Llm(Box::new(LlmResponse {
                 content: Some(text.to_string()),
                 usage: Some(Usage::new(read, 0, 0, 10)),
@@ -130,6 +167,10 @@ fn lowered(action: DecisionAction, id: &str) -> Action {
             model,
             ..
         } => Action::CallLlm {
+            source: match messages {
+                Some(_) => PromptSource::Explicit,
+                None => PromptSource::tree(),
+            },
             llm: "claude".to_string(),
             format: None,
             id: given.unwrap_or_else(|| id.to_string()),
@@ -405,4 +446,158 @@ fn a_replace_sets_a_new_branch_any_time() {
     );
     assert_eq!(emitted(&t), ["context.replaced"]);
     assert!(t.agg.state.at_head().resolve_agent_for().is_some());
+}
+
+fn summarizing() -> Vec<ContextStrategy> {
+    vec![ContextStrategy {
+        over_tokens: Some(1000),
+        keep_tokens: Some(1),
+        ..strategy(ContextStrategyKind::Summarize)
+    }]
+}
+
+#[test]
+fn a_held_tree_call_shows_the_prompt_it_would_send() {
+    let mut t = skilled(PromptSource::tree(), summarizing());
+    turn(&mut t, 1, 100);
+    turn(&mut t, 2, 2000);
+    ask(&mut t, 3);
+    let DecisionTrigger::ContextLimit { call, .. } = wire(&t) else {
+        panic!("a context.limit decision");
+    };
+    let held = texts(&call.request.messages);
+    assert_eq!(held[0], "be brief");
+    assert!(held[1].contains("\"skill\":\"visits\""), "{held:?}");
+    assert_eq!(held[2..], ["q1", "a1", "q2", "a2", "q3"]);
+    assert!(
+        t.agg.state.limited.as_ref().unwrap().source.is_tree(),
+        "and is held as a tree call"
+    );
+}
+
+#[test]
+fn a_held_tree_call_runs_on_the_new_branch_and_is_told_its_context_once() {
+    let mut t = skilled(PromptSource::tree(), summarizing());
+    turn(&mut t, 1, 100);
+    turn(&mut t, 2, 2000);
+    assert_eq!(listings(&t, "call-2"), 1);
+
+    ask(&mut t, 3);
+    plan(&mut t, "sum-1");
+    let summary = t.agg.state.llm_call("sum-1").expect("the summary call");
+    assert_eq!(summary.source, PromptSource::Explicit);
+    assert_eq!(
+        listings(&t, "sum-1"),
+        0,
+        "a summary call is sent as written"
+    );
+    answered(&mut t, "sum-1", "they asked twice", 50);
+    let again = proposed(&t, &wire(&t)).actions.remove(1);
+    assert!(
+        matches!(&again, DecisionAction::CallLlm { id: Some(id), messages: None, .. } if id == "call-3"),
+        "the held call is proposed as a tree call: {again:?}"
+    );
+    plan(&mut t, "");
+
+    let read = requested(&t, "call-3");
+    assert_eq!(read[0], "be brief");
+    assert_eq!(listings(&t, "call-3"), 1, "{read:?}");
+    assert_eq!(read[2..], path(&t), "then the new branch");
+    let head = t.agg.state.head_id.clone();
+    assert_eq!(
+        t.agg.state.llm_call("call-3").unwrap().source,
+        PromptSource::Tree { at: head }
+    );
+
+    answered(&mut t, "call-3", "a3", 100);
+    t.decide_appending(reply("call-3", "a3"), vec![done()]);
+    t.decide(vec![], vec![done()]);
+    turn(&mut t, 4, 100);
+    assert_eq!(listings(&t, "call-4"), 1, "{:?}", requested(&t, "call-4"));
+    assert_eq!(requested(&t, "call-4")[..read.len()], read[..]);
+}
+
+fn refused_as_too_long(t: &mut Trace, id: &str) {
+    let attempt = t
+        .agg
+        .state
+        .tracking(EffectKind::LlmCall, id)
+        .map(|t| t.retry.attempts);
+    t.run(
+        CommandPayload::settle(
+            EffectKind::LlmCall,
+            id.to_string(),
+            attempt,
+            Outcome::Error(SettleError::new(
+                crate::protocol::ErrorInfo::new(ErrorCode::ContextOverflow, "prompt is too long"),
+                false,
+            )),
+        ),
+        &system(),
+    );
+}
+
+/// The provider refuses call-2, the history is summarized, and call-2 runs
+/// again. How many times call-2 and the turn after it list the skill.
+fn refused_then_summarized(source: PromptSource) -> (usize, usize) {
+    let mut t = skilled(source, vec![]);
+    turn(&mut t, 1, 100);
+    ask(&mut t, 2);
+    refused_as_too_long(&mut t, "call-2");
+    plan(&mut t, "sum-1");
+    answered(&mut t, "sum-1", "they asked once", 50);
+    plan(&mut t, "");
+    let again = listings(&t, "call-2");
+    answered(&mut t, "call-2", "a2", 100);
+    t.decide_appending(reply("call-2", "a2"), vec![done()]);
+    t.decide(vec![], vec![done()]);
+    turn(&mut t, 3, 100);
+    (again, listings(&t, "call-3"))
+}
+
+#[test]
+fn a_tree_call_the_provider_refused_moves_to_the_new_branch() {
+    assert_eq!(refused_then_summarized(PromptSource::tree()), (1, 1));
+}
+
+#[test]
+fn a_legacy_call_the_provider_refused_reads_as_before() {
+    assert_eq!(refused_then_summarized(PromptSource::Legacy), (1, 1));
+}
+
+#[test]
+fn a_held_tree_call_kept_as_it_was_stays_a_tree_call() {
+    let mut t = skilled(
+        PromptSource::tree(),
+        vec![ContextStrategy {
+            over_tokens: Some(90),
+            ..strategy(ContextStrategyKind::Worker)
+        }],
+    );
+    turn(&mut t, 1, 100);
+    ask(&mut t, 2);
+    plan(&mut t, "");
+    assert_eq!(emitted(&t), ["context.limited", "context.kept"]);
+    assert!(t.agg.state.llm_call("call-2").unwrap().source.is_tree());
+    assert_eq!(listings(&t, "call-2"), 1);
+    assert_eq!(requested(&t, "call-2")[2..], ["q1", "a1", "q2"]);
+}
+
+#[test]
+fn a_held_tree_call_starts_over_on_the_turns_own_messages() {
+    let mut t = skilled(
+        PromptSource::tree(),
+        vec![ContextStrategy {
+            idle_secs: Some(3600),
+            ..strategy(ContextStrategyKind::Reset)
+        }],
+    );
+    turn(&mut t, 1, 100);
+    t.advance(7200);
+    ask(&mut t, 2);
+    plan(&mut t, "");
+    let read = requested(&t, "call-2");
+    assert_eq!(read.len(), 3, "{read:?}");
+    assert_eq!((read[0].as_str(), read[2].as_str()), ("be brief", "q2"));
+    assert_eq!(listings(&t, "call-2"), 1);
 }
