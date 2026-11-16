@@ -64,7 +64,7 @@ fn later(at: DateTime<Utc>, by: TimeDelta) -> String {
 pub fn drop_poison(conn: &Connection, topic: &str, now: DateTime<Utc>) -> rusqlite::Result<()> {
     let mut stmt = conn.prepare(
         "DELETE FROM engine_queue
-          WHERE topic = ?1 AND visible_at <= ?2 AND receipt IS NOT NULL AND leases >= ?3
+          WHERE topic = ?1 AND visible_at <= ?2 AND leases >= ?3
           RETURNING id, key",
     )?;
     let dropped = stmt.query_map(params![topic, now.to_rfc3339(), MAX_LEASES], |row| {
