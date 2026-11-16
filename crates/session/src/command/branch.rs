@@ -391,7 +391,7 @@ impl Working {
             }
             _ => None,
         };
-        let task = message.unwrap_or_else(|| DraftMessage {
+        let task = message.unwrap_or(DraftMessage {
             id: None,
             role: crate::protocol::Role::User,
             content: None,
