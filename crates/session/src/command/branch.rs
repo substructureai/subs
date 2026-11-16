@@ -30,6 +30,34 @@ impl SessionState {
         found
     }
 
+    /// How many of `messages`, from the first, are a path in the tree from a
+    /// root, as written. The path ends at a node whose tool calls, if any,
+    /// are answered on it.
+    pub fn recorded_prefix(&self, messages: &[DraftMessage]) -> (Option<String>, usize) {
+        let by_id: std::collections::HashMap<&str, &crate::state::Logged<NewMessage>> = self
+            .nodes
+            .iter()
+            .map(|n| (n.message.id.as_str(), n))
+            .collect();
+        let mut path: Vec<&str> = Vec::new();
+        for draft in messages {
+            let Some(node) = draft.id.as_deref().and_then(|id| by_id.get(id)) else {
+                break;
+            };
+            if node.parent_id.as_deref() != path.last().copied() || !same(draft, &node.message) {
+                break;
+            }
+            path.push(node.message.id.as_str());
+        }
+        while let Some(last) = path.last() {
+            if by_id[last].message.tool_calls.is_empty() {
+                break;
+            }
+            path.pop();
+        }
+        (path.last().map(|id| id.to_string()), path.len())
+    }
+
     fn branch_depth(&self, branch: Option<&str>) -> usize {
         let mut depth = 0;
         let mut cursor = branch;
@@ -300,6 +328,32 @@ impl Working {
         Some(start.id)
     }
 
+    /// The branch an explicit prompt runs on: it forks where the prompt's
+    /// leading messages already are in the tree, from a root, and the rest
+    /// are its own. It runs with no config, so the model reads the prompt as
+    /// written.
+    pub(super) fn explicit_branch(
+        &mut self,
+        call_id: &str,
+        messages: Vec<DraftMessage>,
+    ) -> Option<String> {
+        if let Some(b) = self.branches.get(call_id) {
+            return b.is_open().then(|| call_id.to_string());
+        }
+        let (from, shared) = self.recorded_prefix(&messages);
+        let start = BranchStart {
+            id: call_id.to_string(),
+            from: match from {
+                Some(node) => BranchFrom::Node(node),
+                None => BranchFrom::Root,
+            },
+            agent: BranchConfig::None,
+            name: None,
+            mode: BranchMode::Blocking,
+        };
+        self.start_branch(start, messages.into_iter().skip(shared).collect())
+    }
+
     /// Runs `cmd` as work on `branch`.
     pub(super) fn run_on(
         &mut self,
@@ -364,6 +418,22 @@ impl Working {
     pub(super) fn fail_branch(&mut self, id: &str, error: ErrorInfo) {
         self.then(|s| s.finish_branch(s.ids(), id, serde_json::Value::Null, Some(error)));
     }
+}
+
+fn same(draft: &DraftMessage, node: &crate::protocol::Message) -> bool {
+    let value = |v: &DraftMessage| {
+        let mut v = serde_json::to_value(v).unwrap_or_default();
+        if let Some(o) = v.as_object_mut() {
+            o.remove("id");
+            if o.get("tool_calls")
+                .is_some_and(|c| c.as_array().is_some_and(Vec::is_empty))
+            {
+                o.remove("tool_calls");
+            }
+        }
+        v
+    };
+    value(draft) == value(&DraftMessage::from(node.clone()))
 }
 
 pub fn overflowed() -> ErrorInfo {

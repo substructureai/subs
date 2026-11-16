@@ -563,3 +563,130 @@ fn a_branch_decision_that_leaves_nothing_open_ends_the_branch() {
     let events = submit_decision(&mut agg, d, proposed.messages, vec![]);
     assert_eq!(branch_closed(&events, "title"), Some(BranchEnd::Done));
 }
+
+fn explicit(id: &str, messages: Vec<DraftMessage>) -> Action {
+    Action::CallLlm {
+        id: id.to_string(),
+        llm: "claude".to_string(),
+        request: request_with(messages),
+        source: PromptSource::Explicit,
+        stream: false,
+        retry: RetryPolicy::no_retry(),
+        handler: LlmHandler::Server,
+        format: None,
+        branch: None,
+    }
+}
+
+#[test]
+fn an_explicit_call_runs_on_its_own_branch_as_written() {
+    let mut agg = configured();
+    user_turn(&mut agg, "u1", "what time is it?", "turn-1");
+    let (d, _) = live_decision(&agg);
+    submit_decision(
+        &mut agg,
+        d,
+        vec![node_msg("u1", Role::User, "what time is it?")],
+        vec![explicit(
+            "x1",
+            vec![
+                node_msg("", Role::System, "my rules"),
+                node_msg("u1", Role::User, "what time is it?"),
+            ],
+        )],
+    );
+    let branch = agg.state.open_branch("x1").expect("its own branch");
+    assert_eq!(
+        branch.from, None,
+        "a system message first: nothing to share"
+    );
+    assert_eq!(branch.agent, BranchConfig::None);
+    assert_eq!(prompt_texts(&agg, "x1"), ["my rules", "what time is it?"]);
+    assert_eq!(agg.state.head_id.as_deref(), Some("u1"));
+
+    reply(&mut agg, "x1", calling("clock", "tc-1"));
+    echo(&mut agg);
+    while live_decision_kind(&agg).is_some_and(|t| matches!(t, Trigger::ToolExecute { .. })) {
+        let (d, _) = live_decision(&agg);
+        submit_decision(&mut agg, d, vec![], vec![tool_result_action("tc-1")]);
+    }
+    echo(&mut agg);
+    let next = agg
+        .state
+        .effects_of(EffectKind::LlmCall)
+        .find(|e| e.id != "x1")
+        .map(|e| e.id.clone())
+        .expect("the branch goes on");
+    assert_eq!(
+        prompt_texts(&agg, &next),
+        ["my rules", "what time is it?", "", "result-tc-1"],
+        "the worker's prompt and what followed, as written"
+    );
+    assert_eq!(agg.state.head_id.as_deref(), Some("u1"));
+    assert!(
+        agg.state.context_versions.is_empty(),
+        "no config told it anything"
+    );
+}
+
+#[test]
+fn an_explicit_prompt_that_starts_with_the_conversation_forks_from_it() {
+    let mut agg = configured();
+    user_turn(&mut agg, "u1", "what time is it?", "turn-1");
+    let (d, _) = live_decision(&agg);
+    submit_decision(
+        &mut agg,
+        d,
+        vec![node_msg("u1", Role::User, "what time is it?")],
+        vec![explicit(
+            "x1",
+            vec![
+                node_msg("u1", Role::User, "what time is it?"),
+                node_msg("", Role::User, "Write a title."),
+            ],
+        )],
+    );
+    let branch = agg.state.open_branch("x1").unwrap();
+    assert_eq!(
+        branch.from.as_deref(),
+        Some("u1"),
+        "the shared message is not copied"
+    );
+    assert_eq!(
+        prompt_texts(&agg, "x1"),
+        ["what time is it?", "Write a title."]
+    );
+    let copies = agg
+        .state
+        .nodes
+        .iter()
+        .filter(|n| {
+            n.message
+                .content
+                .as_ref()
+                .map(Content::text_owned)
+                .as_deref()
+                == Some("what time is it?")
+        })
+        .count();
+    assert_eq!(copies, 1);
+}
+
+#[test]
+fn an_explicit_prompt_edited_on_the_way_is_copied_from_there() {
+    let mut agg = configured();
+    user_turn(&mut agg, "u1", "what time is it?", "turn-1");
+    let (d, _) = live_decision(&agg);
+    submit_decision(
+        &mut agg,
+        d,
+        vec![node_msg("u1", Role::User, "what time is it?")],
+        vec![explicit(
+            "x1",
+            vec![node_msg("u1", Role::User, "what time is it in Paris?")],
+        )],
+    );
+    let branch = agg.state.open_branch("x1").unwrap();
+    assert_eq!(branch.from, None);
+    assert_eq!(prompt_texts(&agg, "x1"), ["what time is it in Paris?"]);
+}

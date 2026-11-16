@@ -8,7 +8,7 @@ use crate::protocol::StoredContent;
 use crate::protocol::{
     AgentConfig, BranchMode, ClientContext, ConnectorTool, ConnectorToolKind, Content,
     ContextStrategyKind, DecisionAction, DecisionResponse, DecisionTrigger, DraftMessage,
-    ErrorCode, ErrorInfo, Message, Role, SpawnMode, StoredResult, ToolCall,
+    ErrorCode, ErrorInfo, HeldCall, Message, Role, SpawnMode, StoredResult, ToolCall,
 };
 
 pub struct Proposing<'a> {
@@ -73,11 +73,27 @@ fn for_room(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionResp
     let config = p.state.resolve_agent_for();
     let config = config.as_ref();
     let summarize = || context::strategy(config, ContextStrategyKind::Summarize);
-    let source = state
-        .limited
-        .as_ref()
-        .map(|l| l.source.clone())
-        .unwrap_or_default();
+    if p.scope.is_some() {
+        return None;
+    }
+    let summarized =
+        |held: &HeldCall, summary: Option<String>, overflowed: bool, size: usize| match summary {
+            Some(summary) => vec![
+                DecisionAction::ReplaceContext {
+                    summary: Some(summary),
+                    messages: context::kept(&path, &summarize()),
+                },
+                context::reissue(held),
+            ],
+            None => {
+                let smaller = overflowed
+                    .then(|| {
+                        context::summary_call(config, &summarize(), &path, Some(size / 2), &held.id)
+                    })
+                    .flatten();
+                vec![smaller.unwrap_or_else(|| context::reissue(held))]
+            }
+        };
     let actions = match trigger {
         DecisionTrigger::ContextLimit { strategy, call, .. } => match strategy {
             Some(ContextStrategyKind::Reset) => {
@@ -85,17 +101,36 @@ fn for_room(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionResp
                 vec![
                     DecisionAction::ReplaceContext {
                         summary: None,
-                        messages: messages.clone(),
+                        messages,
                     },
-                    context::reissue(call, &source, Some(messages)),
+                    context::reissue(call),
                 ]
             }
             Some(ContextStrategyKind::Summarize) => {
-                vec![context::summary_call(config, &summarize(), &path, None)
-                    .unwrap_or_else(|| context::reissue(call, &source, None))]
+                vec![
+                    context::summary_call(config, &summarize(), &path, None, &call.id)
+                        .unwrap_or_else(|| context::reissue(call)),
+                ]
             }
-            _ => vec![context::reissue(call, &source, None)],
+            _ => vec![context::reissue(call)],
         },
+        DecisionTrigger::BranchFinished {
+            id,
+            ok,
+            data,
+            error,
+            ..
+        } if state.limited.as_ref().and_then(|l| l.summary.as_deref()) == Some(id) => {
+            let held = &state.limited.as_ref()?.call;
+            let summary = data
+                .as_str()
+                .map(str::to_string)
+                .filter(|text| *ok && !text.trim().is_empty());
+            let overflowed = error
+                .as_ref()
+                .is_some_and(|e| e.code == ErrorCode::ContextOverflow);
+            summarized(held, summary, overflowed, context::summary_size(state, id))
+        }
         DecisionTrigger::LlmFinished {
             id,
             ok,
@@ -114,29 +149,7 @@ fn for_room(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionResp
             let overflowed = error
                 .as_ref()
                 .is_some_and(|e| e.code == ErrorCode::ContextOverflow);
-            match summary {
-                Some(summary) => {
-                    let kept = context::kept(&path, &summarize());
-                    let mut view = vec![context::summary_message(&summary)];
-                    view.extend(kept.iter().cloned());
-                    vec![
-                        DecisionAction::ReplaceContext {
-                            summary: Some(summary),
-                            messages: kept,
-                        },
-                        context::reissue(held, &source, Some(view)),
-                    ]
-                }
-                None => {
-                    let smaller = overflowed
-                        .then(|| {
-                            let half = context::summary_size(state, id) / 2;
-                            context::summary_call(config, &summarize(), &path, Some(half))
-                        })
-                        .flatten();
-                    vec![smaller.unwrap_or_else(|| context::reissue(held, &source, None))]
-                }
-            }
+            summarized(held, summary, overflowed, context::summary_size(state, id))
         }
         _ => return None,
     };
@@ -799,22 +812,13 @@ pub(super) fn reissue(
         .rposition(|m| m.tool_calls.iter().any(|c| c.id == tool_call_id))?;
     let effect = llm_calls.get(&transcript[assistant_at].id)?;
     let call = effect.llm()?;
-
-    let messages = (!call.source.is_tree()).then(|| {
-        call.prompt
-            .iter()
-            .chain(&transcript[assistant_at..])
-            .cloned()
-            .map(DraftMessage::from)
-            .chain(tool_messages.iter().cloned())
-            .collect()
-    });
+    let _ = tool_messages;
 
     Some(DecisionAction::CallLlm {
         id: None,
         llm: Some(call.llm.clone()),
         model: Some(call.spec.model.clone()),
-        messages,
+        messages: None,
         tools: call.spec.tools.clone(),
         temperature: call.spec.temperature,
         max_completion_tokens: call.spec.max_completion_tokens,
@@ -1171,9 +1175,10 @@ mod tests {
                 stream,
                 ..
             }] => {
+                assert!(messages.is_none(), "a reissue reads the tree");
                 let request = LlmRequest {
                     model: model.clone().expect("reissue sets model"),
-                    messages: messages.clone().expect("reissue sets messages"),
+                    messages: Vec::new(),
                     tools: tools.clone(),
                     temperature: *temperature,
                     max_completion_tokens: *max_completion_tokens,
@@ -1531,13 +1536,10 @@ mod tests {
             Some("claude"),
             "the re-issue stays on the block the first call ran on"
         );
-        let roles: Vec<_> = request.messages.iter().map(|m| &m.role).collect();
+        let roles: Vec<_> = p.messages.iter().map(|m| &m.role).collect();
         assert!(
-            matches!(
-                roles[..],
-                [Role::System, Role::User, Role::Assistant, Role::Tool]
-            ),
-            "prompt + path from the assistant + tool result; got {roles:?}"
+            matches!(roles[..], [Role::User, Role::Assistant, Role::Tool]),
+            "the path, then the tool result; got {roles:?}"
         );
     }
 
@@ -1558,8 +1560,8 @@ mod tests {
         )
         .expect("proposes");
 
-        let (request, _, _) = reissued_request(&p);
-        let tool = request.messages.last().expect("tool message in prompt");
+        reissued_request(&p);
+        let tool = p.messages.last().expect("tool message on the path");
         assert_eq!(
             tool.content.as_ref().and_then(Content::text),
             Some("clock offline")

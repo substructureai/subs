@@ -135,13 +135,17 @@ fn turn_saying(t: &mut Trace, n: usize, asked: &str, read: u64) {
     t.decide(vec![], vec![done()]);
 }
 
+fn scope(t: &Trace) -> Option<&str> {
+    t.agg.state.decision_branch(&t.live_decision())
+}
+
 fn proposed(t: &Trace, trigger: &DecisionTrigger) -> DecisionResponse {
     propose(
         trigger,
         &Proposing {
-            state: t.agg.state.at_head(),
+            state: t.agg.state.at_scope(scope(t)),
             pending_calls: 0,
-            scope: None,
+            scope: scope(t),
             detached: false,
         },
     )
@@ -149,7 +153,7 @@ fn proposed(t: &Trace, trigger: &DecisionTrigger) -> DecisionResponse {
 }
 
 fn wire(t: &Trace) -> DecisionTrigger {
-    let at = t.agg.state.at_head();
+    let at = t.agg.state.at_scope(scope(t));
     crate::request::wire_trigger(
         t.live_trigger(),
         &at.transcript(),
@@ -164,15 +168,18 @@ fn lowered(action: DecisionAction, id: &str) -> Action {
         DecisionAction::ReplaceContext { summary, messages } => {
             Action::ReplaceContext { summary, messages }
         }
+        DecisionAction::Done { data } => Action::Done { data },
+        DecisionAction::Fail { error } => Action::Fail { error },
         DecisionAction::CallLlm {
             id: given,
             messages,
             model,
+            branch,
             ..
         } => Action::CallLlm {
-            source: match messages {
-                Some(_) => PromptSource::Explicit,
-                None => PromptSource::tree(),
+            source: match (&messages, &branch) {
+                (Some(_), None) => PromptSource::Explicit,
+                _ => PromptSource::tree(),
             },
             llm: "claude".to_string(),
             format: None,
@@ -185,7 +192,17 @@ fn lowered(action: DecisionAction, id: &str) -> Action {
             stream: false,
             retry: RetryPolicy::no_retry(),
             handler: LlmHandler::Server,
-            branch: None,
+            branch: branch.map(|b| crate::decision::BranchStart {
+                id: b.id.unwrap_or_default(),
+                from: match b.from.as_deref() {
+                    None => crate::decision::BranchFrom::Root,
+                    Some("head") => crate::decision::BranchFrom::Head,
+                    Some(node) => crate::decision::BranchFrom::Node(node.to_string()),
+                },
+                agent: crate::decision::BranchConfig::Inherit,
+                name: b.name,
+                mode: b.mode,
+            }),
         },
         other => panic!("unexpected plan {other:?}"),
     }
@@ -216,6 +233,13 @@ fn plan(t: &mut Trace, summary_id: &str) {
         .map(|a| lowered(a, summary_id))
         .collect();
     t.decide(plan.messages, actions);
+}
+
+/// The summary's branch ends with it, then the conversation takes it.
+fn summarized(t: &mut Trace) {
+    plan(t, "");
+    assert!(matches!(t.live_trigger(), Trigger::BranchFinished { .. }));
+    plan(t, "");
 }
 
 fn ask(t: &mut Trace, n: usize) {
@@ -306,9 +330,11 @@ fn a_full_session_is_summarized_and_keeps_its_recent_messages() {
 
     plan(&mut t, "sum-1");
     assert!(t.agg.state.is_summary_call("sum-1"));
+    let branch = t.agg.state.effect(EffectKind::LlmCall, "sum-1").unwrap();
+    assert_eq!(branch.branch.as_deref(), Some("call-3.summary"));
     answered(&mut t, "sum-1", "they asked twice", 50);
     assert_eq!(path(&t).len(), 5, "the summary is not an answer");
-    plan(&mut t, "");
+    summarized(&mut t);
 
     assert_eq!(
         path(&t),
@@ -341,7 +367,7 @@ fn a_summary_too_long_for_the_model_is_asked_again_shorter() {
     }
     ask(&mut t, 4);
     plan(&mut t, "sum-1");
-    let first = crate::context::summary_size(&t.agg.state, "sum-1");
+    let first = crate::context::summary_size(&t.agg.state, "call-4.summary");
     t.run(
         CommandPayload::settle(
             EffectKind::LlmCall,
@@ -354,9 +380,23 @@ fn a_summary_too_long_for_the_model_is_asked_again_shorter() {
         ),
         &system(),
     );
+    plan(&mut t, "");
+    assert!(matches!(
+        t.live_trigger(),
+        Trigger::BranchFinished { ok: false, .. }
+    ));
     plan(&mut t, "sum-2");
     assert!(t.agg.state.is_summary_call("sum-2"));
-    assert!(crate::context::summary_size(&t.agg.state, "sum-2") < first);
+    let second = t
+        .agg
+        .state
+        .limited
+        .as_ref()
+        .unwrap()
+        .summary
+        .clone()
+        .unwrap();
+    assert!(crate::context::summary_size(&t.agg.state, &second) < first);
 }
 
 #[test]
@@ -410,7 +450,7 @@ fn a_call_the_provider_finds_too_long_is_summarized_then_tried_once_more() {
     ));
     plan(&mut t, "sum-1");
     answered(&mut t, "sum-1", "they asked once", 50);
-    plan(&mut t, "");
+    summarized(&mut t);
     assert_eq!(
         t.agg
             .state
@@ -488,14 +528,25 @@ fn a_held_tree_call_runs_on_the_new_branch_and_is_told_its_context_once() {
 
     ask(&mut t, 3);
     plan(&mut t, "sum-1");
-    let summary = t.agg.state.llm_call("sum-1").expect("the summary call");
-    assert_eq!(summary.source, PromptSource::Explicit);
+    let summary = t.agg.state.effect(EffectKind::LlmCall, "sum-1").unwrap();
+    assert!(
+        summary.branch.is_some(),
+        "a summary is written on its own branch"
+    );
+    assert_eq!(
+        t.agg
+            .state
+            .at_scope(summary.branch.as_deref())
+            .resolve_agent_for(),
+        None
+    );
     assert_eq!(
         listings(&t, "sum-1"),
         0,
         "a summary call is sent as written"
     );
     answered(&mut t, "sum-1", "they asked twice", 50);
+    plan(&mut t, "");
     let again = proposed(&t, &wire(&t)).actions.remove(1);
     assert!(
         matches!(&again, DecisionAction::CallLlm { id: Some(id), messages: None, .. } if id == "call-3"),

@@ -4,8 +4,8 @@ use crate::decision::PromptSource;
 use crate::events::ContextLimited;
 use crate::prompts::context as prompts;
 use crate::protocol::{
-    AgentConfig, Content, ContextConfig, ContextReason, ContextStrategy, ContextStrategyKind,
-    DecisionAction, DraftMessage, HeldCall, LlmRequest, Message, Role,
+    AgentConfig, BranchMode, BranchRequest, Content, ContextConfig, ContextReason, ContextStrategy,
+    ContextStrategyKind, DecisionAction, DraftMessage, HeldCall, LlmRequest, Message, Role,
 };
 use crate::state::{EffectKind, SessionState};
 
@@ -166,7 +166,9 @@ pub fn overflow(state: &SessionState, id: &str) -> Option<ContextLimited> {
     {
         return None;
     }
-    let effect = state.effect(EffectKind::LlmCall, id)?;
+    let effect = state
+        .effect(EffectKind::LlmCall, id)
+        .filter(|e| e.branch.is_none())?;
     let call = effect.llm()?;
     let request = call.sent_request();
     let config = state.at_head().resolve_agent_for();
@@ -282,18 +284,40 @@ fn tail(text: String, chars: Option<usize>) -> String {
     prompts::left_out(&text[skip..])
 }
 
+/// What the summary read, in characters: its branch's path, or a legacy
+/// call's prompt.
 pub fn summary_size(state: &SessionState, id: &str) -> usize {
-    state
-        .llm_call(id)
-        .map(|call| call.prompt.iter().map(|m| text(m).chars().count()).sum())
-        .unwrap_or_default()
+    let chars = |path: &[Message]| path.iter().map(|m| text(m).chars().count()).sum();
+    match state.branches.contains_key(id) {
+        true => chars(&state.at_scope(Some(id)).transcript()),
+        false => state
+            .llm_call(id)
+            .map(|call| chars(&call.prompt))
+            .unwrap_or_default(),
+    }
 }
 
+/// The branch a held call's summary is written on.
+pub fn summary_branch(held: &str) -> String {
+    format!("{held}.summary")
+}
+
+pub fn is_summary_branch(held: &str, branch: &str) -> bool {
+    let named = summary_branch(held);
+    branch == named
+        || branch
+            .strip_prefix(&named)
+            .is_some_and(|r| r.starts_with('.'))
+}
+
+/// A call on a new root branch that writes the summary of what `held` would
+/// read.
 pub fn summary_call(
     config: Option<&AgentConfig>,
     strategy: &ContextStrategy,
     path: &[Message],
     most_chars: Option<usize>,
+    held: &str,
 ) -> Option<DecisionAction> {
     let messages = history(path);
     let at = cut(&messages, keep_tokens(strategy));
@@ -333,36 +357,27 @@ pub fn summary_call(
         reasoning: None,
         stream: Some(false),
         retry: None,
-        branch: None,
+        branch: Some(BranchRequest {
+            id: Some(match most_chars {
+                Some(most) => format!("{}.{most}", summary_branch(held)),
+                None => summary_branch(held),
+            }),
+            from: None,
+            agent: None,
+            name: Some("summary".to_string()),
+            mode: BranchMode::Blocking,
+        }),
     })
 }
 
-/// The held call again, on `view` when the history was replaced. A tree call
-/// stays one: it reads the history as it is then.
-pub fn reissue(
-    call: &HeldCall,
-    source: &PromptSource,
-    view: Option<Vec<DraftMessage>>,
-) -> DecisionAction {
+/// The held call again. It reads the history as it is then.
+pub fn reissue(call: &HeldCall) -> DecisionAction {
     let request = &call.request;
-    let messages = match (source, view) {
-        (PromptSource::Tree { .. }, _) => None,
-        (_, Some(view)) => Some(
-            request
-                .messages
-                .iter()
-                .take_while(|m| m.role == Role::System)
-                .cloned()
-                .chain(view)
-                .collect(),
-        ),
-        (_, None) => Some(request.messages.clone()),
-    };
     DecisionAction::CallLlm {
         id: Some(call.id.clone()),
         llm: Some(call.llm.clone()),
         model: Some(request.model.clone()),
-        messages,
+        messages: None,
         tools: request.tools.clone(),
         temperature: request.temperature,
         max_completion_tokens: request.max_completion_tokens,

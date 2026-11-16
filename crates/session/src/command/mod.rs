@@ -1184,7 +1184,7 @@ impl Working {
             CommandPayload::RequestLlmCall {
                 call_id,
                 llm,
-                request,
+                mut request,
                 source,
                 stream,
                 retry,
@@ -1192,6 +1192,26 @@ impl Working {
                 format,
             } => {
                 SessionState::ensure_internal(caller)?;
+                if source == PromptSource::Explicit && self.scope.is_none() {
+                    let messages = std::mem::take(&mut request.messages);
+                    let Some(branch) = self.explicit_branch(&call_id, messages) else {
+                        return Ok(());
+                    };
+                    return self.run_on(
+                        Some(branch),
+                        CommandPayload::RequestLlmCall {
+                            call_id,
+                            llm,
+                            request,
+                            source: PromptSource::tree(),
+                            stream,
+                            retry,
+                            handler,
+                            format,
+                        },
+                        caller,
+                    );
+                }
                 let source = self.held_source(&call_id, source);
                 let held = HeldCall {
                     id: call_id,
@@ -1199,7 +1219,7 @@ impl Working {
                     request,
                     stream,
                 };
-                if self.held_for_room(&held, &source) {
+                if self.scope.is_none() && self.held_for_room(&held, &source) {
                     return Ok(());
                 }
                 self.try_then(|s| {

@@ -14633,66 +14633,6 @@ fn an_explicit_call_first_leaves_the_context_for_the_tree_call() {
 }
 
 #[test]
-fn a_continuation_of_an_explicit_call_is_explicit_and_the_next_turn_reads_the_tree() {
-    let mut agg = skilled_session();
-    let u1 = node_msg("u1", Role::User, "hi");
-    record(&mut agg, "hi", vec![u1.clone()]);
-    let own = vec![node_msg("", Role::System, "my rules"), u1.clone()];
-    send(&mut agg, "call-1", PromptSource::Explicit, own);
-    assert_eq!(sent(&agg, "call-1").len(), 2);
-
-    let a1 = DraftMessage {
-        tool_calls: Some(vec![asks_the_time()]),
-        ..node_msg("call-1", Role::Assistant, "")
-    };
-    let t1 = DraftMessage {
-        tool_call_id: Some("tc-1".to_string()),
-        ..node_msg("t1", Role::Tool, "noon")
-    };
-    let path = vec![u1, a1.clone(), t1.clone()];
-    record(&mut agg, "tool done", path.clone());
-    let transcript = agg.state.at_head().transcript();
-    let calls = HashMap::from([(
-        "call-1".to_string(),
-        agg.state
-            .effect(EffectKind::LlmCall, "call-1")
-            .expect("the call")
-            .clone(),
-    )]);
-    let crate::protocol::DecisionAction::CallLlm { messages, .. } =
-        crate::propose::reissue("tc-1", &[], &transcript, &calls).expect("a continuation")
-    else {
-        panic!("an llm.call");
-    };
-    let messages = messages.expect("the worker's prompt is copied, not rebuilt");
-    send(&mut agg, "call-2", PromptSource::Explicit, messages);
-    let second = sent(&agg, "call-2");
-    assert_eq!(
-        second.iter().map(|m| m.1.as_str()).collect::<Vec<_>>(),
-        ["my rules", "hi", "", "noon"],
-        "the continuation is the worker's prompt and what followed: {second:?}"
-    );
-    assert!(agg.state.context_versions.is_empty(), "still nothing said");
-
-    let a2 = node_msg("call-2", Role::Assistant, "it is noon");
-    let u2 = node_msg("u2", Role::User, "thanks");
-    let mut next = path;
-    next.extend([a2, u2]);
-    record(&mut agg, "thanks", next);
-    send(&mut agg, "call-3", PromptSource::tree(), vec![]);
-    let third = sent(&agg, "call-3");
-    assert_eq!(third[0], (Role::System, "be brief".to_string()));
-    assert!(
-        third.iter().any(|m| m.1.contains("\"skill\":\"visits\"")),
-        "the tree call tells what no call told: {third:?}"
-    );
-    assert!(
-        third.iter().all(|m| m.1 != "my rules"),
-        "and reads the config, not the worker's prompt"
-    );
-}
-
-#[test]
 fn a_continuation_of_a_tree_call_leaves_the_prompt_to_the_tree() {
     let mut agg = skilled_session();
     let u1 = node_msg("u1", Role::User, "hi");

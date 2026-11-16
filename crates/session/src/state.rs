@@ -1715,6 +1715,11 @@ impl SessionState {
                 });
             }
             EventPayload::BranchStarted(p) => {
+                if let Some(l) = self.limited.as_mut().filter(|l| l.open()) {
+                    if p.parent.is_none() && crate::context::is_summary_branch(&l.call.id, &p.id) {
+                        l.summary = Some(p.id.clone());
+                    }
+                }
                 self.branches.entry(p.id.clone()).or_insert(BranchState {
                     from: p.from.clone(),
                     parent: p.parent.clone(),
@@ -2255,8 +2260,15 @@ impl SessionState {
         .and_then(|e| e.anchor.as_deref())
     }
 
+    /// The call writing the held call's summary: a legacy one by its id, or
+    /// any on the summary's branch.
     pub fn is_summary_call(&self, id: &str) -> bool {
-        self.limited.as_ref().and_then(|l| l.summary.as_deref()) == Some(id)
+        let summary = self.limited.as_ref().and_then(|l| l.summary.as_deref());
+        summary.is_some()
+            && (summary == Some(id)
+                || self
+                    .effect(EffectKind::LlmCall, id)
+                    .is_some_and(|e| e.branch.as_deref() == summary))
     }
 
     pub fn holds(&self, id: &str) -> bool {
@@ -2645,7 +2657,12 @@ impl SessionState {
     /// branch's.
     fn live_nodes(&self) -> std::collections::HashSet<&str> {
         let mut live = std::collections::HashSet::new();
-        let leaves = self.head_id.as_deref().into_iter().chain(
+        let summary = self
+            .limited
+            .as_ref()
+            .and_then(|l| self.branches.get(l.summary.as_deref()?))
+            .and_then(BranchState::at);
+        let leaves = self.head_id.as_deref().into_iter().chain(summary).chain(
             self.branches
                 .values()
                 .filter(|b| b.is_open())
