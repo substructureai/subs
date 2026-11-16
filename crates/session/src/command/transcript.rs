@@ -279,13 +279,38 @@ impl SessionState {
         (queued, Some(waiting.turn_id.to_string()))
     }
 
+    /// A user message a client sends with a recorded id but other words is an
+    /// edit: it goes without the id, so it is written as a new message.
+    fn edits_as_new(&self, messages: Vec<DraftMessage>) -> Vec<DraftMessage> {
+        let text = |c: Option<&Content>| c.map(Content::text_owned).unwrap_or_default();
+        messages
+            .into_iter()
+            .map(|m| {
+                let edited = m.role == Role::User
+                    && m.id.as_deref().is_some_and(|id| {
+                        self.nodes
+                            .iter()
+                            .find(|n| n.message.id == id)
+                            .is_some_and(|n| {
+                                n.message.role == Role::User
+                                    && text(n.message.content.as_ref()) != text(m.content.as_ref())
+                            })
+                    });
+                match edited {
+                    true => DraftMessage { id: None, ..m },
+                    false => m,
+                }
+            })
+            .collect()
+    }
+
     fn client_view_events(
         &self,
         ids: &Ids,
         messages: Vec<DraftMessage>,
         client: ClientContext,
     ) -> Result<Vec<EventPayload>, SessionError> {
-        let messages = self.normalize_client_view(messages);
+        let messages = self.normalize_client_view(self.edits_as_new(messages));
 
         let mut seen = std::collections::HashSet::new();
         let completions: Vec<Completion> = messages

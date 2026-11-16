@@ -1076,3 +1076,29 @@ fn an_interrupt_on_one_branch_holds_only_that_branch() {
         "held, not ended"
     );
 }
+
+#[test]
+fn a_message_a_client_edits_in_place_starts_a_new_path() {
+    let mut agg = configured();
+    seed_tree(
+        &mut agg,
+        vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("a1", Role::Assistant, "hello"),
+        ],
+    );
+    let events = submit_messages(&mut agg, vec![node_msg("u1", Role::User, "hi there")]);
+    let messages = transcript_messages(&events).expect("the edit reaches the worker");
+    assert_eq!(messages[0].id, None, "the edit is a new message");
+    let (d, _) = live_decision(&agg);
+    submit_decision(&mut agg, d, messages, vec![]);
+    let path: Vec<String> = agg
+        .state
+        .at_head()
+        .transcript()
+        .iter()
+        .map(text_of)
+        .collect();
+    assert_eq!(path, ["hi there"]);
+    assert_ne!(agg.state.head_id.as_deref(), Some("u1"));
+}
