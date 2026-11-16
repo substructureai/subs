@@ -135,6 +135,15 @@ where
         run_timeout: b.run_timeout,
         span: envelope.span.clone(),
     });
+    if let Some(bound) = &bound {
+        tracing::info!(
+            task = %envelope.id,
+            session_id = %bound.session_id,
+            kind = ?bound.kind,
+            work = %bound.id,
+            "task started"
+        );
+    }
     let open = match &bound {
         Some(bound) => {
             inbox

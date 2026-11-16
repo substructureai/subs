@@ -77,7 +77,7 @@ CREATE TABLE engine_queue (
             enqueued_at TEXT NOT NULL,
             visible_at  TEXT NOT NULL,
             receipt     TEXT
-         );
+         , leases INTEGER NOT NULL DEFAULT 0);
 
 CREATE TABLE secrets (
             tenant_id   TEXT NOT NULL,

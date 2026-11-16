@@ -106,7 +106,8 @@ const READY: Duration = Duration::from_secs(10);
 /// Past three times a run's CPU, for a contended machine, loading the script,
 /// and work QuickJS cannot interrupt.
 const SLACK: Duration = Duration::from_secs(1);
-const ANSWER: u64 = 64 << 20;
+/// A runner's first line, before any script: its versions and languages.
+const READY_LINE: u64 = 1 << 20;
 /// Time a run may wait on reading its files, apart from its own deadline.
 const READ_WAIT: Duration = Duration::from_secs(60);
 
@@ -229,7 +230,7 @@ impl ProcessRunner {
                 return Err(Start::Again("its pipes did not open".to_string()));
             };
             let mut stdout = BufReader::new(stdout);
-            let line = tokio::time::timeout(READY, read_line(&mut stdout))
+            let line = tokio::time::timeout(READY, read_line(&mut stdout, READY_LINE))
                 .await
                 .map_err(|_| Start::Again("it did not start in time".to_string()))?
                 .map_err(|e| Start::Again(e.to_string()))?;
@@ -272,10 +273,13 @@ impl ProcessRunner {
                 .unwrap_or(Duration::from_millis(3 * script.compute_ms()) + SLACK);
         let (budget, mut served, mut waited) = (script.file_bytes(), 0u64, Duration::ZERO);
         loop {
-            let line = tokio::time::timeout_at(deadline, read_line(&mut worker.stdout))
-                .await
-                .map_err(|_| Stop::Failed(codemode::RAN_TOO_LONG.to_string()))?
-                .map_err(failed)?;
+            let line = tokio::time::timeout_at(
+                deadline,
+                read_line(&mut worker.stdout, script.answer_bytes()),
+            )
+            .await
+            .map_err(|_| Stop::Failed(codemode::RAN_TOO_LONG.to_string()))?
+            .map_err(failed)?;
             let Ok(Request::Read { file, offset, len }) = serde_json::from_slice(&line) else {
                 return serde_json::from_slice(&line).map_err(|e| Stop::Failed(e.to_string()));
             };
@@ -364,9 +368,11 @@ impl ScriptRunner for ProcessRunner {
     }
 }
 
-async fn read_line(stdout: &mut BufReader<ChildStdout>) -> io::Result<Vec<u8>> {
+/// A line of at most `most` bytes. A step's answer is read whole before it is
+/// parsed, so a longer one is refused unread.
+async fn read_line(stdout: &mut BufReader<ChildStdout>, most: u64) -> io::Result<Vec<u8>> {
     let mut line = Vec::new();
-    stdout.take(ANSWER).read_until(b'\n', &mut line).await?;
+    stdout.take(most).read_until(b'\n', &mut line).await?;
     match line.pop() {
         Some(b'\n') => Ok(line),
         Some(_) => Err(io::Error::other(codemode::ANSWER_TOO_LARGE)),

@@ -16,6 +16,11 @@ use super::{parse_dt, SqliteDb};
 
 const POLL: Duration = Duration::from_millis(500);
 
+/// A task handed out this many times without an ack or a retry is dropped:
+/// each lease ran out, most likely because the task took the process down.
+/// The effect it carried times out as any lost work does.
+pub const MAX_LEASES: i64 = 3;
+
 pub struct SqliteQueue<T> {
     db: SqliteDb,
     lease: TimeDelta,
@@ -53,6 +58,29 @@ impl<T> SqliteQueue<T> {
 
 fn later(at: DateTime<Utc>, by: TimeDelta) -> String {
     at.checked_add_signed(by).unwrap_or(at).to_rfc3339()
+}
+
+/// Drops the tasks of `topic` whose every lease ran out.
+pub fn drop_poison(conn: &Connection, topic: &str, now: DateTime<Utc>) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare(
+        "DELETE FROM engine_queue
+          WHERE topic = ?1 AND visible_at <= ?2 AND receipt IS NOT NULL AND leases >= ?3
+          RETURNING id, key",
+    )?;
+    let dropped = stmt.query_map(params![topic, now.to_rfc3339(), MAX_LEASES], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for task in dropped {
+        let (id, key) = task?;
+        tracing::error!(
+            topic,
+            task = %id,
+            key = %key,
+            leases = MAX_LEASES,
+            "dropped a task whose every lease ran out"
+        );
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -97,8 +125,9 @@ where
                 .write(move |conn| {
                     let now = Utc::now();
                     let receipt = Uuid::now_v7().to_string();
+                    drop_poison(conn, &topic, now)?;
                     conn.query_row(
-                        "UPDATE engine_queue SET receipt = ?1, visible_at = ?2
+                        "UPDATE engine_queue SET receipt = ?1, visible_at = ?2, leases = leases + 1
                           WHERE id = (SELECT id FROM engine_queue
                                        WHERE topic = ?3 AND visible_at <= ?4
                                        ORDER BY enqueued_at, id LIMIT 1)
@@ -160,7 +189,8 @@ where
         let after = TimeDelta::from_std(after).unwrap_or(TimeDelta::zero());
         self.write(move |conn| {
             conn.execute(
-                "UPDATE engine_queue SET receipt = NULL, visible_at = ?1 WHERE receipt = ?2",
+                "UPDATE engine_queue SET receipt = NULL, visible_at = ?1, leases = 0
+                  WHERE receipt = ?2",
                 params![later(Utc::now(), after), receipt],
             )
         })
@@ -241,6 +271,29 @@ mod tests {
         let second = tokio::time::timeout(Duration::from_millis(30), q.receive("llm")).await;
         assert!(second.is_err());
         q.ack(&first.receipt).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_task_whose_leases_keep_running_out_is_dropped() {
+        let (_dir, q) = queue(Duration::from_millis(20));
+        q.send(envelope("scripts", "poison", 1)).await.unwrap();
+        for _ in 0..MAX_LEASES {
+            assert_eq!(q.receive("scripts").await.unwrap().envelope.id, "poison");
+        }
+        q.send(envelope("scripts", "next", 2)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(q.receive("scripts").await.unwrap().envelope.id, "next");
+    }
+
+    #[tokio::test]
+    async fn a_retry_is_not_a_lease_that_ran_out() {
+        let (_dir, q) = queue(Duration::from_millis(20));
+        q.send(envelope("scripts", "slow", 1)).await.unwrap();
+        for _ in 0..MAX_LEASES + 1 {
+            let got = q.receive("scripts").await.unwrap();
+            q.retry(&got.receipt, Duration::ZERO).await.unwrap();
+        }
+        assert_eq!(q.receive("scripts").await.unwrap().envelope.id, "slow");
     }
 
     #[tokio::test]

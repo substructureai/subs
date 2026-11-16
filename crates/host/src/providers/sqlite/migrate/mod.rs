@@ -7,6 +7,7 @@ mod m006_subject_issuer;
 mod m007_session_logs;
 mod m008_session_index_summary;
 mod m009_session_index_usage;
+mod m010_queue_leases;
 
 use chrono::Utc;
 use rusqlite::{Connection, Transaction, TransactionBehavior};
@@ -68,6 +69,11 @@ pub const CORE_MIGRATIONS: &[Migration] = &[
         version: 9,
         name: "session_index_usage",
         up: m009_session_index_usage::up,
+    },
+    Migration {
+        version: 10,
+        name: "queue_leases",
+        up: m010_queue_leases::up,
     },
 ];
 
