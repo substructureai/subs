@@ -62,10 +62,8 @@ pub fn attachment_window(first: usize, last: usize, lines: usize) -> String {
 /// After a line of an attachment cut at its length.
 pub const TRUNCATED: &str = "… [truncated]";
 
-/// The call that forked a subagent, as the subagent reads it.
 pub const FORKED: &str = "You now work as the subagent this call started. Do the task below; your last reply is this call's result.";
 
-/// Another call of the same message, as a forked subagent reads it.
 pub const FORK_SIBLING: &str = "Answered in the conversation that started this subagent.";
 
 /// A detached subagent call, answered at once.

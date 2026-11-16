@@ -25,7 +25,6 @@ use crate::span::SpanContext;
 use crate::Caller;
 use crate::{CommitContext, Session};
 
-/// The context call `id` placed, as the tree records it.
 fn placed_by(agg: &Session, id: &str) -> Vec<crate::prompt_context::Placed> {
     agg.state
         .context_versions
@@ -8193,14 +8192,11 @@ thread_local! {
     static SENDS_FROM_TREE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
 
-/// Runs `test` with `send_at_head` sending legacy calls.
 fn as_legacy(test: fn()) {
     SENDS_FROM_TREE.set(false);
     test();
 }
 
-/// Sends call `id` at the head; the prompt it sent. A legacy call carries
-/// `path` as its request. A tree call reads the same from the tree.
 fn send_at_head(agg: &mut Session, id: &str, path: Vec<DraftMessage>) -> Vec<Message> {
     let (source, path) = match SENDS_FROM_TREE.get() {
         true => (PromptSource::tree(), Vec::new()),
@@ -14509,7 +14505,6 @@ fn send(agg: &mut Session, id: &str, source: PromptSource, messages: Vec<DraftMe
     );
 }
 
-/// Each message a call sent, as its role and text.
 fn sent(agg: &Session, id: &str) -> Vec<(Role, String)> {
     let call = agg.state.llm_call(id).expect("the call");
     call.prompt

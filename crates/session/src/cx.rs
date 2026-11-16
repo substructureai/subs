@@ -19,7 +19,6 @@ impl<'a> Cx<'a> {
         }
     }
 
-    /// Work requested through this runs on `branch`.
     pub fn scoped(self, branch: Option<&'a str>) -> Self {
         Self {
             scope: branch,
@@ -27,7 +26,6 @@ impl<'a> Cx<'a> {
         }
     }
 
-    /// The branch work requested now runs on. `None` is the conversation.
     pub fn scope(&self) -> Option<&'a str> {
         self.scope
     }

@@ -704,7 +704,6 @@ impl Runtime {
         self.agents.tenant(tenant_id).await.system1
     }
 
-    /// The configs a branch can name by agent id.
     pub async fn agent_configs(
         &self,
         tenant_id: &str,

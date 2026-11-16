@@ -9,8 +9,6 @@ use crate::protocol::{DraftMessage, HeldCall, NewMessage, Role};
 use crate::state::SessionState;
 
 impl Working {
-    /// A call held before calls named their source runs again as one of
-    /// those.
     pub(super) fn held_source(&self, id: &str, source: PromptSource) -> PromptSource {
         let legacy = self
             .limited

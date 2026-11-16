@@ -349,8 +349,6 @@ impl SessionState {
         !self.at(node).anchor_on_path(self.trigger_anchor(trigger))
     }
 
-    /// Voids the conversation's calls `stranded` picks. A detached branch's
-    /// calls outlive the turn, and a blocking branch's end with the branch.
     pub fn void_effects(
         &self,
         stranded: impl Fn(EffectKind, &EffectTracking, Option<&str>) -> bool,
@@ -433,8 +431,6 @@ impl SessionState {
         }
     }
 
-    /// Where a write on `branch` anchors: its own newest node. A branch with
-    /// none of its own yet takes no write, so the path it forks keeps its own.
     fn write_anchor(&self, branch: Option<&str>) -> Result<Option<String>, ()> {
         match branch {
             None => Ok(self.head_id.clone()),
@@ -504,7 +500,6 @@ pub struct Working {
     waiting: Option<String>,
     joining: Option<String>,
     outside: Outside,
-    /// The branch the decision being applied is about.
     scope: Option<String>,
 }
 

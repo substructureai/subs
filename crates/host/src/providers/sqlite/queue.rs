@@ -16,9 +16,6 @@ use super::{parse_dt, SqliteDb};
 
 const POLL: Duration = Duration::from_millis(500);
 
-/// A task handed out this many times without an ack or a retry is dropped:
-/// each lease ran out, most likely because the task took the process down.
-/// The effect it carried times out as any lost work does.
 pub const MAX_LEASES: i64 = 3;
 
 pub struct SqliteQueue<T> {
@@ -60,7 +57,6 @@ fn later(at: DateTime<Utc>, by: TimeDelta) -> String {
     at.checked_add_signed(by).unwrap_or(at).to_rfc3339()
 }
 
-/// Drops the tasks of `topic` whose every lease ran out.
 pub fn drop_poison(conn: &Connection, topic: &str, now: DateTime<Utc>) -> rusqlite::Result<()> {
     let mut stmt = conn.prepare(
         "DELETE FROM engine_queue

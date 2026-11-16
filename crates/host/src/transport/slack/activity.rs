@@ -35,7 +35,6 @@ impl Item {
 pub(super) struct TurnActivity {
     turn_id: String,
     items: Vec<Item>,
-    /// Calls on a branch: not the thread's to show.
     side: std::collections::HashSet<String>,
 }
 

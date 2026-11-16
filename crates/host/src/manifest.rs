@@ -966,8 +966,6 @@ pub struct SubagentEntry {
     pub prefix: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<SubagentMode>,
-    /// Run it on a branch of the calling session: `head` forks the
-    /// conversation, `root` starts clean as the subagent's config.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<crate::protocol::SubagentBranch>,
 }

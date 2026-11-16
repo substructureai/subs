@@ -168,8 +168,6 @@ impl Script {
         self.limits.compute_ms.min(left)
     }
 
-    /// The most a step may send back: its calls' arguments, what it shows,
-    /// and its result, with room for the record around them.
     pub fn answer_bytes(&self) -> u64 {
         let l = &self.limits;
         (l.step_arguments.max(l.results) + l.shown) as u64 + l.shown_media + (1 << 20)

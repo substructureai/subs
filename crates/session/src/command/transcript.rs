@@ -279,8 +279,6 @@ impl SessionState {
         (queued, Some(waiting.turn_id.to_string()))
     }
 
-    /// A user message a client sends with a recorded id but other words is an
-    /// edit: it goes without the id, so it is written as a new message.
     fn edits_as_new(&self, messages: Vec<DraftMessage>) -> Vec<DraftMessage> {
         let text = |c: Option<&Content>| c.map(Content::text_owned).unwrap_or_default();
         messages

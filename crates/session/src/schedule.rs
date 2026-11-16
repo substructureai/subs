@@ -100,9 +100,6 @@ fn is_resume_decision(state: &SessionState, entry: &QueueEntry) -> bool {
             .is_some_and(|d| matches!(d.trigger, Trigger::InterruptResumed { .. }))
 }
 
-/// Each queue runs in order and stops at its first entry that cannot go.
-/// There is one queue, or one for each branch when branches run in
-/// parallel.
 fn walk(state: &SessionState) -> Vec<ScheduleStep> {
     let mut steps = Vec::new();
     let lanes = |e: &crate::state::EffectState| state.lane(e.branch.as_deref());

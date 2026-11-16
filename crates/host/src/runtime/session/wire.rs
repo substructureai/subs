@@ -95,7 +95,6 @@ pub enum ResolveError {
     },
 }
 
-/// The configs of the agents a branch can run as, by id.
 pub type Agents<'a> = &'a (dyn Fn(&str) -> Option<AgentConfig> + Sync);
 
 pub const NO_AGENTS: Agents<'static> = &|_| None;

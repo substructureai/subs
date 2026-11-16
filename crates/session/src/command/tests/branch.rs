@@ -101,8 +101,6 @@ fn calling(tool: &str, call_id: &str) -> LlmResponse {
     }
 }
 
-/// The engine's proposal for the live decision, as the worker would send it
-/// back.
 fn echo(agg: &mut Session) -> Vec<EventPayload> {
     let (id, _) = live_decision(agg);
     let proposed = proposed_for(agg, &id);
@@ -217,8 +215,6 @@ fn branch_finished(events: &[EventPayload]) -> Option<(Trigger, Option<String>)>
     })
 }
 
-/// A user turn whose decision calls the model on the conversation and forks
-/// `title` off it.
 fn turn_with_side_call(mode: BranchMode) -> Session {
     let mut agg = configured();
     user_turn(&mut agg, "u1", "what is the weather in Paris?", "turn-1");
@@ -802,8 +798,6 @@ fn delegating(agent: &str, call: &str, task: &str) -> LlmResponse {
     }
 }
 
-/// A turn whose model call hands `task` to the subagent, up to the
-/// branch's own first call.
 fn delegated(agent: &str, branch: crate::protocol::SubagentBranch) -> (Session, String) {
     let mut agg = with_subagents(branch, agent);
     user_turn(&mut agg, "u1", "why did the deploy fail?", "turn-1");

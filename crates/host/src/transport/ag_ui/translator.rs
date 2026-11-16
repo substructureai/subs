@@ -41,7 +41,6 @@ pub struct AgUiTranslator {
     called: HashMap<String, (String, String)>,
     making_room: Option<String>,
     summary_calls: HashSet<String>,
-    /// Work on a branch. None of it is the chat.
     side: HashSet<String>,
     terminated: bool,
 }
@@ -159,7 +158,6 @@ impl AgUiTranslator {
         out
     }
 
-    /// Whether the event is about work on a branch.
     fn on_side(&mut self, event: &EventPayload) -> bool {
         let (id, branch) = match event {
             EventPayload::LlmCallRequested(r) => (&r.id, r.branch.is_some()),

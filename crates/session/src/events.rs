@@ -136,10 +136,8 @@ pub enum EventPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BranchStarted {
     pub id: String,
-    /// The node it forks at. Absent for a root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
-    /// The branch that started it. Absent when the conversation did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
     #[serde(default)]
@@ -148,10 +146,8 @@ pub struct BranchStarted {
     pub name: Option<String>,
     #[serde(default)]
     pub mode: BranchMode,
-    /// The turn a blocking branch belongs to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
-    /// The subagent call it answers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent: Option<String>,
 }
@@ -161,7 +157,6 @@ pub struct BranchStarted {
 pub enum BranchEnd {
     Done,
     Failed,
-    /// Its turn ended, or what it forked from was edited away.
     Voided,
     Closed,
     Promoted,
@@ -311,8 +306,6 @@ pub struct LlmCallRequested {
     pub id: String,
     pub attempt: u32,
     pub llm: String,
-    /// A tree call's `messages` are empty: its prompt is built when it is
-    /// sent.
     pub request: LlmRequest,
     #[serde(default)]
     pub source: PromptSource,
@@ -332,7 +325,6 @@ pub struct LlmCallRequested {
 pub struct LlmCallDispatched {
     pub id: String,
     pub attempt: u32,
-    /// A hash of the prompt sent, ids left out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
 }
@@ -449,14 +441,12 @@ pub struct SubagentRequested {
     pub mode: SpawnMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
-    /// It runs on a branch named `session_id`, not in a session of its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_branch: Option<SubagentOnBranch>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SubagentOnBranch {
-    /// It forks the path the call was made on. Otherwise it starts a root.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fork: bool,
     #[serde(default)]
@@ -732,7 +722,6 @@ pub struct CallTotals {
 pub struct DecisionQueued {
     pub id: String,
     pub trigger: Trigger,
-    /// The branch the decision is about. Absent on the conversation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
 }

@@ -45,7 +45,6 @@ thread_local! {
     static SOURCE: std::cell::RefCell<PromptSource> = const { std::cell::RefCell::new(PromptSource::Legacy) };
 }
 
-/// A session whose agent lists a skill, and whose calls come from `source`.
 fn skilled(source: PromptSource, strategies: Vec<ContextStrategy>) -> Trace {
     SOURCE.set(source);
     let mut t = Trace::create();
@@ -62,7 +61,6 @@ fn skilled(source: PromptSource, strategies: Vec<ContextStrategy>) -> Trace {
     t
 }
 
-/// How many of the messages call `id` read list the skill.
 fn listings(t: &Trace, id: &str) -> usize {
     requested(t, id)
         .iter()
@@ -237,7 +235,6 @@ fn plan(t: &mut Trace, summary_id: &str) {
     t.decide(plan.messages, actions);
 }
 
-/// The summary's branch ends with it, then the conversation takes it.
 fn summarized(t: &mut Trace) {
     plan(t, "");
     assert!(matches!(t.live_trigger(), Trigger::BranchFinished { .. }));
@@ -594,8 +591,6 @@ fn refused_as_too_long(t: &mut Trace, id: &str) {
     );
 }
 
-/// The provider refuses call-2, the history is summarized, and call-2 runs
-/// again. How many times call-2 and the turn after it list the skill.
 fn refused_then_summarized(source: PromptSource) -> (usize, usize) {
     let mut t = skilled(source, vec![]);
     turn(&mut t, 1, 100);

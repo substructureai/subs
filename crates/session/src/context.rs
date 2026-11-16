@@ -106,7 +106,6 @@ pub fn strategy(config: Option<&AgentConfig>, kind: ContextStrategyKind) -> Cont
         })
 }
 
-/// `call` with the prompt it would send now. A tree call arrives without one.
 fn held(state: &SessionState, call: &HeldCall, source: &PromptSource) -> HeldCall {
     if !source.is_tree() {
         return call.clone();
@@ -284,8 +283,6 @@ fn tail(text: String, chars: Option<usize>) -> String {
     prompts::left_out(&text[skip..])
 }
 
-/// What the summary read, in characters: its branch's path, or a legacy
-/// call's prompt.
 pub fn summary_size(state: &SessionState, id: &str) -> usize {
     let chars = |path: &[Message]| path.iter().map(|m| text(m).chars().count()).sum();
     match state.branches.contains_key(id) {
@@ -297,7 +294,6 @@ pub fn summary_size(state: &SessionState, id: &str) -> usize {
     }
 }
 
-/// The branch a held call's summary is written on.
 pub fn summary_branch(held: &str) -> String {
     format!("{held}.summary")
 }
@@ -310,8 +306,6 @@ pub fn is_summary_branch(held: &str, branch: &str) -> bool {
             .is_some_and(|r| r.starts_with('.'))
 }
 
-/// A call on a new root branch that writes the summary of what `held` would
-/// read.
 pub fn summary_call(
     config: Option<&AgentConfig>,
     strategy: &ContextStrategy,
@@ -370,7 +364,6 @@ pub fn summary_call(
     })
 }
 
-/// The held call again. It reads the history as it is then.
 pub fn reissue(call: &HeldCall) -> DecisionAction {
     let request = &call.request;
     DecisionAction::CallLlm {

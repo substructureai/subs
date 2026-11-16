@@ -363,8 +363,6 @@ pub fn complete_turn(
 }
 
 impl SessionState {
-    /// A detached subagent's answer: its result, and a message that tells the
-    /// conversation, folded into one waiting to.
     pub fn detached_answer(
         &self,
         ids: &Ids,
@@ -400,7 +398,6 @@ impl SessionState {
         events
     }
 
-    /// The answer of a subagent that ran on a branch, once the branch ends.
     pub fn subagent_branch_answer(
         &self,
         ids: &Ids,

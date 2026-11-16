@@ -57,19 +57,14 @@ pub enum LlmHandler {
     Worker,
 }
 
-/// Where a model call's prompt comes from.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PromptSource {
-    /// Built from the conversation up to `at` when the call is sent. `at` is
-    /// the head when the call is requested.
     Tree {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         at: Option<String>,
     },
-    /// Sent as written.
     Explicit,
-    /// Recorded before calls named their source.
     #[default]
     Legacy,
 }
@@ -84,14 +79,11 @@ impl PromptSource {
     }
 }
 
-/// The config a branch runs as.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "config", rename_all = "snake_case")]
 pub enum BranchConfig {
-    /// The config of the path it forks.
     #[default]
     Inherit,
-    /// None: the prompt is the path as written.
     None,
     Config(Box<AgentConfig>),
 }
@@ -104,7 +96,6 @@ pub enum BranchFrom {
     Node(String),
 }
 
-/// A branch an `llm.call` starts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BranchStart {
     pub id: String,
@@ -571,7 +562,6 @@ pub enum Action {
         retry: RetryPolicy,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mode: Option<SpawnMode>,
-        /// The subagent's own config, for one that runs on a root branch.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         config: Option<Box<AgentConfig>>,
     },

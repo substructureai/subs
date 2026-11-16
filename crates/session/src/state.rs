@@ -292,7 +292,6 @@ pub struct EffectState {
     pub tracking: EffectTracking,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<String>,
-    /// The branch it runs on. Absent on the conversation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     pub payload: EffectPayload,
@@ -399,12 +398,8 @@ impl Limited {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmCallState {
-    /// What the model reads, while the call is open. A tree call's is empty
-    /// until it is sent, and any call's once it settles: the tree and its
-    /// records hold it.
     #[serde(default)]
     pub prompt: Vec<Message>,
-    /// The event that sent it. Its prompt is built again as of then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatched_seq: Option<u64>,
     #[serde(default)]
@@ -418,7 +413,6 @@ pub struct LlmCallState {
     pub format: Option<LlmFormat>,
     #[serde(default)]
     pub defer_tools_strategy: DeferToolsStrategy,
-    /// The contexts a legacy call placed. The tree records the rest.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context_ids: Vec<String>,
     /// The tools the model gets, set at dispatch from `spec.tools`, which
@@ -428,10 +422,6 @@ pub struct LlmCallState {
 }
 
 impl LlmCallState {
-    /// What legacy call `id` placed, read back from its prompt, for a call sent
-    /// before context was recorded on the tree. Its own system and own
-    /// context messages are there; inline context it appended cannot be told
-    /// apart and is not returned.
     pub fn placed_in_prompt(&self, id: &str) -> Vec<prompt_context::Placed> {
         if self.context_ids.is_empty() {
             return Vec::new();
@@ -566,7 +556,6 @@ pub(crate) fn is_zero(n: &u64) -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubagentCallState {
-    /// It runs on the branch named `session_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_branch: Option<SubagentOnBranch>,
     pub agent_id: String,
@@ -612,16 +601,12 @@ pub type StateVersion = Versioned<WorkerState>;
 
 pub type AgentVersion = Versioned<AgentConfig>;
 
-/// Context a call placed, anchored where the call was made.
 pub type ContextVersion = Versioned<prompt_context::Placed>;
 
-/// A prompt about to be sent.
 #[derive(Debug, Clone)]
 pub struct Outgoing {
-    /// Where the call reads from.
     pub node: Option<String>,
     pub prompt: Vec<Message>,
-    /// The context this send places.
     pub placed: Vec<prompt_context::Placed>,
     context_ids: Vec<String>,
 }
@@ -714,7 +699,6 @@ pub fn resolve_on_path<'a, V: Anchored>(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerDecisionState {
     pub trigger: Trigger,
-    /// The branch it is about. Absent on the conversation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     #[serde(default)]
@@ -743,7 +727,6 @@ pub struct BranchState {
     pub name: Option<String>,
     #[serde(default)]
     pub mode: BranchMode,
-    /// When it started. What it inherits is read as of then.
     pub seq: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub leaf: Option<String>,
@@ -751,7 +734,6 @@ pub struct BranchState {
     pub turn_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closed: Option<BranchEnd>,
-    /// The subagent call it answers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent: Option<String>,
 }
@@ -761,7 +743,6 @@ impl BranchState {
         self.closed.is_none()
     }
 
-    /// The node its next call reads to: its newest, or where it forked.
     pub fn at(&self) -> Option<&str> {
         self.leaf.as_deref().or(self.from.as_deref())
     }
@@ -870,7 +851,6 @@ pub struct MetaDecision {
 }
 
 impl EventMeta {
-    /// Work in the decision's branch that it waits for.
     pub fn pending_work(&self, decision_id: &str) -> usize {
         let branch = self
             .decisions
@@ -993,8 +973,6 @@ pub struct SessionState {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agent_versions: Vec<Logged<AgentVersion>>,
 
-    /// Every context placed, on any branch. Kept when a branch unloads: no
-    /// event holds them to load it back from.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context_versions: Vec<Logged<ContextVersion>>,
 
@@ -1052,7 +1030,6 @@ pub struct SessionState {
     #[serde(default)]
     pub session_start_failed: bool,
 
-    /// Every branch started, open or closed. A node names its branch.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub branches: BTreeMap<String, BranchState>,
 }
@@ -1118,8 +1095,6 @@ impl SessionState {
         self.at(self.head_id.as_deref())
     }
 
-    /// The state where `branch` reads next: its newest node, as the branch.
-    /// No branch is the conversation.
     pub fn at_scope<'a>(&'a self, branch: Option<&'a str>) -> SessionStateAtNode<'a, 'a> {
         match branch.and_then(|b| Some((b, self.branches.get(b)?))) {
             Some((id, b)) => SessionStateAtNode {
@@ -1132,7 +1107,6 @@ impl SessionState {
         }
     }
 
-    /// The node work in `branch` anchors at.
     pub fn scope_node(&self, branch: Option<&str>) -> Option<String> {
         match branch.and_then(|b| self.branches.get(b)) {
             Some(b) => b.at().map(str::to_string),
@@ -1144,7 +1118,6 @@ impl SessionState {
         self.branches.get(id).filter(|b| b.is_open())
     }
 
-    /// Whether the worker is asked about branches in parallel.
     pub fn parallel_branches(&self) -> bool {
         self.at_head()
             .resolve_agent_for()
@@ -1152,15 +1125,12 @@ impl SessionState {
             .unwrap_or(false)
     }
 
-    /// The queue work on `branch` waits in: its own when branches run in
-    /// parallel, else the one every decision shares.
     pub fn lane(&self, branch: Option<&str>) -> Option<String> {
         branch
             .filter(|_| self.parallel_branches())
             .map(str::to_string)
     }
 
-    /// Whether `branch`, or a branch above it, outlives its turn.
     pub fn detached(&self, branch: Option<&str>) -> bool {
         let mut cursor = branch;
         let mut seen = 0;
@@ -1177,7 +1147,6 @@ impl SessionState {
         false
     }
 
-    /// Open branches `parent` started that hold it: blocking, and in its turn.
     pub fn held_by_branches(&self, parent: Option<&str>) -> usize {
         self.branches
             .values()
@@ -1186,7 +1155,6 @@ impl SessionState {
             .count()
     }
 
-    /// The branch a node was written on.
     pub fn node_branch(&self, id: &str) -> Option<&str> {
         self.nodes
             .iter()
@@ -1202,7 +1170,6 @@ impl SessionState {
         self.effect(kind, id).and_then(|e| e.branch.clone())
     }
 
-    /// The branch a trigger's work ran on.
     pub fn trigger_branch(&self, trigger: &Trigger) -> Option<String> {
         match trigger {
             Trigger::ToolFinished { id, .. }
@@ -1457,8 +1424,6 @@ impl SessionState {
         self.enqueue(ctx.sequence, EffectKind::LlmCall, &payload.id);
     }
 
-    /// The prompt call `id` sends from the state as it stands, and the context
-    /// that send places. Every prompt comes from here.
     pub fn outgoing(&self, id: &str) -> Option<Outgoing> {
         self.outgoing_until(id, None)
     }
@@ -1479,8 +1444,6 @@ impl SessionState {
         Some(at.outgoing(id, &call.source, &call.prompt, &call.context_ids))
     }
 
-    /// What call `id` sent: its prompt while open, or a tree call's built
-    /// again as of its send.
     pub fn sent_prompt(&self, id: &str) -> Option<Vec<Message>> {
         let call = self.llm_call(id)?;
         if !call.prompt.is_empty() || !call.source.is_tree() {
@@ -1489,8 +1452,6 @@ impl SessionState {
         Some(self.outgoing_until(id, Some(call.dispatched_seq?))?.prompt)
     }
 
-    /// A settled call drops its copy of the prompt. One sent before context
-    /// was recorded on the tree first leaves what it placed there.
     fn settle_prompt(&mut self, id: &str) {
         let Some(effect) = self.effect(EffectKind::LlmCall, id) else {
             return;
@@ -1525,8 +1486,6 @@ impl SessionState {
         }
     }
 
-    /// Drops the prompts of the calls that settled, and the tools of those
-    /// nothing reads again, as replaying their events would.
     pub fn settle_prompts(&mut self) {
         let settled: Vec<String> = self
             .effects_of(EffectKind::LlmCall)
@@ -1541,9 +1500,6 @@ impl SessionState {
         }
     }
 
-    /// A settled call's tools are read again only to check its tool calls and
-    /// to make the call after them. Once its reply asked for none, or each
-    /// has its result, nothing does.
     fn tools_answered(&self, id: &str) -> bool {
         let Some(reply) = self.nodes.iter().find(|n| n.message.id == id) else {
             return true;
@@ -1565,8 +1521,6 @@ impl SessionState {
         }
     }
 
-    /// A new call on `branch` is made: the settled calls before it there have
-    /// had their tool calls answered.
     fn drop_answered_tools(&mut self, branch: Option<&str>, except: &str) {
         let done: Vec<String> = self
             .effects_of(EffectKind::LlmCall)
@@ -2401,7 +2355,6 @@ impl SessionState {
         self.at_head().active_interrupt_for().is_some()
     }
 
-    /// An interrupt that holds a blocking branch of the running turn.
     pub fn branch_interrupt(&self) -> Option<&OpenInterrupt> {
         self.open_interrupts.iter().find(|i| {
             i.anchor
@@ -2442,8 +2395,6 @@ impl SessionState {
         .and_then(|e| e.anchor.as_deref())
     }
 
-    /// The call writing the held call's summary: a legacy one by its id, or
-    /// any on the summary's branch.
     pub fn is_summary_call(&self, id: &str) -> bool {
         let summary = self.limited.as_ref().and_then(|l| l.summary.as_deref());
         summary.is_some()
@@ -2835,8 +2786,6 @@ impl SessionState {
         self.agent_versions.sort_by_key(|v| v.seq);
     }
 
-    /// The nodes kept loaded: the conversation's path, and each open
-    /// branch's.
     fn live_nodes(&self) -> std::collections::HashSet<&str> {
         let mut live = std::collections::HashSet::new();
         let summary = self
@@ -3008,15 +2957,11 @@ pub struct SessionStateAtNode<'a, 'n> {
     state: &'a SessionState,
     node: Option<&'n str>,
     until: Option<u64>,
-    /// The branch read as, when `node` is not yet its own.
     branch: Option<&'n str>,
 }
 
-/// What a path inherits: each node's newest version it may read, and whether
-/// the context placed there carries.
 struct Inherited<'a> {
     nodes: HashMap<&'a str, (u64, bool)>,
-    /// A branch's own config, by when it started.
     config: Option<(u64, &'a BranchConfig)>,
 }
 
@@ -3044,7 +2989,6 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
         self.state
     }
 
-    /// The branch this reads as: the one named, or the one its node is on.
     pub fn branch_id(&self) -> Option<&'a str>
     where
         'n: 'a,
@@ -3059,9 +3003,6 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
         })
     }
 
-    /// Walks up from the node. Crossing out of a branch, what lies above it is
-    /// read as of the branch's start, and its context stops carrying when the
-    /// branch runs as its own config.
     fn inherited(&self) -> Inherited<'a> {
         let state = self.state;
         let by_id: HashMap<&str, &Logged<NewMessage>> = logged_until(&state.nodes, self.until)
@@ -3169,8 +3110,6 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
             .unwrap_or_default()
     }
 
-    /// The newest config on the path, or the branch's own when it started
-    /// later.
     pub fn resolve_agent_for(&self) -> Option<AgentConfig> {
         let inherited = self.inherited();
         let version = logged_until(&self.state.agent_versions, self.until)
@@ -3373,8 +3312,6 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
             .collect()
     }
 
-    /// The contexts the path was told: what the tree records, and what its
-    /// legacy calls placed.
     pub fn said(&self) -> std::collections::HashSet<String> {
         let inherited = self.inherited();
         let legacy = self
@@ -3394,11 +3331,6 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
             .collect()
     }
 
-    /// The prompt a call from `source` sends from this node. A tree call's is
-    /// the config's system message and the path, with each context the path
-    /// placed where it first went, then what is newly owed. An explicit
-    /// call's is `given`, as written. A legacy call's is `given`, with the
-    /// path's context put back.
     pub fn outgoing(
         &self,
         id: &str,
@@ -3457,9 +3389,6 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
         out
     }
 
-    /// The context placed on the path, in the order placed. A call sent
-    /// before context was recorded on the tree has its own read back from its
-    /// prompt, ahead of the rest.
     pub fn placed_on_path(&self) -> Vec<prompt_context::Placed> {
         let inherited = self.inherited();
         let recorded: std::collections::HashSet<&str> = self
@@ -3490,8 +3419,6 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
         placed.into_iter().map(|(_, p)| p).collect()
     }
 
-    /// No call but `exclude` has read the path's prompt yet. An explicit call
-    /// reads its own.
     pub fn system_prefix_open(&self, exclude: &str) -> bool {
         let path = self.path_set();
         !self.state.effects.values().any(|e| {

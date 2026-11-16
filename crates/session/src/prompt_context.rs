@@ -11,21 +11,14 @@ pub enum Placement {
     Own,
 }
 
-/// Context one call placed, kept so every later prompt on its path carries it
-/// where the model first read it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Placed {
-    /// The call that placed it.
     pub call: String,
-    /// The message it went in: its own for `system` and `own`, the one it was
-    /// appended to for `inline`.
     pub message: String,
     pub placement: Placement,
     pub content: String,
-    /// For `own`, the message it followed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after: Option<String>,
-    /// The contexts it holds.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ids: Vec<String>,
 }
@@ -46,7 +39,6 @@ const CONTRIBUTORS: &[Contributor] = &[
     announce_unavailable,
 ];
 
-/// The contexts the path at `at` was not told yet.
 pub fn owed(at: SessionStateAtNode) -> Vec<PromptContext> {
     let said = at.said();
     CONTRIBUTORS
@@ -213,8 +205,6 @@ struct SkillListing {
     tools: Vec<String>,
 }
 
-/// Puts each context the path `placed` into `prompt`, the config's system
-/// message and the path, where it first went.
 pub fn restore(prompt: &mut Vec<Message>, placed: &[Placed]) {
     let mut own = std::collections::HashSet::new();
     for p in placed {
@@ -246,7 +236,6 @@ pub fn restore(prompt: &mut Vec<Message>, placed: &[Placed]) {
     }
 }
 
-/// A hash of `prompt` as the model reads it, ids left out.
 pub fn fingerprint(prompt: &[Message]) -> String {
     let mut hasher = xxhash_rust::xxh3::Xxh3::new();
     for m in prompt {
@@ -258,9 +247,6 @@ pub fn fingerprint(prompt: &[Message]) -> String {
     format!("{:016x}", hasher.digest())
 }
 
-/// The legacy form of `restore`, for a prompt written before calls named
-/// their source: it may hold some of `placed` already, and is searched for
-/// it.
 pub fn carry(prompt: &mut Vec<Message>, placed: &[Placed]) {
     let mut system_at = None;
     for p in placed {
@@ -303,9 +289,6 @@ pub fn carry(prompt: &mut Vec<Message>, placed: &[Placed]) {
     }
 }
 
-/// Places each context `owed` that `applied` does not hold yet, and records
-/// it in `placed`. Contexts placed at the same spot share one message, a line
-/// each.
 pub fn merge(
     prompt: &mut Vec<Message>,
     applied: &mut Vec<String>,
@@ -392,8 +375,6 @@ fn place(
     })
 }
 
-/// `m` is the message `p` placed, or one holding the same words: a copy an
-/// older engine named differently.
 fn same(m: &Message, p: &Placed) -> bool {
     let role = match p.placement {
         Placement::System => Role::System,
@@ -423,8 +404,6 @@ fn append(m: &mut Message, content: &str) {
     });
 }
 
-/// `m` already holds `content` appended, anywhere after its own words: a
-/// message can carry several.
 fn holds(m: &Message, content: &str) -> bool {
     match &m.content {
         Some(Content::Parts(parts)) => parts
@@ -842,8 +821,6 @@ mod tests {
             .collect()
     }
 
-    /// The first call of a turn places its context; the first call of the next
-    /// turn starts from the path alone and must read the same prefix.
     fn first_turn() -> (Vec<Message>, Vec<Placed>) {
         let mut prompt = vec![
             text("sys", Role::System, "be brief"),

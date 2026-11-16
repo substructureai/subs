@@ -13,12 +13,8 @@ use crate::protocol::{
 
 pub struct Proposing<'a> {
     pub state: SessionStateAtNode<'a, 'a>,
-    /// Work the decision waits for: its calls in flight, results not yet
-    /// recorded, and blocking branches it started.
     pub pending_calls: usize,
-    /// The branch the decision is about. `None` is the conversation.
     pub scope: Option<&'a str>,
-    /// It outlives its turn: nobody is there to approve or sign in.
     pub detached: bool,
 }
 
@@ -29,7 +25,6 @@ impl Proposing<'_> {
         self.scope.is_none() && self.state.state().waiting_join().is_some()
     }
 
-    /// A model call on this path is still out.
     pub fn calling(&self) -> bool {
         self.state
             .state()
@@ -347,8 +342,6 @@ pub(super) fn resumed(
     }
 }
 
-/// A model's reply: its tool calls run, or it is done. `waiting` holds the
-/// done for work still out: a joining message, or a branch.
 fn llm_finished(
     message: &DraftMessage,
     transcript: &[Message],
@@ -397,9 +390,6 @@ fn llm_finished(
     }
 }
 
-/// A branch this one started ended. A detached one leaves the path as it
-/// was. Once no blocking one is left, the path goes on from its last message:
-/// the model reads a message that waits for it, and a reply ends the work.
 fn branch_finished(
     mode: BranchMode,
     transcript: &[Message],

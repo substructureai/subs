@@ -106,7 +106,6 @@ const READY: Duration = Duration::from_secs(10);
 /// Past three times a run's CPU, for a contended machine, loading the script,
 /// and work QuickJS cannot interrupt.
 const SLACK: Duration = Duration::from_secs(1);
-/// A runner's first line, before any script: its versions and languages.
 const READY_LINE: u64 = 1 << 20;
 /// Time a run may wait on reading its files, apart from its own deadline.
 const READ_WAIT: Duration = Duration::from_secs(60);
@@ -368,8 +367,6 @@ impl ScriptRunner for ProcessRunner {
     }
 }
 
-/// A line of at most `most` bytes. A step's answer is read whole before it is
-/// parsed, so a longer one is refused unread.
 async fn read_line(stdout: &mut BufReader<ChildStdout>, most: u64) -> io::Result<Vec<u8>> {
     let mut line = Vec::new();
     stdout.take(most).read_until(b'\n', &mut line).await?;

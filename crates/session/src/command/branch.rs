@@ -13,7 +13,6 @@ use crate::Caller;
 pub const MAX_BRANCH_DEPTH: usize = 5;
 
 impl SessionState {
-    /// `id` and the open branches below it, parents first.
     pub fn branch_and_below(&self, id: &str) -> Vec<String> {
         let mut found = vec![id.to_string()];
         let mut at = 0;
@@ -30,9 +29,6 @@ impl SessionState {
         found
     }
 
-    /// How many of `messages`, from the first, are a path in the tree from a
-    /// root, as written. The path ends at a node whose tool calls, if any,
-    /// are answered on it.
     pub fn recorded_prefix(&self, messages: &[DraftMessage]) -> (Option<String>, usize) {
         let by_id: std::collections::HashMap<&str, &crate::state::Logged<NewMessage>> = self
             .nodes
@@ -71,8 +67,6 @@ impl SessionState {
         depth
     }
 
-    /// Ends `id` and every open branch below it: their work is voided and
-    /// their waiting decisions dropped.
     pub fn close_branch(
         &self,
         id: &str,
@@ -116,7 +110,6 @@ impl SessionState {
         events
     }
 
-    /// Ends `id` and tells whoever started it.
     pub fn finish_branch(
         &self,
         ids: &Ids,
@@ -157,7 +150,6 @@ impl SessionState {
         events
     }
 
-    /// The blocking branches a turn ending takes with it.
     pub fn void_turn_branches(&self) -> Vec<EventPayload> {
         self.branches
             .iter()
@@ -170,7 +162,6 @@ impl SessionState {
             .collect()
     }
 
-    /// Blocking branches whose fork is no longer on the conversation.
     pub fn void_stranded_branches(&self, node: Option<&str>) -> Vec<EventPayload> {
         let at = self.at(node);
         self.branches
@@ -184,7 +175,6 @@ impl SessionState {
             .collect()
     }
 
-    /// A branch whose decision left nothing to wait for ends, as a turn does.
     pub fn quiet_branch(&self, ids: &Ids, id: &str) -> Vec<EventPayload> {
         if self.open_branch(id).is_none() {
             return Vec::new();
@@ -207,9 +197,6 @@ impl SessionState {
         self.finish_branch(ids, id, serde_json::Value::Null, None)
     }
 
-    /// The branch's messages as a worker returned them: those after its
-    /// newest node are written on it. A view that does not run through its
-    /// newest node writes nothing.
     pub(super) fn reconcile_branch(
         &self,
         ids: &Ids,
@@ -253,8 +240,6 @@ impl SessionState {
 }
 
 impl Working {
-    /// Starts the branch an `llm.call` asked for, with its messages written
-    /// after `from`. `None` when it cannot start.
     pub(super) fn start_branch(
         &mut self,
         start: BranchStart,
@@ -334,10 +319,6 @@ impl Working {
         Some(start.id)
     }
 
-    /// The branch an explicit prompt runs on: it forks where the prompt's
-    /// leading messages already are in the tree, from a root, and the rest
-    /// are its own. It runs with no config, so the model reads the prompt as
-    /// written.
     pub(super) fn explicit_branch(
         &mut self,
         call_id: &str,
@@ -360,9 +341,6 @@ impl Working {
         self.start_branch(start, messages.into_iter().skip(shared).collect())
     }
 
-    /// A subagent call that runs on a branch: the branch starts, or one it ran
-    /// on before goes on, with its task last, and its first decision asks the
-    /// worker to run it.
     pub(super) fn start_subagent_branch(&mut self, call: &str) {
         let Some(effect) = self.effect(EffectKind::Subagent, call) else {
             return;
@@ -492,7 +470,6 @@ impl Working {
         );
     }
 
-    /// Runs `cmd` as work on `branch`.
     pub(super) fn run_on(
         &mut self,
         branch: Option<String>,
@@ -505,9 +482,6 @@ impl Working {
         result
     }
 
-    /// The head moves to the branch's newest node. An open branch with no
-    /// work out, or one that finished, can be promoted, when the
-    /// conversation started it.
     pub(super) fn promote_branch(&mut self, id: &str) {
         let Some(branch) = self.branches.get(id) else {
             tracing::warn!(branch = id, "branch.promote names no branch");
@@ -551,8 +525,6 @@ impl Working {
         self.then(|s| s.void_stranded_work(s.head_id.as_deref()));
     }
 
-    /// A branch decision's work failed for good: the branch fails, not the
-    /// run.
     pub(super) fn fail_branch(&mut self, id: &str, error: ErrorInfo) {
         self.then(|s| s.finish_branch(s.ids(), id, serde_json::Value::Null, Some(error)));
     }
