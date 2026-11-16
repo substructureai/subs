@@ -258,14 +258,11 @@ mod tests {
     }
 
     fn session_of(tree: MessageTree) -> SessionState {
-        use crate::runtime::session::state::Logged;
         let mut s = SessionState::new("s".to_string());
+        for node in tree.nodes {
+            s.seed_message(node);
+        }
         s.head_id = tree.head_id.clone();
-        s.nodes = tree
-            .nodes
-            .into_iter()
-            .map(|entry| Logged { seq: 0, entry })
-            .collect();
         s
     }
 

@@ -34,6 +34,7 @@ pub mod state;
 pub mod store;
 pub mod system1;
 pub mod tool_contract;
+pub mod tree;
 pub mod work;
 mod worker_state;
 

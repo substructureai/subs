@@ -1334,11 +1334,10 @@ mod branches {
             !session.state().has_node("a1"),
             "the old branch is unloaded"
         );
-        assert_eq!(
-            store.tied("a1").unwrap().len(),
-            2,
-            "its message and its state are in the log"
-        );
+        let a1 = store.tied("a1").unwrap();
+        assert_eq!(a1.len(), 1, "its message is in the log");
+        let above = a1[0].parent.clone().expect("a1 hangs below its state");
+        assert_eq!(store.tied(&above).unwrap().len(), 1, "and so is its state");
         assert_eq!(
             state_value(&session),
             serde_json::json!({ "branch": "edited" })
@@ -1428,7 +1427,7 @@ mod branches {
                 .collect();
             decide(&store, &mut session, n, path, None);
         }
-        assert!(session.state().nodes.len() > 40);
+        assert!(session.state().message_tree().nodes.len() > 40);
 
         turn(&store, &mut session, 30);
         decide(
@@ -1442,9 +1441,9 @@ mod branches {
             Some(serde_json::json!({ "reset": true })),
         );
 
-        assert_eq!(session.state().nodes.len(), 2);
+        assert_eq!(session.state().message_tree().nodes.len(), 2);
         let reloaded = load(&store, Settings::default());
-        assert_eq!(reloaded.state().nodes.len(), 2);
+        assert_eq!(reloaded.state().message_tree().nodes.len(), 2);
         assert_eq!(state_value(&reloaded), serde_json::json!({ "reset": true }));
     }
 }

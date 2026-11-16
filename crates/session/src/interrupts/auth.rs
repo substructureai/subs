@@ -130,7 +130,11 @@ mod tests {
         s.apply(
             &EventPayload::AgentConfigUpdated(AgentConfigUpdated {
                 config: config(policy),
-                anchor: None,
+                node: crate::tree::Place {
+                    id: uuid::Uuid::now_v7().to_string(),
+                    parent_id: None,
+                    branch: None,
+                },
             }),
             &ctx(),
         );

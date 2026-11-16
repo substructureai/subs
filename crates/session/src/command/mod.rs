@@ -430,64 +430,6 @@ impl SessionState {
             }
         }
     }
-
-    fn write_anchor(&self, branch: Option<&str>) -> Result<Option<String>, ()> {
-        match branch {
-            None => Ok(self.head_id.clone()),
-            Some(b) => match self.branches.get(b).and_then(|b| b.leaf.clone()) {
-                Some(leaf) => Ok(Some(leaf)),
-                None => {
-                    tracing::warn!(
-                        branch = b,
-                        "a branch with no message of its own takes no write"
-                    );
-                    Err(())
-                }
-            },
-        }
-    }
-
-    fn worker_state_events(
-        &self,
-        state: Option<WorkerState>,
-        branch: Option<&str>,
-    ) -> Vec<EventPayload> {
-        let Some(state) = state else {
-            return Vec::new();
-        };
-        if state == self.at_scope(branch).resolve_state_for() {
-            return Vec::new();
-        }
-        let Ok(anchor) = self.write_anchor(branch) else {
-            return Vec::new();
-        };
-        vec![EventPayload::WorkerStateUpdated(WorkerStateUpdated {
-            state,
-            anchor,
-        })]
-    }
-
-    fn agent_config_events(
-        &self,
-        config: Option<AgentConfig>,
-        branch: Option<&str>,
-    ) -> Vec<EventPayload> {
-        let Some(config) = config else {
-            return Vec::new();
-        };
-        if Some(&config) == self.at_scope(branch).resolve_agent_for().as_ref() {
-            return Vec::new();
-        }
-        let Ok(anchor) = self.write_anchor(branch) else {
-            return Vec::new();
-        };
-        let mut events = effects::connector::sync(self, &config);
-        events.push(EventPayload::AgentConfigUpdated(AgentConfigUpdated {
-            config,
-            anchor,
-        }));
-        events
-    }
 }
 
 pub struct Working {
@@ -1093,8 +1035,7 @@ impl Working {
                     worker,
                     events,
                 })));
-                self.then(|s| s.agent_config_events(agent.map(|a| *a), None));
-                self.then(|s| s.worker_state_events(state, None));
+                self.then(|s| s.start_conversation(s.ids(), state, agent.map(|a| *a)));
                 self.queue_decision(Trigger::SessionStart);
             }
             (true, CommandPayload::CreateSession { .. }) => {
@@ -1444,9 +1385,7 @@ impl Working {
                     }
                     let on = Some(branch.as_str());
                     self.then(|_| vec![completed])
-                        .then(|s| s.reconcile_branch(s.ids(), transcript, &branch))
-                        .then(|s| s.worker_state_events(state, on))
-                        .then(|s| s.agent_config_events(agent, on));
+                        .then(|s| s.write_response(s.ids(), transcript, state, agent, on, false));
                     let outer = self.scope.replace(branch.clone());
                     self.apply_actions(actions, &decision_id, answered);
                     self.scope = outer;
@@ -1466,10 +1405,11 @@ impl Working {
                         id: decision_id.clone(),
                     })]
                 })
-                .then(|s| s.reconcile_transcript(s.ids(), transcript).0)
-                .then(|s| s.void_stranded_work(s.head_id.as_deref()))
-                .then(|s| s.worker_state_events(state, None))
-                .then(|s| s.agent_config_events(agent, None));
+                .then(|s| {
+                    let setup = matches!(answered, Some(Trigger::SessionStart));
+                    s.write_response(s.ids(), transcript, state, agent, None, setup)
+                })
+                .then(|s| s.void_stranded_work(s.head_id.as_deref()));
 
                 self.apply_actions(actions, &decision_id, answered);
                 self.then(|s| effects::tool::unanswered(s));

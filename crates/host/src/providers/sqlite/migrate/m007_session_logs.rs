@@ -344,7 +344,10 @@ mod tests {
         assert_eq!(delivered, DELIVERED.len() as i64);
         let entry = substructure_session::Entry::from_json(&body).unwrap();
         let mut backfilled: Vec<(String, u64, bool, Option<String>)> = conn
-            .prepare("SELECT node_id, seq, message, parent_id FROM session_ties ORDER BY seq")
+            .prepare(
+                "SELECT node_id, seq, message, parent_id FROM session_ties
+                  WHERE message ORDER BY seq",
+            )
             .unwrap()
             .query_map([], |row| {
                 Ok((
@@ -358,9 +361,16 @@ mod tests {
             .collect::<Result<_, _>>()
             .unwrap();
         let mut expected: Vec<(String, u64, bool, Option<String>)> = entry
-            .ties()
-            .into_iter()
-            .map(|t| (t.node, t.seq, t.message, t.parent))
+            .events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.payload,
+                    substructure_session::events::EventPayload::NewMessage(_)
+                )
+            })
+            .filter_map(|e| substructure_session::branch::tie(&e.payload, e.seq))
+            .map(|t| (t.node, t.seq, true, t.parent))
             .collect();
         assert!(!expected.is_empty());
         backfilled.sort();

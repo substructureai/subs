@@ -195,9 +195,9 @@ mod tests {
         };
         let mut s = SessionState::new("s1".to_string());
         s.status = SessionStatus::Idle;
-        s.nodes.push(node("u1", Role::User, None));
-        s.nodes.push(node("a1", Role::Assistant, Some("u1")));
-        s.nodes.push(node("a2", Role::Assistant, Some("u1")));
+        s.seed_message(node("u1", Role::User, None).entry);
+        s.seed_message(node("a1", Role::Assistant, Some("u1")).entry);
+        s.seed_message(node("a2", Role::Assistant, Some("u1")).entry);
         s.head_id = Some("a1".to_string());
         let json =
             serde_json::to_value(session_response("s1".into(), &s, s.message_tree())).unwrap();

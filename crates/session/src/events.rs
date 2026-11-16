@@ -25,6 +25,8 @@ pub enum EventPayload {
     NewMessage(NewMessage),
     #[serde(rename = "head.moved")]
     HeadMoved(HeadMoved),
+    #[serde(rename = "conversation.started")]
+    ConversationStarted(ConversationStarted),
     #[serde(rename = "llm.call.requested")]
     LlmCallRequested(LlmCallRequested),
     #[serde(rename = "llm.call.dispatched")]
@@ -136,6 +138,7 @@ pub enum EventPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BranchStarted {
     pub id: String,
+    pub node: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -274,6 +277,12 @@ pub struct SessionCreated {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionDone {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationStarted {
+    #[serde(flatten)]
+    pub node: crate::tree::Place,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeadMoved {
@@ -650,15 +659,15 @@ pub struct SessionMessageRequested {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerStateUpdated {
     pub state: WorkerState,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub anchor: Option<String>,
+    #[serde(flatten)]
+    pub node: crate::tree::Place,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfigUpdated {
     pub config: AgentConfig,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub anchor: Option<String>,
+    #[serde(flatten)]
+    pub node: crate::tree::Place,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

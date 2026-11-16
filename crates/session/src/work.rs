@@ -194,10 +194,11 @@ impl Session {
         let running = state.phase.turn_id().is_some();
         let title = state.title.clone().or_else(|| {
             state
-                .nodes
+                .tree
                 .iter()
-                .find(|n| n.message.role == Role::User)
-                .and_then(|n| n.message.content.as_ref())
+                .filter_map(|n| n.message())
+                .find(|m| m.role == Role::User)
+                .and_then(|m| m.content.as_ref())
                 .and_then(|c| title(&c.text_owned()))
         });
         Summary {

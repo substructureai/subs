@@ -6,7 +6,6 @@ use crate::effects::{self, decision_queued_on};
 use crate::events::*;
 use crate::ids::Ids;
 use crate::protocol::{BranchMode, DraftMessage, EffectStatus, ErrorCode, ErrorInfo, NewMessage};
-use crate::reconcile::{landing_leaf, plan_reconcile};
 use crate::state::{EffectKind, SessionState};
 use crate::Caller;
 
@@ -30,23 +29,25 @@ impl SessionState {
     }
 
     pub fn recorded_prefix(&self, messages: &[DraftMessage]) -> (Option<String>, usize) {
-        let by_id: std::collections::HashMap<&str, &crate::state::Logged<NewMessage>> = self
-            .nodes
-            .iter()
-            .map(|n| (n.message.id.as_str(), n))
-            .collect();
         let mut path: Vec<&str> = Vec::new();
         for draft in messages {
-            let Some(node) = draft.id.as_deref().and_then(|id| by_id.get(id)) else {
+            let Some(node) = draft.id.as_deref().and_then(|id| self.tree.get(id)) else {
                 break;
             };
-            if node.parent_id.as_deref() != path.last().copied() || !same(draft, &node.message) {
+            let Some(message) = node.message() else { break };
+            if self.tree.message_at(node.parent()) != path.last().copied() || !same(draft, message)
+            {
                 break;
             }
-            path.push(node.message.id.as_str());
+            path.push(node.id());
         }
         while let Some(last) = path.last() {
-            if by_id[last].message.tool_calls.is_empty() {
+            let answered = self
+                .tree
+                .get(last)
+                .and_then(|n| n.message())
+                .is_none_or(|m| m.tool_calls.is_empty());
+            if answered {
                 break;
             }
             path.pop();
@@ -196,47 +197,6 @@ impl SessionState {
         }
         self.finish_branch(ids, id, serde_json::Value::Null, None)
     }
-
-    pub(super) fn reconcile_branch(
-        &self,
-        ids: &Ids,
-        transcript: Vec<DraftMessage>,
-        branch: &str,
-    ) -> Vec<EventPayload> {
-        let Some(b) = self.open_branch(branch) else {
-            return Vec::new();
-        };
-        let known: HashSet<&str> = self.nodes.iter().map(|n| n.message.id.as_str()).collect();
-        let plan = plan_reconcile(&known, &transcript);
-        if plan.is_empty() {
-            return Vec::new();
-        }
-        if landing_leaf(&transcript, &plan).as_deref() != b.at() {
-            tracing::warn!(
-                branch,
-                "a branch's messages must follow its newest node; not written"
-            );
-            return Vec::new();
-        }
-        let mut parent = b.at().map(str::to_string);
-        let mut events = Vec::with_capacity(plan.len());
-        for write in plan {
-            let draft = transcript[write.index].clone();
-            let copied_from = write.rerecord.then(|| draft.id.clone()).flatten();
-            let message = match write.rerecord {
-                true => draft.rerecord(ids),
-                false => draft.record(ids),
-            };
-            let id = message.id.clone();
-            events.push(EventPayload::NewMessage(NewMessage {
-                message,
-                parent_id: parent.replace(id),
-                copied_from,
-                branch: Some(branch.to_string()),
-            }));
-        }
-        events
-    }
 }
 
 impl Working {
@@ -260,11 +220,17 @@ impl Working {
             BranchFrom::Node(node) => Some(node.clone()),
         };
         if let Some(node) = from.as_deref() {
-            let Some(at) = self.nodes.iter().find(|n| n.message.id == node) else {
+            if !self.has_node(node) {
                 tracing::warn!(branch = %start.id, node, "branch forks at an unknown node");
                 return None;
-            };
-            if !at.message.tool_calls.is_empty() {
+            }
+            let open = self
+                .tree
+                .message_at(Some(node))
+                .and_then(|m| self.tree.get(m))
+                .and_then(|n| n.message())
+                .is_some_and(|m| !m.tool_calls.is_empty());
+            if open {
                 tracing::warn!(
                     branch = %start.id,
                     node,
@@ -290,8 +256,10 @@ impl Working {
         if let BranchConfig::Config(config) = &agent {
             self.then(|s| effects::connector::sync(s, config));
         }
+        let node = self.ids.next();
         self.emit(EventPayload::BranchStarted(Box::new(BranchStarted {
             id: start.id.clone(),
+            node: node.clone(),
             from: from.clone(),
             parent,
             agent,
@@ -300,10 +268,9 @@ impl Working {
             turn_id,
             subagent: None,
         })));
-        let known: HashSet<String> = self.nodes.iter().map(|n| n.message.id.clone()).collect();
-        let mut parent_id = from;
+        let mut parent_id = Some(node);
         for draft in messages {
-            let copied_from = draft.id.clone().filter(|id| known.contains(id));
+            let copied_from = draft.id.clone().filter(|id| self.has_node(id));
             let message = match copied_from {
                 Some(_) => draft.rerecord(&self.ids),
                 None => draft.record(&self.ids),
@@ -378,7 +345,7 @@ impl Working {
             name: None,
             reasoning: None,
         });
-        let (from, agent, mut own) = match self.branches.get(&branch) {
+        let (from, agent, mut own, node) = match self.branches.get(&branch) {
             Some(b) => {
                 let leaf = b.at().map(str::to_string);
                 if let Some(missing) = leaf.as_deref().filter(|l| !self.has_node(l)) {
@@ -407,13 +374,19 @@ impl Working {
                     });
                     return;
                 }
-                (b.from.clone(), b.agent.clone(), leaf)
+                (b.from.clone(), b.agent.clone(), leaf, b.node.clone())
             }
-            None => (anchor.clone().filter(|_| on.fork), on.agent.clone(), None),
+            None => (
+                anchor.clone().filter(|_| on.fork),
+                on.agent.clone(),
+                None,
+                self.ids.next(),
+            ),
         };
         let fresh = own.is_none();
         self.emit(EventPayload::BranchStarted(Box::new(BranchStarted {
             id: branch.clone(),
+            node: node.clone(),
             from: from.clone(),
             parent,
             agent: agent.clone(),
@@ -427,10 +400,12 @@ impl Working {
         }
         let mut messages = Vec::new();
         if fresh && on.fork {
-            let asked = from
-                .as_deref()
-                .and_then(|f| self.nodes.iter().find(|n| n.message.id == f))
-                .map(|n| n.message.tool_calls.clone())
+            let asked = self
+                .tree
+                .message_at(from.as_deref())
+                .and_then(|m| self.tree.get(m))
+                .and_then(|n| n.message())
+                .map(|m| m.tool_calls.clone())
                 .unwrap_or_default();
             messages.extend(asked.into_iter().map(|c| DraftMessage {
                 id: None,
@@ -447,7 +422,7 @@ impl Working {
         }
         messages.push(task);
         if fresh {
-            own = from;
+            own = Some(node);
         }
         for draft in messages {
             let message = draft.record(&self.ids);

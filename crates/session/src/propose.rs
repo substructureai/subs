@@ -877,8 +877,7 @@ mod tests {
         ToolCallFunction, ToolInput, SUBAGENT,
     };
     use crate::state::{
-        AgentVersion, ConnectorSyncState, EffectPayload, EffectTracking, LlmCallSpec, Logged,
-        SessionState, ToolCallState,
+        ConnectorSyncState, EffectPayload, EffectTracking, LlmCallSpec, SessionState, ToolCallState,
     };
 
     fn state_of(
@@ -888,28 +887,20 @@ mod tests {
     ) -> SessionState {
         let mut s = SessionState::new("sess-1".to_string());
         let mut parent: Option<String> = None;
+        if let Some(config) = config {
+            s.seed_config(config.clone());
+            parent = s.head_id.clone();
+        }
         for m in transcript {
-            s.nodes.push(Logged {
-                seq: 0,
-                entry: NewMessage {
-                    message: m.clone(),
-                    parent_id: parent.take(),
-                    copied_from: None,
-                    branch: None,
-                },
+            s.seed_message(NewMessage {
+                message: m.clone(),
+                parent_id: parent.take(),
+                copied_from: None,
+                branch: None,
             });
             parent = Some(m.id.clone());
         }
         s.head_id = parent;
-        if let Some(config) = config {
-            s.agent_versions.push(Logged {
-                seq: 0,
-                entry: AgentVersion {
-                    value: config.clone(),
-                    anchor: None,
-                },
-            });
-        }
         for effect in llm_calls.values() {
             s.put_effect(effect.clone());
         }

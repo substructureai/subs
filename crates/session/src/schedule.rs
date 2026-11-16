@@ -288,9 +288,9 @@ mod tests {
     };
     use crate::retry::RetryTarget;
     use crate::state::{
-        AgentVersion, ConnectorSyncState, EffectPayload, EffectState, EffectTracking, LlmCallSpec,
-        LlmCallState, Logged, OpenInterrupt, QueueEntry, SubagentCallState, ToolCallState,
-        TurnPhase, WorkerDecisionState,
+        ConnectorSyncState, EffectPayload, EffectState, EffectTracking, LlmCallSpec, LlmCallState,
+        OpenInterrupt, QueueEntry, SubagentCallState, ToolCallState, TurnPhase,
+        WorkerDecisionState,
     };
 
     fn epoch() -> DateTime<Utc> {
@@ -465,13 +465,7 @@ mod tests {
     }
 
     fn set_config(s: &mut SessionState, config: AgentConfig) {
-        s.agent_versions.push(Logged {
-            seq: 0,
-            entry: AgentVersion {
-                value: config,
-                anchor: None,
-            },
-        });
+        s.seed_config(config);
     }
 
     fn dispatch(kind: EffectKind, id: &str) -> ScheduleStep {
@@ -565,22 +559,19 @@ mod tests {
     #[test]
     fn a_parked_decision_is_skipped_not_blocking() {
         let mut s = state();
-        s.nodes.push(Logged {
-            seq: 1,
-            entry: NewMessage {
-                message: Message {
-                    id: "u1".to_string(),
-                    role: Role::User,
-                    content: None,
-                    tool_calls: vec![],
-                    tool_call_id: None,
-                    name: None,
-                    reasoning: None,
-                },
-                parent_id: None,
-                copied_from: None,
-                branch: None,
+        s.seed_message(NewMessage {
+            message: Message {
+                id: "u1".to_string(),
+                role: Role::User,
+                content: None,
+                tool_calls: vec![],
+                tool_call_id: None,
+                name: None,
+                reasoning: None,
             },
+            parent_id: None,
+            copied_from: None,
+            branch: None,
         });
         s.head_id = Some("u1".to_string());
         s.open_interrupts.push(OpenInterrupt {

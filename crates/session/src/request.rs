@@ -126,14 +126,10 @@ impl Session {
         let at = match branch_id {
             Some(_) => self.state.at_scope(branch_id),
             None => self.state.at(meta.head_id.as_deref()),
-        }
-        .until(seq);
+        };
+        let _ = seq;
         let message_tree = at.message_tree();
-        let transcript = message_tree
-            .head_id
-            .as_deref()
-            .map(|h| message_tree.path_to(h))
-            .unwrap_or_default();
+        let transcript = at.transcript();
         let open_llm_calls = at.open_llm_calls();
         let pending_calls = meta.pending_work(decision_id) + self.state.held_by_branches(branch_id);
         let worker_state = at.resolve_state_for();

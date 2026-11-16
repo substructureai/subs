@@ -915,9 +915,11 @@ fn trace_full_loop() {
     );
     t.assert_trace(&[
         "session.created",
+        "conversation.started",
         "decision.queued",
         "decision.dispatched",
         "decision.completed",
+        "conversation.started",
         "turn.started",
         "decision.queued",
         "decision.dispatched",
@@ -1019,11 +1021,13 @@ fn trace_connector_fetch_gates_an_llm_call() {
     );
     t.assert_trace(&[
         "session.created",
+        "conversation.started",
         "decision.queued",
         "decision.dispatched",
         "decision.completed",
         "connector.sync.requested",
         "agent.updated",
+        "conversation.started",
         "turn.started",
         "decision.queued",
         "connector.sync.completed",
@@ -1061,11 +1065,13 @@ fn trace_a_failed_fetch_releases_the_gate() {
     );
     t.assert_trace(&[
         "session.created",
+        "conversation.started",
         "decision.queued",
         "decision.dispatched",
         "decision.completed",
         "connector.sync.requested",
         "agent.updated",
+        "conversation.started",
         "turn.started",
         "decision.queued",
         "connector.sync.errored",
@@ -1144,10 +1150,12 @@ fn trace_interrupt_and_resume() {
     );
     t.assert_trace(&[
         "session.created",
+        "conversation.started",
         "decision.queued",
         "decision.dispatched",
         "decision.completed",
         "agent.updated",
+        "conversation.started",
         "turn.started",
         "decision.queued",
         "decision.dispatched",
@@ -1210,9 +1218,11 @@ fn trace_queued_turn() {
     );
     t.assert_trace(&[
         "session.created",
+        "conversation.started",
         "decision.queued",
         "decision.dispatched",
         "decision.completed",
+        "conversation.started",
         "turn.started",
         "decision.queued",
         "decision.dispatched",
@@ -1286,9 +1296,11 @@ fn trace_merged_turn() {
     );
     t.assert_trace(&[
         "session.created",
+        "conversation.started",
         "decision.queued",
         "decision.dispatched",
         "decision.completed",
+        "conversation.started",
         "turn.started",
         "decision.queued",
         "decision.dispatched",
@@ -1423,9 +1435,11 @@ fn trace_timeout_retry_then_exhaustion() {
     let t = flow_timeout_to_exhaustion();
     t.assert_trace(&[
         "session.created",
+        "conversation.started",
         "decision.queued",
         "decision.dispatched",
         "decision.completed",
+        "conversation.started",
         "turn.started",
         "decision.queued",
         "decision.dispatched",
@@ -1497,9 +1511,11 @@ fn trace_decision_retry_then_terminal_failure() {
     );
     t.assert_trace(&[
         "session.created",
+        "conversation.started",
         "decision.queued",
         "decision.dispatched",
         "decision.completed",
+        "conversation.started",
         "turn.started",
         "decision.queued",
         "decision.dispatched",
@@ -1553,9 +1569,11 @@ fn trace_parallel_fan_out_holds_a_sibling_result() {
     );
     t.assert_trace(&[
         "session.created",
+        "conversation.started",
         "decision.queued",
         "decision.dispatched",
         "decision.completed",
+        "conversation.started",
         "turn.started",
         "decision.queued",
         "decision.dispatched",
@@ -1629,9 +1647,11 @@ fn trace_fork_voids_stranded_work() {
     );
     t.assert_trace(&[
         "session.created",
+        "conversation.started",
         "decision.queued",
         "decision.dispatched",
         "decision.completed",
+        "conversation.started",
         "turn.started",
         "decision.queued",
         "decision.dispatched",
@@ -1740,9 +1760,11 @@ fn trace_subagent_call() {
     ));
     t.assert_trace(&[
         "session.created",
+        "conversation.started",
         "decision.queued",
         "decision.dispatched",
         "decision.completed",
+        "conversation.started",
         "turn.started",
         "decision.queued",
         "decision.dispatched",
@@ -1881,9 +1903,11 @@ fn trace_direct_commands_then_cancel() {
     t.names.truncate(t.names.len() - 3);
     t.assert_trace(&[
         "session.created",
+        "conversation.started",
         "decision.queued",
         "decision.dispatched",
         "decision.completed",
+        "conversation.started",
         "turn.started",
         "decision.queued",
         "decision.dispatched",

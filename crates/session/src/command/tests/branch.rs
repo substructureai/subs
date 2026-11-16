@@ -677,15 +677,11 @@ fn an_explicit_prompt_that_starts_with_the_conversation_forks_from_it() {
     );
     let copies = agg
         .state
-        .nodes
+        .tree
         .iter()
-        .filter(|n| {
-            n.message
-                .content
-                .as_ref()
-                .map(Content::text_owned)
-                .as_deref()
-                == Some("what time is it?")
+        .filter_map(|n| n.message())
+        .filter(|m| {
+            m.content.as_ref().map(Content::text_owned).as_deref() == Some("what time is it?")
         })
         .count();
     assert_eq!(copies, 1);

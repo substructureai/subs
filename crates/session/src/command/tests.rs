@@ -10,7 +10,6 @@ use crate::protocol::{
 use crate::reconcile::plan_reconcile;
 use chrono::Utc;
 
-use super::super::state::{AgentVersion, Logged};
 use super::*;
 use crate::connectors::{AuthNeed, RemoteTool};
 use crate::decision::ToolHandler;
@@ -1707,12 +1706,7 @@ fn normalize_folds_a_client_tool_echo_onto_its_recorded_node() {
         Some("w1"),
         "tool echo adopts the recorded node id"
     );
-    let known: std::collections::HashSet<&str> = agg
-        .state
-        .nodes
-        .iter()
-        .map(|n| n.message.id.as_str())
-        .collect();
+    let known: std::collections::HashSet<&str> = agg.state.known_messages();
     let plan = plan_reconcile(&known, &messages);
     assert_eq!(
         plan.len(),
@@ -1793,12 +1787,7 @@ fn edit_with_tail_replay_keeps_the_tool_result() {
         Some("w1"),
         "the replayed tool result folds onto w1"
     );
-    let known: std::collections::HashSet<&str> = agg
-        .state
-        .nodes
-        .iter()
-        .map(|n| n.message.id.as_str())
-        .collect();
+    let known: std::collections::HashSet<&str> = agg.state.known_messages();
     let plan = plan_reconcile(&known, &messages);
     assert_eq!(
         plan.len(),
@@ -2221,12 +2210,7 @@ fn a_resend_of_a_prior_assistant_turn_appends_without_forking() {
         ],
     );
     let messages = transcript_messages(&events).expect("a transcript decision");
-    let known: std::collections::HashSet<&str> = agg
-        .state
-        .nodes
-        .iter()
-        .map(|n| n.message.id.as_str())
-        .collect();
+    let known: std::collections::HashSet<&str> = agg.state.known_messages();
     let plan = plan_reconcile(&known, &messages);
     assert_eq!(
         plan.len(),
@@ -3788,6 +3772,14 @@ fn admin() -> Caller {
 }
 
 fn declare_client_tool(agg: &mut Session, name: &str) {
+    let declared = agg
+        .state
+        .at_head()
+        .resolve_agent_for()
+        .is_some_and(|c| c.tools.iter().any(|t| t.name == name));
+    if declared {
+        return;
+    }
     let mut agent = agent_config("m1");
     agent.tools.push(AgentTool {
         name: name.to_string(),
@@ -3797,13 +3789,7 @@ fn declare_client_tool(agg: &mut Session, name: &str) {
         handler: Some(Handler::Client),
         defer: None,
     });
-    agg.state.agent_versions.push(Logged {
-        seq: agg.state.agent_versions.last().map_or(0, |v| v.seq),
-        entry: AgentVersion {
-            value: agent,
-            anchor: None,
-        },
-    });
+    agg.state.seed_config(agent);
 }
 
 fn request_client_tool(agg: &mut Session, id: &str) {
@@ -7263,9 +7249,9 @@ fn changed_state_anchors_at_the_post_reconcile_head() {
     let updates = state_updates(&events);
     assert_eq!(updates.len(), 1);
     assert_eq!(
-        updates[0].anchor.as_deref(),
-        Some("a1"),
-        "the version anchors to the last appended node"
+        agg.state.tree.get("u1").and_then(|n| n.parent()),
+        Some(updates[0].node.id.as_str()),
+        "the version precedes the response's messages"
     );
     assert_eq!(agg.state.at_head().resolve_state_for().0, json!({"v": 1}));
 }
@@ -8055,7 +8041,7 @@ fn session_with_searched_connector(id: &str, tools: &[&str]) -> Session {
 
 fn offered(agg: &Session) -> Vec<String> {
     agg.state
-        .at(None)
+        .at_head()
         .connector_tools()
         .tools
         .into_iter()
@@ -8066,7 +8052,7 @@ fn offered(agg: &Session) -> Vec<String> {
 
 fn held(agg: &Session) -> Vec<String> {
     agg.state
-        .at(None)
+        .at_head()
         .connector_tools()
         .tools
         .into_iter()
@@ -8115,7 +8101,11 @@ fn a_search_answers_at_the_anchor_of_the_call() {
                 mcp: vec![],
                 ..searching_connector_config(&["sentry"])
             },
-            anchor: agg.state.head_id.clone(),
+            node: crate::tree::Place {
+                id: "config-2".to_string(),
+                parent_id: agg.state.head_id.clone(),
+                branch: None,
+            },
         })],
         &ctx,
     );
@@ -8556,7 +8546,7 @@ fn subagent_session(defer: Option<bool>, prefix: Option<bool>) -> Session {
 fn a_subagent_is_offered_as_a_connector_tool() {
     let agg = subagent_session(None, None);
     assert_eq!(offered(&agg), ["helper", "subagent_wait"]);
-    let tools = agg.state.at(None).connector_tools().tools;
+    let tools = agg.state.at_head().connector_tools().tools;
     assert_eq!(tools[0].kind, crate::protocol::ConnectorToolKind::Subagent);
     assert_eq!(
         tools[0].connector,
@@ -8675,7 +8665,7 @@ fn a_subagent_and_an_unprefixed_connector_tool_both_lose_a_shared_name() {
         ),
         &system(),
     );
-    let merged = agg.state.at(None).connector_tools();
+    let merged = agg.state.at_head().connector_tools();
     assert!(
         merged.tools.iter().all(|t| t.name != "helper"),
         "picking one of the two would route the model arbitrarily"
@@ -8870,7 +8860,7 @@ fn a_worker_tool_takes_a_search_name_and_the_other_half_survives() {
     );
     settle_sync(&mut agg, "sentry", &["search_issues"]);
 
-    let merged = agg.state.at(None).connector_tools();
+    let merged = agg.state.at_head().connector_tools();
     assert_eq!(
         offered(&agg),
         ["call_tool"],
@@ -8973,7 +8963,7 @@ fn a_connection_overrides_the_agents_default() {
     settle_sync(&mut agg, "sentry", &["search_issues"]);
     assert_eq!(
         agg.state
-            .at(None)
+            .at_head()
             .connector_tools()
             .tools
             .iter()
@@ -9089,7 +9079,7 @@ fn tool_search_picks_which_engine_tools_the_agent_gets() {
     let offered = |search: DeferToolsStrategy| -> Vec<String> {
         let agg = create_session_with_config("sess-1", "tenant-a", "user-1", Some(agent(search)));
         agg.state
-            .at(None)
+            .at_head()
             .connector_tools()
             .tools
             .into_iter()
@@ -9330,7 +9320,7 @@ fn a_deferred_connector_tool_carries_its_output_contract() {
     );
     let tool = agg
         .state
-        .at(None)
+        .at_head()
         .connector_tools()
         .tools
         .into_iter()
@@ -9673,9 +9663,9 @@ fn changed_agent_config_anchors_at_head_and_dedups() {
     let updates = agent_updates(&events);
     assert_eq!(updates.len(), 1, "the first write records a config version");
     assert_eq!(
-        updates[0].anchor.as_deref(),
-        Some("a1"),
-        "the config anchors to the last appended node"
+        agg.state.tree.get("u1").and_then(|n| n.parent()),
+        Some(updates[0].node.id.as_str()),
+        "the config precedes the response's messages"
     );
     assert_eq!(
         agg.state.at_head().resolve_agent_for(),
@@ -9759,6 +9749,7 @@ fn create_session_emits_session_start_before_client_input() {
             events.as_slice(),
             [
                 EventPayload::SessionCreated(_),
+                EventPayload::ConversationStarted(_),
                 EventPayload::DecisionQueued(q),
                 EventPayload::DecisionDispatched(_),
             ] if matches!(q.trigger, Trigger::SessionStart)
@@ -9801,6 +9792,7 @@ fn create_session_writes_seeded_state_before_session_start() {
             [
                 EventPayload::SessionCreated(_),
                 EventPayload::WorkerStateUpdated(_),
+                EventPayload::ConversationStarted(_),
                 EventPayload::DecisionQueued(q),
                 EventPayload::DecisionDispatched(_),
             ] if matches!(q.trigger, Trigger::SessionStart)
@@ -10278,7 +10270,11 @@ fn fork_anchors_new_state_and_resolves_as_of_the_prefix_without_one() {
     );
     let updates = state_updates(&events);
     assert_eq!(updates.len(), 1);
-    assert_eq!(updates[0].anchor.as_deref(), Some("x1"));
+    assert_eq!(updates[0].node.parent_id.as_deref(), Some("u1"));
+    assert_eq!(
+        agg.state.tree.get("x1").and_then(|n| n.parent()),
+        Some(updates[0].node.id.as_str())
+    );
     assert_eq!(agg.state.at_head().resolve_state_for().0, json!({"v": 3}));
 
     let d4 = open_decision(&mut agg, "retry");
@@ -10319,17 +10315,6 @@ fn submit_config(
     );
 }
 
-fn root_of(agg: &Session) -> Option<String> {
-    let mut at = agg.state.head_id.clone()?;
-    loop {
-        let node = agg.state.nodes.iter().find(|n| n.message.id == at)?;
-        match &node.parent_id {
-            Some(parent) => at = parent.clone(),
-            None => return Some(at),
-        }
-    }
-}
-
 fn long_chat(agg: &mut Session) {
     let d1 = open_decision(agg, "hi");
     submit_state(
@@ -10365,14 +10350,19 @@ fn a_reset_starts_a_new_root_and_keeps_the_state_sent_with_it() {
         Some(json!({"v": 3})),
     );
 
-    let head = agg.state.head_id.clone().expect("a head");
-    assert_eq!(root_of(&agg), Some(head.clone()), "the head is a new root");
-    assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, EventPayload::NewMessage(m) if m.parent_id.is_none())),
-        "the view records a root; got {events:?}"
-    );
+    let texts: Vec<_> = agg
+        .state
+        .at_head()
+        .transcript()
+        .iter()
+        .map(|m| {
+            m.content
+                .as_ref()
+                .map(Content::text_owned)
+                .unwrap_or_default()
+        })
+        .collect();
+    assert_eq!(texts, ["latest"], "the view replaces the conversation");
     assert!(
         events
             .iter()
@@ -10451,7 +10441,15 @@ fn a_new_root_without_state_or_config_reads_the_start() {
         None,
     );
 
-    assert_eq!(root_of(&agg).as_deref(), Some("e1"));
+    let edited = agg.state.tree.get("e1").expect("the edit is recorded");
+    assert!(
+        edited
+            .parent()
+            .and_then(|p| agg.state.tree.get(p))
+            .is_some_and(|p| p.message().is_none()),
+        "it hangs where the first message hung"
+    );
+    assert_eq!(agg.state.at_head().transcript().len(), 1);
     assert!(
         agg.state.at_head().resolve_state_for().0.is_null(),
         "state written on the old branch stays there"
@@ -10729,6 +10727,7 @@ fn fork_voids_a_pending_tool_call() {
 #[test]
 fn fork_spares_work_anchored_on_the_shared_prefix() {
     let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    declare_client_tool(&mut agg, "tool_tc-1");
     let d1 = open_decision(&mut agg, "hi");
     submit_state(&mut agg, d1, vec![node_msg("u1", Role::User, "hi")], None);
     request_client_tool(&mut agg, "tc-1");
@@ -11021,6 +11020,7 @@ fn submit_settling_a_call_its_own_interrupt_voided_swallows_it() {
 #[test]
 fn void_guard_matches_kind_not_just_id() {
     let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    declare_client_tool(&mut agg, "tool_shared");
     let d1 = open_decision(&mut agg, "hi");
     submit_state(&mut agg, d1, vec![node_msg("u1", Role::User, "hi")], None);
     request_client_tool(&mut agg, "shared");
@@ -11258,7 +11258,11 @@ fn appending_to_a_parked_branch_is_rejected() {
 fn global_interrupt_gates_all_new_views() {
     let mut agg = create_session("sess-1", "tenant-a", "user-1");
     interrupt(&mut agg, "int-1");
-    assert_eq!(agg.state.open_interrupt("int-1").unwrap().anchor, None);
+    assert_eq!(
+        agg.state.open_interrupt("int-1").unwrap().anchor,
+        agg.state.head_id,
+        "it anchors on the conversation's start"
+    );
     let err = agg
         .try_handle(
             CommandPayload::SubmitClientPayload {
@@ -12572,7 +12576,7 @@ fn a_declared_tool_named_skill_shadows_the_engines_and_is_a_collision() {
         defer: None,
     });
     let agg = create_session_with_config("sess-1", "tenant-a", "user-1", Some(cfg));
-    let merged = agg.state.at(None).connector_tools();
+    let merged = agg.state.at_head().connector_tools();
     assert!(
         merged.collisions.contains(&"skill".to_string()),
         "reported, so the warning has something to say: {:?}",

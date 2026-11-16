@@ -137,7 +137,6 @@ CREATE TABLE session_ties (
             session_id TEXT NOT NULL,
             node_id    TEXT NOT NULL,
             seq        INTEGER NOT NULL,
-            message    INTEGER NOT NULL,
             parent_id  TEXT,
             PRIMARY KEY (tenant_id, session_id, node_id, seq)
         ) WITHOUT ROWID;

@@ -2,32 +2,26 @@ use std::collections::{HashMap, HashSet};
 
 use crate::command::CommandPayload;
 use crate::entry::Entry;
-use crate::events::{AgentConfigUpdated, EventPayload, WorkerStateUpdated};
-use crate::protocol::{ClientPayload, DraftMessage, NewMessage};
+use crate::events::EventPayload;
+use crate::protocol::{ClientPayload, DraftMessage};
 use crate::session::{Error, Session};
 use crate::state::{Logged, SessionState};
 use crate::store::{Store, StoreError};
+use crate::tree::Node;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tie {
     pub node: String,
     pub seq: u64,
-    pub message: bool,
     pub parent: Option<String>,
 }
 
 pub fn tie(payload: &EventPayload, seq: u64) -> Option<Tie> {
-    let (node, message, parent) = match payload {
-        EventPayload::NewMessage(m) => (m.message.id.clone(), true, m.parent_id.clone()),
-        EventPayload::WorkerStateUpdated(v) => (v.anchor.clone()?, false, None),
-        EventPayload::AgentConfigUpdated(v) => (v.anchor.clone()?, false, None),
-        _ => return None,
-    };
+    let node = Node::of_event(payload)?;
     Some(Tie {
-        node,
+        node: node.id().to_string(),
         seq,
-        message,
-        parent,
+        parent: node.parent().map(str::to_string),
     })
 }
 
@@ -42,31 +36,22 @@ impl Entry {
 
 #[derive(Debug, Clone, Default)]
 pub struct Loaded {
-    pub nodes: Vec<Logged<NewMessage>>,
-    pub states: Vec<Logged<WorkerStateUpdated>>,
-    pub agents: Vec<Logged<AgentConfigUpdated>>,
+    pub nodes: Vec<Logged<Node>>,
 }
 
 impl Loaded {
     pub fn seqs(&self) -> Vec<u64> {
-        let mut seqs: Vec<u64> = self
-            .nodes
-            .iter()
-            .map(|n| n.seq)
-            .chain(self.states.iter().map(|v| v.seq))
-            .chain(self.agents.iter().map(|v| v.seq))
-            .collect();
+        let mut seqs: Vec<u64> = self.nodes.iter().map(|n| n.seq).collect();
         seqs.sort_unstable();
         seqs
     }
 
     fn take(&mut self, event: crate::SessionEvent) {
-        let seq = event.seq;
-        match event.payload {
-            EventPayload::NewMessage(node) => self.nodes.push(Logged { seq, entry: node }),
-            EventPayload::WorkerStateUpdated(v) => self.states.push(Logged { seq, entry: v }),
-            EventPayload::AgentConfigUpdated(v) => self.agents.push(Logged { seq, entry: v }),
-            _ => {}
+        if let Some(node) = Node::of_event(&event.payload) {
+            self.nodes.push(Logged {
+                seq: event.seq,
+                entry: node,
+            });
         }
     }
 }
@@ -82,9 +67,7 @@ pub fn resolve(store: &dyn Store, seqs: &[u64]) -> Result<Loaded, StoreError> {
 #[derive(Debug, Clone, Default)]
 pub struct Outside {
     known: HashSet<String>,
-    nodes: HashMap<String, Logged<NewMessage>>,
-    states: Vec<Logged<WorkerStateUpdated>>,
-    agents: Vec<Logged<AgentConfigUpdated>>,
+    nodes: HashMap<String, Logged<Node>>,
 }
 
 impl Outside {
@@ -104,10 +87,10 @@ impl Outside {
                 if state.has_node(at) || !wanted.insert(at.to_string()) {
                     break;
                 }
-                cursor = self.nodes.get(at).and_then(|n| n.parent_id.as_deref());
+                cursor = self.nodes.get(at).and_then(|n| n.parent());
             }
         }
-        let mut nodes: Vec<Logged<NewMessage>> = wanted
+        let mut nodes: Vec<Logged<Node>> = wanted
             .iter()
             .filter_map(|id| self.nodes.get(id).cloned())
             .collect();
@@ -115,22 +98,7 @@ impl Outside {
             return None;
         }
         nodes.sort_by_key(|n| n.seq);
-        let on = |anchor: &Option<String>| anchor.as_ref().is_some_and(|a| wanted.contains(a));
-        Some(Loaded {
-            nodes,
-            states: self
-                .states
-                .iter()
-                .filter(|v| on(&v.anchor))
-                .cloned()
-                .collect(),
-            agents: self
-                .agents
-                .iter()
-                .filter(|v| on(&v.anchor))
-                .cloned()
-                .collect(),
-        })
+        Some(Loaded { nodes })
     }
 
     pub fn drop_known(&self, payload: ClientPayload) -> Option<ClientPayload> {
@@ -161,24 +129,21 @@ impl Outside {
             self.known.insert(at);
             for tie in ties {
                 seqs.push(tie.seq);
-                if tie.message {
-                    cursor = tie.parent;
-                }
+                cursor = tie.parent;
             }
         }
         if seqs.is_empty() {
             return Ok(());
         }
         for event in store.events_at(&seqs)? {
-            let seq = event.seq;
-            match event.payload {
-                EventPayload::NewMessage(node) => {
-                    self.nodes
-                        .insert(node.message.id.clone(), Logged { seq, entry: node });
-                }
-                EventPayload::WorkerStateUpdated(v) => self.states.push(Logged { seq, entry: v }),
-                EventPayload::AgentConfigUpdated(v) => self.agents.push(Logged { seq, entry: v }),
-                _ => {}
+            if let Some(node) = Node::of_event(&event.payload) {
+                self.nodes.insert(
+                    node.id().to_string(),
+                    Logged {
+                        seq: event.seq,
+                        entry: node,
+                    },
+                );
             }
         }
         Ok(())

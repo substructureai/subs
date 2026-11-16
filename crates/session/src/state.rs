@@ -68,8 +68,8 @@ pub use crate::protocol::EffectKind;
 use crate::protocol::{
     AgentConfig, BranchMode, BranchView, ClientContext, Content, ContextReason, DecisionTurn,
     DraftMessage, Effect, EffectStatus, HeldCall, InterruptOrigin, LlmFormat, LlmRequest, LlmTool,
-    Message, MessageTree, NewMessage, ReasoningConfig, RetryConfig, RetryPolicy, Role,
-    SessionOwner, SpawnMode, SubagentTools, Usage, WorkerRef, WorkerState,
+    Message, MessageTree, ReasoningConfig, RetryConfig, RetryPolicy, Role, SessionOwner, SpawnMode,
+    SubagentTools, Usage, WorkerRef, WorkerState,
 };
 use crate::retry::RetryState;
 
@@ -597,10 +597,6 @@ pub struct Versioned<T> {
     pub anchor: Option<String>,
 }
 
-pub type StateVersion = Versioned<WorkerState>;
-
-pub type AgentVersion = Versioned<AgentConfig>;
-
 pub type ContextVersion = Versioned<prompt_context::Placed>;
 
 #[derive(Debug, Clone)]
@@ -657,13 +653,6 @@ impl<T> std::ops::Deref for Logged<T> {
     }
 }
 
-fn logged_until<T>(log: &[Logged<T>], until: Option<u64>) -> &[Logged<T>] {
-    match until {
-        Some(seq) => &log[..log.partition_point(|e| e.seq <= seq)],
-        None => log,
-    }
-}
-
 pub trait Anchored {
     fn anchor(&self) -> Option<&str>;
 }
@@ -717,6 +706,7 @@ impl WorkerDecisionState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BranchState {
+    pub node: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -967,12 +957,6 @@ pub struct SessionState {
     #[serde(default)]
     pub subagent_token_usage: Usage,
 
-    #[serde(default)]
-    pub state_versions: Vec<Logged<StateVersion>>,
-
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub agent_versions: Vec<Logged<AgentVersion>>,
-
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context_versions: Vec<Logged<ContextVersion>>,
 
@@ -1021,8 +1005,8 @@ pub struct SessionState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_id: Option<String>,
 
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub nodes: Vec<Logged<NewMessage>>,
+    #[serde(default, skip_serializing_if = "crate::tree::Tree::is_empty")]
+    pub tree: crate::tree::Tree,
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub open_interrupts: Vec<OpenInterrupt>,
@@ -1058,8 +1042,6 @@ impl SessionState {
             quiet_end: None,
             context_kept: false,
             subagent_token_usage: Usage::default(),
-            state_versions: Vec::new(),
-            agent_versions: Vec::new(),
             context_versions: Vec::new(),
             ancestry: Vec::new(),
             data: serde_json::Value::Null,
@@ -1075,7 +1057,7 @@ impl SessionState {
             title: None,
             detached_turns: BTreeSet::new(),
             head_id: None,
-            nodes: Vec::new(),
+            tree: crate::tree::Tree::default(),
             open_interrupts: Vec::new(),
             session_start_failed: false,
             branches: BTreeMap::new(),
@@ -1083,12 +1065,7 @@ impl SessionState {
     }
 
     pub fn at<'a, 'n>(&'a self, node: Option<&'n str>) -> SessionStateAtNode<'a, 'n> {
-        SessionStateAtNode {
-            state: self,
-            node,
-            until: None,
-            branch: None,
-        }
+        SessionStateAtNode { state: self, node }
     }
 
     pub fn at_head(&self) -> SessionStateAtNode<'_, '_> {
@@ -1096,13 +1073,8 @@ impl SessionState {
     }
 
     pub fn at_scope<'a>(&'a self, branch: Option<&'a str>) -> SessionStateAtNode<'a, 'a> {
-        match branch.and_then(|b| Some((b, self.branches.get(b)?))) {
-            Some((id, b)) => SessionStateAtNode {
-                state: self,
-                node: b.at(),
-                until: None,
-                branch: Some(id),
-            },
+        match branch.and_then(|b| self.branches.get(b)) {
+            Some(b) => self.at(b.at()),
             None => self.at_head(),
         }
     }
@@ -1156,10 +1128,47 @@ impl SessionState {
     }
 
     pub fn node_branch(&self, id: &str) -> Option<&str> {
-        self.nodes
-            .iter()
-            .find(|n| n.message.id == id)
-            .and_then(|n| n.branch.as_deref())
+        self.tree.get(id).and_then(|n| n.branch())
+    }
+
+    #[doc(hidden)]
+    pub fn seed(&mut self, node: crate::tree::Node) {
+        let seq = self.tree.len() as u64;
+        self.grow(node, seq);
+    }
+
+    #[doc(hidden)]
+    pub fn seed_config(&mut self, config: AgentConfig) {
+        let parent = self.head_id.clone();
+        let id = format!("seed-config-{}", self.tree.len());
+        self.seed(crate::tree::Node {
+            place: crate::tree::Place {
+                id,
+                parent_id: parent,
+                branch: None,
+            },
+            fact: crate::tree::Fact::Config { config },
+        });
+    }
+
+    #[doc(hidden)]
+    pub fn seed_message(&mut self, message: crate::protocol::NewMessage) {
+        self.seed(crate::tree::Node::of_message(&message));
+    }
+
+    fn grow(&mut self, node: crate::tree::Node, seq: u64) {
+        let id = node.id().to_string();
+        let user = node.message().is_some_and(|m| m.role == Role::User);
+        match node.branch().and_then(|b| self.branches.get_mut(b)) {
+            Some(branch) => branch.leaf = Some(id),
+            None => {
+                if user {
+                    self.status = SessionStatus::Idle;
+                }
+                self.head_id = Some(id);
+            }
+        }
+        self.tree.push(Logged { seq, entry: node });
     }
 
     pub fn decision_branch(&self, id: &str) -> Option<&str> {
@@ -1425,23 +1434,16 @@ impl SessionState {
     }
 
     pub fn outgoing(&self, id: &str) -> Option<Outgoing> {
-        self.outgoing_until(id, None)
-    }
-
-    fn outgoing_until(&self, id: &str, until: Option<u64>) -> Option<Outgoing> {
         let effect = self.effect(EffectKind::LlmCall, id)?;
         let call = effect.llm()?;
         let node = match &call.source {
             PromptSource::Tree { at } => at.clone(),
             _ => effect.anchor.clone().or_else(|| self.head_id.clone()),
         };
-        let at = SessionStateAtNode {
-            state: self,
-            node: node.as_deref(),
-            until,
-            branch: effect.branch.as_deref(),
-        };
-        Some(at.outgoing(id, &call.source, &call.prompt, &call.context_ids))
+        Some(
+            self.at(node.as_deref())
+                .outgoing(id, &call.source, &call.prompt, &call.context_ids),
+        )
     }
 
     pub fn sent_prompt(&self, id: &str) -> Option<Vec<Message>> {
@@ -1449,7 +1451,7 @@ impl SessionState {
         if !call.prompt.is_empty() || !call.source.is_tree() {
             return Some(call.prompt.clone());
         }
-        Some(self.outgoing_until(id, Some(call.dispatched_seq?))?.prompt)
+        Some(self.outgoing(id)?.prompt)
     }
 
     fn settle_prompt(&mut self, id: &str) {
@@ -1501,13 +1503,14 @@ impl SessionState {
     }
 
     fn tools_answered(&self, id: &str) -> bool {
-        let Some(reply) = self.nodes.iter().find(|n| n.message.id == id) else {
+        let Some(reply) = self.tree.get(id).and_then(|n| n.message()) else {
             return true;
         };
-        reply.message.tool_calls.iter().all(|c| {
-            self.nodes
-                .iter()
-                .any(|n| n.message.tool_call_id.as_deref() == Some(c.id.as_str()))
+        reply.tool_calls.iter().all(|c| {
+            self.tree.iter().any(|n| {
+                n.message()
+                    .is_some_and(|m| m.tool_call_id.as_deref() == Some(c.id.as_str()))
+            })
         })
     }
 
@@ -1803,23 +1806,7 @@ impl SessionState {
                 self.events = payload.events.clone();
             }
             EventPayload::NewMessage(payload) => {
-                match payload
-                    .branch
-                    .as_ref()
-                    .and_then(|b| self.branches.get_mut(b))
-                {
-                    Some(branch) => branch.leaf = Some(payload.message.id.clone()),
-                    None => {
-                        if payload.message.role == Role::User {
-                            self.status = SessionStatus::Idle;
-                        }
-                        self.head_id = Some(payload.message.id.clone());
-                    }
-                }
-                self.nodes.push(Logged {
-                    seq: ctx.sequence,
-                    entry: payload.clone(),
-                });
+                self.grow(crate::tree::Node::of_message(payload), ctx.sequence);
             }
             EventPayload::BranchStarted(p) => {
                 if let Some(l) = self.limited.as_mut().filter(|l| l.open()) {
@@ -1839,6 +1826,7 @@ impl SessionState {
                         self.branches.insert(
                             p.id.clone(),
                             BranchState {
+                                node: p.node.clone(),
                                 from: p.from.clone(),
                                 parent: p.parent.clone(),
                                 agent: p.agent.clone(),
@@ -1850,6 +1838,19 @@ impl SessionState {
                                 closed: None,
                                 subagent: p.subagent.clone(),
                             },
+                        );
+                        self.grow(
+                            crate::tree::Node {
+                                place: crate::tree::Place {
+                                    id: p.node.clone(),
+                                    parent_id: p.from.clone(),
+                                    branch: Some(p.id.clone()),
+                                },
+                                fact: crate::tree::Fact::BranchStart {
+                                    agent: p.agent.clone(),
+                                },
+                            },
+                            ctx.sequence,
                         );
                     }
                 }
@@ -2140,23 +2141,12 @@ impl SessionState {
                     sync.auth = Some(p.auth);
                 }
             }
-            EventPayload::WorkerStateUpdated(p) => {
-                self.state_versions.push(Logged {
-                    seq: ctx.sequence,
-                    entry: StateVersion {
-                        value: p.state.clone(),
-                        anchor: p.anchor.clone(),
-                    },
-                });
-            }
-            EventPayload::AgentConfigUpdated(p) => {
-                self.agent_versions.push(Logged {
-                    seq: ctx.sequence,
-                    entry: AgentVersion {
-                        value: p.config.clone(),
-                        anchor: p.anchor.clone(),
-                    },
-                });
+            EventPayload::WorkerStateUpdated(_)
+            | EventPayload::AgentConfigUpdated(_)
+            | EventPayload::ConversationStarted(_) => {
+                if let Some(node) = crate::tree::Node::of_event(event) {
+                    self.grow(node, ctx.sequence);
+                }
             }
             EventPayload::SessionCancelled => {
                 self.limited = None;
@@ -2459,10 +2449,7 @@ impl SessionState {
         }
         if let Trigger::ClientTranscript { messages, .. } = trigger {
             let messages = self.normalize_client_view(messages.clone());
-            let known: std::collections::HashSet<&str> =
-                self.nodes.iter().map(|n| n.message.id.as_str()).collect();
-            let plan = super::reconcile::plan_reconcile(&known, &messages);
-            let landing = super::reconcile::landing_leaf(&messages, &plan);
+            let (landing, _) = self.landing_point(&messages, None);
             return self.at(landing.as_deref()).active_interrupt_for();
         }
         let at = match self.trigger_anchor(trigger) {
@@ -2563,21 +2550,14 @@ impl SessionState {
     }
 
     pub fn path_ids<'a>(&'a self, node: &'a str) -> std::collections::HashSet<&'a str> {
-        let by_id: HashMap<&str, &Logged<NewMessage>> = self
-            .nodes
+        self.tree.path_ids(node)
+    }
+
+    pub fn known_messages(&self) -> std::collections::HashSet<&str> {
+        self.tree
             .iter()
-            .map(|n| (n.message.id.as_str(), n))
-            .collect();
-        let mut ids = std::collections::HashSet::new();
-        let mut cursor = Some(node);
-        while let Some(id) = cursor {
-            let Some(node) = by_id.get(id) else { break };
-            if !ids.insert(id) {
-                break;
-            }
-            cursor = node.parent_id.as_deref();
-        }
-        ids
+            .filter_map(|n| n.message().map(|m| m.id.as_str()))
+            .collect()
     }
 
     pub fn tool_handler_for(&self, name: &str) -> ToolHandler {
@@ -2742,48 +2722,7 @@ impl SessionState {
     }
 
     pub fn load_branch(&mut self, loaded: &crate::branch::Loaded) {
-        let have: std::collections::HashSet<String> =
-            self.nodes.iter().map(|n| n.message.id.clone()).collect();
-        self.nodes.extend(
-            loaded
-                .nodes
-                .iter()
-                .filter(|n| !have.contains(&n.message.id))
-                .cloned(),
-        );
-        self.nodes.sort_by_key(|n| n.seq);
-        let states: std::collections::HashSet<u64> =
-            self.state_versions.iter().map(|v| v.seq).collect();
-        self.state_versions.extend(
-            loaded
-                .states
-                .iter()
-                .filter(|v| !states.contains(&v.seq))
-                .map(|v| Logged {
-                    seq: v.seq,
-                    entry: StateVersion {
-                        value: v.state.clone(),
-                        anchor: v.anchor.clone(),
-                    },
-                }),
-        );
-        self.state_versions.sort_by_key(|v| v.seq);
-        let agents: std::collections::HashSet<u64> =
-            self.agent_versions.iter().map(|v| v.seq).collect();
-        self.agent_versions.extend(
-            loaded
-                .agents
-                .iter()
-                .filter(|v| !agents.contains(&v.seq))
-                .map(|v| Logged {
-                    seq: v.seq,
-                    entry: AgentVersion {
-                        value: v.config.clone(),
-                        anchor: v.anchor.clone(),
-                    },
-                }),
-        );
-        self.agent_versions.sort_by_key(|v| v.seq);
+        self.tree.extend(loaded.nodes.iter().cloned());
     }
 
     fn live_nodes(&self) -> std::collections::HashSet<&str> {
@@ -2806,26 +2745,26 @@ impl SessionState {
     }
 
     pub fn off_path(&self) -> bool {
-        self.nodes.len() > self.live_nodes().len()
+        self.tree.len() > self.live_nodes().len()
     }
 
     fn unload_off_path(&mut self) {
         let path: std::collections::HashSet<String> =
             self.live_nodes().into_iter().map(str::to_string).collect();
-        let kept = |anchor: Option<&str>| anchor.is_none_or(|a| path.contains(a));
-        self.nodes.retain(|n| path.contains(&n.message.id));
-        self.state_versions.retain(|v| kept(v.anchor.as_deref()));
-        self.agent_versions.retain(|v| kept(v.anchor.as_deref()));
+        self.tree.retain(|n| path.contains(n.id()));
     }
 
     pub fn has_node(&self, id: &str) -> bool {
-        self.nodes.iter().any(|n| n.message.id == id)
+        self.tree.has(id)
     }
 
     pub fn message_tree(&self) -> MessageTree {
         MessageTree {
-            nodes: self.nodes.iter().map(|n| n.entry.clone()).collect(),
-            head_id: self.head_id.clone(),
+            nodes: self.tree.message_nodes(),
+            head_id: self
+                .tree
+                .message_at(self.head_id.as_deref())
+                .map(str::to_string),
         }
     }
 
@@ -2956,32 +2895,6 @@ impl SessionState {
 pub struct SessionStateAtNode<'a, 'n> {
     state: &'a SessionState,
     node: Option<&'n str>,
-    until: Option<u64>,
-    branch: Option<&'n str>,
-}
-
-struct Inherited<'a> {
-    nodes: HashMap<&'a str, (u64, bool)>,
-    config: Option<(u64, &'a BranchConfig)>,
-}
-
-impl Inherited<'_> {
-    fn reads(&self, anchor: Option<&str>, seq: u64) -> bool {
-        match anchor {
-            None => true,
-            Some(a) => self.nodes.get(a).is_some_and(|(until, _)| seq <= *until),
-        }
-    }
-
-    fn carries(&self, anchor: Option<&str>, seq: u64) -> bool {
-        match anchor {
-            None => true,
-            Some(a) => self
-                .nodes
-                .get(a)
-                .is_some_and(|(until, context)| *context && seq <= *until),
-        }
-    }
 }
 
 impl<'a, 'n> SessionStateAtNode<'a, 'n> {
@@ -2989,88 +2902,44 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
         self.state
     }
 
+    pub fn node(&self) -> Option<&'n str> {
+        self.node
+    }
+
     pub fn branch_id(&self) -> Option<&'a str>
     where
         'n: 'a,
     {
-        self.branch.or_else(|| {
-            let node = self.node?;
-            self.state
-                .nodes
-                .iter()
-                .find(|n| n.message.id == node)
-                .and_then(|n| n.branch.as_deref())
-        })
+        self.state.node_branch(self.node?)
     }
 
-    fn inherited(&self) -> Inherited<'a> {
-        let state = self.state;
-        let by_id: HashMap<&str, &Logged<NewMessage>> = logged_until(&state.nodes, self.until)
-            .iter()
-            .map(|n| (n.message.id.as_str(), n))
-            .collect();
-        let own = |b: Option<&str>| {
-            b.and_then(|id| state.branches.get(id))
-                .filter(|b| b.agent != BranchConfig::Inherit)
-                .map(|b| (b.seq, &b.agent))
-        };
-        let mut region: Option<&str> = match self.branch {
-            Some(b) => Some(
-                state
-                    .branches
-                    .get_key_value(b)
-                    .map_or(b, |(k, _)| k.as_str()),
-            ),
-            None => self
-                .node
-                .and_then(|n| by_id.get(n))
-                .and_then(|n| n.branch.as_deref()),
-        };
-        let mut config = own(region);
-        let mut until = u64::MAX;
-        let mut context = true;
-        let mut nodes = HashMap::new();
-        let mut cursor = self.node;
-        while let Some(id) = cursor {
-            let Some(node) = by_id.get(id) else { break };
-            let tag = node.branch.as_deref();
-            if tag != region {
-                if let Some(left) = region.and_then(|b| state.branches.get(b)) {
-                    until = until.min(left.seq);
-                    context &= left.agent == BranchConfig::Inherit;
-                }
-                region = tag;
-                if config.is_none() {
-                    config = own(region).filter(|(seq, _)| *seq <= until);
-                }
-            }
-            if nodes
-                .insert(node.message.id.as_str(), (until, context))
-                .is_some()
-            {
-                break;
-            }
-            cursor = node.parent_id.as_deref();
-        }
-        Inherited { nodes, config }
+    fn up(&self) -> crate::tree::Up<'a>
+    where
+        'n: 'a,
+    {
+        self.state.tree.up(self.node)
     }
 
-    /// Reads the logs as they were at `seq`. Everything else is current.
-    #[must_use]
-    pub fn until(self, seq: u64) -> Self {
-        Self {
-            until: Some(seq),
-            ..self
+    fn context_path(&self) -> std::collections::HashSet<&'a str>
+    where
+        'n: 'a,
+    {
+        let mut path = std::collections::HashSet::new();
+        for node in self.up() {
+            path.insert(node.id());
+            if let crate::tree::Fact::BranchStart { agent } = &node.fact {
+                if *agent != BranchConfig::Inherit {
+                    break;
+                }
+            }
         }
+        path
     }
 
     pub fn message_tree(&self) -> MessageTree {
         MessageTree {
-            nodes: logged_until(&self.state.nodes, self.until)
-                .iter()
-                .map(|n| n.entry.clone())
-                .collect(),
-            head_id: self.node.map(str::to_string),
+            nodes: self.state.tree.message_nodes(),
+            head_id: self.state.tree.message_at(self.node).map(str::to_string),
         }
     }
 
@@ -3101,27 +2970,27 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
     }
 
     pub fn resolve_state_for(&self) -> WorkerState {
-        let inherited = self.inherited();
-        logged_until(&self.state.state_versions, self.until)
-            .iter()
-            .rev()
-            .find(|v| inherited.reads(v.anchor(), v.seq))
-            .map(|v| v.value.clone())
+        self.up()
+            .find_map(|n| match &n.fact {
+                crate::tree::Fact::State { state } => Some(state.clone()),
+                _ => None,
+            })
             .unwrap_or_default()
     }
 
     pub fn resolve_agent_for(&self) -> Option<AgentConfig> {
-        let inherited = self.inherited();
-        let version = logged_until(&self.state.agent_versions, self.until)
-            .iter()
-            .rev()
-            .find(|v| inherited.reads(v.anchor(), v.seq));
-        match (version, inherited.config) {
-            (Some(v), Some((seq, _))) if v.seq > seq => Some(v.value.clone()),
-            (_, Some((_, BranchConfig::Config(config)))) => Some((**config).clone()),
-            (_, Some(_)) => None,
-            (v, None) => v.map(|v| v.value.clone()),
+        for node in self.up() {
+            match &node.fact {
+                crate::tree::Fact::Config { config } => return Some(config.clone()),
+                crate::tree::Fact::BranchStart { agent } => match agent {
+                    BranchConfig::Inherit => {}
+                    BranchConfig::None => return None,
+                    BranchConfig::Config(config) => return Some((**config).clone()),
+                },
+                _ => {}
+            }
         }
+        None
     }
 
     pub fn connector_tool(&self, name: &str) -> Option<ConnectorTool> {
@@ -3313,19 +3182,18 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
     }
 
     pub fn said(&self) -> std::collections::HashSet<String> {
-        let inherited = self.inherited();
+        let path = self.context_path();
         let legacy = self
             .state
             .effects
             .values()
-            .filter(|e| inherited.carries(e.anchor.as_deref(), 0))
+            .filter(|e| SessionState::anchored_on(&path, e.anchor.as_deref()))
             .filter_map(EffectState::llm)
             .flat_map(|call| call.context_ids.iter().cloned());
         self.state
             .context_versions
             .iter()
-            .filter(|v| self.until.is_none_or(|u| v.seq <= u))
-            .filter(|v| inherited.carries(v.anchor.as_deref(), v.seq))
+            .filter(|v| SessionState::anchored_on(&path, v.anchor.as_deref()))
             .flat_map(|v| v.value.ids.iter().cloned())
             .chain(legacy)
             .collect()
@@ -3390,7 +3258,7 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
     }
 
     pub fn placed_on_path(&self) -> Vec<prompt_context::Placed> {
-        let inherited = self.inherited();
+        let path = self.context_path();
         let recorded: std::collections::HashSet<&str> = self
             .state
             .context_versions
@@ -3402,7 +3270,7 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
             .effects
             .values()
             .filter(|e| !recorded.contains(e.id.as_str()))
-            .filter(|e| inherited.carries(e.anchor.as_deref(), 0))
+            .filter(|e| SessionState::anchored_on(&path, e.anchor.as_deref()))
             .filter_map(|e| e.llm().map(|call| call.placed_in_prompt(&e.id)))
             .flatten()
             .map(|p| (0, p))
@@ -3411,8 +3279,7 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
             self.state
                 .context_versions
                 .iter()
-                .filter(|v| self.until.is_none_or(|u| v.seq <= u))
-                .filter(|v| inherited.carries(v.anchor.as_deref(), v.seq))
+                .filter(|v| SessionState::anchored_on(&path, v.anchor.as_deref()))
                 .map(|v| (v.seq, v.value.clone())),
         );
         placed.sort_by_key(|(seq, _)| *seq);
@@ -3518,10 +3385,7 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
     }
 
     pub fn transcript(&self) -> Vec<Message> {
-        match self.node {
-            Some(node) => self.state.message_tree().path_to(node),
-            None => Vec::new(),
-        }
+        self.state.tree.messages(self.node)
     }
 
     pub fn open_llm_calls(&self) -> HashMap<String, EffectState> {
@@ -3634,9 +3498,8 @@ mod open_llm_calls_tests {
     #[test]
     fn a_call_is_open_until_its_tool_answer_is_recorded() {
         let mut s = SessionState::new("sess-1".to_string());
-        s.nodes.push(node(user("u1"), None));
-        s.nodes
-            .push(node(assistant_calling("call-1", "tc-1"), Some("u1")));
+        s.seed_message(node(user("u1"), None).entry);
+        s.seed_message(node(assistant_calling("call-1", "tc-1"), Some("u1")).entry);
         s.head_id = Some("call-1".to_string());
         s.put_effect(call_state("call-1"));
 
@@ -3645,8 +3508,7 @@ mod open_llm_calls_tests {
             "unanswered tool call keeps the parent open"
         );
 
-        s.nodes
-            .push(node(tool_answer("t1", "tc-1"), Some("call-1")));
+        s.seed_message(node(tool_answer("t1", "tc-1"), Some("call-1")).entry);
         s.head_id = Some("t1".to_string());
         assert!(
             s.at_head().open_llm_calls().is_empty(),
@@ -3656,326 +3518,134 @@ mod open_llm_calls_tests {
 }
 
 #[cfg(test)]
-mod state_version_tests {
-    use serde_json::json;
-
+mod tree_tests {
     use super::*;
-    use crate::protocol::NewMessage;
-
-    fn message_node(id: &str, parent_id: Option<&str>) -> Logged<NewMessage> {
-        Logged {
-            seq: 0,
-            entry: NewMessage {
-                message: Message {
-                    id: id.to_string(),
-                    role: Role::User,
-                    content: None,
-                    tool_calls: vec![],
-                    tool_call_id: None,
-                    name: None,
-                    reasoning: None,
-                },
-                parent_id: parent_id.map(str::to_string),
-                copied_from: None,
-                branch: None,
-            },
-        }
-    }
-
-    fn forked_session() -> SessionState {
-        let mut s = SessionState::new("sess-1".to_string());
-        s.nodes.push(message_node("u1", None));
-        s.nodes.push(message_node("a1", Some("u1")));
-        s.nodes.push(message_node("u2", Some("a1")));
-        s.nodes.push(message_node("x1", Some("u1")));
-        s
-    }
-
-    fn version(state: serde_json::Value, anchor: Option<&str>) -> Logged<StateVersion> {
-        Logged {
-            seq: 0,
-            entry: StateVersion {
-                value: WorkerState(state),
-                anchor: anchor.map(str::to_string),
-            },
-        }
-    }
-
-    #[test]
-    fn empty_versions_resolve_to_default() {
-        let s = forked_session();
-        assert_eq!(s.at(Some("u2")).resolve_state_for(), WorkerState::default());
-        assert_eq!(s.at(None).resolve_state_for(), WorkerState::default());
-    }
-
-    #[test]
-    fn linear_resolution_latest_on_path_wins() {
-        let mut s = forked_session();
-        s.state_versions.push(version(json!({"v": 1}), Some("u1")));
-        s.state_versions.push(version(json!({"v": 2}), Some("u2")));
-        assert_eq!(s.at(Some("u2")).resolve_state_for().0, json!({"v": 2}));
-    }
-
-    #[test]
-    fn fork_resolves_as_of_the_fork_point() {
-        let mut s = forked_session();
-        s.state_versions.push(version(json!({"v": 1}), Some("u1")));
-        s.state_versions.push(version(json!({"v": 2}), Some("u2")));
-        assert_eq!(s.at(Some("x1")).resolve_state_for().0, json!({"v": 1}));
-    }
-
-    #[test]
-    fn unanchored_version_matches_any_path() {
-        let mut s = forked_session();
-        s.state_versions.push(version(json!({"v": 0}), None));
-        s.state_versions.push(version(json!({"v": 2}), Some("u2")));
-        assert_eq!(s.at(Some("x1")).resolve_state_for().0, json!({"v": 0}));
-        assert_eq!(s.at(Some("u2")).resolve_state_for().0, json!({"v": 2}));
-        assert_eq!(s.at(None).resolve_state_for().0, json!({"v": 0}));
-    }
-
-    #[test]
-    fn same_anchor_versions_resolve_to_the_newest() {
-        let mut s = forked_session();
-        s.head_id = Some("u2".to_string());
-        let ctx = ApplyContext {
-            occurred_at: Utc::now(),
-            sequence: 1,
-        };
-        for (i, anchor) in [(1, Some("u1")), (2, Some("u2")), (3, Some("u2"))] {
-            s.apply(
-                &EventPayload::WorkerStateUpdated(WorkerStateUpdated {
-                    state: WorkerState(json!({ "v": i })),
-                    anchor: anchor.map(str::to_string),
-                }),
-                &ctx,
-            );
-        }
-        assert_eq!(s.state_versions.len(), 3);
-        assert_eq!(s.at_head().resolve_state_for().0, json!({"v": 3}));
-        assert_eq!(s.at(Some("x1")).resolve_state_for().0, json!({"v": 1}));
-    }
-
-    #[test]
-    fn a_version_serializes_flat_under_its_log_tag() {
-        let v = version(json!({"v": 1}), Some("u1"));
-        let value = serde_json::to_value(&v).expect("serializes");
-        assert_eq!(value, json!({"seq": 0, "value": {"v": 1}, "anchor": "u1"}));
-    }
-
-    #[test]
-    fn until_reads_each_log_as_it_was_at_a_seq() {
-        let mut s = SessionState::new("sess-1".to_string());
-        let apply = |s: &mut SessionState, seq: u64, payload: EventPayload| {
-            s.apply(
-                &payload,
-                &ApplyContext {
-                    occurred_at: Utc::now(),
-                    sequence: seq,
-                },
-            );
-        };
-        let msg = |id: &str, parent: Option<&str>| {
-            EventPayload::NewMessage(NewMessage {
-                message: Message {
-                    id: id.to_string(),
-                    role: Role::User,
-                    content: None,
-                    tool_calls: vec![],
-                    tool_call_id: None,
-                    name: None,
-                    reasoning: None,
-                },
-                parent_id: parent.map(str::to_string),
-                copied_from: None,
-                branch: None,
-            })
-        };
-        let state = |v: serde_json::Value, anchor: &str| {
-            EventPayload::WorkerStateUpdated(WorkerStateUpdated {
-                state: WorkerState(v),
-                anchor: Some(anchor.to_string()),
-            })
-        };
-
-        apply(&mut s, 1, msg("u1", None));
-        apply(&mut s, 2, state(json!({"v": 1}), "u1"));
-        apply(&mut s, 3, msg("u2", Some("u1")));
-        apply(&mut s, 4, state(json!({"v": 2}), "u1"));
-
-        let at = s.at(Some("u1")).until(2);
-        assert_eq!(at.message_tree().nodes.len(), 1);
-        assert_eq!(at.message_tree().head_id.as_deref(), Some("u1"));
-        assert_eq!(at.resolve_state_for().0, json!({"v": 1}));
-        assert_eq!(s.at(Some("u1")).resolve_state_for().0, json!({"v": 2}));
-    }
-}
-
-#[cfg(test)]
-mod agent_version_tests {
-    use super::*;
-    use crate::protocol::NewMessage;
-
-    fn message_node(id: &str, parent_id: Option<&str>) -> Logged<NewMessage> {
-        Logged {
-            seq: 0,
-            entry: NewMessage {
-                message: Message {
-                    id: id.to_string(),
-                    role: Role::User,
-                    content: None,
-                    tool_calls: vec![],
-                    tool_call_id: None,
-                    name: None,
-                    reasoning: None,
-                },
-                parent_id: parent_id.map(str::to_string),
-                copied_from: None,
-                branch: None,
-            },
-        }
-    }
-
-    fn forked_session() -> SessionState {
-        let mut s = SessionState::new("sess-1".to_string());
-        s.nodes.push(message_node("u1", None));
-        s.nodes.push(message_node("a1", Some("u1")));
-        s.nodes.push(message_node("u2", Some("a1")));
-        s.nodes.push(message_node("x1", Some("u1")));
-        s
-    }
+    use crate::tree::{Fact, Node, Place};
 
     fn config(model: &str) -> AgentConfig {
-        AgentConfig {
-            llm: Some("claude".to_string()),
-            model: model.to_string(),
-            ..Default::default()
+        serde_json::from_value(serde_json::json!({ "model": model })).unwrap()
+    }
+
+    fn user(id: &str) -> Message {
+        serde_json::from_value(serde_json::json!({ "id": id, "role": "user", "content": id }))
+            .unwrap()
+    }
+
+    fn put(s: &mut SessionState, id: &str, parent: Option<&str>, fact: Fact) {
+        s.seed(Node {
+            place: Place {
+                id: id.to_string(),
+                parent_id: parent.map(str::to_string),
+                branch: None,
+            },
+            fact,
+        });
+    }
+
+    fn state(v: i64) -> Fact {
+        Fact::State {
+            state: WorkerState(serde_json::json!({ "v": v })),
         }
     }
 
-    fn version(model: &str, anchor: Option<&str>) -> Logged<AgentVersion> {
-        Logged {
-            seq: 0,
-            entry: AgentVersion {
-                value: config(model),
-                anchor: anchor.map(str::to_string),
-            },
+    fn message(id: &str) -> Fact {
+        Fact::Message {
+            message: user(id),
+            copied_from: None,
         }
     }
 
-    #[test]
-    fn empty_versions_resolve_to_none() {
-        let s = forked_session();
-        assert_eq!(s.at(Some("u2")).resolve_agent_for(), None);
-        assert_eq!(s.at(None).resolve_agent_for(), None);
+    fn read(s: &SessionState, at: &str) -> serde_json::Value {
+        s.at(Some(at)).resolve_state_for().0
     }
 
     #[test]
-    fn linear_resolution_latest_on_path_wins() {
-        let mut s = forked_session();
-        s.agent_versions.push(version("m1", Some("u1")));
-        s.agent_versions.push(version("m2", Some("u2")));
-        assert_eq!(s.at(Some("u2")).resolve_agent_for(), Some(config("m2")));
-    }
-
-    #[test]
-    fn fork_resolves_as_of_the_fork_point() {
-        let mut s = forked_session();
-        s.agent_versions.push(version("m1", Some("u1")));
-        s.agent_versions.push(version("m2", Some("u2")));
-        assert_eq!(s.at(Some("x1")).resolve_agent_for(), Some(config("m1")));
-    }
-
-    #[test]
-    fn a_connection_is_summarised_where_the_work_was_authored() {
-        let with_sentry = |model: &str, anchor: Option<&str>| Logged {
-            seq: 0,
-            entry: AgentVersion {
-                value: AgentConfig {
-                    mcp: vec![McpServer {
-                        id: "sentry".into(),
-                        tools: None,
-                        auth_failure: Default::default(),
-                        tool_sync_failure: Default::default(),
-                        approve: Default::default(),
-                    }],
-                    ..config(model)
-                },
-                anchor: anchor.map(str::to_string),
-            },
-        };
-        let mut s = forked_session();
-        s.head_id = Some("u2".to_string());
-        s.agent_versions.push(with_sentry("m1", Some("u1")));
-        s.agent_versions.push(version("m2", Some("u2")));
-        s.insert_effect(
-            "mcp.sentry",
-            EffectTracking::new_queued(RetryPolicy::no_retry()),
-            EffectPayload::ConnectorSync(ConnectorSyncState {
-                prefix: Some("sentry".to_string()),
-                tools: vec![RemoteTool {
-                    name: "search_issues".to_string(),
-                    title: None,
-                    description: String::new(),
-                    input: None,
-                    output: None,
-                    annotations: Default::default(),
-                }],
-                instructions: None,
-                error: None,
-                auth: None,
-            }),
+    fn the_nearest_write_above_a_node_is_what_it_reads() {
+        let mut s = SessionState::new("s".into());
+        put(
+            &mut s,
+            "c0",
             None,
+            Fact::Config {
+                config: config("m1"),
+            },
         );
-        if let Some(e) = s.effect_mut(EffectKind::ConnectorSync, "mcp.sentry") {
-            e.tracking.dispatch(Utc::now());
-            e.tracking.complete();
-        }
-
-        assert!(
-            s.at(Some("x1"))
-                .connection_summary(&ConnectionPath::Mcp("sentry".into()))
-                .is_some(),
-            "the fork still holds the connection, so a call there can describe it"
+        put(&mut s, "s1", Some("c0"), state(1));
+        put(&mut s, "u1", Some("s1"), message("u1"));
+        put(&mut s, "s2", Some("u1"), state(2));
+        put(&mut s, "u2", Some("s2"), message("u2"));
+        assert_eq!(read(&s, "u1"), serde_json::json!({ "v": 1 }));
+        assert_eq!(read(&s, "u2"), serde_json::json!({ "v": 2 }));
+        assert_eq!(
+            s.at(Some("u2")).resolve_agent_for().map(|c| c.model),
+            Some("m1".into())
         );
-        assert!(
-            s.at(Some("u2"))
-                .connection_summary(&ConnectionPath::Mcp("sentry".into()))
-                .is_none(),
-            "u2 dropped it, so a call there has nothing to describe"
+        assert_eq!(
+            s.at(Some("u2")).transcript().len(),
+            2,
+            "only messages are the transcript"
         );
     }
 
     #[test]
-    fn unanchored_config_is_the_universal_fallback() {
-        let mut s = forked_session();
-        s.agent_versions.push(version("m0", None));
-        s.agent_versions.push(version("m2", Some("u2")));
-        assert_eq!(s.at(Some("x1")).resolve_agent_for(), Some(config("m0")));
-        assert_eq!(s.at(Some("u2")).resolve_agent_for(), Some(config("m2")));
-        assert_eq!(s.at(None).resolve_agent_for(), Some(config("m0")));
+    fn a_write_after_a_fork_is_not_on_the_fork() {
+        let mut s = SessionState::new("s".into());
+        put(&mut s, "u1", None, message("u1"));
+        put(&mut s, "s1", Some("u1"), state(1));
+        put(&mut s, "x1", Some("u1"), message("x1"));
+        assert_eq!(read(&s, "s1"), serde_json::json!({ "v": 1 }));
+        assert_eq!(read(&s, "x1"), serde_json::Value::Null);
     }
 
     #[test]
-    fn same_anchor_configs_resolve_to_the_newest() {
-        let mut s = forked_session();
-        s.head_id = Some("u2".to_string());
-        let ctx = ApplyContext {
-            occurred_at: Utc::now(),
-            sequence: 1,
-        };
-        for (model, anchor) in [("m1", Some("u1")), ("m2", Some("u2")), ("m3", Some("u2"))] {
-            s.apply(
-                &EventPayload::AgentConfigUpdated(AgentConfigUpdated {
-                    config: config(model),
-                    anchor: anchor.map(str::to_string),
-                }),
-                &ctx,
-            );
-        }
-        assert_eq!(s.agent_versions.len(), 3);
-        assert_eq!(s.at_head().resolve_agent_for(), Some(config("m3")));
-        assert_eq!(s.at(Some("x1")).resolve_agent_for(), Some(config("m1")));
+    fn a_branch_with_its_own_config_reads_it_and_inherits_state() {
+        let mut s = SessionState::new("s".into());
+        put(
+            &mut s,
+            "c0",
+            None,
+            Fact::Config {
+                config: config("m1"),
+            },
+        );
+        put(&mut s, "s1", Some("c0"), state(1));
+        put(&mut s, "u1", Some("s1"), message("u1"));
+        let start = |agent| Fact::BranchStart { agent };
+        put(
+            &mut s,
+            "b1",
+            Some("u1"),
+            start(BranchConfig::Config(Box::new(config("m2")))),
+        );
+        put(&mut s, "b2", Some("u1"), start(BranchConfig::None));
+        put(&mut s, "b3", Some("u1"), start(BranchConfig::Inherit));
+        let model = |at| s.at(Some(at)).resolve_agent_for().map(|c| c.model);
+        assert_eq!(model("b1"), Some("m2".into()));
+        assert_eq!(model("b2"), None);
+        assert_eq!(model("b3"), Some("m1".into()));
+        assert_eq!(read(&s, "b1"), serde_json::json!({ "v": 1 }));
+    }
+
+    #[test]
+    fn the_message_view_skips_other_nodes() {
+        let mut s = SessionState::new("s".into());
+        put(&mut s, "u1", None, message("u1"));
+        put(&mut s, "s1", Some("u1"), state(1));
+        put(&mut s, "u2", Some("s1"), message("u2"));
+        let tree = s.message_tree();
+        assert_eq!(tree.head_id.as_deref(), Some("u2"));
+        let parents: Vec<_> = tree.nodes.iter().map(|n| n.parent_id.clone()).collect();
+        assert_eq!(parents, vec![None, Some("u1".to_string())]);
+    }
+
+    #[test]
+    fn a_tree_round_trips_and_keeps_its_index() {
+        let mut s = SessionState::new("s".into());
+        put(&mut s, "u1", None, message("u1"));
+        put(&mut s, "s1", Some("u1"), state(1));
+        let back: SessionState = serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
+        assert!(back.has_node("s1"));
+        assert_eq!(read(&back, "s1"), serde_json::json!({ "v": 1 }));
     }
 }
 
@@ -4010,22 +3680,6 @@ mod effect_tests {
         assert!(json.get("agent_id").is_none());
         let back: Effect = serde_json::from_value(json).unwrap();
         assert_eq!(back, e);
-    }
-}
-
-#[cfg(test)]
-mod node_wire_compat_tests {
-    use crate::protocol::NewMessage;
-
-    #[test]
-    fn legacy_kind_tagged_node_json_still_deserializes() {
-        let node: NewMessage = serde_json::from_value(serde_json::json!({
-            "kind": "message",
-            "message": {"id": "m1", "role": "user", "content": "hi", "tool_calls": []},
-            "parent_id": null,
-        }))
-        .expect("unknown fields are ignored");
-        assert_eq!(node.message.id, "m1");
     }
 }
 

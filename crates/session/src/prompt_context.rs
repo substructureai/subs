@@ -483,7 +483,11 @@ mod tests {
                     }],
                     ..Default::default()
                 },
-                anchor: None,
+                node: crate::tree::Place {
+                    id: uuid::Uuid::now_v7().to_string(),
+                    parent_id: None,
+                    branch: None,
+                },
             }),
         );
         if settled {
@@ -525,7 +529,7 @@ mod tests {
     }
 
     fn owed_ids(state: &SessionState) -> Vec<String> {
-        owed(state.at(None)).into_iter().map(|c| c.id).collect()
+        owed(state.at_head()).into_iter().map(|c| c.id).collect()
     }
 
     fn sentry() -> ConnectionPath {
@@ -549,7 +553,11 @@ mod tests {
                     }],
                     ..Default::default()
                 },
-                anchor: None,
+                node: crate::tree::Place {
+                    id: uuid::Uuid::now_v7().to_string(),
+                    parent_id: None,
+                    branch: None,
+                },
             }),
         );
         apply(
@@ -582,7 +590,7 @@ mod tests {
         let state = failed_state(McpToolSyncFailure::Warn, None);
         assert_eq!(owed_ids(&state), ["mcp.sentry:unavailable:unreachable"]);
         assert_eq!(
-            owed(state.at(None))[0].content,
+            owed(state.at_head())[0].content,
             "{\"mcp_server\":\"mcp.sentry\",\"unavailable\":true,\"reason\":\"unreachable\"}"
         );
     }
@@ -590,7 +598,7 @@ mod tests {
     #[test]
     fn the_remotes_own_error_never_reaches_the_prompt() {
         let state = failed_state(McpToolSyncFailure::Warn, None);
-        let content = &owed(state.at(None))[0].content;
+        let content = &owed(state.at_head())[0].content;
         assert!(!content.contains("502"), "{content}");
         assert!(!content.contains("script"), "{content}");
     }
@@ -608,10 +616,10 @@ mod tests {
     fn a_silent_connection_is_not_named() {
         let state = failed_state(McpToolSyncFailure::Silent, None);
         assert!(owed_ids(&state).is_empty());
-        let config = state.at(None).resolve_agent_for().expect("config");
+        let config = state.at_head().resolve_agent_for().expect("config");
         assert!(
             state
-                .at(None)
+                .at_head()
                 .unavailable_connector_paths(&config)
                 .is_empty(),
             "silent covers the search answer too"
@@ -621,14 +629,18 @@ mod tests {
     #[test]
     fn announcing_no_servers_still_reports_one_that_is_missing() {
         let mut s = failed_state(McpToolSyncFailure::Warn, None);
-        let mut config = s.at(None).resolve_agent_for().expect("config");
+        let mut config = s.at_head().resolve_agent_for().expect("config");
         config.mcp_announce = McpAnnounce::Never;
         apply(
             &mut s,
             4,
             EventPayload::AgentConfigUpdated(AgentConfigUpdated {
                 config,
-                anchor: None,
+                node: crate::tree::Place {
+                    id: uuid::Uuid::now_v7().to_string(),
+                    parent_id: None,
+                    branch: None,
+                },
             }),
         );
         assert_eq!(owed_ids(&s), ["mcp.sentry:unavailable:unreachable"]);
@@ -653,7 +665,7 @@ mod tests {
     fn a_down_connection_is_named_in_the_search_answer() {
         let state = failed_state(McpToolSyncFailure::Warn, None);
         let answered = crate::engine_tools::answer(
-            state.at(None),
+            state.at_head(),
             crate::protocol::ConnectorToolKind::Find,
             "{\"query\":\"issues\"}",
         )
@@ -674,7 +686,7 @@ mod tests {
     fn a_call_to_an_unknown_tool_says_a_connection_is_down_without_claiming_the_tool() {
         let state = failed_state(McpToolSyncFailure::Warn, None);
         let fault = state
-            .at(None)
+            .at_head()
             .call_tool_fault("{\"name\":\"sentry_list_issues\"}")
             .expect("fault");
         assert!(fault.contains("no tool `sentry_list_issues`"), "{fault}");
@@ -692,7 +704,11 @@ mod tests {
                     model: "m1".to_string(),
                     ..Default::default()
                 },
-                anchor: None,
+                node: crate::tree::Place {
+                    id: uuid::Uuid::now_v7().to_string(),
+                    parent_id: None,
+                    branch: None,
+                },
             }),
         );
         assert!(
@@ -736,7 +752,7 @@ mod tests {
     fn a_plugins_settled_server_is_announced_like_any_connection() {
         let state = plugin_state(true);
         assert_eq!(owed_ids(&state), ["plugin.pdf", "plugin.pdf.mcp.renderer"]);
-        let owed = owed(state.at(None));
+        let owed = owed(state.at_head());
         assert!(
             owed[1]
                 .content
@@ -759,7 +775,7 @@ mod tests {
     #[test]
     fn the_catalog_carries_every_skill_description() {
         let state = plugin_state(false);
-        let catalog = &owed(state.at(None))[0].content;
+        let catalog = &owed(state.at_head())[0].content;
         assert!(catalog.matches("long long").count() >= 2, "{catalog}");
         assert!(catalog.contains("pdf:text-extraction"), "{catalog}");
     }
@@ -1165,7 +1181,11 @@ mod tests {
             1,
             EventPayload::AgentConfigUpdated(AgentConfigUpdated {
                 config,
-                anchor: None,
+                node: crate::tree::Place {
+                    id: uuid::Uuid::now_v7().to_string(),
+                    parent_id: None,
+                    branch: None,
+                },
             }),
         );
         let owed = owed(s.at_head());

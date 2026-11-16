@@ -135,14 +135,13 @@ impl Store for SqliteSessionStore {
         for tie in entry.ties() {
             tx.execute(
                 "INSERT OR IGNORE INTO session_ties
-                    (tenant_id, session_id, node_id, seq, message, parent_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    (tenant_id, session_id, node_id, seq, parent_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     self.tenant_id,
                     self.session_id,
                     tie.node,
                     tie.seq as i64,
-                    tie.message,
                     tie.parent
                 ],
             )
@@ -155,7 +154,7 @@ impl Store for SqliteSessionStore {
         let conn = self.reader()?;
         let mut stmt = conn
             .prepare_cached(
-                "SELECT seq, message, parent_id FROM session_ties
+                "SELECT seq, parent_id FROM session_ties
                   WHERE tenant_id = ?1 AND session_id = ?2 AND node_id = ?3
                   ORDER BY seq",
             )
@@ -165,8 +164,7 @@ impl Store for SqliteSessionStore {
                 Ok(Tie {
                     node: node.to_string(),
                     seq: row.get::<_, i64>(0)? as u64,
-                    message: row.get(1)?,
-                    parent: row.get(2)?,
+                    parent: row.get(1)?,
                 })
             })
             .map_err(unavailable)?;
@@ -440,13 +438,16 @@ mod tests {
         decide(&mut session, "echo", vec![hi]);
 
         let indexed = store.tied("u1").unwrap();
-        assert_eq!(indexed.len(), 2, "the message and the state written on it");
+        assert_eq!(indexed.len(), 1, "the message is indexed by its node");
         assert_eq!(
             indexed,
             substructure_session::branch::scan_ties(store.as_ref(), "u1").unwrap()
         );
         assert!(store.tied("nobody").unwrap().is_empty());
-        assert!(indexed.iter().any(|t| t.message && t.parent.is_none()));
+        assert!(
+            indexed.iter().all(|t| t.parent.is_some()),
+            "it hangs below the start"
+        );
 
         let seqs: Vec<u64> = indexed.iter().map(|t| t.seq).collect();
         let found: Vec<u64> = store

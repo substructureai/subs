@@ -1,11 +1,9 @@
-use std::collections::HashSet;
-
 use super::Working;
 use crate::context;
 use crate::decision::{PromptSource, Trigger};
 use crate::events::*;
 use crate::ids::Ids;
-use crate::protocol::{DraftMessage, HeldCall, NewMessage, Role};
+use crate::protocol::{DraftMessage, HeldCall, NewMessage, Role, WorkerState};
 use crate::state::SessionState;
 
 impl Working {
@@ -46,29 +44,14 @@ impl Working {
             return;
         }
         let before = self.at_head().transcript();
-        let state = self.at_head().resolve_state_for();
-        let config = self.at_head().resolve_agent_for();
         let reason = self.limited.as_ref().filter(|l| l.open()).map(|l| l.reason);
-
-        let (written, summary, copies) = self.branch(&self.ids, summary, messages);
-        let kept = written.len() - usize::from(summary.is_some());
+        let (written, summary, copies) = self.restart(&self.ids, summary, messages);
+        let kept = written
+            .iter()
+            .filter(|e| matches!(e, EventPayload::NewMessage(_)))
+            .count()
+            - usize::from(summary.is_some());
         self.emit_all(written);
-
-        let head = self.head_id.clone();
-        if self.at_head().resolve_state_for() != state {
-            self.emit(EventPayload::WorkerStateUpdated(WorkerStateUpdated {
-                state,
-                anchor: head.clone(),
-            }));
-        }
-        if let Some(config) = config {
-            if self.at_head().resolve_agent_for().as_ref() != Some(&config) {
-                self.emit(EventPayload::AgentConfigUpdated(AgentConfigUpdated {
-                    config,
-                    anchor: head,
-                }));
-            }
-        }
         self.then(|s| s.void_stranded_work(s.head_id.as_deref()));
         let dropped = before
             .iter()
@@ -85,18 +68,42 @@ impl Working {
 }
 
 impl SessionState {
-    fn branch(
+    fn restart(
         &self,
         ids: &Ids,
         summary: Option<String>,
         messages: Vec<DraftMessage>,
     ) -> (Vec<EventPayload>, Option<ContextSummary>, usize) {
-        let known: HashSet<&str> = self.nodes.iter().map(|n| n.message.id.as_str()).collect();
-        let mut events = Vec::with_capacity(messages.len() + 1);
+        let here = self.at_head();
         let mut parent: Option<String> = None;
+        let mut events = Vec::with_capacity(messages.len() + 3);
+        let place = |parent: &mut Option<String>| {
+            let id = ids.next();
+            crate::tree::Place {
+                id: id.clone(),
+                parent_id: parent.replace(id),
+                branch: None,
+            }
+        };
+        let state = here.resolve_state_for();
+        if state != WorkerState::default() {
+            events.push(EventPayload::WorkerStateUpdated(WorkerStateUpdated {
+                state,
+                node: place(&mut parent),
+            }));
+        }
+        if let Some(config) = here.resolve_agent_for() {
+            events.push(EventPayload::AgentConfigUpdated(AgentConfigUpdated {
+                config,
+                node: place(&mut parent),
+            }));
+        }
+        events.push(EventPayload::ConversationStarted(ConversationStarted {
+            node: place(&mut parent),
+        }));
         let mut copies = 0;
         let mut write = |draft: DraftMessage| {
-            let copied_from = draft.id.clone().filter(|id| known.contains(id.as_str()));
+            let copied_from = draft.id.clone().filter(|id| self.has_node(id));
             let message = match copied_from {
                 Some(_) => draft.rerecord(ids),
                 None => draft.record(ids),
