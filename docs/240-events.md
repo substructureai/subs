@@ -200,13 +200,23 @@ the same attempt.
 
 ## Branches
 
-Engine bookkeeping. The engine keeps the active branch in memory and loads other
-branches from the log when a view needs them. These events go to no reader.
+| Event | Meaning |
+| --- | --- |
+| `branch.started` | `{ id, from?, parent?, agent, name?, mode, turn_id?, subagent? }`. A [branch](./125-branches.md) started, or a subagent's went on. |
+| `branch.closed` | `{ id, reason, data?, error? }`. `reason` is `done`, `failed`, `voided`, `closed`, or `promoted`. |
+
+A `message.new` with `branch` is written on that branch. It does not move the
+head, and a client shows it as no part of the conversation. A call's
+`*.requested` event names its `branch` too.
+
+Engine bookkeeping: the engine keeps the conversation and the open branches in
+memory, and loads others from the log when a view needs them. These events go
+to no reader.
 
 | Event | Meaning |
 | --- | --- |
-| `branch.loaded` | A branch came back into memory from the log. |
-| `branch.unloaded` | Branches off the active path left memory. They stay in the log. |
+| `branch.loaded` | Messages came back into memory from the log. |
+| `branch.unloaded` | Messages off every open path left memory. They stay in the log. |
 
 ## AG-UI
 

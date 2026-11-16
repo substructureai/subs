@@ -70,8 +70,8 @@ worker.
 
 ## How the tool is offered
 
-An entry can also be a table with `id`, `defer`, `prefix`, and `mode`. The
-string form is the table with all of them unset.
+An entry can also be a table with `id`, `defer`, `prefix`, `mode`, and
+`branch`. The string form is the table with all of them unset.
 
 ```toml title="subs.toml"
 [agent.assistant]
@@ -92,6 +92,37 @@ either way.
 `prefix = true` offers the tool as `agent__<id>` instead of `<id>`. Use it when
 the bare ID would collide with another tool's name. A prefixed ID frees the
 bare name, and the collision rule applies to the offered name.
+
+## Run a subagent on a branch
+
+By default a subagent runs in a session of its own. `branch` runs it in the
+calling session instead, on a [branch](./125-branches.md).
+
+```toml title="subs.toml"
+[agent.assistant]
+llm = "claude"
+model = "claude-sonnet-4-5"
+subagents = [
+    { id = "agent.researcher", branch = "head" },
+    { id = "agent.poet", branch = "root" },
+]
+```
+
+| `branch` | The subagent |
+| --- | --- |
+| `head` | Forks the conversation where the model called it, and runs as the calling agent. It reads everything before the call, and shares the cached prompt. |
+| `root` | Starts clean, and runs as its own `[agent.<id>]` config. |
+
+The model sees the same tool, and gets the same answer:
+`{ "session": "<branch>", "result": "..." }`. `session` goes on with the same
+branch. `mode`, `wait`, and the depth limit work as they do for a session. A
+blocking one ends with the turn, and a detached one reports back as a message.
+
+The branch's first decision is `branch.started`, with the task as its last
+message. Its `proposed` calls the model. The branch's `done` answers the call.
+
+A subagent on a branch has no session of its own: its work is in the calling
+session's log and events. A detached subagent cannot start on a branch.
 
 ## One tool for every subagent
 

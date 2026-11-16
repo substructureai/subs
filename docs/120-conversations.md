@@ -105,7 +105,7 @@ read more than 184,000 tokens, the engine summarizes.
 | Strategy | `proposed` holds |
 | --- | --- |
 | `reset` | `context.replace` with only the turn's own messages, then the held call on them. |
-| `summarize` | An `llm.call` that summarizes the older messages. About `keep_tokens` of recent messages, from a user message, stay as they are. |
+| `summarize` | An `llm.call` on a new root branch that summarizes the older messages. About `keep_tokens` of recent messages, from a user message, stay as they are. |
 | `worker` | The held call, as it was. Change it or replace it. |
 
 `window` is the model's context window. Set it to what the model reads. A
@@ -135,12 +135,15 @@ does not hold it a second time.
 | Answer | Then |
 | --- | --- |
 | `context.replace`, then `call` | The engine sets the history, and the call runs on it. |
-| An `llm.call` with another id | That call writes the summary. Its `llm.finished` proposes `context.replace` with the summary and the kept messages, then `call` on them. |
+| The proposed summary `llm.call` | It runs on a root branch named `<call id>.summary`. That branch's `llm.finished` proposes `done` with the summary. Then `branch.finished` proposes `context.replace` with the summary and the kept messages, then `call` on them. |
 | `call` alone | The history stays. The engine does not ask again in that turn. |
 
 The summary is not added to the conversation. When the summary call fails, the
 engine proposes `call` as it was. When the provider finds the summary call too
-long, the engine proposes a shorter one.
+long, the engine proposes a shorter one, on a new branch.
+
+A summary of your own is a branch of your own. Answer its `branch.finished`
+with `context.replace` and `call`.
 
 A `summarize` strategy takes `prompt` for its own instructions, and `llm` and
 `model` to write the summary elsewhere. An earlier summary is part of what the
@@ -190,9 +193,8 @@ without `messages` after the replace reads the new history.
 | `context.replaced` | Room was made. |
 | `context.kept` | The history stays. |
 
-A model call between `context.limited` and the next of the other two writes the
-summary. Do not show its text as an answer. The summary that the engine
-proposes is not streamed.
+The summary is written on a branch, so its reply never reaches the chat. The
+summary that the engine proposes is not streamed.
 
 ## One turn at a time
 

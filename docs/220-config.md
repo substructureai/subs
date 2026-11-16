@@ -167,13 +167,14 @@ tool = { max_attempts = 3 }
 | `mcp_announce` | `auto`, `never` | `auto` | Whether the engine tells the model that a connection is available. See [Tell the model a connection exists](./40-connectors.md#tell-the-model-a-connection-exists). |
 | `mcp_auth_failure` | `interrupt`, `degrade` | `interrupt` | The default for every connection this agent reaches, including each plugin's. A connection overrides it with its own `auth_failure`. |
 | `mcp_tool_sync_failure` | `warn`, `silent` | `warn` | The default for every connection this agent reaches, including each plugin's. A connection overrides it with its own `tool_sync_failure`. |
-| `subagents` | list | none | Agents this one can call. Each entry is an `agent.<id>` path, or a table with `id`, `defer`, and `prefix`. See [Subagents](./80-subagents.md#how-the-tool-is-offered). |
+| `subagents` | list | none | Agents this one can call. Each entry is an `agent.<id>` path, or a table with `id`, `defer`, `prefix`, `mode`, and `branch`. See [Subagents](./80-subagents.md#how-the-tool-is-offered). |
 | `subagent_tools` | table | `{ strategy = "per_agent" }` | What shape the subagents take as tools. `per_agent` offers one tool per agent; `single` offers one `subagent` tool for all of them. See [Subagents](./80-subagents.md#one-tool-for-every-subagent). |
 | `max_subagent_depth` | integer | `5` | How deep this agent's subagents may nest. A session that deep may not delegate; `0` never delegates. See [Subagents](./80-subagents.md#how-deep-subagents-nest). |
 | `tools` | list | none | Tools the worker or the browser runs: `name`, `description`, `input`, `output`, `handler` and `defer`. Leave out `handler` for the worker, or set `handler = "client"`. `input` and `output` are a JSON Schema, or the path of a file that holds one. |
 | `attachments` | table | none | How files reach the model. See [`[agent.<id>.attachments]`](#agentidattachments). |
 | `context` | table | none | How the agent makes room when the model reads too much. See [`[agent.<id>.context]`](#agentidcontext). |
 | `codemode` | `javascript` | none | Offers `run_code`, which runs a script in this language that calls the agent's tools. See [Code mode](./67-code-mode.md). |
+| `parallel_branches` | bool | `false` | Asks the worker about each branch while others are out, instead of one decision at a time. See [Branches](./125-branches.md#parallel-branches). |
 | `worker` | url | none | Where decisions go. Leave it off and the engine decides. |
 | `events` | string | none | The `[events.<id>]` block that gets this agent's events. See [Events URL](./55-events-url.md). |
 | `signing_secret_env` | string | none | The variable holding the signing secret. For an engine you run. |

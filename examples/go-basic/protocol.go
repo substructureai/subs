@@ -204,10 +204,14 @@ type ClientPayload struct {
 
 type DecisionRequest struct {
 	// The agent config for the active path. `null` when none is set.
-	Agent      *AgentConfig   `json:"agent"`
-	AgentID    string         `json:"agent_id"`
-	Ancestry   []string       `json:"ancestry"`
-	Attempts   int64          `json:"attempts"`
+	Agent    *AgentConfig `json:"agent"`
+	AgentID  string       `json:"agent_id"`
+	Ancestry []string     `json:"ancestry"`
+	Attempts int64        `json:"attempts"`
+	// The branch this decision is about. `messages`, `state`, `agent` and
+	// `calls` are read on it, and the response applies to it. Absent on the
+	// conversation.
+	Branch     *BranchView    `json:"branch"`
 	Calls      []Effect       `json:"calls"`
 	Deadline   *time.Time     `json:"deadline"`
 	DecisionID string         `json:"decision_id"`
@@ -248,7 +252,7 @@ type AgentConfig struct {
 	// nothing; a connection can still defer on its own.
 	DeferTools *DeferToolsWire `json:"defer_tools"`
 	// How hard the model thinks. Unset leaves the provider's own default.
-	Effort *ReasoningEffort `json:"effort"`
+	Effort *string `json:"effort"`
 	// The `[llm.*]` block this agent's calls run on.
 	Llm *string `json:"llm"`
 	// How deep this agent's subagents may nest. A session whose depth
@@ -260,6 +264,9 @@ type AgentConfig struct {
 	// what that server says it is for.
 	MCPAnnounce *MCPAnnounce `json:"mcp_announce,omitempty"`
 	Model       string       `json:"model"`
+	// Ask the worker about each branch while others are still out, instead
+	// of one decision at a time.
+	ParallelBranches *bool `json:"parallel_branches"`
 	// Plugins this agent uses.
 	Plugins []AgentPlugin `json:"plugins,omitempty"`
 	// Boxed. Five per-kind overrides are too many bytes to carry inline.
@@ -425,6 +432,8 @@ type SubagentTools struct {
 // A subagent the model can delegate to. `id` names the child agent; the model
 // calls the tool [`Subagent::offered_name`] gives. Its input is one `message`.
 type SubagentElement struct {
+	// Run it on a branch of this session instead of a session of its own.
+	Branch *SubagentBranch `json:"branch"`
 	// Keep this tool out of the request. See [`LlmTool::defer`]. Absent ⇒
 	// the agent's `defer_tools`.
 	Defer       *bool         `json:"defer"`
@@ -435,20 +444,35 @@ type SubagentElement struct {
 	Prefix *bool `json:"prefix"`
 }
 
+// The branch a decision is about.
+type BranchView struct {
+	// The node it forked at. `null` for a root.
+	From *string `json:"from"`
+	ID   string  `json:"id"`
+	// Its newest node. `null` until it has one of its own.
+	Leaf *string    `json:"leaf"`
+	Mode BranchMode `json:"mode"`
+	Name *string    `json:"name"`
+	// The branch that started it. `null` when the conversation did.
+	Parent *string `json:"parent"`
+}
+
 // An effect still running, shown on each worker decision. A flat envelope
 // plus the fields of its kind. A connector sync carries none. Its `id` is the
 // connection being fetched.
 type Effect struct {
 	AgentID *string `json:"agent_id"`
 	// The tree node the effect was requested at.
-	Anchor    *string    `json:"anchor"`
-	Arguments *string    `json:"arguments"`
-	Attempt   int64      `json:"attempt"`
-	Deadline  *time.Time `json:"deadline"`
-	Handler   *Handler   `json:"handler"`
-	ID        string     `json:"id"`
-	Kind      EffectKind `json:"kind"`
-	Name      *string    `json:"name"`
+	Anchor    *string `json:"anchor"`
+	Arguments *string `json:"arguments"`
+	Attempt   int64   `json:"attempt"`
+	// The branch the effect runs on. Absent on the conversation.
+	Branch   *string    `json:"branch"`
+	Deadline *time.Time `json:"deadline"`
+	Handler  *Handler   `json:"handler"`
+	ID       string     `json:"id"`
+	Kind     EffectKind `json:"kind"`
+	Name     *string    `json:"name"`
 	// The child session a subagent runs in. Its `id` is the model tool call
 	// the subagent answers.
 	SessionID *string      `json:"session_id"`
@@ -504,9 +528,14 @@ type DecisionResponse struct {
 //
 // Without `id`, the engine mints one, and it becomes the assistant node's
 // id. A field left out comes from the agent config, then from the engine's
-// default. Without `messages`, the request carries the config's system
-// message and the decision's view. Given `messages`, no system message is
-// added.
+// default. Without `messages`, the engine builds the prompt from the
+// conversation: the config's system message, the decision's view, and
+// the context the engine adds. Given `messages`, the engine sends them as
+// written.
+//
+// Stop a branch. Its open calls are cancelled.
+//
+// Make a branch the conversation: the head moves to its newest node.
 //
 // Without `id`, the engine mints one. A tool the model called carries the
 // model's id.
@@ -543,7 +572,10 @@ type DecisionResponse struct {
 // whose `id` is recorded is kept as a copy; any other is written new.
 // The worker's state and the config carry over.
 type DecisionAction struct {
-	ID *string `json:"id"`
+	// Start a branch: `messages` go after `branch.from`, and the call
+	// reads that path. Its reply lands on the branch.
+	Branch *BranchRequest `json:"branch"`
+	ID     *string        `json:"id"`
 	// The `[llm.*]` block this call runs on. Absent uses the config's
 	// `llm`. Naming another block moves this one call elsewhere.
 	Llm                 *string          `json:"llm"`
@@ -611,6 +643,22 @@ type Asset struct {
 	URI  string    `json:"uri"`
 }
 
+// Where a branch starts, and what it runs as.
+type BranchRequest struct {
+	// A registered agent's id, or a config. Without it, a fork runs as the
+	// path it forks, and a root runs with no config.
+	Agent *BranchAgent `json:"agent"`
+	// `null` starts a new root. `"head"` forks the conversation, after this
+	// response's messages. A node id forks at that node.
+	From *string `json:"from"`
+	// Without `id`, the engine mints one. An id already started starts
+	// nothing.
+	ID   *string     `json:"id"`
+	Mode *BranchMode `json:"mode,omitempty"`
+	// A label for the worker and the dashboard. The engine never reads it.
+	Name *string `json:"name"`
+}
+
 // Why something failed. One shape on every event and on the wire.
 //
 // There is no `retryable` field. Whether to try again is a decision about one
@@ -652,10 +700,10 @@ type NoulCriteria struct {
 }
 
 type ReasoningConfig struct {
-	Effort    *ReasoningEffort `json:"effort"`
-	Enabled   *bool            `json:"enabled"`
-	Exclude   *bool            `json:"exclude"`
-	MaxTokens *int64           `json:"max_tokens"`
+	Effort    *string `json:"effort"`
+	Enabled   *bool   `json:"enabled"`
+	Exclude   *bool   `json:"exclude"`
+	MaxTokens *int64  `json:"max_tokens"`
 }
 
 // A tool's declared contract. Flat on the wire. A provider that needs it
@@ -702,6 +750,12 @@ type LlmTool struct {
 // to the worker. Shared by the [`ClientInput::InterruptResume`] input and the
 // [`DecisionTrigger::InterruptResumed`] trigger.
 //
+// A branch a subagent runs on started, with its task as its last
+// message. Echo the proposed `llm.call` to run it.
+//
+// A branch this conversation or branch started ended. `data` is what
+// its `done` carried.
+//
 // Sent after a turn completes, with its final output. The session stays
 // busy until it is answered. Echo the proposed `done` to finish.
 type DecisionTrigger struct {
@@ -715,7 +769,7 @@ type DecisionTrigger struct {
 	Messages []DraftMessage       `json:"messages,omitempty"`
 	NewFrom  *int64               `json:"new_from,omitempty"`
 	Args     interface{}          `json:"args"`
-	Name     *string              `json:"name,omitempty"`
+	Name     *string              `json:"name"`
 	Call     *HeldCall            `json:"call,omitempty"`
 	Reason   *ContextReason       `json:"reason,omitempty"`
 	Strategy *ContextStrategyKind `json:"strategy"`
@@ -752,8 +806,14 @@ type DecisionTrigger struct {
 	Model       *string           `json:"model"`
 	InterruptID *string           `json:"interrupt_id,omitempty"`
 	Payload     interface{}       `json:"payload"`
+	Mode        *BranchMode       `json:"mode,omitempty"`
 	Data        interface{}       `json:"data"`
-	TurnID      *string           `json:"turn_id,omitempty"`
+	From        *string           `json:"from"`
+	Leaf        *string           `json:"leaf"`
+	// The node it forked at is no longer on the path of whoever started
+	// it.
+	Stale  *bool   `json:"stale,omitempty"`
+	TurnID *string `json:"turn_id,omitempty"`
 }
 
 // The answer to one question. A field the engine does not name stays on
@@ -1080,17 +1140,6 @@ const (
 	DeferToolsStrategySearch DeferToolsStrategy = "search"
 )
 
-type ReasoningEffort string
-
-const (
-	High    ReasoningEffort = "high"
-	Low     ReasoningEffort = "low"
-	Medium  ReasoningEffort = "medium"
-	Minimal ReasoningEffort = "minimal"
-	None    ReasoningEffort = "none"
-	Xhigh   ReasoningEffort = "xhigh"
-)
-
 // Which of a connection's calls stop for a person.
 //
 // A tool that the connection marks `destructiveHint`.
@@ -1171,6 +1220,17 @@ const (
 	Single   SubagentToolsStrategy = "single"
 )
 
+// A fork of the conversation where the call was made, running as this
+// agent. It reads what came before, and shares its cache.
+//
+// A root of its own, running as the subagent's config.
+type SubagentBranch string
+
+const (
+	Head SubagentBranch = "head"
+	Root SubagentBranch = "root"
+)
+
 // How calls to a subagent return. Configuration; each call carries a
 // [`SpawnMode`].
 type SubagentMode string
@@ -1179,6 +1239,15 @@ const (
 	Any                  SubagentMode = "any"
 	SubagentModeBlocking SubagentMode = "blocking"
 	SubagentModeDetached SubagentMode = "detached"
+)
+
+// A blocking branch is part of the turn that started it, and ends with it.
+// A detached branch outlives the turn.
+type BranchMode string
+
+const (
+	BranchModeBlocking BranchMode = "blocking"
+	BranchModeDetached BranchMode = "detached"
 )
 
 // What kind of work an effect is. One enum for the wire and for scheduling. A
@@ -1286,6 +1355,8 @@ const (
 type DecisionActionType string
 
 const (
+	BranchClose       DecisionActionType = "branch.close"
+	BranchPromote     DecisionActionType = "branch.promote"
 	ContextReplace    DecisionActionType = "context.replace"
 	Done              DecisionActionType = "done"
 	Fail              DecisionActionType = "fail"
@@ -1347,6 +1418,8 @@ const (
 type DecisionTriggerType string
 
 const (
+	BranchFinished          DecisionTriggerType = "branch.finished"
+	BranchStarted           DecisionTriggerType = "branch.started"
 	CodemodeCalls           DecisionTriggerType = "codemode.calls"
 	ContextLimit            DecisionTriggerType = "context.limit"
 	InterruptResumed        DecisionTriggerType = "interrupt.resumed"
@@ -1455,6 +1528,30 @@ func (x *DeferToolsWire) UnmarshalJSON(data []byte) error {
 
 func (x *DeferToolsWire) MarshalJSON() ([]byte, error) {
 	return marshalUnion(nil, nil, x.Bool, nil, false, nil, x.DeferTools != nil, x.DeferTools, false, nil, false, nil, true)
+}
+
+// A registered agent's id, or a config. Without it, a fork runs as the
+// path it forks, and a root runs with no config.
+type BranchAgent struct {
+	AgentConfig *AgentConfig
+	String      *string
+}
+
+func (x *BranchAgent) UnmarshalJSON(data []byte) error {
+	x.AgentConfig = nil
+	var c AgentConfig
+	object, err := unmarshalUnion(data, nil, nil, nil, &x.String, false, nil, true, &c, false, nil, false, nil, true)
+	if err != nil {
+		return err
+	}
+	if object {
+		x.AgentConfig = &c
+	}
+	return nil
+}
+
+func (x *BranchAgent) MarshalJSON() ([]byte, error) {
+	return marshalUnion(nil, nil, nil, x.String, false, nil, x.AgentConfig != nil, x.AgentConfig, false, nil, false, nil, true)
 }
 
 type Error struct {

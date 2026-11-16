@@ -97,13 +97,23 @@ type DecisionRequest = {
     attempts: number
     deadline: string | null
     turn: { id: string, metadata: Record<string, string> } | null
+    branch?: BranchView
+}
+
+type BranchView = {
+    id: string
+    name?: string
+    mode: "blocking" | "detached"
+    from?: string               // the node it forked at. absent for a root
+    leaf?: string               // its newest node
+    parent?: string             // the branch that started it. absent: the conversation did
 }
 ```
 
 | Field | Meaning |
 | --- | --- |
 | `session_id` | The conversation this decision belongs to. |
-| `decision_id` | This decision. Only one is live at a time. |
+| `decision_id` | This decision. Only one is live at a time, unless the agent sets `parallel_branches`. See [Branches](./125-branches.md#parallel-branches). |
 | `agent_id` | Which agent to act as. Route on this when one worker serves several agents. |
 | `identity` | The session's owner. The engine sets it once and vouches for it. See [Session identity](./190-auth.md#session-identity). |
 | `trigger` | Why the engine is asking. See [Triggers](#triggers). |
@@ -117,7 +127,8 @@ type DecisionRequest = {
 | `ancestry` | Parent session IDs, for a subagent. Empty for a root session. |
 | `attempts` | How many times the engine has delivered this decision. |
 | `deadline` | When this attempt expires. |
-| `turn` | The turn this decision belongs to. `null` for `session.start` and the work it starts. `metadata` is what the submit of the turn set. It is empty when the submit set none. |
+| `turn` | The turn this decision belongs to. `null` for `session.start` and the work it starts, and for a detached branch. `metadata` is what the submit of the turn set. It is empty when the submit set none. |
+| `branch` | The branch this decision is about. `messages`, `state`, `agent` and `calls` are read on it, and the response applies to it. Absent on the conversation. See [Branches](./125-branches.md). |
 
 ```typescript
 type Subject = {
@@ -144,6 +155,7 @@ type Call = {
     stream?: boolean
     agent_id?: string
     session_id?: string         // subagents: the child session the turn runs in
+    branch?: string             // the branch the call runs on
 }
 ```
 
@@ -162,7 +174,7 @@ type DecisionResponse = {
 
 | Field | Meaning |
 | --- | --- |
-| `messages` | Messages to record on the active path. |
+| `messages` | Messages to record on the active path, or on the decision's branch. |
 | `actions` | What the engine does next. See [Actions](#actions). |
 | `state` | Replaces your state. Omit or send `null` to keep it. Send `{}` to clear it. |
 | `agent` | Replaces the config. Omit to keep it. |
@@ -188,6 +200,8 @@ What fires, what the engine proposes, and what you return.
 | `subagent.finished` | A child session's turn ended. | Record the child's result as the tool result, then call the model. Waits when a message waits to join the turn. | `proposed` |
 | `system1.finished` | A `system1.call` ended, after retries. | Empty. | Your own actions. |
 | `interrupt.resumed` | Someone resumed a paused branch. | Call the model again over the transcript. | `proposed` |
+| `branch.started` | A subagent that runs on a branch started, with its task last. | Call the model on the branch. | `proposed` |
+| `branch.finished` | A branch this conversation or branch started ended. `data` is what its `done` carried. | After a blocking branch, call the model on a user message or tool result, or `done` after a reply. Nothing after a detached one, or while other work is out. | `proposed` |
 | `turn.finished` | A turn completed. Carries its cost and output. If your answer starts work, the turn ends when that work ends. | `done`. | `proposed` |
 
 ```typescript
@@ -275,6 +289,19 @@ type Trigger =
           error?: ErrorInfo
       }
     | { type: "interrupt.resumed"; interrupt_id: string; payload?: unknown }
+    | { type: "branch.started"; id: string; name?: string; mode: "blocking" | "detached" }
+    | {
+          type: "branch.finished"
+          id: string
+          name?: string
+          mode: "blocking" | "detached"
+          ok: boolean
+          data?: unknown            // what the branch's done carried
+          error?: ErrorInfo
+          from?: string             // where it forked
+          leaf?: string             // its newest node
+          stale?: boolean           // `from` is no longer on the path of whoever started it
+      }
     | {
           type: "turn.finished"
           turn_id: string
@@ -311,10 +338,12 @@ type ClientContext = {
 | `message.send` | Write a message into a session. | Any trigger. |
 | `interrupt` | Pause the active branch. | Any trigger. |
 | `interrupt.resolve` | Clear an open interrupt and resume. | Any trigger. |
-| `fail` | End the turn as a failed run. | Any trigger. |
+| `fail` | End the turn as a failed run. On a branch, end the branch. | Any trigger. |
+| `branch.close` | Stop a branch. Its calls are cancelled. | Any trigger. |
+| `branch.promote` | Make a branch the conversation. | Any trigger. |
 | `context.replace` | Set what the model reads, on a new branch. | Any trigger. |
 | `connector.sync` | Fetch a connection's tools again. | Any trigger. |
-| `done` | End the turn. Each tool call with no result in the history gets the result that arrived, or `cancelled: the turn ended`. | Any trigger. |
+| `done` | End the turn. Each tool call with no result in the history gets the result that arrived, or `cancelled: the turn ended`. On a branch, end the branch with `data`. | Any trigger. |
 
 ```typescript
 type Action =
@@ -323,14 +352,24 @@ type Action =
           id?: string             // missing field from the agent config, then
           llm?: string            // from its own defaults
           model?: string
-          messages?: DraftMessage[]  // set these and the engine sends them as written
+          messages?: DraftMessage[]  // with branch: the branch's first messages.
+                                     // without: a prompt sent as written, on a branch of its own
           tools?: LlmTool[]
           temperature?: number
           max_completion_tokens?: number
           reasoning?: ReasoningConfig
           stream?: boolean
           retry?: RetryOverride
+          branch?: {               // start a branch. see Branches
+              id?: string
+              from?: string        // "head", a node id, or absent for a root
+              agent?: string | AgentConfig
+              name?: string
+              mode?: "blocking" | "detached"
+          }
       }
+    | { type: "branch.close"; id: string }
+    | { type: "branch.promote"; id: string }
     | {
           type: "tool.call"
           id?: string             // omitted: the engine creates one
@@ -417,10 +456,15 @@ server announcements. Each of those stays where the model first read it, so a
 later call starts with the same prompt. A `proposed` call has no `messages`.
 Return it as it is.
 
-Set `messages` and your worker owns the prompt. The engine sends it as written.
-It adds no system message and no context, and the call does not count as telling
-the conversation anything. Use it for a call beside the conversation, such as
-one that writes a title.
+Set `messages` and your worker owns the prompt. The call runs on a branch of its
+own, with no config, so the engine sends the prompt as written: no system
+message and no context. The branch forks where the prompt's leading messages
+already are in the tree. Its reply stays on the branch and comes back as
+`branch.finished`, not into the conversation. See
+[Branches](./125-branches.md#calls-with-your-own-prompt).
+
+Add `branch` to run a call beside the conversation that reads it, such as one
+that writes a title. See [Branches](./125-branches.md).
 
 `llm.call` takes an `llm` to send one call to another block. The config stays as
 it is. See [LLMs](./70-llms.md).

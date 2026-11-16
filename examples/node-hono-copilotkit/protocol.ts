@@ -238,6 +238,12 @@ export interface DecisionRequest {
     agent_id: string;
     ancestry: string[];
     attempts: number;
+    /**
+     * The branch this decision is about. `messages`, `state`, `agent` and
+     * `calls` are read on it, and the response applies to it. Absent on the
+     * conversation.
+     */
+    branch?: BranchView | null;
     calls: Effect[];
     deadline?: Date | null;
     decision_id: string;
@@ -316,6 +322,11 @@ export interface AgentConfig {
      */
     mcp_announce?: MCPAnnounce;
     model: string;
+    /**
+     * Ask the worker about each branch while others are still out, instead
+     * of one decision at a time.
+     */
+    parallel_branches?: boolean | null;
     /**
      * Plugins this agent uses.
      */
@@ -662,6 +673,10 @@ export type SubagentToolsStrategy = "per_agent" | "single";
  */
 export interface Subagent {
     /**
+     * Run it on a branch of this session instead of a session of its own.
+     */
+    branch?: SubagentBranch | null;
+    /**
      * Keep this tool out of the request. See [`LlmTool::defer`]. Absent ⇒
      * the agent's `defer_tools`.
      */
@@ -676,10 +691,45 @@ export interface Subagent {
 }
 
 /**
+ * A fork of the conversation where the call was made, running as this
+ * agent. It reads what came before, and shares its cache.
+ *
+ * A root of its own, running as the subagent's config.
+ */
+export type SubagentBranch = "head" | "root";
+
+/**
  * How calls to a subagent return. Configuration; each call carries a
  * [`SpawnMode`].
  */
 export type SubagentMode = "blocking" | "detached" | "any";
+
+/**
+ * The branch a decision is about.
+ */
+export interface BranchView {
+    /**
+     * The node it forked at. `null` for a root.
+     */
+    from?: null | string;
+    id: string;
+    /**
+     * Its newest node. `null` until it has one of its own.
+     */
+    leaf?: null | string;
+    mode: BranchMode;
+    name?: null | string;
+    /**
+     * The branch that started it. `null` when the conversation did.
+     */
+    parent?: null | string;
+}
+
+/**
+ * A blocking branch is part of the turn that started it, and ends with it.
+ * A detached branch outlives the turn.
+ */
+export type BranchMode = "blocking" | "detached";
 
 /**
  * An effect still running, shown on each worker decision. A flat envelope
@@ -694,6 +744,10 @@ export interface Effect {
     anchor?: null | string;
     arguments?: null | string;
     attempt: number;
+    /**
+     * The branch the effect runs on. Absent on the conversation.
+     */
+    branch?: null | string;
     deadline?: Date | null;
     handler?: Handler | null;
     id: string;
@@ -807,9 +861,14 @@ export interface DecisionResponse {
  *
  * Without `id`, the engine mints one, and it becomes the assistant node's
  * id. A field left out comes from the agent config, then from the engine's
- * default. Without `messages`, the request carries the config's system
- * message and the decision's view. Given `messages`, no system message is
- * added.
+ * default. Without `messages`, the engine builds the prompt from the
+ * conversation: the config's system message, the decision's view, and
+ * the context the engine adds. Given `messages`, the engine sends them as
+ * written.
+ *
+ * Stop a branch. Its open calls are cancelled.
+ *
+ * Make a branch the conversation: the head moves to its newest node.
  *
  * Without `id`, the engine mints one. A tool the model called carries the
  * model's id.
@@ -847,6 +906,11 @@ export interface DecisionResponse {
  * The worker's state and the config carry over.
  */
 export interface DecisionAction {
+    /**
+     * Start a branch: `messages` go after `branch.from`, and the call
+     * reads that path. Its reply lands on the branch.
+     */
+    branch?: BranchRequest | null;
     id?: null | string;
     /**
      * The `[llm.*]` block this call runs on. Absent uses the config's
@@ -930,6 +994,32 @@ export interface Asset {
 }
 
 export type AssetType = "image";
+
+/**
+ * Where a branch starts, and what it runs as.
+ */
+export interface BranchRequest {
+    /**
+     * A registered agent's id, or a config. Without it, a fork runs as the
+     * path it forks, and a root runs with no config.
+     */
+    agent?: AgentConfig | null | string;
+    /**
+     * `null` starts a new root. `"head"` forks the conversation, after this
+     * response's messages. A node id forks at that node.
+     */
+    from?: null | string;
+    /**
+     * Without `id`, the engine mints one. An id already started starts
+     * nothing.
+     */
+    id?: null | string;
+    mode?: BranchMode;
+    /**
+     * A label for the worker and the dashboard. The engine never reads it.
+     */
+    name?: null | string;
+}
 
 /**
  * What kind of failure, so a consumer can branch on it instead of reading the
@@ -1056,6 +1146,8 @@ export interface LlmTool {
 
 export type DecisionActionType =
     | "llm.call"
+    | "branch.close"
+    | "branch.promote"
     | "tool.call"
     | "tool.result"
     | "llm.result"
@@ -1094,6 +1186,12 @@ export type DecisionActionType =
  * to the worker. Shared by the [`ClientInput::InterruptResume`] input and the
  * [`DecisionTrigger::InterruptResumed`] trigger.
  *
+ * A branch a subagent runs on started, with its task as its last
+ * message. Echo the proposed `llm.call` to run it.
+ *
+ * A branch this conversation or branch started ended. `data` is what
+ * its `done` carried.
+ *
  * Sent after a turn completes, with its final output. The session stays
  * busy until it is answered. Echo the proposed `done` to finish.
  */
@@ -1112,7 +1210,7 @@ export interface DecisionTrigger {
     messages?: DraftMessage[];
     new_from?: number;
     args?: unknown;
-    name?: string;
+    name?: null | string;
     call?: HeldCall;
     reason?: ContextReason;
     strategy?: ContextStrategyKind | null;
@@ -1159,7 +1257,15 @@ export interface DecisionTrigger {
     model?: null | string;
     interrupt_id?: string;
     payload?: unknown;
+    mode?: BranchMode;
     data?: unknown;
+    from?: null | string;
+    leaf?: null | string;
+    /**
+     * The node it forked at is no longer on the path of whoever started
+     * it.
+     */
+    stale?: boolean;
     turn_id?: string;
 }
 
@@ -1280,6 +1386,8 @@ export type DecisionTriggerType =
     | "subagent.finished"
     | "system1.finished"
     | "interrupt.resumed"
+    | "branch.started"
+    | "branch.finished"
     | "turn.finished";
 
 /**

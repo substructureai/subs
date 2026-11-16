@@ -9,14 +9,32 @@ The `@substructure.ai/cli` package and the `subs`, `substructure-host` and
 
 ## [Unreleased]
 
+### Breaking
+
+- An `llm.call` with `messages` now runs on a branch of its own, and its reply no longer lands in the conversation. It comes back as `branch.finished`, with the reply in `data`. A worker that builds the conversation's prompt itself now leaves out `messages`, and sets its system prompt in the agent config. A worker that makes a call beside the conversation, such as a title, reads the reply from `branch.finished`, or uses `branch` to fork the conversation.
+- The model call after a tool result, and a call held for room, now always read the conversation. Before, they copied the prompt of an `llm.call` with `messages`.
+- A summary the engine proposes now runs on a branch named `<call id>.summary`. Its `llm.finished` proposes `done`, and `branch.finished` then proposes `context.replace` and the held call.
+
+### Added
+
+- An `llm.call` can start a branch with `branch`: forked from the conversation, from any node, or from nothing, as the path's config, another agent's, or none. Its decisions read the branch and apply to it, and `done` sends `branch.finished` to whoever started it. A blocking branch is part of its turn. A detached one outlives it, costs the session only, and fails tools that need approval.
+- Add `branch.close` and `branch.promote`.
+- Add the `branch.started` and `branch.finished` triggers, and `branch` on a decision request.
+- Add the `branch.started` and `branch.closed` events, and `branch` on `message.new`, on each `*.requested` event, and on each call in `calls`.
+- A subagent entry takes `branch = "head"` or `branch = "root"`. It then runs on a branch of the calling session instead of a session of its own.
+- An agent takes `parallel_branches = true`. The worker is then asked about each branch while others are out.
+
 ### Changed
 
 - An `llm.call` with no `messages` now gets its prompt from the conversation when the engine sends it. A `proposed` call has no `messages`.
-- An `llm.call` with `messages` is now sent as written. The engine adds no plugin catalog, skill listings or server announcements to it.
 - `llm.call.requested` now has a `source`. It says if the prompt comes from the conversation or from the worker.
 - `llm.call.dispatched` now has a `fingerprint` of the prompt that the engine sent.
+- A call keeps its prompt in the session only while it is open. A session's state now grows with its conversation, not with its calls times its conversation. A snapshot written before is compacted when it loads.
 
 ### Fixed
+
+- A side call no longer reaches the chat over AG-UI or Slack, no longer counts as the conversation's read for the context limit, and is no longer taken for the summary while the engine makes room.
+- A user message that a client sends with a recorded id and other words is now an edit. Before, the engine ignored it.
 
 - A new turn now keeps the plugin catalog, skill listings and server announcements an earlier turn gave the model. Before, the model lost them after the first turn, and the prompt cache broke at the start of each new turn. A call held at the context limit and sent again keeps them too. Each branch keeps what it was told.
 - A call that runs again after `context.replace` now reads the plugin catalog, skill listings and server announcements one time. Before, a later call could read them two times.
