@@ -1096,6 +1096,7 @@ mod tests {
                 },
                 stream: true,
                 handler: LlmHandler::Server,
+                dispatched_seq: None,
             }),
         )
     }

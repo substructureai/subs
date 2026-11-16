@@ -364,6 +364,7 @@ mod tests {
                 },
                 stream: false,
                 handler: crate::decision::LlmHandler::Server,
+                dispatched_seq: None,
             }),
         ));
     }

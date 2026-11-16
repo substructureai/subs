@@ -399,9 +399,14 @@ impl Limited {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmCallState {
-    /// What the model read. A tree call's is empty until it is sent.
+    /// What the model reads, while the call is open. A tree call's is empty
+    /// until it is sent, and any call's once it settles: the tree and its
+    /// records hold it.
     #[serde(default)]
     pub prompt: Vec<Message>,
+    /// The event that sent it. Its prompt is built again as of then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatched_seq: Option<u64>,
     #[serde(default)]
     pub source: PromptSource,
     pub llm: String,
@@ -1406,6 +1411,7 @@ impl SessionState {
                     handler: payload.handler,
                     format: payload.format,
                     context_ids: Vec::new(),
+                    dispatched_seq: None,
                     sent_tools: None,
                     defer_tools_strategy: payload.defer_tools_strategy,
                 }),
@@ -1431,16 +1437,82 @@ impl SessionState {
     /// The prompt call `id` sends from the state as it stands, and the context
     /// that send places. Every prompt comes from here.
     pub fn outgoing(&self, id: &str) -> Option<Outgoing> {
+        self.outgoing_until(id, None)
+    }
+
+    fn outgoing_until(&self, id: &str, until: Option<u64>) -> Option<Outgoing> {
         let effect = self.effect(EffectKind::LlmCall, id)?;
         let call = effect.llm()?;
         let node = match &call.source {
             PromptSource::Tree { at } => at.clone(),
             _ => effect.anchor.clone().or_else(|| self.head_id.clone()),
         };
-        Some(
-            self.at(node.as_deref())
-                .outgoing(id, &call.source, &call.prompt, &call.context_ids),
-        )
+        let at = SessionStateAtNode {
+            state: self,
+            node: node.as_deref(),
+            until,
+            branch: effect.branch.as_deref(),
+        };
+        Some(at.outgoing(id, &call.source, &call.prompt, &call.context_ids))
+    }
+
+    /// What call `id` sent: its prompt while open, or a tree call's built
+    /// again as of its send.
+    pub fn sent_prompt(&self, id: &str) -> Option<Vec<Message>> {
+        let call = self.llm_call(id)?;
+        if !call.prompt.is_empty() || !call.source.is_tree() {
+            return Some(call.prompt.clone());
+        }
+        Some(self.outgoing_until(id, Some(call.dispatched_seq?))?.prompt)
+    }
+
+    /// A settled call drops its copy of the prompt. One sent before context
+    /// was recorded on the tree first leaves what it placed there.
+    fn settle_prompt(&mut self, id: &str) {
+        let Some(effect) = self.effect(EffectKind::LlmCall, id) else {
+            return;
+        };
+        let Some(call) = effect.llm().filter(|c| !c.prompt.is_empty()) else {
+            return;
+        };
+        let recorded = self.context_versions.iter().any(|v| v.value.call == id);
+        let placed = match recorded {
+            true => Vec::new(),
+            false => call.placed_in_prompt(id),
+        };
+        let anchor = effect.anchor.clone();
+        let at = self
+            .context_versions
+            .partition_point(|v| v.seq == 0 && v.value.call.as_str() <= id);
+        self.context_versions.splice(
+            at..at,
+            placed.into_iter().map(|value| Logged {
+                seq: 0,
+                entry: ContextVersion {
+                    value,
+                    anchor: anchor.clone(),
+                },
+            }),
+        );
+        if let Some(call) = self
+            .effect_mut(EffectKind::LlmCall, id)
+            .and_then(|e| e.llm_mut())
+        {
+            call.prompt = Vec::new();
+        }
+    }
+
+    /// Drops the prompts of the calls that settled, as replaying their events
+    /// would.
+    pub fn settle_prompts(&mut self) {
+        let settled: Vec<String> = self
+            .effects_of(EffectKind::LlmCall)
+            .filter(|e| !e.tracking.is_unsettled())
+            .map(|e| e.id.clone())
+            .collect();
+        for id in settled {
+            self.settle_prompt(&id);
+        }
     }
 
     fn apply_llm_dispatched(&mut self, payload: &LlmCallDispatched, ctx: &ApplyContext) {
@@ -1472,6 +1544,7 @@ impl SessionState {
                 };
                 call.prompt = out.prompt;
                 call.context_ids = out.context_ids;
+                call.dispatched_seq = Some(ctx.sequence);
             }
         }
         self.context_versions
@@ -1680,6 +1753,9 @@ impl SessionState {
                 effect.tracking.void();
             }
         }
+        if kind == EffectKind::LlmCall {
+            self.settle_prompt(&p.id);
+        }
         self.dequeue(kind, &p.id);
     }
 
@@ -1773,11 +1849,18 @@ impl SessionState {
                 if let Some(e) = self.effect_mut(EffectKind::LlmCall, &payload.id) {
                     e.tracking.complete();
                 }
+                self.settle_prompt(&payload.id);
             }
             EventPayload::LlmCallErrored(payload) => {
                 self.turn_calls.llm.errors += 1;
                 if let Some(e) = self.effect_mut(EffectKind::LlmCall, &payload.id) {
                     e.tracking.record_error(payload.retryable, now);
+                }
+                if self
+                    .tracking(EffectKind::LlmCall, &payload.id)
+                    .is_some_and(|t| t.status() == EffectStatus::Failed)
+                {
+                    self.settle_prompt(&payload.id);
                 }
             }
             EventPayload::System1CallRequested(p) => self.apply_system1_requested(p, ctx),
@@ -3205,6 +3288,7 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
         self.state
             .context_versions
             .iter()
+            .filter(|v| self.until.is_none_or(|u| v.seq <= u))
             .filter(|v| inherited.carries(v.anchor.as_deref(), v.seq))
             .flat_map(|v| v.value.ids.iter().cloned())
             .chain(legacy)
@@ -3299,6 +3383,7 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
             self.state
                 .context_versions
                 .iter()
+                .filter(|v| self.until.is_none_or(|u| v.seq <= u))
                 .filter(|v| inherited.carries(v.anchor.as_deref(), v.seq))
                 .map(|v| (v.seq, v.value.clone())),
         );
@@ -3515,6 +3600,7 @@ mod open_llm_calls_tests {
                 },
                 stream: false,
                 handler: LlmHandler::Server,
+                dispatched_seq: None,
             }),
         )
     }

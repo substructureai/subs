@@ -1584,6 +1584,7 @@ mod tests {
                 },
                 stream: false,
                 handler: crate::runtime::session::decision::LlmHandler::Server,
+                dispatched_seq: None,
             }),
         );
         (

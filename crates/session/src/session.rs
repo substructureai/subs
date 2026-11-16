@@ -145,7 +145,10 @@ impl Session {
         settings: Settings,
     ) -> Result<Self, Error> {
         let mut session = match store.latest()? {
-            Some(session) => session,
+            Some(mut session) => {
+                session.state.settle_prompts();
+                session
+            }
             None => Self::new(id, tenant_id, Settings::default()),
         };
         session.settings = settings;

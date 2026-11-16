@@ -209,8 +209,10 @@ fn lowered(action: DecisionAction, id: &str) -> Action {
 }
 
 fn requested(t: &Trace, id: &str) -> Vec<String> {
-    let call = t.agg.state.llm_call(id).expect("requested");
-    call.prompt
+    t.agg
+        .state
+        .sent_prompt(id)
+        .expect("requested")
         .iter()
         .map(|m| {
             m.content
@@ -601,7 +603,7 @@ fn refused_then_summarized(source: PromptSource) -> (usize, usize) {
     refused_as_too_long(&mut t, "call-2");
     plan(&mut t, "sum-1");
     answered(&mut t, "sum-1", "they asked once", 50);
-    plan(&mut t, "");
+    summarized(&mut t);
     let again = listings(&t, "call-2");
     answered(&mut t, "call-2", "a2", 100);
     t.decide_appending(reply("call-2", "a2"), vec![done()]);
@@ -616,8 +618,16 @@ fn a_tree_call_the_provider_refused_moves_to_the_new_branch() {
 }
 
 #[test]
-fn a_legacy_call_the_provider_refused_reads_as_before() {
-    assert_eq!(refused_then_summarized(PromptSource::Legacy), (1, 1));
+fn a_legacy_call_the_provider_refused_runs_again_as_a_tree_call() {
+    let mut t = skilled(PromptSource::Legacy, vec![]);
+    turn(&mut t, 1, 100);
+    ask(&mut t, 2);
+    refused_as_too_long(&mut t, "call-2");
+    plan(&mut t, "sum-1");
+    answered(&mut t, "sum-1", "they asked once", 50);
+    summarized(&mut t);
+    assert!(t.agg.state.llm_call("call-2").unwrap().source.is_tree());
+    assert_eq!(listings(&t, "call-2"), 1);
 }
 
 #[test]

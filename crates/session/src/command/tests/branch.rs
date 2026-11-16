@@ -690,3 +690,61 @@ fn an_explicit_prompt_edited_on_the_way_is_copied_from_there() {
     assert_eq!(branch.from, None);
     assert_eq!(prompt_texts(&agg, "x1"), ["what time is it in Paris?"]);
 }
+
+fn dispatched_fingerprint(events: &[EventPayload], id: &str) -> Option<String> {
+    events.iter().find_map(|e| match e {
+        EventPayload::LlmCallDispatched(d) if d.id == id => d.fingerprint.clone(),
+        _ => None,
+    })
+}
+
+#[test]
+fn a_settled_call_keeps_no_prompt_and_builds_the_one_it_sent() {
+    let mut agg = configured();
+    user_turn(&mut agg, "u1", "what is the weather in Paris?", "turn-1");
+    let (d, _) = live_decision(&agg);
+    let events = submit_decision(
+        &mut agg,
+        d,
+        vec![node_msg("u1", Role::User, "what is the weather in Paris?")],
+        vec![
+            tree_call("c1"),
+            branch_call(
+                "t1",
+                start("title", BranchFrom::Head, BranchMode::Detached),
+                vec![node_msg("", Role::User, "Write a short title.")],
+            ),
+        ],
+    );
+    let sent: Vec<(String, String)> = ["c1", "t1"]
+        .iter()
+        .map(|id| {
+            (
+                id.to_string(),
+                dispatched_fingerprint(&events, id).expect("dispatched"),
+            )
+        })
+        .collect();
+    assert!(
+        !agg.state.llm_call("c1").unwrap().prompt.is_empty(),
+        "open: kept"
+    );
+
+    reply(&mut agg, "c1", said("Sunny.", 100));
+    echo(&mut agg);
+    echo(&mut agg);
+    reply(&mut agg, "t1", said("Paris weather", 100));
+    for (id, fingerprint) in sent {
+        let call = agg.state.llm_call(&id).unwrap();
+        assert!(
+            call.prompt.is_empty(),
+            "{id} settled: the tree holds its prompt"
+        );
+        let built = agg.state.sent_prompt(&id).expect("built again");
+        assert_eq!(
+            crate::prompt_context::fingerprint(&built),
+            fingerprint,
+            "{id}"
+        );
+    }
+}
