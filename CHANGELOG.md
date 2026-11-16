@@ -29,7 +29,8 @@ The `@substructure.ai/cli` package and the `subs`, `substructure-host` and
 - An `llm.call` with no `messages` now gets its prompt from the conversation when the engine sends it. A `proposed` call has no `messages`.
 - `llm.call.requested` now has a `source`. It says if the prompt comes from the conversation or from the worker.
 - `llm.call.dispatched` now has a `fingerprint` of the prompt that the engine sent.
-- A call keeps its prompt in the session only while it is open. A session's state now grows with its conversation, not with its calls times its conversation. A snapshot written before is compacted when it loads.
+- A call keeps its prompt in the session only while it is open, and its tools only until its tool calls are answered. A session's state now grows with its conversation, not with its calls times its conversation. A snapshot written before is compacted when it loads. On 161 production sessions, state fell from 163MB to 22MB.
+- A task handed out three times without finishing is dropped and logged, instead of taking the process down on every restart. Each task logs its session and kind when it starts.
 
 ### Fixed
 

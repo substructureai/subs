@@ -1102,3 +1102,75 @@ fn a_message_a_client_edits_in_place_starts_a_new_path() {
     assert_eq!(path, ["hi there"]);
     assert_ne!(agg.state.head_id.as_deref(), Some("u1"));
 }
+
+#[test]
+fn a_settled_call_keeps_its_tools_until_its_calls_are_answered() {
+    let tools = Some(vec![crate::protocol::LlmTool {
+        name: "lookup".to_string(),
+        description: "Looks it up.".to_string(),
+        input: None,
+        output: None,
+        defer: false,
+    }]);
+    let mut agg = configured();
+    user_turn(&mut agg, "u1", "what time is it?", "turn-1");
+    let (d, _) = live_decision(&agg);
+    let call = match tree_call("c1") {
+        Action::CallLlm {
+            id,
+            llm,
+            request,
+            source,
+            stream,
+            retry,
+            handler,
+            format,
+            branch,
+        } => Action::CallLlm {
+            id,
+            llm,
+            request: LlmRequest {
+                tools: tools.clone(),
+                ..request
+            },
+            source,
+            stream,
+            retry,
+            handler,
+            format,
+            branch,
+        },
+        other => other,
+    };
+    submit_decision(
+        &mut agg,
+        d,
+        vec![node_msg("u1", Role::User, "what time is it?")],
+        vec![call],
+    );
+    reply(&mut agg, "c1", calling("lookup", "tc-1"));
+    assert!(
+        agg.state.llm_call("c1").unwrap().spec.tools.is_some(),
+        "its call is not answered"
+    );
+    echo(&mut agg);
+    while live_decision_kind(&agg).is_some_and(|t| matches!(t, Trigger::ToolExecute { .. })) {
+        let (d, _) = live_decision(&agg);
+        submit_decision(&mut agg, d, vec![], vec![tool_result_action("tc-1")]);
+    }
+    let (d, _) = live_decision(&agg);
+    let proposed = proposed_for(&agg, &d);
+    assert!(
+        matches!(
+            proposed.actions.as_slice(),
+            [DecisionAction::CallLlm { tools: Some(t), .. }] if t.len() == 1
+        ),
+        "the next call asks for the same tools"
+    );
+    echo(&mut agg);
+    assert!(
+        agg.state.llm_call("c1").unwrap().spec.tools.is_none(),
+        "answered: dropped"
+    );
+    assert!(agg.state.llm_call("c1").unwrap().sent_tools.is_none());
+}

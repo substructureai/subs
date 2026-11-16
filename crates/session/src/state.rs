@@ -1445,6 +1445,7 @@ impl SessionState {
             ) {
                 e.anchor = at.clone();
             }
+            self.drop_answered_tools(payload.branch.as_deref(), &payload.id);
         }
         match &mut self.limited {
             Some(l) if l.open() && l.call.id != payload.id && payload.branch.is_none() => {
@@ -1524,8 +1525,8 @@ impl SessionState {
         }
     }
 
-    /// Drops the prompts of the calls that settled, as replaying their events
-    /// would.
+    /// Drops the prompts of the calls that settled, and the tools of those
+    /// nothing reads again, as replaying their events would.
     pub fn settle_prompts(&mut self) {
         let settled: Vec<String> = self
             .effects_of(EffectKind::LlmCall)
@@ -1534,6 +1535,52 @@ impl SessionState {
             .collect();
         for id in settled {
             self.settle_prompt(&id);
+            if self.tools_answered(&id) {
+                self.drop_tools(&id);
+            }
+        }
+    }
+
+    /// A settled call's tools are read again only to check its tool calls and
+    /// to make the call after them. Once its reply asked for none, or each
+    /// has its result, nothing does.
+    fn tools_answered(&self, id: &str) -> bool {
+        let Some(reply) = self.nodes.iter().find(|n| n.message.id == id) else {
+            return true;
+        };
+        reply.message.tool_calls.iter().all(|c| {
+            self.nodes
+                .iter()
+                .any(|n| n.message.tool_call_id.as_deref() == Some(c.id.as_str()))
+        })
+    }
+
+    fn drop_tools(&mut self, id: &str) {
+        if let Some(call) = self
+            .effect_mut(EffectKind::LlmCall, id)
+            .and_then(|e| e.llm_mut())
+        {
+            call.spec.tools = None;
+            call.sent_tools = None;
+        }
+    }
+
+    /// A new call on `branch` is made: the settled calls before it there have
+    /// had their tool calls answered.
+    fn drop_answered_tools(&mut self, branch: Option<&str>, except: &str) {
+        let done: Vec<String> = self
+            .effects_of(EffectKind::LlmCall)
+            .filter(|e| e.id != except && e.branch.as_deref() == branch)
+            .filter(|e| !e.tracking.is_unsettled())
+            .filter(|e| {
+                e.llm()
+                    .is_some_and(|c| c.spec.tools.is_some() || c.sent_tools.is_some())
+            })
+            .map(|e| e.id.clone())
+            .filter(|id| self.tools_answered(id))
+            .collect();
+        for id in done {
+            self.drop_tools(&id);
         }
     }
 
@@ -1895,6 +1942,9 @@ impl SessionState {
                     e.tracking.complete();
                 }
                 self.settle_prompt(&payload.id);
+                if payload.response.tool_calls.is_empty() {
+                    self.drop_tools(&payload.id);
+                }
             }
             EventPayload::LlmCallErrored(payload) => {
                 self.turn_calls.llm.errors += 1;
