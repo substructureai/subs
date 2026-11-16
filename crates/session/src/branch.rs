@@ -200,9 +200,22 @@ impl Session {
         let mut outside = Outside::default();
         let state = self.state();
         match command {
-            CommandPayload::SubmitWorkerDecision { transcript, .. } => {
+            CommandPayload::SubmitWorkerDecision {
+                transcript,
+                actions,
+                ..
+            } => {
                 for id in transcript.iter().filter_map(|m| m.id.as_deref()) {
                     outside.load(store, state, id)?;
+                }
+                let promoted = actions.iter().filter_map(|a| match a {
+                    crate::decision::Action::PromoteBranch { id } => {
+                        state.branches.get(id)?.leaf.as_deref()
+                    }
+                    _ => None,
+                });
+                for leaf in promoted {
+                    outside.load(store, state, leaf)?;
                 }
             }
             CommandPayload::SendMessage { message, .. } => {

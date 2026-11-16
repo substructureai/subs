@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::decision::{LlmHandler, PromptSource, ToolHandler, Trigger};
+use super::decision::{BranchConfig, LlmHandler, PromptSource, ToolHandler, Trigger};
 use super::events::*;
 use super::prompt_context;
 use super::tool_contract::classify_arguments;
@@ -66,10 +66,10 @@ use rust_decimal::Decimal;
 
 pub use crate::protocol::EffectKind;
 use crate::protocol::{
-    AgentConfig, ClientContext, Content, ContextReason, DecisionTurn, DraftMessage, Effect,
-    EffectStatus, HeldCall, InterruptOrigin, LlmFormat, LlmRequest, LlmTool, Message, MessageTree,
-    NewMessage, ReasoningConfig, RetryConfig, RetryPolicy, Role, SessionOwner, SpawnMode,
-    SubagentTools, Usage, WorkerRef, WorkerState,
+    AgentConfig, BranchMode, BranchView, ClientContext, Content, ContextReason, DecisionTurn,
+    DraftMessage, Effect, EffectStatus, HeldCall, InterruptOrigin, LlmFormat, LlmRequest, LlmTool,
+    Message, MessageTree, NewMessage, ReasoningConfig, RetryConfig, RetryPolicy, Role,
+    SessionOwner, SpawnMode, SubagentTools, Usage, WorkerRef, WorkerState,
 };
 use crate::retry::RetryState;
 
@@ -292,6 +292,9 @@ pub struct EffectState {
     pub tracking: EffectTracking,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<String>,
+    /// The branch it runs on. Absent on the conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     pub payload: EffectPayload,
 }
 
@@ -350,6 +353,7 @@ impl EffectState {
             id: id.into(),
             tracking,
             anchor: None,
+            branch: None,
             payload,
         }
     }
@@ -702,6 +706,9 @@ pub fn resolve_on_path<'a, V: Anchored>(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerDecisionState {
     pub trigger: Trigger,
+    /// The branch it is about. Absent on the conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     #[serde(default)]
     pub source_event_sequence: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -713,6 +720,50 @@ pub struct WorkerDecisionState {
 impl WorkerDecisionState {
     pub fn built_at(&self) -> u64 {
         self.dispatched_seq.unwrap_or(self.source_event_sequence)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    #[serde(default)]
+    pub agent: BranchConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub mode: BranchMode,
+    /// When it started. What it inherits is read as of then.
+    pub seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leaf: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed: Option<BranchEnd>,
+}
+
+impl BranchState {
+    pub fn is_open(&self) -> bool {
+        self.closed.is_none()
+    }
+
+    /// The node its next call reads to: its newest, or where it forked.
+    pub fn at(&self) -> Option<&str> {
+        self.leaf.as_deref().or(self.from.as_deref())
+    }
+
+    pub fn view(&self, id: &str) -> BranchView {
+        BranchView {
+            id: id.to_string(),
+            name: self.name.clone(),
+            mode: self.mode,
+            from: self.from.clone(),
+            leaf: self.leaf.clone(),
+            parent: self.parent.clone(),
+        }
     }
 }
 
@@ -797,6 +848,8 @@ pub struct EventMeta {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetaDecision {
     pub decision_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     pub status: EffectStatus,
     pub finished: bool,
     pub attempts: u32,
@@ -806,10 +859,17 @@ pub struct MetaDecision {
 }
 
 impl EventMeta {
+    /// Work in the decision's branch that it waits for.
     pub fn pending_work(&self, decision_id: &str) -> usize {
+        let branch = self
+            .decisions
+            .iter()
+            .find(|d| d.decision_id == decision_id)
+            .and_then(|d| d.branch.as_deref());
         let in_flight_calls = self
             .calls
             .iter()
+            .filter(|e| e.branch.as_deref() == branch)
             .filter(|e| {
                 matches!(e.kind, EffectKind::ToolCall | EffectKind::Subagent)
                     && matches!(
@@ -824,7 +884,7 @@ impl EventMeta {
         let unrecorded_results = self
             .decisions
             .iter()
-            .filter(|d| d.decision_id != decision_id)
+            .filter(|d| d.decision_id != decision_id && d.branch.as_deref() == branch)
             .filter(|d| {
                 matches!(d.status, EffectStatus::Pending | EffectStatus::Queued) && d.finished
             })
@@ -980,6 +1040,10 @@ pub struct SessionState {
 
     #[serde(default)]
     pub session_start_failed: bool,
+
+    /// Every branch started, open or closed. A node names its branch.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub branches: BTreeMap<String, BranchState>,
 }
 
 impl SessionState {
@@ -1026,6 +1090,7 @@ impl SessionState {
             nodes: Vec::new(),
             open_interrupts: Vec::new(),
             session_start_failed: false,
+            branches: BTreeMap::new(),
         }
     }
 
@@ -1034,11 +1099,98 @@ impl SessionState {
             state: self,
             node,
             until: None,
+            branch: None,
         }
     }
 
     pub fn at_head(&self) -> SessionStateAtNode<'_, '_> {
         self.at(self.head_id.as_deref())
+    }
+
+    /// The state where `branch` reads next: its newest node, as the branch.
+    /// No branch is the conversation.
+    pub fn at_scope<'a>(&'a self, branch: Option<&'a str>) -> SessionStateAtNode<'a, 'a> {
+        match branch.and_then(|b| Some((b, self.branches.get(b)?))) {
+            Some((id, b)) => SessionStateAtNode {
+                state: self,
+                node: b.at(),
+                until: None,
+                branch: Some(id),
+            },
+            None => self.at_head(),
+        }
+    }
+
+    /// The node work in `branch` anchors at.
+    pub fn scope_node(&self, branch: Option<&str>) -> Option<String> {
+        match branch.and_then(|b| self.branches.get(b)) {
+            Some(b) => b.at().map(str::to_string),
+            None => self.head_id.clone(),
+        }
+    }
+
+    pub fn open_branch(&self, id: &str) -> Option<&BranchState> {
+        self.branches.get(id).filter(|b| b.is_open())
+    }
+
+    /// Whether `branch`, or a branch above it, outlives its turn.
+    pub fn detached(&self, branch: Option<&str>) -> bool {
+        let mut cursor = branch;
+        let mut seen = 0;
+        while let Some(b) = cursor.and_then(|id| self.branches.get(id)) {
+            if b.mode == BranchMode::Detached {
+                return true;
+            }
+            cursor = b.parent.as_deref();
+            seen += 1;
+            if seen > self.branches.len() {
+                break;
+            }
+        }
+        false
+    }
+
+    /// Open branches `parent` started that hold it: blocking, and in its turn.
+    pub fn held_by_branches(&self, parent: Option<&str>) -> usize {
+        self.branches
+            .values()
+            .filter(|b| b.is_open() && b.mode == BranchMode::Blocking)
+            .filter(|b| b.parent.as_deref() == parent)
+            .count()
+    }
+
+    /// The branch a node was written on.
+    pub fn node_branch(&self, id: &str) -> Option<&str> {
+        self.nodes
+            .iter()
+            .find(|n| n.message.id == id)
+            .and_then(|n| n.branch.as_deref())
+    }
+
+    pub fn decision_branch(&self, id: &str) -> Option<&str> {
+        self.worker_decision(id).and_then(|d| d.branch.as_deref())
+    }
+
+    fn effect_branch(&self, kind: EffectKind, id: &str) -> Option<String> {
+        self.effect(kind, id).and_then(|e| e.branch.clone())
+    }
+
+    /// The branch a trigger's work ran on.
+    pub fn trigger_branch(&self, trigger: &Trigger) -> Option<String> {
+        match trigger {
+            Trigger::ToolFinished { id, .. }
+            | Trigger::ToolExecute { id, .. }
+            | Trigger::CodemodeCalls { id, .. } => self.effect_branch(EffectKind::ToolCall, id),
+            Trigger::SubagentFinished { id, .. } => self.effect_branch(EffectKind::Subagent, id),
+            Trigger::LlmFinished { id, .. } | Trigger::LlmExecute { id, .. } => {
+                self.effect_branch(EffectKind::LlmCall, id)
+            }
+            Trigger::System1Finished { id, .. } => self.effect_branch(EffectKind::System1Call, id),
+            Trigger::BranchFinished { id, .. } => {
+                self.branches.get(id).and_then(|b| b.parent.clone())
+            }
+            _ => None,
+        }
     }
 
     pub fn turn_id(&self) -> Option<&str> {
@@ -1167,10 +1319,16 @@ impl SessionState {
             .and_then(|e| e.connector())
     }
 
-    fn insert_effect(&mut self, id: &str, tracking: EffectTracking, payload: EffectPayload) {
+    fn insert_effect(
+        &mut self,
+        id: &str,
+        tracking: EffectTracking,
+        payload: EffectPayload,
+        branch: Option<&str>,
+    ) {
         let anchor = match payload {
             EffectPayload::ConnectorSync(_) => None,
-            _ => self.head_id.clone(),
+            _ => self.scope_node(branch),
         };
         self.effects.insert(
             (payload.kind(), id.to_string()),
@@ -1178,6 +1336,7 @@ impl SessionState {
                 id: id.to_string(),
                 tracking,
                 anchor,
+                branch: branch.map(str::to_string),
                 payload,
             },
         );
@@ -1232,7 +1391,9 @@ impl SessionState {
                 call.defer_tools_strategy = payload.defer_tools_strategy;
             }
         } else {
-            self.turn_calls.llm.count += 1;
+            if !self.detached(payload.branch.as_deref()) {
+                self.turn_calls.llm.count += 1;
+            }
             self.insert_effect(
                 &payload.id,
                 EffectTracking::new_queued(payload.retry.clone()),
@@ -1248,11 +1409,21 @@ impl SessionState {
                     sent_tools: None,
                     defer_tools_strategy: payload.defer_tools_strategy,
                 }),
+                payload.branch.as_deref(),
             );
+            if let (Some(e), PromptSource::Tree { at }) = (
+                self.effect_mut(EffectKind::LlmCall, &payload.id),
+                &payload.source,
+            ) {
+                e.anchor = at.clone();
+            }
         }
         match &mut self.limited {
-            Some(l) if l.open() && l.call.id != payload.id => l.summary = Some(payload.id.clone()),
-            _ => self.turn_called = true,
+            Some(l) if l.open() && l.call.id != payload.id && payload.branch.is_none() => {
+                l.summary = Some(payload.id.clone())
+            }
+            _ if payload.branch.is_none() => self.turn_called = true,
+            _ => {}
         }
         self.enqueue(ctx.sequence, EffectKind::LlmCall, &payload.id);
     }
@@ -1321,10 +1492,12 @@ impl SessionState {
                 tc.arguments = payload.arguments.clone();
             }
         } else {
-            self.turn_calls.tool.count += 1;
+            if !self.detached(payload.branch.as_deref()) {
+                self.turn_calls.tool.count += 1;
+            }
             let script_language = match payload.target {
                 Some(ConnectorTarget::Code) => self
-                    .at_head()
+                    .at_scope(payload.branch.as_deref())
                     .resolve_agent_for()
                     .and_then(|c| c.codemode)
                     .unwrap_or_default(),
@@ -1347,6 +1520,7 @@ impl SessionState {
                     script_skill_files: None,
                     script_asked: Vec::new(),
                 }),
+                payload.branch.as_deref(),
             );
             if let Some(script) = &payload.script {
                 if let Some(parent) = self
@@ -1375,7 +1549,9 @@ impl SessionState {
                 }
             }
             None => {
-                self.turn_calls.system1.count += 1;
+                if !self.detached(p.branch.as_deref()) {
+                    self.turn_calls.system1.count += 1;
+                }
                 self.insert_effect(
                     &p.id,
                     EffectTracking::new_queued(p.retry.clone()),
@@ -1383,6 +1559,7 @@ impl SessionState {
                         system1: p.system1.clone(),
                         request: p.request.clone(),
                     }),
+                    p.branch.as_deref(),
                 )
             }
         }
@@ -1393,7 +1570,9 @@ impl SessionState {
         if let Some(existing) = self.effect_mut(EffectKind::Subagent, &payload.id) {
             existing.tracking.requeue();
         } else {
-            self.turn_calls.subagent.count += 1;
+            if !self.detached(payload.branch.as_deref()) {
+                self.turn_calls.subagent.count += 1;
+            }
             self.insert_effect(
                 &payload.id,
                 EffectTracking::new_queued(payload.retry.clone()),
@@ -1405,6 +1584,7 @@ impl SessionState {
                     is_error: false,
                     mode: payload.mode,
                 }),
+                payload.branch.as_deref(),
             );
         }
         self.enqueue(ctx.sequence, EffectKind::Subagent, &payload.id);
@@ -1460,15 +1640,18 @@ impl SessionState {
             _ => {}
         }
         let retry_policy = self.worker_retry.clone().unwrap_or(RetryPolicy::no_retry());
+        let branch = p.branch.clone().or_else(|| self.trigger_branch(&p.trigger));
         self.insert_effect(
             &p.id,
             EffectTracking::new_queued(retry_policy),
             EffectPayload::Decision(WorkerDecisionState {
                 trigger: p.trigger.clone(),
+                branch: branch.clone(),
                 source_event_sequence: ctx.sequence,
                 dispatched_seq: None,
                 turn: None,
             }),
+            branch.as_deref(),
         );
         self.enqueue(ctx.sequence, EffectKind::Decision, &p.id);
         if let Trigger::TurnFinished {
@@ -1513,14 +1696,44 @@ impl SessionState {
                 self.events = payload.events.clone();
             }
             EventPayload::NewMessage(payload) => {
-                if payload.message.role == Role::User {
-                    self.status = SessionStatus::Idle;
+                match payload
+                    .branch
+                    .as_ref()
+                    .and_then(|b| self.branches.get_mut(b))
+                {
+                    Some(branch) => branch.leaf = Some(payload.message.id.clone()),
+                    None => {
+                        if payload.message.role == Role::User {
+                            self.status = SessionStatus::Idle;
+                        }
+                        self.head_id = Some(payload.message.id.clone());
+                    }
                 }
-                self.head_id = Some(payload.message.id.clone());
                 self.nodes.push(Logged {
                     seq: ctx.sequence,
                     entry: payload.clone(),
                 });
+            }
+            EventPayload::BranchStarted(p) => {
+                self.branches.entry(p.id.clone()).or_insert(BranchState {
+                    from: p.from.clone(),
+                    parent: p.parent.clone(),
+                    agent: p.agent.clone(),
+                    name: p.name.clone(),
+                    mode: p.mode,
+                    seq: ctx.sequence,
+                    leaf: None,
+                    turn_id: p.turn_id.clone(),
+                    closed: None,
+                });
+            }
+            EventPayload::BranchClosed(p) => {
+                if let Some(b) = self.branches.get_mut(&p.id) {
+                    b.closed = match (b.closed, p.reason) {
+                        (_, BranchEnd::Promoted) | (None, _) => Some(p.reason),
+                        (closed, _) => closed,
+                    };
+                }
             }
             EventPayload::HeadMoved(payload) => {
                 self.head_id = Some(payload.head_id.clone());
@@ -1530,8 +1743,9 @@ impl SessionState {
             EventPayload::LlmCallRequested(payload) => self.apply_llm_requested(payload, ctx),
             EventPayload::LlmCallDispatched(payload) => self.apply_llm_dispatched(payload, ctx),
             EventPayload::LlmCallCompleted(payload) => {
+                let branch = self.effect_branch(EffectKind::LlmCall, &payload.id);
                 match &payload.response.usage {
-                    Some(usage) if !self.is_summary_call(&payload.id) => {
+                    Some(usage) if branch.is_none() && !self.is_summary_call(&payload.id) => {
                         self.last_read = Some(LastRead {
                             call_id: payload.id.clone(),
                             tokens: usage.input,
@@ -1539,12 +1753,17 @@ impl SessionState {
                     }
                     _ => {}
                 }
+                let in_turn = !self.detached(branch.as_deref());
                 self.track_usage(&payload.response.usage);
-                self.track_turn_usage(&payload.response.usage);
+                if in_turn {
+                    self.track_turn_usage(&payload.response.usage);
+                }
                 if let Some(c) = payload.response.cost {
                     self.cost += c;
-                    self.turn_cost += c;
-                    self.turn_calls.llm.cost += c;
+                    if in_turn {
+                        self.turn_cost += c;
+                        self.turn_calls.llm.cost += c;
+                    }
                 }
                 if let Some(e) = self.effect_mut(EffectKind::LlmCall, &payload.id) {
                     e.tracking.complete();
@@ -1565,13 +1784,21 @@ impl SessionState {
             }
             EventPayload::System1CallCompleted(p) => {
                 let usage = &p.response.usage;
+                let in_turn = !self.detached(
+                    self.effect_branch(EffectKind::System1Call, &p.id)
+                        .as_deref(),
+                );
                 self.token_usage.add(usage);
-                self.turn_token_usage.add(usage);
-                self.turn_calls.system1.tokens.add(usage);
+                if in_turn {
+                    self.turn_token_usage.add(usage);
+                    self.turn_calls.system1.tokens.add(usage);
+                }
                 if let Some(c) = p.response.cost {
                     self.cost += c;
-                    self.turn_cost += c;
-                    self.turn_calls.system1.cost += c;
+                    if in_turn {
+                        self.turn_cost += c;
+                        self.turn_calls.system1.cost += c;
+                    }
                 }
                 if let Some(e) = self.effect_mut(EffectKind::System1Call, &p.id) {
                     e.tracking.complete();
@@ -1658,7 +1885,15 @@ impl SessionState {
                     .retain(|i| i.interrupt_id != p.interrupt_id);
             }
             EventPayload::DecisionDispatched(p) => {
-                let turn = self.phase.turn_id().map(|id| {
+                let turnless = self.detached(self.decision_branch(&p.id))
+                    || matches!(
+                        self.worker_decision(&p.id).map(|d| &d.trigger),
+                        Some(Trigger::BranchFinished {
+                            mode: BranchMode::Detached,
+                            ..
+                        })
+                    );
+                let turn = self.phase.turn_id().filter(|_| !turnless).map(|id| {
                     Box::new(DecisionTurn {
                         id: id.to_string(),
                         metadata: self.turn_metadata.clone(),
@@ -1729,6 +1964,7 @@ impl SessionState {
                             error: None,
                             auth: None,
                         }),
+                        None,
                     );
                 }
                 if let Some(e) = self.effect_mut(EffectKind::ConnectorSync, &p.path.to_string()) {
@@ -1978,8 +2214,23 @@ impl SessionState {
         self.at_head().active_interrupt_for().is_some()
     }
 
+    /// An interrupt that holds a blocking branch of the running turn.
+    pub fn branch_interrupt(&self) -> Option<&OpenInterrupt> {
+        self.open_interrupts.iter().find(|i| {
+            i.anchor
+                .as_deref()
+                .and_then(|a| self.node_branch(a))
+                .and_then(|b| Some((b, self.open_branch(b)?)))
+                .is_some_and(|(b, _)| !self.detached(Some(b)))
+        })
+    }
+
     pub fn projected_status(&self) -> SessionStatus {
-        match self.at_head().active_interrupt_for() {
+        match self
+            .at_head()
+            .active_interrupt_for()
+            .or_else(|| self.branch_interrupt())
+        {
             Some(i) => SessionStatus::Interrupted {
                 interrupt_id: i.interrupt_id.clone(),
                 origin: i.origin,
@@ -2185,16 +2436,7 @@ impl SessionState {
     }
 
     pub fn tool_handler_for(&self, name: &str) -> ToolHandler {
-        let config = self.at_head().resolve_agent_for();
-        let connector = || {
-            self.connector_tool_for(name)
-                .is_some_and(|t| t.kind != ConnectorToolKind::Subagent)
-        };
-        match config.as_ref().and_then(|c| c.tool(name)) {
-            Some(t) => ToolHandler::declared(t.handler),
-            None if connector() => ToolHandler::Server,
-            None => ToolHandler::Worker,
-        }
+        self.at_head().tool_handler(name)
     }
 
     pub fn dispatched_calls(&self) -> Vec<String> {
@@ -2208,11 +2450,7 @@ impl SessionState {
     }
 
     pub fn connector_tool_for(&self, name: &str) -> Option<ConnectorTool> {
-        self.at_head()
-            .connector_tools()
-            .tools
-            .into_iter()
-            .find(|t| t.name == name)
+        self.at_head().connector_tool(name)
     }
 
     pub fn connector_tools_for_config(&self, config: &AgentConfig) -> filter::Merged {
@@ -2338,10 +2576,7 @@ impl SessionState {
     }
 
     pub fn retry_config(&self) -> Option<RetryConfig> {
-        self.at_head()
-            .resolve_agent_for()
-            .and_then(|c| c.retry)
-            .map(|b| *b)
+        self.at_head().retry_config()
     }
 
     pub fn depth(&self) -> u32 {
@@ -2406,23 +2641,29 @@ impl SessionState {
         self.agent_versions.sort_by_key(|v| v.seq);
     }
 
+    /// The nodes kept loaded: the conversation's path, and each open
+    /// branch's.
+    fn live_nodes(&self) -> std::collections::HashSet<&str> {
+        let mut live = std::collections::HashSet::new();
+        let leaves = self.head_id.as_deref().into_iter().chain(
+            self.branches
+                .values()
+                .filter(|b| b.is_open())
+                .filter_map(BranchState::at),
+        );
+        for leaf in leaves {
+            live.extend(self.path_ids(leaf));
+        }
+        live
+    }
+
     pub fn off_path(&self) -> bool {
-        let path = match self.head_id.as_deref() {
-            Some(head) => self.path_ids(head).len(),
-            None => 0,
-        };
-        self.nodes.len() > path
+        self.nodes.len() > self.live_nodes().len()
     }
 
     fn unload_off_path(&mut self) {
-        let path: std::collections::HashSet<String> = match self.head_id.as_deref() {
-            Some(head) => self
-                .path_ids(head)
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-            None => std::collections::HashSet::new(),
-        };
+        let path: std::collections::HashSet<String> =
+            self.live_nodes().into_iter().map(str::to_string).collect();
         let kept = |anchor: Option<&str>| anchor.is_none_or(|a| path.contains(a));
         self.nodes.retain(|n| path.contains(&n.message.id));
         self.state_versions.retain(|v| kept(v.anchor.as_deref()));
@@ -2471,6 +2712,7 @@ impl SessionState {
                     stream: None,
                     agent_id: None,
                     session_id: None,
+                    branch: e.branch.clone(),
                 };
                 match &e.payload {
                     EffectPayload::ToolCall(c) => {
@@ -2510,10 +2752,16 @@ impl SessionState {
                 let d = e.decision()?;
                 Some(MetaDecision {
                     decision_id: e.id.clone(),
+                    branch: d.branch.clone(),
                     status: e.tracking.status(),
                     finished: matches!(
                         d.trigger,
-                        Trigger::ToolFinished { .. } | Trigger::SubagentFinished { .. }
+                        Trigger::ToolFinished { .. }
+                            | Trigger::SubagentFinished { .. }
+                            | Trigger::BranchFinished {
+                                mode: BranchMode::Blocking,
+                                ..
+                            }
                     ),
                     attempts: e.tracking.retry.attempts,
                     deadline: e.tracking.deadline,
@@ -2561,11 +2809,110 @@ pub struct SessionStateAtNode<'a, 'n> {
     state: &'a SessionState,
     node: Option<&'n str>,
     until: Option<u64>,
+    /// The branch read as, when `node` is not yet its own.
+    branch: Option<&'n str>,
+}
+
+/// What a path inherits: each node's newest version it may read, and whether
+/// the context placed there carries.
+struct Inherited<'a> {
+    nodes: HashMap<&'a str, (u64, bool)>,
+    /// A branch's own config, by when it started.
+    config: Option<(u64, &'a BranchConfig)>,
+}
+
+impl Inherited<'_> {
+    fn reads(&self, anchor: Option<&str>, seq: u64) -> bool {
+        match anchor {
+            None => true,
+            Some(a) => self.nodes.get(a).is_some_and(|(until, _)| seq <= *until),
+        }
+    }
+
+    fn carries(&self, anchor: Option<&str>, seq: u64) -> bool {
+        match anchor {
+            None => true,
+            Some(a) => self
+                .nodes
+                .get(a)
+                .is_some_and(|(until, context)| *context && seq <= *until),
+        }
+    }
 }
 
 impl<'a, 'n> SessionStateAtNode<'a, 'n> {
     pub fn state(&self) -> &'a SessionState {
         self.state
+    }
+
+    /// The branch this reads as: the one named, or the one its node is on.
+    pub fn branch_id(&self) -> Option<&'a str>
+    where
+        'n: 'a,
+    {
+        self.branch.or_else(|| {
+            let node = self.node?;
+            self.state
+                .nodes
+                .iter()
+                .find(|n| n.message.id == node)
+                .and_then(|n| n.branch.as_deref())
+        })
+    }
+
+    /// Walks up from the node. Crossing out of a branch, what lies above it is
+    /// read as of the branch's start, and its context stops carrying when the
+    /// branch runs as its own config.
+    fn inherited(&self) -> Inherited<'a> {
+        let state = self.state;
+        let by_id: HashMap<&str, &Logged<NewMessage>> = logged_until(&state.nodes, self.until)
+            .iter()
+            .map(|n| (n.message.id.as_str(), n))
+            .collect();
+        let own = |b: Option<&str>| {
+            b.and_then(|id| state.branches.get(id))
+                .filter(|b| b.agent != BranchConfig::Inherit)
+                .map(|b| (b.seq, &b.agent))
+        };
+        let mut region: Option<&str> = match self.branch {
+            Some(b) => Some(
+                state
+                    .branches
+                    .get_key_value(b)
+                    .map_or(b, |(k, _)| k.as_str()),
+            ),
+            None => self
+                .node
+                .and_then(|n| by_id.get(n))
+                .and_then(|n| n.branch.as_deref()),
+        };
+        let mut config = own(region);
+        let mut until = u64::MAX;
+        let mut context = true;
+        let mut nodes = HashMap::new();
+        let mut cursor = self.node;
+        while let Some(id) = cursor {
+            let Some(node) = by_id.get(id) else { break };
+            let tag = node.branch.as_deref();
+            if tag != region {
+                if let Some(left) = region.and_then(|b| state.branches.get(b)) {
+                    until = until.min(left.seq);
+                    context &= left.agent == BranchConfig::Inherit;
+                }
+                region = tag;
+                if config.is_none() {
+                    config = own(region).filter(|(seq, _)| *seq <= until);
+                }
+            }
+            if nodes
+                .insert(node.message.id.as_str(), (until, context))
+                .is_some()
+            {
+                break;
+            }
+            cursor = node.parent_id.as_deref();
+        }
+        Inherited { nodes, config }
     }
 
     /// Reads the logs as they were at `seq`. Everything else is current.
@@ -2614,20 +2961,53 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
     }
 
     pub fn resolve_state_for(&self) -> WorkerState {
-        resolve_on_path(
-            logged_until(&self.state.state_versions, self.until),
-            &self.path_set(),
-        )
-        .map(|v| v.value.clone())
-        .unwrap_or_default()
+        let inherited = self.inherited();
+        logged_until(&self.state.state_versions, self.until)
+            .iter()
+            .rev()
+            .find(|v| inherited.reads(v.anchor(), v.seq))
+            .map(|v| v.value.clone())
+            .unwrap_or_default()
     }
 
+    /// The newest config on the path, or the branch's own when it started
+    /// later.
     pub fn resolve_agent_for(&self) -> Option<AgentConfig> {
-        resolve_on_path(
-            logged_until(&self.state.agent_versions, self.until),
-            &self.path_set(),
-        )
-        .map(|v| v.value.clone())
+        let inherited = self.inherited();
+        let version = logged_until(&self.state.agent_versions, self.until)
+            .iter()
+            .rev()
+            .find(|v| inherited.reads(v.anchor(), v.seq));
+        match (version, inherited.config) {
+            (Some(v), Some((seq, _))) if v.seq > seq => Some(v.value.clone()),
+            (_, Some((_, BranchConfig::Config(config)))) => Some((**config).clone()),
+            (_, Some(_)) => None,
+            (v, None) => v.map(|v| v.value.clone()),
+        }
+    }
+
+    pub fn connector_tool(&self, name: &str) -> Option<ConnectorTool> {
+        self.connector_tools()
+            .tools
+            .into_iter()
+            .find(|t| t.name == name)
+    }
+
+    pub fn tool_handler(&self, name: &str) -> ToolHandler {
+        let config = self.resolve_agent_for();
+        let connector = || {
+            self.connector_tool(name)
+                .is_some_and(|t| t.kind != ConnectorToolKind::Subagent)
+        };
+        match config.as_ref().and_then(|c| c.tool(name)) {
+            Some(t) => ToolHandler::declared(t.handler),
+            None if connector() => ToolHandler::Server,
+            None => ToolHandler::Worker,
+        }
+    }
+
+    pub fn retry_config(&self) -> Option<RetryConfig> {
+        self.resolve_agent_for().and_then(|c| c.retry).map(|b| *b)
     }
 
     pub fn connector_tools(&self) -> filter::Merged {
@@ -2797,18 +3177,18 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
     /// The contexts the path was told: what the tree records, and what its
     /// legacy calls placed.
     pub fn said(&self) -> std::collections::HashSet<String> {
-        let path = self.path_set();
+        let inherited = self.inherited();
         let legacy = self
             .state
             .effects
             .values()
-            .filter(|e| SessionState::anchored_on(&path, e.anchor.as_deref()))
+            .filter(|e| inherited.carries(e.anchor.as_deref(), 0))
             .filter_map(EffectState::llm)
             .flat_map(|call| call.context_ids.iter().cloned());
         self.state
             .context_versions
             .iter()
-            .filter(|v| SessionState::anchored_on(&path, v.anchor.as_deref()))
+            .filter(|v| inherited.carries(v.anchor.as_deref(), v.seq))
             .flat_map(|v| v.value.ids.iter().cloned())
             .chain(legacy)
             .collect()
@@ -2881,7 +3261,7 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
     /// before context was recorded on the tree has its own read back from its
     /// prompt, ahead of the rest.
     pub fn placed_on_path(&self) -> Vec<prompt_context::Placed> {
-        let path = self.path_set();
+        let inherited = self.inherited();
         let recorded: std::collections::HashSet<&str> = self
             .state
             .context_versions
@@ -2893,7 +3273,7 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
             .effects
             .values()
             .filter(|e| !recorded.contains(e.id.as_str()))
-            .filter(|e| SessionState::anchored_on(&path, e.anchor.as_deref()))
+            .filter(|e| inherited.carries(e.anchor.as_deref(), 0))
             .filter_map(|e| e.llm().map(|call| call.placed_in_prompt(&e.id)))
             .flatten()
             .map(|p| (0, p))
@@ -2902,7 +3282,7 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
             self.state
                 .context_versions
                 .iter()
-                .filter(|v| SessionState::anchored_on(&path, v.anchor.as_deref()))
+                .filter(|v| inherited.carries(v.anchor.as_deref(), v.seq))
                 .map(|v| (v.seq, v.value.clone())),
         );
         placed.sort_by_key(|(seq, _)| *seq);
@@ -2932,13 +3312,11 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
         if let Some(declared) = config.tool(named) {
             return Some(CallTarget::Declared(declared.clone()));
         }
-        self.state
-            .connector_tool_for(named)
-            .and_then(|t| match t.kind {
-                ConnectorToolKind::Remote => Some(CallTarget::Connector(t)),
-                ConnectorToolKind::Subagent => Some(CallTarget::Subagent(t)),
-                _ => None,
-            })
+        self.connector_tool(named).and_then(|t| match t.kind {
+            ConnectorToolKind::Remote => Some(CallTarget::Connector(t)),
+            ConnectorToolKind::Subagent => Some(CallTarget::Subagent(t)),
+            _ => None,
+        })
     }
 
     pub fn call_tool_fault(&self, arguments: &str) -> Option<String> {
@@ -3051,6 +3429,7 @@ mod open_llm_calls_tests {
                 message,
                 parent_id: parent_id.map(str::to_string),
                 copied_from: None,
+                branch: None,
             },
         }
     }
@@ -3169,6 +3548,7 @@ mod state_version_tests {
                 },
                 parent_id: parent_id.map(str::to_string),
                 copied_from: None,
+                branch: None,
             },
         }
     }
@@ -3279,6 +3659,7 @@ mod state_version_tests {
                 },
                 parent_id: parent.map(str::to_string),
                 copied_from: None,
+                branch: None,
             })
         };
         let state = |v: serde_json::Value, anchor: &str| {
@@ -3321,6 +3702,7 @@ mod agent_version_tests {
                 },
                 parent_id: parent_id.map(str::to_string),
                 copied_from: None,
+                branch: None,
             },
         }
     }
@@ -3414,6 +3796,7 @@ mod agent_version_tests {
                 error: None,
                 auth: None,
             }),
+            None,
         );
         if let Some(e) = s.effect_mut(EffectKind::ConnectorSync, "mcp.sentry") {
             e.tracking.dispatch(Utc::now());
@@ -3486,6 +3869,7 @@ mod effect_tests {
             stream: None,
             agent_id: None,
             session_id: None,
+            branch: None,
         };
         let json = serde_json::to_value(&e).unwrap();
         assert_eq!(json["id"], "call_1");

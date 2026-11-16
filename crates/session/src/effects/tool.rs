@@ -12,7 +12,7 @@ use crate::protocol::{
 };
 use crate::protocol::{RetryOverride, RetryPolicy};
 use crate::schedule::Dep;
-use crate::state::{inner_arguments, CallTarget, EffectKind, SessionState};
+use crate::state::{inner_arguments, CallTarget, EffectKind, SessionState, SessionStateAtNode};
 use crate::tool_contract::{classify_arguments, declared_tool, output_violation, DeclaredTool};
 use crate::Caller;
 
@@ -153,6 +153,7 @@ impl KindSpec for ToolSpec {
             target: tc.target.clone(),
             retry: t.retry_policy.clone(),
             script: tc.script.clone(),
+            branch: effect.branch.clone(),
         })]
     }
 }
@@ -336,10 +337,13 @@ fn scripted(
     (name, arguments): (String, String),
     target: Option<ConnectorTarget>,
 ) -> EventPayload {
-    let anchor = state
-        .effect(EffectKind::ToolCall, &script.parent)
-        .and_then(|e| e.anchor.clone());
-    let here = state.at(anchor.as_deref());
+    let parent = state.effect(EffectKind::ToolCall, &script.parent);
+    let anchor = parent.and_then(|e| e.anchor.clone());
+    let branch = parent.and_then(|e| e.branch.clone());
+    let here = match &branch {
+        Some(b) => state.at_scope(Some(b)),
+        None => state.at(anchor.as_deref()),
+    };
     let config = here.resolve_agent_for();
     let tools = here.connector_tools().tools;
     let reach = codemode::reach(&name, config.as_ref(), &tools);
@@ -377,7 +381,15 @@ fn scripted(
             None => None,
         });
     let called = asked;
-    let mut call = requested(state, id, name, arguments, None, Some(script));
+    let mut call = requested(
+        state,
+        id,
+        name,
+        arguments,
+        None,
+        Some(script),
+        branch.as_deref(),
+    );
     if let Some(script) = call.script.as_mut() {
         script.called =
             (call.name != called.name || call.arguments != called.arguments).then_some(called);
@@ -436,6 +448,7 @@ pub fn request(
     name: String,
     arguments: String,
     retry: Option<RetryOverride>,
+    branch: Option<&str>,
     caller: &Caller,
 ) -> Result<Vec<EventPayload>, SessionError> {
     SessionState::ensure_internal(caller)?;
@@ -449,7 +462,15 @@ pub fn request(
     if state.has_effect(EffectKind::ToolCall, &tool_call_id) {
         return Ok(Vec::new());
     }
-    let call = requested(state, tool_call_id, name, arguments, retry.as_ref(), None);
+    let call = requested(
+        state,
+        tool_call_id,
+        name,
+        arguments,
+        retry.as_ref(),
+        None,
+        branch,
+    );
     Ok(vec![EventPayload::ToolCallRequested(call)])
 }
 
@@ -460,14 +481,15 @@ fn requested(
     arguments: String,
     retry: Option<&RetryOverride>,
     script: Option<ScriptCaller>,
+    branch: Option<&str>,
 ) -> ToolCallRequested {
-    let (name, arguments) = engine_call(state, name, arguments);
-    let engine_tool = state
-        .connector_tool_for(&name)
+    let here = state.at_scope(branch);
+    let (name, arguments) = engine_call(here, name, arguments);
+    let engine_tool = here
+        .connector_tool(&name)
         .filter(|t| t.kind != ConnectorToolKind::Subagent);
-    let locked = state.at_head().locked_tools().contains_key(&name);
-    let in_code_mode = state
-        .at_head()
+    let locked = here.locked_tools().contains_key(&name);
+    let in_code_mode = here
         .resolve_agent_for()
         .is_some_and(|c| c.codemode.is_some());
     let (name, arguments, handler, target) = match engine_tool {
@@ -486,7 +508,7 @@ fn requested(
             ToolHandler::Server,
             Some(ConnectorTarget::Locked),
         ),
-        Some(tool) if tool.kind == ConnectorToolKind::Call => unwrap_call(state, name, arguments),
+        Some(tool) if tool.kind == ConnectorToolKind::Call => unwrap_call(here, name, arguments),
         Some(tool) if tool.kind == ConnectorToolKind::Code => {
             let target = match argument(&arguments, "code") {
                 Some(_) => ConnectorTarget::Code,
@@ -504,7 +526,7 @@ fn requested(
         ),
         Some(tool) if tool.kind == ConnectorToolKind::Skill => {
             let named = argument(&arguments, "name").unwrap_or_default();
-            let config = state.at_head().resolve_agent_for();
+            let config = here.resolve_agent_for();
             let found = config.as_ref().and_then(|c| c.named_skill(&named));
             let (plugin, skill) = match &found {
                 Some(s) => (s.bundle, s.skill),
@@ -529,11 +551,11 @@ fn requested(
             };
             (name, arguments, ToolHandler::Server, Some(target))
         }
-        None => (name.clone(), arguments, state.tool_handler_for(&name), None),
+        None => (name.clone(), arguments, here.tool_handler(&name), None),
     };
     let retry = match target {
         Some(ConnectorTarget::Code) => codemode::retry(),
-        _ => RetryPolicy::resolve(retry, state.retry_config().as_ref(), handler.retry_target()),
+        _ => RetryPolicy::resolve(retry, here.retry_config().as_ref(), handler.retry_target()),
     };
     ToolCallRequested {
         id,
@@ -544,20 +566,24 @@ fn requested(
         target,
         retry,
         script,
+        branch: branch.map(str::to_string),
     }
 }
 
 /// `call_tool` that names `tool_search` or `skill` is that tool's call, as it
 /// is for any other tool.
-fn engine_call(state: &SessionState, name: String, arguments: String) -> (String, String) {
+fn engine_call(
+    state: SessionStateAtNode<'_, '_>,
+    name: String,
+    arguments: String,
+) -> (String, String) {
     if name != CALL_TOOL {
         return (name, arguments);
     }
     let raw: serde_json::Value = serde_json::from_str(&arguments).unwrap_or_default();
     match raw.get("name").and_then(|v| v.as_str()) {
         Some(named)
-            if [TOOL_SEARCH, SKILL].contains(&named)
-                && state.connector_tool_for(named).is_some() =>
+            if [TOOL_SEARCH, SKILL].contains(&named) && state.connector_tool(named).is_some() =>
         {
             (named.to_string(), inner_arguments(&raw))
         }
@@ -566,12 +592,11 @@ fn engine_call(state: &SessionState, name: String, arguments: String) -> (String
 }
 
 fn unwrap_call(
-    state: &SessionState,
+    here: SessionStateAtNode<'_, '_>,
     name: String,
     arguments: String,
 ) -> (String, String, ToolHandler, Option<ConnectorTarget>) {
     let named = argument(&arguments, "name").unwrap_or_default();
-    let here = state.at_head();
     let target = here
         .call_tool_fault(&arguments)
         .is_none()

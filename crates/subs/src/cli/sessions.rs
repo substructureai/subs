@@ -723,6 +723,7 @@ mod tests {
             payload: EventPayload::DecisionQueued(crate::session::events::DecisionQueued {
                 id: "d1".into(),
                 trigger: crate::session::decision::Trigger::SessionStart,
+                branch: None,
             }),
             meta: EventMeta {
                 status: crate::session::state::SessionStatus::Idle,

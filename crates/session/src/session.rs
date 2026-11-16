@@ -491,6 +491,7 @@ mod ends_run_tests {
             stream: None,
             agent_id: None,
             session_id: None,
+            branch: None,
         }
     }
 
@@ -528,6 +529,7 @@ mod ends_run_tests {
             EventPayload::DecisionQueued(DecisionQueued {
                 id: "d1".into(),
                 trigger: crate::decision::Trigger::SessionStart,
+                branch: None,
             }),
             calls,
         )

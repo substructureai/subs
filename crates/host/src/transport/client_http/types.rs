@@ -190,6 +190,7 @@ mod tests {
                 },
                 parent_id: parent.map(str::to_string),
                 copied_from: None,
+                branch: None,
             },
         };
         let mut s = SessionState::new("s1".to_string());

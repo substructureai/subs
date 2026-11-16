@@ -173,6 +173,14 @@ pub fn subagent_busy(agent: &str) -> String {
     format!("{agent} is already answering; wait for its result")
 }
 
+/// A call that needs a person's approval, from work nobody waits on.
+pub fn unapproved_detached(tool: &str) -> String {
+    format!("`{tool}` needs a person's approval, and this work runs in the background where nobody can give it")
+}
+
+/// A detached subagent asked for from a branch.
+pub const DETACHED_ON_BRANCH: &str = "a branch cannot start a detached subagent; call it blocking";
+
 /// A `wait` without a detached call's `session`.
 pub const WAIT_NEEDS_SESSION: &str = "`wait` needs a `session` from an earlier detached call";
 

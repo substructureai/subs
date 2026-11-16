@@ -202,9 +202,16 @@ pub(super) fn mismatched(kind: EffectKind, outcome: &Outcome) -> Vec<EventPayloa
 }
 
 pub(super) fn decision_queued(ids: &Ids, trigger: Trigger) -> EventPayload {
+    decision_queued_on(ids, trigger, None)
+}
+
+/// A decision about `branch`. Without one, the branch the trigger's work ran
+/// on.
+pub fn decision_queued_on(ids: &Ids, trigger: Trigger, branch: Option<String>) -> EventPayload {
     EventPayload::DecisionQueued(DecisionQueued {
         id: ids.next(),
         trigger,
+        branch,
     })
 }
 

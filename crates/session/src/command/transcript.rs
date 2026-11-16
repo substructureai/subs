@@ -24,6 +24,18 @@ impl SessionState {
         let known: std::collections::HashSet<&str> =
             self.nodes.iter().map(|n| n.message.id.as_str()).collect();
         let plan = plan_reconcile(&known, &transcript);
+        let landing = landing_leaf(&transcript, &plan);
+        if let Some(branch) = landing
+            .as_deref()
+            .and_then(|l| self.node_branch(l))
+            .filter(|b| self.open_branch(b).is_some())
+        {
+            tracing::warn!(
+                branch,
+                "the conversation cannot land on an open branch; promote it instead"
+            );
+            return (Vec::new(), self.head_id.clone());
+        }
         let mut events = Vec::with_capacity(plan.len());
         let mut plan_iter = plan.iter().peekable();
         let mut parent: Option<String> = None;
@@ -43,6 +55,7 @@ impl SessionState {
                         message: msg,
                         parent_id: parent.take(),
                         copied_from,
+                        branch: None,
                     }));
                     parent = Some(id);
                 }

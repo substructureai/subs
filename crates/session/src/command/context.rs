@@ -109,6 +109,7 @@ impl SessionState {
                 message,
                 parent_id: parent.replace(id.clone()),
                 copied_from,
+                branch: None,
             }));
             id
         };

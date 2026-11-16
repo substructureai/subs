@@ -453,6 +453,7 @@ mod tests {
             attempts: 0,
             deadline: None,
             turn: None,
+            branch: None,
         }
     }
 

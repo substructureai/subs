@@ -333,6 +333,7 @@ pub fn summary_call(
         reasoning: None,
         stream: Some(false),
         retry: None,
+        branch: None,
     })
 }
 
@@ -368,5 +369,6 @@ pub fn reissue(
         reasoning: request.reasoning.clone(),
         stream: Some(call.stream),
         retry: None,
+        branch: None,
     }
 }

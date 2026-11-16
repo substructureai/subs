@@ -50,6 +50,14 @@ impl KindSpec for DecisionSpec {
     }
 
     fn terminal(&self, state: &Cx<'_>, id: &str, e: &SettleError) -> Vec<EventPayload> {
+        if let Some(branch) = state.decision_branch(id) {
+            return state.finish_branch(
+                state.ids(),
+                branch,
+                serde_json::Value::Null,
+                Some(e.error.clone()),
+            );
+        }
         let joined = state.worker_decision(id).is_some_and(|d| {
             matches!(d.trigger, Trigger::ClientAction { .. })
                 && !d
@@ -115,7 +123,10 @@ impl KindSpec for DecisionSpec {
                 decision_id: e.id.clone(),
             })
             .collect();
-        deps.extend(super::connector::owed(state.at_head()));
+        let branch = state
+            .worker_decision(&entry.id)
+            .and_then(|d| d.branch.as_deref());
+        deps.extend(super::connector::owed(state.at_scope(branch)));
         deps.sort_by_key(Dep::label);
         deps.dedup();
         deps
@@ -196,6 +207,7 @@ impl SessionState {
     pub fn drop_queued_decisions(&self) -> Vec<EventPayload> {
         self.queued_decisions()
             .into_iter()
+            .filter(|e| !self.detached(e.branch.as_deref()))
             .filter(|e| e.decision().is_none_or(|d| d.trigger.is_turn_work()))
             .map(|e| self.decision_dropped(&e.id))
             .collect()

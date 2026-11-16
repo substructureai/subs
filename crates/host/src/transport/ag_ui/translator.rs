@@ -41,6 +41,8 @@ pub struct AgUiTranslator {
     called: HashMap<String, (String, String)>,
     making_room: Option<String>,
     summary_calls: HashSet<String>,
+    /// Work on a branch. None of it is the chat.
+    side: HashSet<String>,
     terminated: bool,
 }
 
@@ -63,6 +65,7 @@ impl AgUiTranslator {
             called: HashMap::new(),
             making_room: None,
             summary_calls: HashSet::new(),
+            side: HashSet::new(),
             terminated: false,
         }
     }
@@ -79,7 +82,7 @@ impl AgUiTranslator {
     }
 
     pub fn on_delta(&mut self, delta: TokenDelta) -> Vec<AgUiEvent> {
-        if self.terminated() {
+        if self.terminated() || self.side.contains(&delta.call_id) {
             return vec![];
         }
         match (&self.turn_id, &delta.turn_id) {
@@ -156,8 +159,31 @@ impl AgUiTranslator {
         out
     }
 
+    /// Whether the event is about work on a branch.
+    fn on_side(&mut self, event: &EventPayload) -> bool {
+        let (id, branch) = match event {
+            EventPayload::LlmCallRequested(r) => (&r.id, r.branch.is_some()),
+            EventPayload::ToolCallRequested(t) => (&t.id, t.branch.is_some()),
+            EventPayload::SubagentRequested(s) => (&s.id, s.branch.is_some()),
+            EventPayload::LlmCallCompleted(c) => (&c.id, false),
+            EventPayload::LlmCallErrored(e) => (&e.id, false),
+            EventPayload::ToolCallCompleted(t) => (&t.id, false),
+            EventPayload::ToolCallErrored(t) => (&t.id, false),
+            EventPayload::SubagentStarted(s) => (&s.id, false),
+            EventPayload::SubagentTurnCompleted(s) => (&s.id, false),
+            EventPayload::SubagentErrored(s) => (&s.id, false),
+            EventPayload::NewMessage(m) => return m.branch.is_some(),
+            EventPayload::BranchStarted(_) | EventPayload::BranchClosed(_) => return true,
+            _ => return false,
+        };
+        if branch {
+            self.side.insert(id.clone());
+        }
+        self.side.contains(id)
+    }
+
     pub fn on_event(&mut self, event: EventPayload, ends_run: bool) -> Vec<AgUiEvent> {
-        if self.terminated() {
+        if self.terminated() || self.on_side(&event) {
             return vec![];
         }
         match event {
@@ -664,6 +690,52 @@ mod tests {
             "handler": handler,
             "retry": serde_json::from_str::<Value>(RETRY).unwrap(),
         }))
+    }
+
+    fn llm_requested(id: &str, branch: Option<&str>) -> EventPayload {
+        let mut requested = json!({
+            "type": "llm.call.requested",
+            "id": id,
+            "attempt": 0,
+            "llm": "claude",
+            "request": { "model": "m", "messages": [] },
+            "stream": true,
+            "retry": serde_json::from_str::<Value>(RETRY).unwrap(),
+        });
+        if let Some(branch) = branch {
+            requested["branch"] = json!(branch);
+        }
+        ev(requested)
+    }
+
+    #[test]
+    fn a_branch_never_reaches_the_chat() {
+        let mut t = AgUiTranslator::new("t1".into(), "r1".into());
+        assert!(t
+            .on_event(llm_requested("side", Some("title")), false)
+            .is_empty());
+        assert!(t.on_delta(delta("side", "r1", "Paris weather")).is_empty());
+        let mut tool = tool_requested("tc-s", "lookup", "{}", "worker");
+        if let EventPayload::ToolCallRequested(r) = &mut tool {
+            r.branch = Some("title".into());
+        }
+        assert!(t.on_event(tool, false).is_empty());
+        let failed = ev(json!({
+            "type": "llm.call.errored",
+            "id": "side",
+            "attempt": 0,
+            "error": { "code": "provider_error", "message": "boom" },
+            "retryable": false,
+        }));
+        assert!(
+            t.on_event(failed, false).is_empty(),
+            "a side failure is not the run's"
+        );
+        assert!(!t.terminated());
+
+        t.on_event(llm_requested("c1", None), false);
+        let out = vals(t.on_delta(delta("c1", "r1", "Sunny.")));
+        assert_eq!(kinds(&out), ["TEXT_MESSAGE_START", "TEXT_MESSAGE_CONTENT"]);
     }
 
     #[test]

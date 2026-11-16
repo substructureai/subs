@@ -274,12 +274,14 @@ async fn submit(
     response: DecisionResponse,
     span_name: &str,
 ) -> Result<(), String> {
+    let agents = runtime.agent_configs(tenant_id).await;
     let resolved = match resolve_response(
         response,
         decision.agent.as_ref(),
         Some(&decision.trigger),
         &runtime.llm_blocks(tenant_id).await,
         &runtime.system1_blocks(tenant_id).await,
+        &|id| agents.get(id).cloned(),
         runtime.blob_store(),
         tenant_id,
     )

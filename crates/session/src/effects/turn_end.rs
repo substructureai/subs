@@ -108,6 +108,7 @@ impl SessionState {
                 message,
                 parent_id: parent.replace(id),
                 copied_from: None,
+                branch: None,
             }));
         }
         let voided: Vec<(EffectKind, String)> = self
@@ -122,6 +123,7 @@ impl SessionState {
                         | EffectKind::System1Call
                 )
             })
+            .filter(|e| e.branch.is_none())
             .filter(|e| closed.contains(&e.id) || at.anchor_on_path(e.anchor.as_deref()))
             .filter(|e| e.tracking.is_unsettled())
             .map(|e| (e.kind(), e.id.clone()))
@@ -173,6 +175,7 @@ impl SessionState {
     pub fn open_work(&self) -> Vec<(EffectKind, &str)> {
         self.effects
             .values()
+            .filter(|e| !self.detached(e.branch.as_deref()))
             .filter(|e| match e.decision() {
                 Some(d) => d.trigger.is_turn_work(),
                 None => matches!(
@@ -189,6 +192,12 @@ impl SessionState {
     }
 
     pub fn finalize_run(&self, error: Option<&ErrorInfo>) -> Vec<EventPayload> {
+        let mut events = self.void_turn_branches();
+        events.extend(self.finalized(error));
+        events
+    }
+
+    fn finalized(&self, error: Option<&ErrorInfo>) -> Vec<EventPayload> {
         match self.phase.finalizing().cloned() {
             Some(f) => vec![
                 EventPayload::TurnCompleted(TurnCompleted {
@@ -223,9 +232,11 @@ impl SessionState {
                 })
             })
             .collect();
+        events.extend(self.void_turn_branches());
         events.extend(self.void_effects(|_, tracking, _| tracking.is_unsettled()));
         events.extend(
             self.effects_of(EffectKind::Decision)
+                .filter(|e| !self.detached(e.branch.as_deref()))
                 .filter(|e| {
                     let Some(d) = e.decision() else { return false };
                     let waits =
@@ -238,7 +249,7 @@ impl SessionState {
         );
         let error = ErrorInfo::new(ErrorCode::Cancelled, "cancelled");
         match &self.phase {
-            TurnPhase::Finalizing(_) => events.extend(self.finalize_run(Some(&error))),
+            TurnPhase::Finalizing(_) => events.extend(self.finalized(Some(&error))),
             TurnPhase::Active { turn_id } => events.extend([
                 EventPayload::TurnCompleted(TurnCompleted {
                     turn_id: turn_id.clone(),
@@ -261,6 +272,7 @@ impl SessionState {
             || !self.open_interrupts.is_empty()
             || self.effects.values().any(|e| {
                 e.tracking.is_unsettled()
+                    && !self.detached(e.branch.as_deref())
                     && !matches!(
                         e.decision().map(|d| &d.trigger),
                         Some(Trigger::SessionStart)
@@ -270,10 +282,11 @@ impl SessionState {
     }
 
     pub fn fail_run(&self, error: &ErrorInfo) -> Vec<EventPayload> {
-        let mut events = self.void_effects(|kind, tracking, _| stops(kind, tracking));
+        let mut events = self.void_turn_branches();
+        events.extend(self.void_effects(|kind, tracking, _| stops(kind, tracking)));
         events.extend(self.drop_queued_decisions());
         if self.phase.finalizing().is_some() {
-            events.extend(self.finalize_run(Some(error)));
+            events.extend(self.finalized(Some(error)));
             return events;
         }
         let TurnPhase::Active { turn_id } = &self.phase else {

@@ -4,12 +4,12 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use super::decision::{LlmHandler, PromptSource, ToolHandler, Trigger};
+use super::decision::{BranchConfig, LlmHandler, PromptSource, ToolHandler, Trigger};
 use crate::connectors::ConnectionPath;
 use crate::connectors::{AuthNeed, RemoteTool};
 pub use crate::protocol::EffectKind;
 use crate::protocol::{
-    AgentConfig, ClientContext, ConnectorToolKind, ContextReason, ContextStrategyKind,
+    AgentConfig, BranchMode, ClientContext, ConnectorToolKind, ContextReason, ContextStrategyKind,
     DeferToolsStrategy, DraftMessage, ErrorInfo, HeldCall, InterruptOrigin, LlmFormat, LlmRequest,
     LlmResponse, Message, MessageTree, NewMessage, RetryPolicy, SessionOwner, SpawnMode,
     StoredResult, Usage, WorkerRef, WorkerState,
@@ -127,6 +127,51 @@ pub enum EventPayload {
     ContextReplaced(ContextReplaced),
     #[serde(rename = "context.kept")]
     ContextKept,
+    #[serde(rename = "branch.started")]
+    BranchStarted(Box<BranchStarted>),
+    #[serde(rename = "branch.closed")]
+    BranchClosed(BranchClosed),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchStarted {
+    pub id: String,
+    /// The node it forks at. Absent for a root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// The branch that started it. Absent when the conversation did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    #[serde(default)]
+    pub agent: BranchConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub mode: BranchMode,
+    /// The turn a blocking branch belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BranchEnd {
+    Done,
+    Failed,
+    /// Its turn ended, or what it forked from was edited away.
+    Voided,
+    Closed,
+    Promoted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchClosed {
+    pub id: String,
+    pub reason: BranchEnd,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub data: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ErrorInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -276,6 +321,8 @@ pub struct LlmCallRequested {
     pub format: Option<LlmFormat>,
     #[serde(default)]
     pub defer_tools_strategy: DeferToolsStrategy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -325,6 +372,8 @@ pub struct System1CallRequested {
     pub system1: String,
     pub request: System1Request,
     pub retry: RetryPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -395,6 +444,8 @@ pub struct SubagentRequested {
     pub retry: RetryPolicy,
     #[serde(default, skip_serializing_if = "is_blocking")]
     pub mode: SpawnMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
 }
 
 fn is_blocking(mode: &SpawnMode) -> bool {
@@ -472,6 +523,8 @@ pub struct ToolCallRequested {
     pub retry: RetryPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub script: Option<ScriptCaller>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
 }
 
 /// A `run_code` call's script ran a step, and asked for these calls.
@@ -664,6 +717,9 @@ pub struct CallTotals {
 pub struct DecisionQueued {
     pub id: String,
     pub trigger: Trigger,
+    /// The branch the decision is about. Absent on the conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

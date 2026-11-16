@@ -103,6 +103,7 @@ mod tests {
             message,
             parent_id: parent.map(|p| Uuid::from_u128(p).to_string()),
             copied_from: None,
+            branch: None,
         }
     }
 

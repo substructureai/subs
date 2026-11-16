@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 
 use crate::connectors::ConnectionPath;
 use crate::protocol::{
-    ClientContext, ContextReason, ContextStrategyKind, DeferToolsStrategy, DraftMessage, ErrorInfo,
-    Handler, HeldCall, LlmFormat, LlmRequest, LlmResponse, RetryOverride, RetryPolicy, SpawnMode,
-    StoredResult, ToolResult, Usage,
+    AgentConfig, BranchMode, ClientContext, ContextReason, ContextStrategyKind, DeferToolsStrategy,
+    DraftMessage, ErrorInfo, Handler, HeldCall, LlmFormat, LlmRequest, LlmResponse, RetryOverride,
+    RetryPolicy, SpawnMode, StoredResult, ToolResult, Usage,
 };
 use crate::retry::RetryTarget;
 use crate::state::TurnPhase;
@@ -82,6 +82,39 @@ impl PromptSource {
     pub fn is_tree(&self) -> bool {
         matches!(self, Self::Tree { .. })
     }
+}
+
+/// The config a branch runs as.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "config", rename_all = "snake_case")]
+pub enum BranchConfig {
+    /// The config of the path it forks.
+    #[default]
+    Inherit,
+    /// None: the prompt is the path as written.
+    None,
+    Config(Box<AgentConfig>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "node", rename_all = "snake_case")]
+pub enum BranchFrom {
+    Root,
+    Head,
+    Node(String),
+}
+
+/// A branch an `llm.call` starts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchStart {
+    pub id: String,
+    pub from: BranchFrom,
+    #[serde(default)]
+    pub agent: BranchConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub mode: BranchMode,
 }
 
 impl From<ToolHandler> for Handler {
@@ -279,6 +312,23 @@ pub enum Trigger {
         #[serde(default)]
         usage: Usage,
     },
+    #[serde(rename = "branch.finished")]
+    BranchFinished {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default)]
+        mode: BranchMode,
+        ok: bool,
+        #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+        data: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<ErrorInfo>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        leaf: Option<String>,
+    },
 }
 
 pub fn spare_turn_id(decision_id: &str) -> String {
@@ -321,7 +371,15 @@ impl Trigger {
 
     /// Work the running turn waits for before it ends.
     pub fn is_turn_work(&self) -> bool {
-        self.deferred_turn_id().is_none() && self.joining_turn_id().is_none()
+        self.deferred_turn_id().is_none()
+            && self.joining_turn_id().is_none()
+            && !matches!(
+                self,
+                Trigger::BranchFinished {
+                    mode: BranchMode::Detached,
+                    ..
+                }
+            )
     }
 
     pub fn turn_metadata(&self) -> BTreeMap<String, String> {
@@ -448,7 +506,13 @@ pub enum Action {
         handler: LlmHandler,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         format: Option<LlmFormat>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<BranchStart>,
     },
+    #[serde(rename = "branch.close")]
+    CloseBranch { id: String },
+    #[serde(rename = "branch.promote")]
+    PromoteBranch { id: String },
     #[serde(rename = "tool.call")]
     CallTool {
         id: String,

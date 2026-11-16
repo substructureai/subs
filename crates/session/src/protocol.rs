@@ -679,6 +679,82 @@ pub struct NewMessage {
     pub parent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copied_from: Option<String>,
+    /// The branch the message was written on. A branch message does not move
+    /// the head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+}
+
+impl NewMessage {
+    pub fn new(message: Message, parent_id: Option<String>) -> Self {
+        Self {
+            message,
+            parent_id,
+            copied_from: None,
+            branch: None,
+        }
+    }
+}
+
+/// Where a branch starts, and what it runs as.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[schemars(title = "BranchRequest")]
+pub struct BranchRequest {
+    /// Without `id`, the engine mints one. An id already started starts
+    /// nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// `null` starts a new root. `"head"` forks the conversation, after this
+    /// response's messages. A node id forks at that node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// A registered agent's id, or a config. Without it, a fork runs as the
+    /// path it forks, and a root runs with no config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<BranchAgent>,
+    /// A label for the worker and the dashboard. The engine never reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub mode: BranchMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+#[schemars(title = "BranchAgent")]
+pub enum BranchAgent {
+    Id(String),
+    Config(Box<AgentConfig>),
+}
+
+/// A blocking branch is part of the turn that started it, and ends with it.
+/// A detached branch outlives the turn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(title = "BranchMode")]
+pub enum BranchMode {
+    #[default]
+    Blocking,
+    Detached,
+}
+
+/// The branch a decision is about.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[schemars(title = "BranchView")]
+pub struct BranchView {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub mode: BranchMode,
+    /// The node it forked at. `null` for a root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// Its newest node. `null` until it has one of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leaf: Option<String>,
+    /// The branch that started it. `null` when the conversation did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
 }
 
 /// The privilege of the caller that raised an interrupt. Read from the
@@ -2209,6 +2285,9 @@ pub struct Effect {
     /// the subagent answers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// The branch the effect runs on. Absent on the conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
 }
 
 /// What the engine made of a tool call's arguments, sent with the raw
@@ -2695,6 +2774,28 @@ pub enum DecisionTrigger {
         #[serde(flatten)]
         resumption: InterruptResumption,
     },
+    /// A branch this conversation or branch started ended. `data` is what
+    /// its `done` carried.
+    #[serde(rename = "branch.finished")]
+    BranchFinished {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        mode: BranchMode,
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Value::is_null")]
+        data: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<ErrorInfo>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        leaf: Option<String>,
+        /// The node it forked at is no longer on the path of whoever started
+        /// it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        stale: bool,
+    },
     /// Sent after a turn completes, with its final output. The session stays
     /// busy until it is answered. Echo the proposed `done` to finish.
     #[serde(rename = "turn.finished")]
@@ -2725,6 +2826,7 @@ impl DecisionTrigger {
             Self::SubagentFinished { .. } => "subagent.finished",
             Self::System1Finished { .. } => "system1.finished",
             Self::InterruptResumed { .. } => "interrupt.resumed",
+            Self::BranchFinished { .. } => "branch.finished",
             Self::TurnFinished { .. } => "turn.finished",
         }
     }
@@ -2774,7 +2876,17 @@ pub enum DecisionAction {
         /// default.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry: Option<RetryOverride>,
+        /// Start a branch: `messages` go after `branch.from`, and the call
+        /// reads that path. Its reply lands on the branch.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<BranchRequest>,
     },
+    /// Stop a branch. Its open calls are cancelled.
+    #[serde(rename = "branch.close")]
+    CloseBranch { id: String },
+    /// Make a branch the conversation: the head moves to its newest node.
+    #[serde(rename = "branch.promote")]
+    PromoteBranch { id: String },
     /// Without `id`, the engine mints one. A tool the model called carries the
     /// model's id.
     ///
@@ -2998,6 +3110,11 @@ pub struct DecisionRequest<'a> {
     pub deadline: &'a Option<DateTime<Utc>>,
     /// The turn this decision belongs to. `null` outside a turn.
     pub turn: &'a Option<DecisionTurn>,
+    /// The branch this decision is about. `messages`, `state`, `agent` and
+    /// `calls` are read on it, and the response applies to it. Absent on the
+    /// conversation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: &'a Option<BranchView>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -3042,6 +3159,7 @@ mod tests {
             reasoning: None,
             stream: None,
             retry: None,
+            branch: None,
         })
         .unwrap();
         assert_eq!(out, serde_json::json!({ "type": "llm.call" }));

@@ -72,10 +72,15 @@ pub fn plan(state: &SessionState, now: DateTime<Utc>) -> Vec<ScheduleStep> {
 }
 
 fn owed_fetches(state: &SessionState) -> Vec<ScheduleStep> {
-    state
-        .at_head()
-        .unsynced_connectors()
-        .into_iter()
+    let mut owed = state.at_head().unsynced_connectors();
+    for (id, _) in state.branches.iter().filter(|(_, b)| b.is_open()) {
+        for path in state.at_scope(Some(id)).unsynced_connectors() {
+            if !owed.contains(&path) {
+                owed.push(path);
+            }
+        }
+    }
+    owed.into_iter()
         .map(|connection_id| ScheduleStep::RequestFetch { connection_id })
         .collect()
 }
@@ -373,6 +378,7 @@ mod tests {
                 source_event_sequence: seq,
                 dispatched_seq: None,
                 turn: None,
+                branch: None,
             }),
         ));
     }
@@ -558,6 +564,7 @@ mod tests {
                 },
                 parent_id: None,
                 copied_from: None,
+                branch: None,
             },
         });
         s.head_id = Some("u1".to_string());

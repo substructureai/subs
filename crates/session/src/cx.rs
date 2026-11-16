@@ -7,11 +7,33 @@ use crate::state::SessionState;
 pub struct Cx<'a> {
     state: &'a SessionState,
     ids: &'a Ids,
+    scope: Option<&'a str>,
 }
 
 impl<'a> Cx<'a> {
     pub fn new(state: &'a SessionState, ids: &'a Ids) -> Self {
-        Self { state, ids }
+        Self {
+            state,
+            ids,
+            scope: None,
+        }
+    }
+
+    /// Work requested through this runs on `branch`.
+    pub fn scoped(self, branch: Option<&'a str>) -> Self {
+        Self {
+            scope: branch,
+            ..self
+        }
+    }
+
+    /// The branch work requested now runs on. `None` is the conversation.
+    pub fn scope(&self) -> Option<&'a str> {
+        self.scope
+    }
+
+    pub fn scope_branch(&self) -> Option<String> {
+        self.scope.map(str::to_string)
     }
 
     pub fn state(&self) -> &'a SessionState {

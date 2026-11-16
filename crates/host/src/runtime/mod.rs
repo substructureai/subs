@@ -704,6 +704,20 @@ impl Runtime {
         self.agents.tenant(tenant_id).await.system1
     }
 
+    /// The configs a branch can name by agent id.
+    pub async fn agent_configs(
+        &self,
+        tenant_id: &str,
+    ) -> std::collections::BTreeMap<String, crate::protocol::AgentConfig> {
+        self.agents
+            .tenant(tenant_id)
+            .await
+            .agents
+            .into_iter()
+            .filter_map(|(id, entry)| Some((id, entry.config?)))
+            .collect()
+    }
+
     pub fn reader(&self) -> SessionReader {
         SessionReader::new(self.sessions.clone(), self.session_index.clone())
     }

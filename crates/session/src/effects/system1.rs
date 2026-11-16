@@ -63,6 +63,7 @@ impl KindSpec for System1Spec {
                 system1: call.system1.clone(),
                 request: call.request.clone(),
                 retry: effect.tracking.retry_policy.clone(),
+                branch: effect.branch.clone(),
             },
         ))]
     }
@@ -112,6 +113,7 @@ pub fn request(
             system1,
             request,
             retry,
+            branch: state.scope_branch(),
         },
     ))])
 }

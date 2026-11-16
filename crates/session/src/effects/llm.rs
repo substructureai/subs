@@ -102,8 +102,11 @@ impl KindSpec for LlmSpec {
     }
 
     fn deps(&self, state: &SessionState, entry: &QueueEntry) -> Vec<Dep> {
-        let node = state
-            .effect(EffectKind::LlmCall, &entry.id)
+        let effect = state.effect(EffectKind::LlmCall, &entry.id);
+        if let Some(branch) = effect.and_then(|e| e.branch.as_deref()) {
+            return super::connector::owed(state.at_scope(Some(branch)));
+        }
+        let node = effect
             .and_then(|e| e.anchor.clone())
             .or_else(|| state.head_id.clone());
         super::connector::owed(state.at(node.as_deref()))
@@ -130,6 +133,7 @@ impl KindSpec for LlmSpec {
             handler: call.handler,
             format: call.format,
             defer_tools_strategy: call.defer_tools_strategy,
+            branch: effect.branch.clone(),
         })]
     }
 }
@@ -195,7 +199,7 @@ pub fn request(
         PromptSource::Tree { .. } => (
             Vec::new(),
             PromptSource::Tree {
-                at: state.head_id.clone(),
+                at: state.scope_node(state.scope()),
             },
         ),
         source => (
@@ -212,7 +216,7 @@ pub fn request(
         ..request
     };
     let defer_tools_strategy = state
-        .at_head()
+        .at_scope(state.scope())
         .resolve_agent_for()
         .map(|c| c.defer_strategy())
         .unwrap_or_default();
@@ -227,6 +231,7 @@ pub fn request(
         handler,
         format,
         defer_tools_strategy,
+        branch: state.scope_branch(),
     })])
 }
 

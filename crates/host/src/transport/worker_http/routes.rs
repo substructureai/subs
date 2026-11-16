@@ -38,12 +38,14 @@ pub async fn submit(
 
     let blocks = state.runtime.llm_blocks(caller.tenant_id()).await;
     let system1 = state.runtime.system1_blocks(caller.tenant_id()).await;
+    let agents = state.runtime.agent_configs(caller.tenant_id()).await;
     let resolved = match resolve_response(
         req.decision,
         None,
         None,
         &blocks,
         &system1,
+        &|id| agents.get(id).cloned(),
         state.runtime.blob_store(),
         caller.tenant_id(),
     )

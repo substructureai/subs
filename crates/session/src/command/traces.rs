@@ -445,6 +445,7 @@ fn call_llm(id: &str, retry: RetryPolicy) -> Action {
         stream: false,
         retry,
         handler: LlmHandler::Server,
+        branch: None,
     }
 }
 

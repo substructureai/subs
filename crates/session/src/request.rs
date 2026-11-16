@@ -8,9 +8,9 @@ use crate::decision::Trigger;
 use crate::ids::Ids;
 use crate::propose::{propose, Proposing};
 use crate::protocol::{
-    AgentConfig, ClientContext, DecisionRequest, DecisionResponse, DecisionTrigger, DecisionTurn,
-    DeferToolsStrategy, DraftMessage, Effect, InterruptResumption, LlmFormat, LlmRequest, Message,
-    MessageTree, SessionOwner, WorkerIdentity, WorkerRef, WorkerState,
+    AgentConfig, BranchView, ClientContext, DecisionRequest, DecisionResponse, DecisionTrigger,
+    DecisionTurn, DeferToolsStrategy, DraftMessage, Effect, InterruptResumption, LlmFormat,
+    LlmRequest, Message, MessageTree, SessionOwner, WorkerIdentity, WorkerRef, WorkerState,
 };
 use crate::reconcile::news_start;
 use crate::session::Session;
@@ -60,6 +60,8 @@ pub struct WorkerDecisionRequest {
     pub deadline: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn: Option<DecisionTurn>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<BranchView>,
 }
 
 impl WorkerDecisionRequest {
@@ -91,6 +93,7 @@ impl<'a> From<&'a WorkerDecisionRequest> for DecisionRequest<'a> {
             attempts: r.attempts,
             deadline: &r.deadline,
             turn: &r.turn,
+            branch: &r.branch,
         }
     }
 }
@@ -118,7 +121,13 @@ impl Session {
                 .is_some_and(|t| worker_decision.trigger.owns_turn(decision_id, &t.id));
         }
         let worker = self.state.worker.clone();
-        let at = self.state.at(meta.head_id.as_deref()).until(seq);
+        let branch_id = worker_decision.branch.as_deref();
+        let branch = branch_id.and_then(|b| Some(self.state.branches.get(b)?.view(b)));
+        let at = match branch_id {
+            Some(_) => self.state.at_scope(branch_id),
+            None => self.state.at(meta.head_id.as_deref()),
+        }
+        .until(seq);
         let message_tree = at.message_tree();
         let transcript = message_tree
             .head_id
@@ -126,7 +135,7 @@ impl Session {
             .map(|h| message_tree.path_to(h))
             .unwrap_or_default();
         let open_llm_calls = at.open_llm_calls();
-        let pending_calls = meta.pending_work(decision_id);
+        let pending_calls = meta.pending_work(decision_id) + self.state.held_by_branches(branch_id);
         let worker_state = at.resolve_state_for();
         let agent_config = at.resolve_agent_for();
         if let (
@@ -138,12 +147,24 @@ impl Session {
         ) {
             attachments::mark(messages, rules, &message_tree);
         }
-        let (trigger, prompt) = wire_trigger(trigger, &transcript, &message_tree, &open_llm_calls);
+        let (mut trigger, prompt) =
+            wire_trigger(trigger, &transcript, &message_tree, &open_llm_calls);
+        if let DecisionTrigger::BranchFinished {
+            from: Some(from),
+            stale,
+            ..
+        } = &mut trigger
+        {
+            *stale = !at.anchor_on_path(Some(from));
+        }
+        let detached = self.state.detached(branch_id);
         let proposed = propose(
             &trigger,
             &Proposing {
                 state: at,
                 pending_calls,
+                scope: branch_id,
+                detached,
             },
         )
         .unwrap_or_default();
@@ -157,15 +178,21 @@ impl Session {
             state: worker_state,
             agent: agent_config,
             worker,
-            calls: meta.calls.clone(),
+            calls: meta
+                .calls
+                .iter()
+                .filter(|c| c.branch.as_deref() == branch_id)
+                .cloned()
+                .collect(),
             pending_calls,
-            joining: self.state.waiting_join().is_some(),
+            joining: branch_id.is_none() && self.state.waiting_join().is_some(),
             transcript,
             ancestry: meta.ancestry.clone(),
             span: span.clone(),
             attempts: decision.attempts,
             deadline: decision.deadline,
             turn: worker_decision.turn.as_deref().cloned(),
+            branch,
         };
         Some((request, prompt))
     }
@@ -388,6 +415,26 @@ pub fn wire_trigger(
             data,
             cost,
             usage,
+        },
+        Trigger::BranchFinished {
+            id,
+            name,
+            mode,
+            ok,
+            data,
+            error,
+            from,
+            leaf,
+        } => DecisionTrigger::BranchFinished {
+            id,
+            name,
+            mode,
+            ok,
+            data,
+            error,
+            from,
+            leaf,
+            stale: false,
         },
     };
     (trigger, pending)

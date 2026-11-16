@@ -228,6 +228,7 @@ impl Action {
                 retry,
                 handler,
                 format,
+                branch: _,
             } => Some(CommandPayload::RequestLlmCall {
                 call_id: id,
                 llm,
@@ -320,6 +321,8 @@ impl Action {
                 Outcome::from(SettleError::new(error, retryable)),
             )),
             Action::SendMessage { .. }
+            | Action::CloseBranch { .. }
+            | Action::PromoteBranch { .. }
             | Action::Interrupt { .. }
             | Action::ResolveInterrupt { .. }
             | Action::SyncConnector { .. }
@@ -342,9 +345,20 @@ impl SessionState {
         !self.at(node).anchor_on_path(self.trigger_anchor(trigger))
     }
 
+    /// Voids the conversation's calls `stranded` picks. A detached branch's
+    /// calls outlive the turn, and a blocking branch's end with the branch.
     pub fn void_effects(
         &self,
         stranded: impl Fn(EffectKind, &EffectTracking, Option<&str>) -> bool,
+    ) -> Vec<EventPayload> {
+        self.void_effects_where(|e| {
+            e.branch.is_none() && stranded(e.kind(), &e.tracking, e.anchor.as_deref())
+        })
+    }
+
+    pub fn void_effects_where(
+        &self,
+        stranded: impl Fn(&super::state::EffectState) -> bool,
     ) -> Vec<EventPayload> {
         self.effects
             .values()
@@ -357,7 +371,7 @@ impl SessionState {
                         | EffectKind::System1Call
                 )
             })
-            .filter(|e| stranded(e.kind(), &e.tracking, e.anchor.as_deref()))
+            .filter(|e| stranded(e))
             .map(|e| {
                 EventPayload::CallVoided(CallVoided {
                     kind: e.kind(),
@@ -374,14 +388,17 @@ impl SessionState {
         });
         for e in self.effects_of(EffectKind::Decision) {
             let Some(wd) = e.decision() else { continue };
-            if matches!(
-                e.tracking.status(),
-                EffectStatus::Queued | EffectStatus::RetryScheduled
-            ) && self.stale_decision(node, &wd.trigger)
+            if wd.branch.is_none()
+                && matches!(
+                    e.tracking.status(),
+                    EffectStatus::Queued | EffectStatus::RetryScheduled
+                )
+                && self.stale_decision(node, &wd.trigger)
             {
                 events.push(self.decision_dropped(&e.id));
             }
         }
+        events.extend(self.void_stranded_branches(node));
         events
     }
 
@@ -412,30 +429,62 @@ impl SessionState {
         }
     }
 
-    fn worker_state_events(&self, state: Option<WorkerState>) -> Vec<EventPayload> {
+    /// Where a write on `branch` anchors: its own newest node. A branch with
+    /// none of its own yet takes no write, so the path it forks keeps its own.
+    fn write_anchor(&self, branch: Option<&str>) -> Result<Option<String>, ()> {
+        match branch {
+            None => Ok(self.head_id.clone()),
+            Some(b) => match self.branches.get(b).and_then(|b| b.leaf.clone()) {
+                Some(leaf) => Ok(Some(leaf)),
+                None => {
+                    tracing::warn!(
+                        branch = b,
+                        "a branch with no message of its own takes no write"
+                    );
+                    Err(())
+                }
+            },
+        }
+    }
+
+    fn worker_state_events(
+        &self,
+        state: Option<WorkerState>,
+        branch: Option<&str>,
+    ) -> Vec<EventPayload> {
         let Some(state) = state else {
             return Vec::new();
         };
-        if state == self.at_head().resolve_state_for() {
+        if state == self.at_scope(branch).resolve_state_for() {
             return Vec::new();
         }
+        let Ok(anchor) = self.write_anchor(branch) else {
+            return Vec::new();
+        };
         vec![EventPayload::WorkerStateUpdated(WorkerStateUpdated {
             state,
-            anchor: self.head_id.clone(),
+            anchor,
         })]
     }
 
-    fn agent_config_events(&self, config: Option<AgentConfig>) -> Vec<EventPayload> {
+    fn agent_config_events(
+        &self,
+        config: Option<AgentConfig>,
+        branch: Option<&str>,
+    ) -> Vec<EventPayload> {
         let Some(config) = config else {
             return Vec::new();
         };
-        if Some(&config) == self.at_head().resolve_agent_for().as_ref() {
+        if Some(&config) == self.at_scope(branch).resolve_agent_for().as_ref() {
             return Vec::new();
         }
+        let Ok(anchor) = self.write_anchor(branch) else {
+            return Vec::new();
+        };
         let mut events = effects::connector::sync(self, &config);
         events.push(EventPayload::AgentConfigUpdated(AgentConfigUpdated {
             config,
-            anchor: self.head_id.clone(),
+            anchor,
         }));
         events
     }
@@ -451,6 +500,8 @@ pub struct Working {
     waiting: Option<String>,
     joining: Option<String>,
     outside: Outside,
+    /// The branch the decision being applied is about.
+    scope: Option<String>,
 }
 
 impl std::ops::Deref for Working {
@@ -473,6 +524,7 @@ impl Working {
             waiting: None,
             joining: None,
             outside: Outside::default(),
+            scope: None,
         }
     }
 
@@ -505,7 +557,7 @@ impl Working {
     }
 
     fn cx(&self) -> Cx<'_> {
-        Cx::new(&self.state, &self.ids)
+        Cx::new(&self.state, &self.ids).scoped(self.scope.as_deref())
     }
 
     fn then(&mut self, step: impl FnOnce(&Cx<'_>) -> Vec<EventPayload>) -> &mut Self {
@@ -658,10 +710,15 @@ impl Working {
     }
 
     fn queue_decision(&mut self, trigger: Trigger) -> String {
+        self.queue_decision_on(trigger, None)
+    }
+
+    fn queue_decision_on(&mut self, trigger: Trigger, branch: Option<String>) -> String {
         let decision_id = self.ids.next();
         self.emit(EventPayload::DecisionQueued(DecisionQueued {
             id: decision_id.clone(),
             trigger,
+            branch,
         }));
         decision_id
     }
@@ -673,10 +730,15 @@ impl Working {
         reason: String,
         payload: serde_json::Value,
     ) {
-        if self.head_parked() {
+        let scope = self.scope.clone();
+        if self
+            .at_scope(scope.as_deref())
+            .active_interrupt_for()
+            .is_some()
+        {
             return;
         }
-        let anchor = self.head_id.clone();
+        let anchor = self.scope_node(scope.as_deref());
         self.emit(EventPayload::SessionInterrupted(SessionInterrupted {
             interrupt_id,
             origin,
@@ -777,6 +839,7 @@ impl Working {
 
     fn void_llm_calls_for_interrupt(&mut self, node: Option<String>) {
         let at = self.at(node.as_deref());
+        let scope = self.scope.clone();
         let ids: Vec<String> = self
             .effects_of(EffectKind::LlmCall)
             .filter(|e| {
@@ -785,6 +848,7 @@ impl Working {
                     EffectStatus::Queued | EffectStatus::Pending
                 )
             })
+            .filter(|e| e.branch == scope)
             .filter(|e| at.anchor_on_path(e.anchor.as_deref()))
             .map(|e| e.id.clone())
             .collect();
@@ -822,7 +886,64 @@ impl Working {
                     });
                 }
             }
+            let scope = self.scope.clone();
             let _ = match action {
+                Action::CallLlm {
+                    id,
+                    llm,
+                    request,
+                    source: _,
+                    stream,
+                    retry,
+                    handler,
+                    format,
+                    branch: Some(start),
+                } => {
+                    let messages = request.messages.clone();
+                    match self.start_branch(start, messages) {
+                        Some(branch) => self.run_on(
+                            Some(branch),
+                            CommandPayload::RequestLlmCall {
+                                call_id: id,
+                                llm,
+                                request: LlmRequest {
+                                    messages: Vec::new(),
+                                    ..request
+                                },
+                                source: PromptSource::tree(),
+                                stream,
+                                retry,
+                                handler,
+                                format,
+                            },
+                            &system,
+                        ),
+                        None => Ok(()),
+                    }
+                }
+                Action::CloseBranch { id } => {
+                    self.then(|s| {
+                        s.close_branch(&id, BranchEnd::Closed, serde_json::Value::Null, None)
+                    });
+                    Ok(())
+                }
+                Action::PromoteBranch { id } => {
+                    self.promote_branch(&id);
+                    Ok(())
+                }
+                Action::ReplaceContext { .. } if scope.is_some() => {
+                    tracing::warn!("context.replace on a branch; ignored");
+                    Ok(())
+                }
+                Action::Done { data } if scope.is_some() => {
+                    let branch = scope.unwrap_or_default();
+                    self.then(|s| s.finish_branch(s.ids(), &branch, data, None));
+                    Ok(())
+                }
+                Action::Fail { error } if scope.is_some() => {
+                    self.fail_branch(&scope.unwrap_or_default(), error);
+                    Ok(())
+                }
                 Action::ReplaceContext { summary, messages } => {
                     self.replace_context(summary, messages);
                     Ok(())
@@ -901,6 +1022,7 @@ impl Working {
                     Ok(())
                 }
                 Action::Done { data } => {
+                    self.then(|s| s.void_turn_branches());
                     self.then(|s| s.close_open_calls(s.ids(), answered.as_ref()));
                     let cmd = if self.phase.finalizing().is_some() {
                         CommandPayload::CompleteTurn
@@ -964,8 +1086,8 @@ impl Working {
                     worker,
                     events,
                 })));
-                self.then(|s| s.agent_config_events(agent.map(|a| *a)));
-                self.then(|s| s.worker_state_events(state));
+                self.then(|s| s.agent_config_events(agent.map(|a| *a), None));
+                self.then(|s| s.worker_state_events(state, None));
                 self.queue_decision(Trigger::SessionStart);
             }
             (true, CommandPayload::CreateSession { .. }) => {
@@ -1122,7 +1244,15 @@ impl Working {
                 retry,
             } => self
                 .try_then(|s| {
-                    effects::tool::request(s, tool_call_id, name, arguments, retry, caller)
+                    effects::tool::request(
+                        s,
+                        tool_call_id,
+                        name,
+                        arguments,
+                        retry,
+                        s.scope(),
+                        caller,
+                    )
                 })
                 .map(|_| ()),
 
@@ -1257,15 +1387,28 @@ impl Working {
                     return Err(SessionError::SessionAccessDenied);
                 }
                 let parked_head = self.at_head().anchor_on_path(open.anchor.as_deref());
+                let branch = open
+                    .anchor
+                    .as_deref()
+                    .and_then(|a| self.node_branch(a))
+                    .filter(|b| self.open_branch(b).is_some())
+                    .map(str::to_string);
                 self.emit(EventPayload::InterruptResumed(InterruptResumed {
                     interrupt_id: interrupt_id.clone(),
                     payload: payload.clone(),
                 }));
-                if parked_head {
-                    self.queue_decision(Trigger::InterruptResumed {
-                        interrupt_id,
-                        payload,
-                    });
+                let trigger = Trigger::InterruptResumed {
+                    interrupt_id,
+                    payload,
+                };
+                match branch {
+                    Some(b) => {
+                        self.queue_decision_on(trigger, Some(b));
+                    }
+                    None if parked_head => {
+                        self.queue_decision(trigger);
+                    }
+                    None => {}
                 }
                 Ok(())
             }
@@ -1288,6 +1431,26 @@ impl Working {
                 let answered = self
                     .worker_decision(&decision_id)
                     .map(|d| d.trigger.clone());
+                if let Some(branch) = self.decision_branch(&decision_id).map(str::to_string) {
+                    let completed = EventPayload::DecisionCompleted(DecisionCompleted {
+                        id: decision_id.clone(),
+                    });
+                    if self.open_branch(&branch).is_none() {
+                        self.emit(completed);
+                        return Ok(());
+                    }
+                    let on = Some(branch.as_str());
+                    self.then(|_| vec![completed])
+                        .then(|s| s.reconcile_branch(s.ids(), transcript, &branch))
+                        .then(|s| s.worker_state_events(state, on))
+                        .then(|s| s.agent_config_events(agent, on));
+                    let outer = self.scope.replace(branch.clone());
+                    self.apply_actions(actions, &decision_id, answered);
+                    self.scope = outer;
+                    self.then(|s| effects::tool::unanswered(s));
+                    self.then(|s| s.quiet_branch(s.ids(), &branch));
+                    return Ok(());
+                }
                 let ids: Vec<&str> = transcript.iter().filter_map(|m| m.id.as_deref()).collect();
                 if let Some(loaded) = self.outside.branch_to(&ids, &self.state) {
                     self.emit(EventPayload::BranchLoaded(BranchLoaded {
@@ -1302,8 +1465,8 @@ impl Working {
                 })
                 .then(|s| s.reconcile_transcript(s.ids(), transcript).0)
                 .then(|s| s.void_stranded_work(s.head_id.as_deref()))
-                .then(|s| s.worker_state_events(state))
-                .then(|s| s.agent_config_events(agent));
+                .then(|s| s.worker_state_events(state, None))
+                .then(|s| s.agent_config_events(agent, None));
 
                 self.apply_actions(actions, &decision_id, answered);
                 self.then(|s| effects::tool::unanswered(s));
@@ -1368,6 +1531,7 @@ impl Working {
 }
 
 mod authorize;
+pub mod branch;
 mod context;
 mod delivery;
 mod transcript;

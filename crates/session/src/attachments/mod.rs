@@ -405,6 +405,7 @@ max_inline = "1kb"
                     name: None,
                     reasoning: None,
                 },
+                branch: None,
             }],
         };
         mark(

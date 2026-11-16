@@ -90,6 +90,7 @@ fn reading(t: &Trace, id: &str, new: Option<DraftMessage>) -> Action {
         stream: false,
         retry: RetryPolicy::no_retry(),
         handler: LlmHandler::Server,
+        branch: None,
     }
 }
 
@@ -140,6 +141,8 @@ fn proposed(t: &Trace, trigger: &DecisionTrigger) -> DecisionResponse {
         &Proposing {
             state: t.agg.state.at_head(),
             pending_calls: 0,
+            scope: None,
+            detached: false,
         },
     )
     .expect("a plan")
@@ -182,6 +185,7 @@ fn lowered(action: DecisionAction, id: &str) -> Action {
             stream: false,
             retry: RetryPolicy::no_retry(),
             handler: LlmHandler::Server,
+            branch: None,
         },
         other => panic!("unexpected plan {other:?}"),
     }

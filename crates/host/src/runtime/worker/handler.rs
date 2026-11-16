@@ -372,6 +372,7 @@ mod tests {
                 Some(&request.trigger),
                 &blocks,
                 &Default::default(),
+                crate::runtime::session::wire::NO_AGENTS,
                 &crate::runtime::blob::NOWHERE,
                 "tenant-a",
             )

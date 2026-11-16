@@ -334,6 +334,7 @@ impl World {
                     } else {
                         LlmHandler::Server
                     },
+                    branch: None,
                 },
                 ActOp::CallTool => Action::CallTool {
                     id: self.mint(),

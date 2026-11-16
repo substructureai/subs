@@ -6,21 +6,35 @@ use super::state::{inner_arguments, EffectState, SessionStateAtNode};
 use super::tool_contract::{declared_tool, violates, DeclaredTool};
 use crate::protocol::StoredContent;
 use crate::protocol::{
-    AgentConfig, ClientContext, ConnectorTool, ConnectorToolKind, Content, ContextStrategyKind,
-    DecisionAction, DecisionResponse, DecisionTrigger, DraftMessage, ErrorCode, ErrorInfo, Message,
-    Role, SpawnMode, StoredResult, ToolCall,
+    AgentConfig, BranchMode, ClientContext, ConnectorTool, ConnectorToolKind, Content,
+    ContextStrategyKind, DecisionAction, DecisionResponse, DecisionTrigger, DraftMessage,
+    ErrorCode, ErrorInfo, Message, Role, SpawnMode, StoredResult, ToolCall,
 };
 
 pub struct Proposing<'a> {
     pub state: SessionStateAtNode<'a, 'a>,
+    /// Work the decision waits for: its calls in flight, results not yet
+    /// recorded, and blocking branches it started.
     pub pending_calls: usize,
+    /// The branch the decision is about. `None` is the conversation.
+    pub scope: Option<&'a str>,
+    /// It outlives its turn: nobody is there to approve or sign in.
+    pub detached: bool,
 }
 
 impl Proposing<'_> {
     /// A joined message calls the model next, so the step before it leaves
     /// the call to it.
     pub fn joining(&self) -> bool {
-        self.state.state().waiting_join().is_some()
+        self.scope.is_none() && self.state.state().waiting_join().is_some()
+    }
+
+    /// A model call on this path is still out.
+    pub fn calling(&self) -> bool {
+        self.state
+            .state()
+            .effects_of(crate::state::EffectKind::LlmCall)
+            .any(|e| e.branch.as_deref() == self.scope && e.tracking.is_unsettled())
     }
 
     pub fn waiting_calls(&self) -> usize {
@@ -39,6 +53,9 @@ pub fn propose(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionR
             DecisionAction::Interrupt { .. } | DecisionAction::Fail { .. }
         )
     }) {
+        return Some(proposed);
+    }
+    if p.detached {
         return Some(proposed);
     }
     Some(match stopped_for_auth(trigger, p) {
@@ -172,7 +189,19 @@ fn derive(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionRespon
             truncated: false,
             refused: false,
             ..
-        } => Some(llm_finished(message, transcript, connector_tools, joining)),
+        } => Some(llm_finished(
+            message,
+            transcript,
+            connector_tools,
+            joining || pending_calls > 0,
+            p.detached,
+        )),
+        DecisionTrigger::BranchFinished { mode, .. } => Some(branch_finished(
+            *mode,
+            transcript,
+            config,
+            pending_calls + usize::from(p.calling()),
+        )),
         DecisionTrigger::LlmFinished {
             ok,
             truncated,
@@ -298,28 +327,47 @@ pub(super) fn resumed(
             reasoning: config.reasoning(),
             stream: None,
             retry: None,
+            branch: None,
         }],
         ..Default::default()
     }
 }
 
+/// A model's reply: its tool calls run, or it is done. `waiting` holds the
+/// done for work still out: a joining message, or a branch.
 fn llm_finished(
     message: &DraftMessage,
     transcript: &[Message],
     connector_tools: &[ConnectorTool],
-    joining: bool,
+    waiting: bool,
+    detached: bool,
 ) -> DecisionResponse {
     let tool_calls = message.tool_calls.as_deref().unwrap_or_default();
     let mut held = tool_calls
         .iter()
         .filter(|call| approval::needed(call, connector_tools));
     let first_held = held.next();
-    let actions = if tool_calls.is_empty() && joining {
+    let actions = if tool_calls.is_empty() && waiting {
         Vec::new()
     } else if tool_calls.is_empty() {
         vec![DecisionAction::Done {
             data: serde_json::to_value(&message.content).unwrap_or_default(),
         }]
+    } else if first_held.is_some() && detached {
+        tool_calls
+            .iter()
+            .flat_map(|call| match approval::needed(call, connector_tools) {
+                true => vec![DecisionAction::ToolError {
+                    id: Some(call.id.clone()),
+                    attempt: None,
+                    error: crate::prompts::errors::unapproved_detached(&call.function.name),
+                    retryable: false,
+                    code: None,
+                    detail: None,
+                }],
+                false => route_tool_call(call, connector_tools),
+            })
+            .collect()
     } else if let Some(first) = first_held {
         vec![approval::ask(first, connector_tools, held.count())]
     } else {
@@ -330,6 +378,38 @@ fn llm_finished(
     };
     DecisionResponse {
         messages: appended(transcript, message.clone()),
+        actions,
+        ..Default::default()
+    }
+}
+
+/// A branch this one started ended. A detached one leaves the path as it
+/// was. Once no blocking one is left, the path goes on from its last message:
+/// the model reads a message that waits for it, and a reply ends the work.
+fn branch_finished(
+    mode: BranchMode,
+    transcript: &[Message],
+    config: Option<&AgentConfig>,
+    waiting: usize,
+) -> DecisionResponse {
+    let view = recorded(transcript);
+    let last = transcript.last();
+    let actions = match (mode, last) {
+        (BranchMode::Detached, _) => Vec::new(),
+        _ if waiting > 0 => Vec::new(),
+        (_, Some(m)) if m.role == Role::Assistant && m.tool_calls.is_empty() => {
+            vec![DecisionAction::Done {
+                data: serde_json::to_value(&m.content).unwrap_or_default(),
+            }]
+        }
+        (_, Some(m)) if matches!(m.role, Role::User | Role::Tool) => match config {
+            Some(c) => resumed(transcript, c, false).actions,
+            None => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+    DecisionResponse {
+        messages: view,
         actions,
         ..Default::default()
     }
@@ -554,6 +634,7 @@ fn client_turn(
             reasoning: effective.reasoning(),
             stream: None,
             retry: None,
+            branch: None,
         }],
         agent: merged,
         ..Default::default()
@@ -740,6 +821,7 @@ pub(super) fn reissue(
         reasoning: call.spec.reasoning.clone(),
         stream: Some(call.stream),
         retry: Some(effect.tracking.retry_policy.as_override()),
+        branch: None,
     })
 }
 
@@ -818,6 +900,7 @@ mod tests {
                     message: m.clone(),
                     parent_id: parent.take(),
                     copied_from: None,
+                    branch: None,
                 },
             });
             parent = Some(m.id.clone());
@@ -848,6 +931,8 @@ mod tests {
             &Proposing {
                 state: state.at_head(),
                 pending_calls,
+                scope: None,
+                detached: false,
             },
         )
     }

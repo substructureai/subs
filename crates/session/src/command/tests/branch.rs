@@ -1,0 +1,565 @@
+use super::*;
+use crate::decision::{BranchConfig, BranchFrom, BranchStart};
+use crate::protocol::{BranchMode, DecisionAction, ToolCall, ToolCallFunction, Usage};
+
+fn configured() -> Session {
+    create_session_with_config("sess-b", "tenant-a", "user-1", Some(agent_config("m1")))
+}
+
+fn user_turn(agg: &mut Session, id: &str, text: &str, turn: &str) -> Vec<EventPayload> {
+    dispatch(
+        agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Message(ClientMessage {
+                message: node_msg(id, Role::User, text),
+                stream: false,
+            }),
+            turn: TurnTarget::Open(turn.to_string()),
+            queue: QueueMode::Refuse,
+            metadata: Default::default(),
+        },
+        &system(),
+    )
+}
+
+fn tree_call(id: &str) -> Action {
+    Action::CallLlm {
+        id: id.to_string(),
+        llm: "claude".to_string(),
+        request: request_with(vec![]),
+        source: PromptSource::tree(),
+        stream: false,
+        retry: RetryPolicy::no_retry(),
+        handler: LlmHandler::Server,
+        format: None,
+        branch: None,
+    }
+}
+
+fn start(id: &str, from: BranchFrom, mode: BranchMode) -> BranchStart {
+    BranchStart {
+        id: id.to_string(),
+        from,
+        agent: BranchConfig::Inherit,
+        name: Some(id.to_string()),
+        mode,
+    }
+}
+
+fn branch_call(id: &str, start: BranchStart, messages: Vec<DraftMessage>) -> Action {
+    Action::CallLlm {
+        id: id.to_string(),
+        llm: "claude".to_string(),
+        request: request_with(messages),
+        source: PromptSource::tree(),
+        stream: false,
+        retry: RetryPolicy::no_retry(),
+        handler: LlmHandler::Server,
+        format: None,
+        branch: Some(start),
+    }
+}
+
+fn reply(agg: &mut Session, id: &str, response: LlmResponse) -> Vec<EventPayload> {
+    let attempt = agg
+        .state
+        .tracking(EffectKind::LlmCall, id)
+        .map(|t| t.retry.attempts);
+    dispatch(
+        agg,
+        CommandPayload::settle(
+            EffectKind::LlmCall,
+            id.to_string(),
+            attempt,
+            Outcome::Llm(Box::new(response)),
+        ),
+        &system(),
+    )
+}
+
+fn said(text: &str, input_tokens: u64) -> LlmResponse {
+    LlmResponse {
+        usage: Some(Usage::new(input_tokens, 0, 0, 5)),
+        cost: Some(rust_decimal::Decimal::new(1, 2)),
+        ..llm_response(text)
+    }
+}
+
+fn calling(tool: &str, call_id: &str) -> LlmResponse {
+    LlmResponse {
+        content: None,
+        tool_calls: vec![ToolCall {
+            id: call_id.to_string(),
+            call_type: "function".to_string(),
+            function: ToolCallFunction {
+                name: tool.to_string(),
+                arguments: "{}".to_string(),
+            },
+        }],
+        finish_reason: Some("tool_calls".to_string()),
+        ..llm_response("")
+    }
+}
+
+/// The engine's proposal for the live decision, as the worker would send it
+/// back.
+fn echo(agg: &mut Session) -> Vec<EventPayload> {
+    let (id, _) = live_decision(agg);
+    let proposed = proposed_for(agg, &id);
+    let actions = proposed.actions.into_iter().filter_map(lower).collect();
+    submit_decision(agg, id, proposed.messages, actions)
+}
+
+fn lower(action: DecisionAction) -> Option<Action> {
+    Some(match action {
+        DecisionAction::CallLlm {
+            id,
+            messages,
+            tools,
+            ..
+        } => Action::CallLlm {
+            id: id.unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
+            llm: "claude".to_string(),
+            request: LlmRequest {
+                tools,
+                ..request_with(messages.clone().unwrap_or_default())
+            },
+            source: match messages {
+                Some(_) => PromptSource::Explicit,
+                None => PromptSource::tree(),
+            },
+            stream: false,
+            retry: RetryPolicy::no_retry(),
+            handler: LlmHandler::Server,
+            format: None,
+            branch: None,
+        },
+        DecisionAction::CallTool {
+            id,
+            name,
+            arguments,
+            ..
+        } => Action::CallTool {
+            id: id.unwrap_or_default(),
+            name,
+            arguments: match arguments {
+                serde_json::Value::String(s) => s,
+                other => other.to_string(),
+            },
+            retry: None,
+        },
+        DecisionAction::ToolError { id, error, .. } => Action::ToolError {
+            id: id.unwrap_or_default(),
+            attempt: None,
+            error: ErrorInfo::handler(error),
+            retryable: false,
+        },
+        DecisionAction::Done { data } => Action::Done { data },
+        DecisionAction::Fail { error } => Action::Fail { error },
+        other => panic!("not lowered here: {other:?}"),
+    })
+}
+
+fn text_of(message: &Message) -> String {
+    message
+        .content
+        .as_ref()
+        .map(Content::text_owned)
+        .unwrap_or_default()
+}
+
+fn prompt_texts(agg: &Session, call: &str) -> Vec<String> {
+    agg.state
+        .outgoing(call)
+        .expect("the call builds a prompt")
+        .prompt
+        .iter()
+        .map(text_of)
+        .collect()
+}
+
+fn branch_closed(events: &[EventPayload], id: &str) -> Option<BranchEnd> {
+    events.iter().find_map(|e| match e {
+        EventPayload::BranchClosed(c) if c.id == id => Some(c.reason),
+        _ => None,
+    })
+}
+
+fn branch_finished(events: &[EventPayload]) -> Option<(Trigger, Option<String>)> {
+    events.iter().find_map(|e| match e {
+        EventPayload::DecisionQueued(q) if matches!(q.trigger, Trigger::BranchFinished { .. }) => {
+            Some((q.trigger.clone(), q.branch.clone()))
+        }
+        _ => None,
+    })
+}
+
+/// A user turn whose decision calls the model on the conversation and forks
+/// `title` off it.
+fn turn_with_side_call(mode: BranchMode) -> Session {
+    let mut agg = configured();
+    user_turn(&mut agg, "u1", "what is the weather in Paris?", "turn-1");
+    let (d, _) = live_decision(&agg);
+    submit_decision(
+        &mut agg,
+        d,
+        vec![node_msg("u1", Role::User, "what is the weather in Paris?")],
+        vec![
+            tree_call("c1"),
+            branch_call(
+                "t1",
+                start("title", BranchFrom::Head, mode),
+                vec![node_msg("", Role::User, "Write a short title.")],
+            ),
+        ],
+    );
+    agg
+}
+
+#[test]
+fn a_fork_reads_the_conversation_and_then_its_own_messages() {
+    let agg = turn_with_side_call(BranchMode::Detached);
+    let branch = agg.state.open_branch("title").expect("the branch started");
+    assert_eq!(branch.from.as_deref(), Some("u1"));
+    assert_eq!(agg.state.head_id.as_deref(), Some("u1"), "the head stays");
+    let own = branch.leaf.clone().expect("its message is its own node");
+    assert_eq!(agg.state.node_branch(&own), Some("title"));
+
+    let call = agg.state.effect(EffectKind::LlmCall, "t1").unwrap();
+    assert_eq!(call.branch.as_deref(), Some("title"));
+    assert_eq!(call.anchor.as_deref(), Some(own.as_str()));
+
+    let chat = prompt_texts(&agg, "c1");
+    let side = prompt_texts(&agg, "t1");
+    assert_eq!(
+        side[..chat.len()],
+        chat[..],
+        "the fork keeps the cached prefix"
+    );
+    assert_eq!(
+        side.last().map(String::as_str),
+        Some("Write a short title.")
+    );
+}
+
+#[test]
+fn a_detached_branch_reports_back_without_a_turn() {
+    let mut agg = turn_with_side_call(BranchMode::Detached);
+    reply(&mut agg, "c1", said("Sunny.", 100));
+    let events = echo(&mut agg);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::DecisionQueued(q) if matches!(q.trigger, Trigger::TurnFinished { .. }))),
+        "the detached branch does not hold the turn: {events:?}"
+    );
+    echo(&mut agg);
+    assert!(agg.state.phase.turn_id().is_none(), "the turn ended");
+    assert!(
+        agg.state.open_branch("title").is_some(),
+        "and the branch lives on"
+    );
+
+    reply(&mut agg, "t1", said("Paris weather", 120));
+    let (d, _) = live_decision(&agg);
+    assert_eq!(agg.state.decision_branch(&d), Some("title"));
+    let proposed = proposed_for(&agg, &d);
+    assert!(matches!(
+        proposed.actions.as_slice(),
+        [DecisionAction::Done { data }] if data == &serde_json::json!("Paris weather")
+    ));
+    let events = echo(&mut agg);
+    assert_eq!(branch_closed(&events, "title"), Some(BranchEnd::Done));
+    let (finished, on) = branch_finished(&events).expect("its parent hears");
+    assert_eq!(on, None, "the conversation started it");
+    assert!(matches!(
+        finished,
+        Trigger::BranchFinished { ok: true, ref data, .. } if data == &serde_json::json!("Paris weather")
+    ));
+    assert_eq!(
+        agg.state.head_id.as_deref(),
+        Some("c1"),
+        "the reply never reached the chat"
+    );
+
+    let (d, _) = live_decision(&agg);
+    assert!(agg.state.worker_decision(&d).unwrap().turn.is_none());
+    assert!(proposed_for(&agg, &d).actions.is_empty());
+}
+
+#[test]
+fn a_blocking_branch_holds_the_turn_until_it_reports() {
+    let mut agg = turn_with_side_call(BranchMode::Blocking);
+    reply(&mut agg, "c1", said("Sunny.", 100));
+    let (d, _) = live_decision(&agg);
+    assert!(
+        proposed_for(&agg, &d).actions.is_empty(),
+        "the reply waits for the branch"
+    );
+    echo(&mut agg);
+    assert!(agg.state.phase.active_turn_id().is_some());
+
+    reply(&mut agg, "t1", said("Paris weather", 120));
+    echo(&mut agg);
+    let (d, trigger) = live_decision(&agg);
+    assert!(matches!(trigger, Trigger::BranchFinished { .. }));
+    assert_eq!(
+        agg.state
+            .worker_decision(&d)
+            .unwrap()
+            .turn
+            .as_ref()
+            .map(|t| t.id.as_str()),
+        Some("turn-1")
+    );
+    assert!(matches!(
+        proposed_for(&agg, &d).actions.as_slice(),
+        [DecisionAction::Done { data }] if data == &serde_json::json!("Sunny.")
+    ));
+    let events = echo(&mut agg);
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, EventPayload::DecisionQueued(q) if matches!(q.trigger, Trigger::TurnFinished { .. }))));
+}
+
+#[test]
+fn a_turn_that_ends_takes_its_blocking_branches_with_it() {
+    let mut agg = turn_with_side_call(BranchMode::Blocking);
+    reply(&mut agg, "c1", said("Sunny.", 100));
+    let (d, _) = live_decision(&agg);
+    let view = delivered_transcript(&agg);
+    let events = submit_decision(
+        &mut agg,
+        d,
+        view,
+        vec![Action::Done {
+            data: serde_json::Value::Null,
+        }],
+    );
+    assert_eq!(branch_closed(&events, "title"), Some(BranchEnd::Voided));
+    assert!(branch_finished(&events).is_none(), "nobody waits for it");
+    assert_eq!(
+        agg.state
+            .tracking(EffectKind::LlmCall, "t1")
+            .unwrap()
+            .status(),
+        EffectStatus::Failed
+    );
+}
+
+#[test]
+fn a_detached_branch_outlives_a_cancel() {
+    let mut agg = turn_with_side_call(BranchMode::Detached);
+    dispatch(
+        &mut agg,
+        CommandPayload::CancelSession { drop_queued: false },
+        &frontend(),
+    );
+    assert!(agg.state.phase.turn_id().is_none());
+    assert!(agg.state.open_branch("title").is_some());
+    assert!(agg
+        .state
+        .tracking(EffectKind::LlmCall, "t1")
+        .unwrap()
+        .is_unsettled());
+    assert_eq!(
+        agg.state
+            .tracking(EffectKind::LlmCall, "c1")
+            .unwrap()
+            .status(),
+        EffectStatus::Failed
+    );
+}
+
+#[test]
+fn a_branch_runs_its_tools_on_itself() {
+    let mut agg = turn_with_side_call(BranchMode::Detached);
+    reply(&mut agg, "c1", said("Sunny.", 100));
+    echo(&mut agg);
+    echo(&mut agg);
+
+    reply(&mut agg, "t1", calling("lookup", "tc-b"));
+    echo(&mut agg);
+    let tool = agg.state.effect(EffectKind::ToolCall, "tc-b").unwrap();
+    assert_eq!(tool.branch.as_deref(), Some("title"));
+    while live_decision_kind(&agg).is_some_and(|t| matches!(t, Trigger::ToolExecute { .. })) {
+        let (d, _) = live_decision(&agg);
+        submit_decision(&mut agg, d, vec![], vec![tool_result_action("tc-b")]);
+    }
+    let (d, trigger) = live_decision(&agg);
+    assert!(matches!(trigger, Trigger::ToolFinished { .. }));
+    assert_eq!(agg.state.decision_branch(&d), Some("title"));
+    echo(&mut agg);
+
+    let next = agg
+        .state
+        .effects_of(EffectKind::LlmCall)
+        .find(|e| e.id != "c1" && e.id != "t1")
+        .expect("the branch calls the model again");
+    assert_eq!(next.branch.as_deref(), Some("title"));
+    let leaf = agg.state.open_branch("title").unwrap().leaf.clone();
+    assert_eq!(
+        next.anchor, leaf,
+        "it reads the branch, tool result included"
+    );
+    assert_eq!(agg.state.head_id.as_deref(), Some("c1"));
+}
+
+fn live_decision_kind(agg: &Session) -> Option<Trigger> {
+    agg.state
+        .effects_of(EffectKind::Decision)
+        .filter(|d| d.tracking.status() == EffectStatus::Pending)
+        .find_map(|e| e.decision().map(|d| d.trigger.clone()))
+}
+
+#[test]
+fn a_side_call_neither_counts_as_the_conversations_read_nor_its_turn() {
+    let mut agg = turn_with_side_call(BranchMode::Detached);
+    reply(&mut agg, "c1", said("Sunny.", 9_000));
+    reply(&mut agg, "t1", said("Paris weather", 50));
+    let read = agg
+        .state
+        .last_read
+        .clone()
+        .expect("the conversation's read");
+    assert_eq!((read.call_id.as_str(), read.tokens), ("c1", 9_000));
+    assert_eq!(
+        agg.state.turn_calls.llm.count, 1,
+        "the detached call is not the turn's"
+    );
+    assert_eq!(agg.state.turn_cost, rust_decimal::Decimal::new(1, 2));
+    assert_eq!(
+        agg.state.cost,
+        rust_decimal::Decimal::new(2, 2),
+        "the session pays for both"
+    );
+}
+
+#[test]
+fn a_root_branch_with_no_config_sends_its_messages_as_written() {
+    let mut agg = configured();
+    user_turn(&mut agg, "u1", "hi", "turn-1");
+    let (d, _) = live_decision(&agg);
+    submit_decision(
+        &mut agg,
+        d,
+        vec![node_msg("u1", Role::User, "hi")],
+        vec![branch_call(
+            "j1",
+            start("judge", BranchFrom::Root, BranchMode::Blocking),
+            vec![
+                node_msg("", Role::System, "You judge."),
+                node_msg("", Role::User, "Is 2+2=4?"),
+            ],
+        )],
+    );
+    assert_eq!(prompt_texts(&agg, "j1"), vec!["You judge.", "Is 2+2=4?"]);
+    assert_eq!(
+        agg.state.at_scope(Some("judge")).resolve_agent_for(),
+        None,
+        "a root runs with no config"
+    );
+}
+
+#[test]
+fn a_fork_reads_the_config_as_it_was_when_it_started() {
+    let mut agg = turn_with_side_call(BranchMode::Detached);
+    let (d, _) = {
+        reply(&mut agg, "c1", said("Sunny.", 100));
+        live_decision(&agg)
+    };
+    let transcript = delivered_transcript(&agg)
+        .into_iter()
+        .chain([node_msg("c1", Role::Assistant, "Sunny.")])
+        .collect();
+    dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: d,
+            transcript,
+            actions: vec![],
+            state: None,
+            agent: Some(agent_config("m2")),
+        },
+        &machine(),
+    );
+    assert_eq!(
+        agg.state.at_head().resolve_agent_for().map(|c| c.model),
+        Some("m2".to_string())
+    );
+    assert_eq!(
+        agg.state
+            .at_scope(Some("title"))
+            .resolve_agent_for()
+            .map(|c| c.model),
+        Some("m1".to_string()),
+        "a later write on the conversation does not reach the branch"
+    );
+}
+
+#[test]
+fn the_conversation_cannot_land_on_an_open_branch() {
+    let mut agg = turn_with_side_call(BranchMode::Detached);
+    let own = agg
+        .state
+        .open_branch("title")
+        .unwrap()
+        .leaf
+        .clone()
+        .unwrap();
+    reply(&mut agg, "c1", said("Sunny.", 100));
+    let (d, _) = live_decision(&agg);
+    let landing: Vec<DraftMessage> = agg
+        .state
+        .message_tree()
+        .path_to(&own)
+        .into_iter()
+        .map(DraftMessage::from)
+        .collect();
+    submit_decision(&mut agg, d, landing, vec![]);
+    assert_ne!(agg.state.head_id.as_deref(), Some(own.as_str()));
+}
+
+#[test]
+fn a_branch_with_work_out_cannot_be_promoted() {
+    let mut agg = turn_with_side_call(BranchMode::Blocking);
+    reply(&mut agg, "c1", said("Draft A", 100));
+    let (d, _) = live_decision(&agg);
+    submit_decision(
+        &mut agg,
+        d,
+        vec![],
+        vec![Action::PromoteBranch {
+            id: "title".to_string(),
+        }],
+    );
+    assert_eq!(agg.state.head_id.as_deref(), Some("u1"));
+    assert!(agg.state.open_branch("title").is_some());
+}
+
+#[test]
+fn an_open_branch_stays_loaded_when_the_conversation_moves_on() {
+    let mut agg = turn_with_side_call(BranchMode::Detached);
+    reply(&mut agg, "c1", said("Sunny.", 100));
+    echo(&mut agg);
+    echo(&mut agg);
+    let own = agg
+        .state
+        .open_branch("title")
+        .unwrap()
+        .leaf
+        .clone()
+        .unwrap();
+    assert!(agg.state.has_node(&own));
+    assert!(!agg.state.off_path(), "nothing waits to be unloaded");
+}
+
+#[test]
+fn a_branch_decision_that_leaves_nothing_open_ends_the_branch() {
+    let mut agg = turn_with_side_call(BranchMode::Detached);
+    reply(&mut agg, "t1", said("Paris weather", 100));
+    let (d, _) = live_decision(&agg);
+    let proposed = proposed_for(&agg, &d);
+    let events = submit_decision(&mut agg, d, proposed.messages, vec![]);
+    assert_eq!(branch_closed(&events, "title"), Some(BranchEnd::Done));
+}

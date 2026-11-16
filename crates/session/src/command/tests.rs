@@ -4927,6 +4927,7 @@ fn a_failed_action_decision_does_not_end_the_running_turn() {
                 retry: RetryPolicy::no_retry(),
                 handler: LlmHandler::Server,
                 format: None,
+                branch: None,
             }],
             state: None,
             agent: None,
@@ -5097,6 +5098,7 @@ fn interrupt_action_voids_llm_calls_requested_in_the_same_submit() {
                     retry: RetryPolicy::no_retry(),
                     handler: LlmHandler::Server,
                     format: None,
+                    branch: None,
                 },
                 Action::Interrupt {
                     interrupt_id: "int-1".to_string(),
@@ -6171,6 +6173,7 @@ fn call_llm_action(id: &str, handler: LlmHandler) -> Action {
         stream: false,
         retry: RetryPolicy::no_retry(),
         handler,
+        branch: None,
     }
 }
 
@@ -8093,6 +8096,7 @@ fn a_search_answers_at_the_anchor_of_the_call() {
             )),
             parent_id: agg.state.head_id.clone(),
             copied_from: None,
+            branch: None,
         })],
         &ctx,
     );
@@ -11399,6 +11403,7 @@ fn interrupt_voiding_is_scoped_to_the_parked_path() {
             )),
             parent_id: parent.map(str::to_string),
             copied_from: None,
+            branch: None,
         })
     };
     let llm = |id: &str| {
@@ -11413,6 +11418,7 @@ fn interrupt_voiding_is_scoped_to_the_parked_path() {
             stream: false,
             retry: RetryPolicy::no_retry(),
             handler: LlmHandler::Server,
+            branch: None,
         })
     };
     agg.commit(vec![msg("u1", None), msg("a1", Some("u1"))], &ctx);
@@ -11553,6 +11559,7 @@ fn wake_promotes_a_queued_decision_on_an_unparked_branch() {
                 join: false,
                 metadata: Default::default(),
             },
+            branch: None,
         })],
         &CommitContext {
             span: SpanContext::root(),
@@ -12838,6 +12845,7 @@ fn an_open_system1_call_holds_the_turn_until_done_voids_it() {
                 retry: RetryPolicy::no_retry(),
                 handler: LlmHandler::Server,
                 format: None,
+                branch: None,
             },
         ],
     );
@@ -13378,6 +13386,7 @@ fn codemode_calls(events: &[EventPayload]) -> Option<(String, Vec<crate::protoco
         EventPayload::DecisionQueued(DecisionQueued {
             id,
             trigger: Trigger::CodemodeCalls { tool_calls, .. },
+            ..
         }) => Some((id.clone(), tool_calls.clone())),
         _ => None,
     })
@@ -13610,6 +13619,7 @@ fn tool_executes(events: &[EventPayload]) -> Vec<(String, String)> {
             EventPayload::DecisionQueued(DecisionQueued {
                 id,
                 trigger: Trigger::ToolExecute { id: call, .. },
+                ..
             }) => Some((id.clone(), call.clone())),
             _ => None,
         })
@@ -14811,3 +14821,5 @@ fn a_dispatch_records_a_fingerprint_of_the_prompt() {
     renamed[0].content = Some(Content::Text("be long".to_string()));
     assert_ne!(recorded, crate::prompt_context::fingerprint(&renamed));
 }
+
+mod branch;

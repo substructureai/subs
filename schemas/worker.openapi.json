@@ -506,6 +506,114 @@
         "title": "AudioData",
         "type": "object"
       },
+      "BranchAgent": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "$ref": "#/components/schemas/AgentConfig"
+          }
+        ],
+        "title": "BranchAgent"
+      },
+      "BranchMode": {
+        "description": "A blocking branch is part of the turn that started it, and ends with it.\nA detached branch outlives the turn.",
+        "enum": [
+          "blocking",
+          "detached"
+        ],
+        "title": "BranchMode",
+        "type": "string"
+      },
+      "BranchRequest": {
+        "additionalProperties": false,
+        "description": "Where a branch starts, and what it runs as.",
+        "properties": {
+          "agent": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BranchAgent"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A registered agent's id, or a config. Without it, a fork runs as the\npath it forks, and a root runs with no config."
+          },
+          "from": {
+            "description": "`null` starts a new root. `\"head\"` forks the conversation, after this\nresponse's messages. A node id forks at that node.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "description": "Without `id`, the engine mints one. An id already started starts\nnothing.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mode": {
+            "$ref": "#/components/schemas/BranchMode"
+          },
+          "name": {
+            "description": "A label for the worker and the dashboard. The engine never reads it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "BranchRequest",
+        "type": "object"
+      },
+      "BranchView": {
+        "additionalProperties": false,
+        "description": "The branch a decision is about.",
+        "properties": {
+          "from": {
+            "description": "The node it forked at. `null` for a root.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "leaf": {
+            "description": "Its newest node. `null` until it has one of its own.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mode": {
+            "$ref": "#/components/schemas/BranchMode"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "parent": {
+            "description": "The branch that started it. `null` when the conversation did.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "mode"
+        ],
+        "title": "BranchView",
+        "type": "object"
+      },
       "ClientContext": {
         "additionalProperties": false,
         "description": "Inputs a client declares on its run, passed to the worker on the\n`client.messages` decision. `tools` are the browser's own tools, read as\nclient-handled [`AgentTool`]s. The engine adds them to the proposed config.\nA worker can override that by returning its own `agent`.",
@@ -789,6 +897,17 @@
             "additionalProperties": false,
             "description": "A flat LLM request. Every field is optional.\n\nWithout `id`, the engine mints one, and it becomes the assistant node's\nid. A field left out comes from the agent config, then from the engine's\ndefault. Without `messages`, the engine builds the prompt from the\nconversation: the config's system message, the decision's view, and\nthe context the engine adds. Given `messages`, the engine sends them as\nwritten.",
             "properties": {
+              "branch": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/BranchRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Start a branch: `messages` go after `branch.from`, and the call\nreads that path. Its reply lands on the branch."
+              },
               "id": {
                 "type": [
                   "string",
@@ -875,6 +994,42 @@
             },
             "required": [
               "type"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Stop a branch. Its open calls are cancelled.",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "type": {
+                "const": "branch.close",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "id"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Make a branch the conversation: the head moves to its newest node.",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "type": {
+                "const": "branch.promote",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "id"
             ],
             "type": "object"
           },
@@ -1369,6 +1524,17 @@
             "format": "uint32",
             "minimum": 0,
             "type": "integer"
+          },
+          "branch": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BranchView"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The branch this decision is about. `messages`, `state`, `agent` and\n`calls` are read on it, and the response applies to it. Absent on the\nconversation."
           },
           "calls": {
             "items": {
@@ -1973,6 +2139,65 @@
           },
           {
             "additionalProperties": false,
+            "description": "A branch this conversation or branch started ended. `data` is what\nits `done` carried.",
+            "properties": {
+              "data": {},
+              "error": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ErrorInfo"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "from": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "id": {
+                "type": "string"
+              },
+              "leaf": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "mode": {
+                "$ref": "#/components/schemas/BranchMode"
+              },
+              "name": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "ok": {
+                "type": "boolean"
+              },
+              "stale": {
+                "description": "The node it forked at is no longer on the path of whoever started\nit.",
+                "type": "boolean"
+              },
+              "type": {
+                "const": "branch.finished",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "id",
+              "mode",
+              "ok"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
             "description": "Sent after a turn completes, with its final output. The session stays\nbusy until it is answered. Echo the proposed `done` to finish.",
             "properties": {
               "cost": {
@@ -2194,6 +2419,13 @@
             "format": "uint32",
             "minimum": 0,
             "type": "integer"
+          },
+          "branch": {
+            "description": "The branch the effect runs on. Absent on the conversation.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "deadline": {
             "format": "date-time",

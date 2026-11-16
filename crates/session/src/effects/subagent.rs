@@ -105,6 +105,7 @@ impl KindSpec for SubagentSpec {
             message: sa.message.clone(),
             retry: t.retry_policy.clone(),
             mode: sa.mode,
+            branch: effect.branch.clone(),
         })]
     }
 }
@@ -183,7 +184,10 @@ pub fn request(
             },
         )])
     };
-    let config = state.at_head().resolve_agent_for().unwrap_or_default();
+    let config = state
+        .at_scope(state.scope())
+        .resolve_agent_for()
+        .unwrap_or_default();
     if !config.may_spawn_subagent(state.depth()) {
         let limit = config.depth_limit();
         return answer(ErrorInfo::new(
@@ -221,6 +225,12 @@ pub fn request(
         Some(SubagentMode::Blocking) => SpawnMode::Blocking,
         Some(SubagentMode::Detached) => SpawnMode::Detached,
     };
+    if mode == SpawnMode::Detached && state.scope().is_some() {
+        return answer(ErrorInfo::new(
+            ErrorCode::Unroutable,
+            errors::DETACHED_ON_BRANCH.to_string(),
+        ));
+    }
     if mode == SpawnMode::Wait {
         let Some((_, sa)) = spawn
             .session_id
@@ -241,6 +251,7 @@ pub fn request(
                 message: None,
                 retry: spawn.retry,
                 mode: SpawnMode::Wait,
+                branch: state.scope_branch(),
             })]);
         };
         let mut events = withdraw_notice(state, &session_id);
@@ -283,6 +294,7 @@ pub fn request(
         message: spawn.message,
         retry: spawn.retry,
         mode,
+        branch: state.scope_branch(),
     })])
 }
 

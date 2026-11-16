@@ -35,6 +35,8 @@ impl Item {
 pub(super) struct TurnActivity {
     turn_id: String,
     items: Vec<Item>,
+    /// Calls on a branch: not the thread's to show.
+    side: std::collections::HashSet<String>,
 }
 
 impl TurnActivity {
@@ -42,6 +44,7 @@ impl TurnActivity {
         Self {
             turn_id: turn_id.to_string(),
             items: Vec::new(),
+            side: Default::default(),
         }
     }
 
@@ -54,10 +57,7 @@ impl TurnActivity {
         let mut turn: Option<Self> = None;
         for event in events {
             if let EventPayload::TurnStarted(t) = &event.payload {
-                turn = Some(Self {
-                    turn_id: t.turn_id.clone(),
-                    items: Vec::new(),
-                });
+                turn = Some(Self::new(&t.turn_id));
                 continue;
             }
             if let Some(turn) = turn.as_mut() {
@@ -69,6 +69,12 @@ impl TurnActivity {
 
     pub(super) fn apply(&mut self, event: &SessionEvent) {
         match &event.payload {
+            EventPayload::LlmCallRequested(r) if r.branch.is_some() => {
+                self.side.insert(r.id.clone());
+            }
+            EventPayload::ToolCallRequested(t) if t.branch.is_some() => {}
+            EventPayload::SubagentRequested(s) if s.branch.is_some() => {}
+            EventPayload::LlmCallCompleted(c) if self.side.contains(&c.id) => {}
             EventPayload::LlmCallCompleted(c) if !c.response.tool_calls.is_empty() => {
                 if let Some(text) = c.response.content.as_deref().map(str::trim) {
                     if !text.is_empty() {
@@ -314,6 +320,7 @@ pub(in crate::transport::slack) mod tests {
                 target: None,
                 retry: retry(),
                 script: None,
+                branch: None,
             }),
         )
     }
@@ -324,6 +331,22 @@ pub(in crate::transport::slack) mod tests {
             .as_str()
             .unwrap_or_default()
             .to_string()
+    }
+
+    #[test]
+    fn work_on_a_branch_stays_off_the_card() {
+        let mut side = tool_requested("tc-s", "lookup", "{}", 2);
+        if let EventPayload::ToolCallRequested(t) = &mut side.payload {
+            t.branch = Some("title".into());
+        }
+        let events = vec![
+            started("turn-1", 1),
+            side,
+            tool_requested("tc1", "search_web", r#"{"q":"x"}"#, 3),
+        ];
+        let text = details(&events);
+        assert!(text.contains("search_web"));
+        assert!(!text.contains("lookup"));
     }
 
     #[test]
@@ -402,6 +425,7 @@ pub(in crate::transport::slack) mod tests {
                     message: None,
                     retry: retry(),
                     mode: Default::default(),
+                    branch: None,
                 }),
             ),
         ];

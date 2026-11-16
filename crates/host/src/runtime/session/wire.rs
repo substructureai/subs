@@ -4,7 +4,7 @@ use substructure_session::request::PendingPrompt;
 use crate::llm::LlmCallError;
 use crate::providers::format::Wire as _;
 
-use super::decision::{Action, PromptSource, ToolHandler};
+use super::decision::{Action, BranchConfig, BranchFrom, BranchStart, PromptSource, ToolHandler};
 
 pub async fn finish_prompt(
     trigger: &mut DecisionTrigger,
@@ -29,8 +29,8 @@ fn new_call_id() -> String {
     uuid::Uuid::now_v7().to_string()
 }
 use crate::protocol::{
-    AgentConfig, DecisionAction, DecisionResponse, DecisionTrigger, DraftMessage, ErrorInfo,
-    Handler, LlmFormat, LlmRequest, LlmResponse, RetryPolicy, WorkerState,
+    AgentConfig, BranchAgent, BranchRequest, DecisionAction, DecisionResponse, DecisionTrigger,
+    DraftMessage, ErrorInfo, Handler, LlmFormat, LlmRequest, LlmResponse, RetryPolicy, WorkerState,
 };
 use crate::runtime::blob::{intern_uri, resolve, store, BlobStore};
 use crate::runtime::llm::LlmBlocks;
@@ -90,7 +90,15 @@ pub enum ResolveError {
     UnstoredAsset {
         key: String,
     },
+    UnknownAgent {
+        name: String,
+    },
 }
+
+/// The configs of the agents a branch can run as, by id.
+pub type Agents<'a> = &'a (dyn Fn(&str) -> Option<AgentConfig> + Sync);
+
+pub const NO_AGENTS: Agents<'static> = &|_| None;
 
 impl ResolveError {
     pub fn param(&self) -> Option<String> {
@@ -107,6 +115,7 @@ impl ResolveError {
             ResolveError::MissingSystem1Model { .. } => "model".to_string(),
             ResolveError::InvalidSystem1 { .. } => "questions".to_string(),
             ResolveError::UnstoredAsset { key } => format!("assets.{key}"),
+            ResolveError::UnknownAgent { .. } => "branch.agent".to_string(),
         })
     }
 
@@ -145,6 +154,9 @@ impl ResolveError {
             }
             ResolveError::UnstoredAsset { key } => {
                 serde_json::json!({ "reason": "unstored_asset", "key": key })
+            }
+            ResolveError::UnknownAgent { name } => {
+                serde_json::json!({ "reason": "unknown_agent", "name": name })
             }
         }
     }
@@ -194,6 +206,9 @@ impl std::fmt::Display for ResolveError {
             ResolveError::InvalidSystem1 { message } => write!(f, "{message}"),
             ResolveError::UnstoredAsset { key } => {
                 write!(f, "asset `{key}` could not be stored")
+            }
+            ResolveError::UnknownAgent { name } => {
+                write!(f, "branch.agent names `{name}`, which no [agent.{name}] declares")
             }
         }
     }
@@ -261,12 +276,14 @@ pub struct ResolvedResponse {
     pub agent: Option<AgentConfig>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn resolve_response(
     response: DecisionResponse,
     echoed_config: Option<&AgentConfig>,
     trigger: Option<&DecisionTrigger>,
     blocks: &LlmBlocks,
     system1: &System1Blocks,
+    agents: Agents<'_>,
     blobs: &dyn BlobStore,
     tenant_id: &str,
 ) -> Result<ResolvedResponse, ResolveError> {
@@ -285,7 +302,7 @@ pub async fn resolve_response(
     }
     let merge_cfg = agent.as_ref().or(echoed_config);
     let resolved = lower_actions(
-        actions, merge_cfg, trigger, blocks, system1, blobs, tenant_id,
+        actions, merge_cfg, trigger, blocks, system1, agents, blobs, tenant_id,
     )
     .await?;
     Ok(ResolvedResponse {
@@ -303,6 +320,7 @@ async fn lower_actions(
     trigger: Option<&DecisionTrigger>,
     blocks: &LlmBlocks,
     system1: &System1Blocks,
+    agents: Agents<'_>,
     blobs: &dyn BlobStore,
     tenant_id: &str,
 ) -> Result<Vec<Action>, ResolveError> {
@@ -322,13 +340,21 @@ async fn lower_actions(
                     reasoning,
                     stream,
                     retry,
+                    branch,
                 } => {
+                    let branch = branch.map(|b| lower_branch(b, agents)).transpose()?;
+                    let config = match branch.as_ref().map(|b| &b.agent) {
+                        Some(BranchConfig::Config(own)) => Some(&**own),
+                        Some(BranchConfig::None) => None,
+                        _ => config,
+                    };
                     let model = model
                         .or_else(|| config.map(|c| c.model.clone()))
                         .ok_or(ResolveError::MissingModel)?;
-                    let (messages, source) = match messages {
-                        Some(messages) => (messages, PromptSource::Explicit),
-                        None => (Vec::new(), PromptSource::tree()),
+                    let (messages, source) = match (messages, &branch) {
+                        (messages, Some(_)) => (messages.unwrap_or_default(), PromptSource::tree()),
+                        (Some(messages), None) => (messages, PromptSource::Explicit),
+                        (None, None) => (Vec::new(), PromptSource::tree()),
                     };
                     let tools = tools.or_else(|| config.and_then(|c| c.tools_as_llm()));
                     let stream = stream.unwrap_or(true);
@@ -359,8 +385,11 @@ async fn lower_actions(
                         retry,
                         handler: block.handler,
                         format: block.format,
+                        branch,
                     }
                 }
+                DecisionAction::CloseBranch { id } => Action::CloseBranch { id },
+                DecisionAction::PromoteBranch { id } => Action::PromoteBranch { id },
                 DecisionAction::CallSystem1 {
                     id,
                     system1: named,
@@ -551,6 +580,29 @@ async fn lower_actions(
     Ok(lowered)
 }
 
+fn lower_branch(branch: BranchRequest, agents: Agents<'_>) -> Result<BranchStart, ResolveError> {
+    let from = match branch.from {
+        None => BranchFrom::Root,
+        Some(head) if head == "head" => BranchFrom::Head,
+        Some(node) => BranchFrom::Node(node),
+    };
+    let agent = match branch.agent {
+        None => BranchConfig::Inherit,
+        Some(BranchAgent::Config(config)) => BranchConfig::Config(config),
+        Some(BranchAgent::Id(name)) => match agents(&name) {
+            Some(config) => BranchConfig::Config(Box::new(config)),
+            None => return Err(ResolveError::UnknownAgent { name }),
+        },
+    };
+    Ok(BranchStart {
+        id: branch.id.unwrap_or_else(new_call_id),
+        from,
+        agent,
+        name: branch.name,
+        mode: branch.mode,
+    })
+}
+
 pub fn result_to_string(value: Value) -> String {
     match value {
         Value::String(s) => s,
@@ -614,6 +666,7 @@ mod tests {
             trigger,
             &blocks(),
             &System1Blocks::default(),
+            crate::runtime::session::wire::NO_AGENTS,
             &crate::runtime::blob::NOWHERE,
             "t1",
         )
@@ -695,6 +748,7 @@ mod tests {
             None,
             &blocks(),
             &System1Blocks::default(),
+            crate::runtime::session::wire::NO_AGENTS,
             &crate::runtime::blob::NOWHERE,
             "t1",
         )
@@ -1055,6 +1109,7 @@ mod tests {
             reasoning: None,
             stream: None,
             retry: None,
+            branch: None,
         }
     }
 
@@ -1075,6 +1130,7 @@ mod tests {
             None,
             &blocks(),
             &System1Blocks::default(),
+            crate::runtime::session::wire::NO_AGENTS,
             &crate::runtime::blob::NOWHERE,
             "t1",
         )
@@ -1121,6 +1177,7 @@ mod tests {
             reasoning: None,
             stream: None,
             retry: None,
+            branch: None,
         };
         let action = resolve_one_call(call, vec![user_wire("the view")], Some(&config), None)
             .await
@@ -1154,6 +1211,7 @@ mod tests {
             reasoning: None,
             stream: None,
             retry: None,
+            branch: None,
         };
         let action = resolve_one_call(call, vec![], Some(&config), None)
             .await
@@ -1212,6 +1270,7 @@ mod tests {
                 message: m.clone(),
                 parent_id: (i > 0).then(|| messages[i - 1].id.clone()),
                 copied_from: None,
+                branch: None,
             })
             .collect();
         MessageTree {

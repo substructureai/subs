@@ -907,6 +907,7 @@ mod tests {
                 handler: Default::default(),
                 format: None,
                 defer_tools_strategy: Default::default(),
+                branch: None,
             }),
         );
         apply(
