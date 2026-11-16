@@ -1035,7 +1035,16 @@ impl Working {
                     worker,
                     events,
                 })));
-                self.then(|s| s.start_conversation(s.ids(), state, agent.map(|a| *a)));
+                self.then(|s| {
+                    s.write_response(
+                        s.ids(),
+                        Vec::new(),
+                        state,
+                        agent.map(|a| *a),
+                        None,
+                        Writes::Setup,
+                    )
+                });
                 self.queue_decision(Trigger::SessionStart);
             }
             (true, CommandPayload::CreateSession { .. }) => {
@@ -1384,8 +1393,9 @@ impl Working {
                         return Ok(());
                     }
                     let on = Some(branch.as_str());
-                    self.then(|_| vec![completed])
-                        .then(|s| s.write_response(s.ids(), transcript, state, agent, on, false));
+                    self.then(|_| vec![completed]).then(|s| {
+                        s.write_response(s.ids(), transcript, state, agent, on, Writes::Turn)
+                    });
                     let outer = self.scope.replace(branch.clone());
                     self.apply_actions(actions, &decision_id, answered);
                     self.scope = outer;
@@ -1406,8 +1416,11 @@ impl Working {
                     })]
                 })
                 .then(|s| {
-                    let setup = matches!(answered, Some(Trigger::SessionStart));
-                    s.write_response(s.ids(), transcript, state, agent, None, setup)
+                    let kind = match answered {
+                        Some(Trigger::SessionStart) => Writes::Setup,
+                        _ => Writes::Turn,
+                    };
+                    s.write_response(s.ids(), transcript, state, agent, None, kind)
                 })
                 .then(|s| s.void_stranded_work(s.head_id.as_deref()));
 
@@ -1478,6 +1491,7 @@ pub mod branch;
 mod context;
 mod delivery;
 mod transcript;
+use transcript::Writes;
 
 #[cfg(test)]
 mod tests;

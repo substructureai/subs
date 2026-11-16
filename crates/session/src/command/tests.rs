@@ -9749,7 +9749,6 @@ fn create_session_emits_session_start_before_client_input() {
             events.as_slice(),
             [
                 EventPayload::SessionCreated(_),
-                EventPayload::ConversationStarted(_),
                 EventPayload::DecisionQueued(q),
                 EventPayload::DecisionDispatched(_),
             ] if matches!(q.trigger, Trigger::SessionStart)
@@ -9792,7 +9791,6 @@ fn create_session_writes_seeded_state_before_session_start() {
             [
                 EventPayload::SessionCreated(_),
                 EventPayload::WorkerStateUpdated(_),
-                EventPayload::ConversationStarted(_),
                 EventPayload::DecisionQueued(q),
                 EventPayload::DecisionDispatched(_),
             ] if matches!(q.trigger, Trigger::SessionStart)
@@ -10337,7 +10335,7 @@ fn long_chat(agg: &mut Session) {
 }
 
 #[test]
-fn a_reset_starts_a_new_root_and_keeps_the_state_sent_with_it() {
+fn a_reset_lands_on_the_start_and_keeps_the_state_sent_with_it() {
     let mut agg =
         create_session_with_config("sess-1", "tenant-a", "user-1", Some(agent_config("m1")));
     long_chat(&mut agg);
@@ -10363,6 +10361,7 @@ fn a_reset_starts_a_new_root_and_keeps_the_state_sent_with_it() {
         })
         .collect();
     assert_eq!(texts, ["latest"], "the view replaces the conversation");
+    assert_eq!(starts(&agg), 1, "the reset lands on the one start");
     assert!(
         events
             .iter()
@@ -10423,7 +10422,7 @@ fn a_compaction_records_the_summary_then_copies_of_the_kept_messages() {
 }
 
 #[test]
-fn a_new_root_without_state_or_config_reads_the_start() {
+fn an_edit_of_the_first_message_reads_the_setup() {
     let mut agg =
         create_session_with_config("sess-1", "tenant-a", "user-1", Some(agent_config("m1")));
     long_chat(&mut agg);
@@ -10459,6 +10458,15 @@ fn a_new_root_without_state_or_config_reads_the_start() {
         Some("m1".to_string()),
         "the session.start config holds on every branch"
     );
+    assert_eq!(starts(&agg), 1, "the edit lands on the one start");
+}
+
+fn starts(agg: &Session) -> usize {
+    agg.state
+        .tree
+        .iter()
+        .filter(|n| matches!(n.fact, crate::tree::Fact::Start))
+        .count()
 }
 
 #[test]

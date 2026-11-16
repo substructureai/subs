@@ -14,6 +14,27 @@ use crate::reconcile::{landing_leaf, plan_reconcile};
 use crate::state::{EffectKind, SessionState};
 use crate::Caller;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Writes {
+    Setup,
+    Turn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Landing {
+    Follows(Option<String>),
+    Forks(Option<String>),
+    Strays(Option<String>),
+}
+
+impl Landing {
+    pub fn node(&self) -> Option<&str> {
+        match self {
+            Landing::Follows(n) | Landing::Forks(n) | Landing::Strays(n) => n.as_deref(),
+        }
+    }
+}
+
 impl SessionState {
     pub(super) fn write_response(
         &self,
@@ -22,7 +43,7 @@ impl SessionState {
         state: Option<WorkerState>,
         config: Option<AgentConfig>,
         scope: Option<&str>,
-        setup: bool,
+        kind: Writes,
     ) -> Vec<EventPayload> {
         let leaf = self.scope_node(scope);
         let transcript = match scope {
@@ -31,7 +52,8 @@ impl SessionState {
         };
         let known = self.known_messages();
         let plan = plan_reconcile(&known, &transcript);
-        let (parent, writes) = self.landing_point(&transcript, scope);
+        let landing = self.landing_point(&transcript, scope);
+        let parent = landing.node().map(str::to_string);
         let branch = scope.map(str::to_string);
         let mut cursor = parent.clone();
         let mut events = Vec::new();
@@ -44,25 +66,32 @@ impl SessionState {
             }
         };
         let base = self.at(parent.as_deref());
-        if let Some(state) = state.filter(|s| *s != base.resolve_state_for()) {
+        let state = state.filter(|s| *s != base.resolve_state_for());
+        let config = config.filter(|c| Some(c) != base.resolve_agent_for().as_ref());
+        let messages = !matches!(landing, Landing::Strays(_)) && !plan.is_empty();
+        let opens = kind == Writes::Turn
+            && scope.is_none()
+            && self.tree.start_of(parent.as_deref()).is_none()
+            && (state.is_some() || config.is_some() || messages);
+        if opens {
+            events.push(EventPayload::ConversationStarted(ConversationStarted {
+                node: place(&mut cursor),
+            }));
+        }
+        if let Some(state) = state {
             events.push(EventPayload::WorkerStateUpdated(WorkerStateUpdated {
                 state,
                 node: place(&mut cursor),
             }));
         }
-        if let Some(config) = config.filter(|c| Some(c) != base.resolve_agent_for().as_ref()) {
+        if let Some(config) = config {
             events.extend(crate::effects::connector::sync(self, &config));
             events.push(EventPayload::AgentConfigUpdated(AgentConfigUpdated {
                 config,
                 node: place(&mut cursor),
             }));
         }
-        if setup {
-            events.push(EventPayload::ConversationStarted(ConversationStarted {
-                node: place(&mut cursor),
-            }));
-        }
-        if writes {
+        if messages {
             let mut plan = plan.iter().peekable();
             for (index, msg) in transcript.into_iter().enumerate() {
                 if plan.peek().is_none_or(|w| w.index != index) {
@@ -91,11 +120,11 @@ impl SessionState {
         events
     }
 
-    pub fn landing_point(
+    pub(crate) fn landing_point(
         &self,
         transcript: &[DraftMessage],
         scope: Option<&str>,
-    ) -> (Option<String>, bool) {
+    ) -> Landing {
         let leaf = self.scope_node(scope);
         let known = self.known_messages();
         let plan = plan_reconcile(&known, transcript);
@@ -107,31 +136,22 @@ impl SessionState {
             .and_then(|l| self.node_branch(l))
             .is_some_and(|b| self.open_branch(b).is_some());
         match (scope, at_leaf) {
-            (_, true) => (leaf, true),
+            (_, true) => Landing::Follows(leaf),
             (None, false) if !on_open_branch => match landing {
-                Some(landing) => (Some(landing), true),
-                None => (
-                    self.tree.start_of(leaf.as_deref()).map(str::to_string),
-                    true,
-                ),
+                Some(landing) => Landing::Forks(Some(landing)),
+                None => match self.tree.start_of(leaf.as_deref()) {
+                    Some(start) => Landing::Forks(Some(start.to_string())),
+                    None => Landing::Follows(leaf),
+                },
             },
             _ => {
                 tracing::warn!(
                     ?scope,
                     "a response that does not follow its path; messages not written"
                 );
-                (leaf, false)
+                Landing::Strays(leaf)
             }
         }
-    }
-
-    pub(super) fn start_conversation(
-        &self,
-        ids: &Ids,
-        state: Option<WorkerState>,
-        config: Option<AgentConfig>,
-    ) -> Vec<EventPayload> {
-        self.write_response(ids, Vec::new(), state, config, None, true)
     }
 
     fn pending_client_result(&self, m: &DraftMessage) -> Option<(String, String, String)> {
@@ -386,7 +406,10 @@ impl SessionState {
         let (landing, single_answer) = {
             let known = self.known_messages();
             let plan = plan_reconcile(&known, &messages);
-            let (landing, _) = self.landing_point(&messages, None);
+            let landing = self
+                .landing_point(&messages, None)
+                .node()
+                .map(str::to_string);
             let single_answer = plan.len() == 1
                 && completions.len() == 1
                 && plan.first().map(|w| w.index) == completions.first().map(|c| c.index);

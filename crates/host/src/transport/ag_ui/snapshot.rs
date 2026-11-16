@@ -259,8 +259,11 @@ mod tests {
 
     fn session_of(tree: MessageTree) -> SessionState {
         let mut s = SessionState::new("s".to_string());
-        for node in tree.nodes {
-            s.seed_message(node);
+        for node in &tree.nodes {
+            s.tree.push(crate::runtime::session::state::Logged {
+                seq: 0,
+                entry: substructure_session::tree::Node::of_message(node),
+            });
         }
         s.head_id = tree.head_id.clone();
         s

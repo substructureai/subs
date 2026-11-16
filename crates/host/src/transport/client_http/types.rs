@@ -178,7 +178,7 @@ mod tests {
         use crate::runtime::session::state::Logged;
         let node = |id: &str, role: Role, parent: Option<&str>| Logged {
             seq: 0,
-            entry: NewMessage {
+            entry: substructure_session::tree::Node::of_message(&NewMessage {
                 message: Message {
                     id: id.to_string(),
                     role,
@@ -191,13 +191,13 @@ mod tests {
                 parent_id: parent.map(str::to_string),
                 copied_from: None,
                 branch: None,
-            },
+            }),
         };
         let mut s = SessionState::new("s1".to_string());
         s.status = SessionStatus::Idle;
-        s.seed_message(node("u1", Role::User, None).entry);
-        s.seed_message(node("a1", Role::Assistant, Some("u1")).entry);
-        s.seed_message(node("a2", Role::Assistant, Some("u1")).entry);
+        s.tree.push(node("u1", Role::User, None));
+        s.tree.push(node("a1", Role::Assistant, Some("u1")));
+        s.tree.push(node("a2", Role::Assistant, Some("u1")));
         s.head_id = Some("a1".to_string());
         let json =
             serde_json::to_value(session_response("s1".into(), &s, s.message_tree())).unwrap();

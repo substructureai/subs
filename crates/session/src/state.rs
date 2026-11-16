@@ -1131,13 +1131,13 @@ impl SessionState {
         self.tree.get(id).and_then(|n| n.branch())
     }
 
-    #[doc(hidden)]
+    #[cfg(test)]
     pub fn seed(&mut self, node: crate::tree::Node) {
         let seq = self.tree.len() as u64;
         self.grow(node, seq);
     }
 
-    #[doc(hidden)]
+    #[cfg(test)]
     pub fn seed_config(&mut self, config: AgentConfig) {
         let parent = self.head_id.clone();
         let id = format!("seed-config-{}", self.tree.len());
@@ -1151,7 +1151,7 @@ impl SessionState {
         });
     }
 
-    #[doc(hidden)]
+    #[cfg(test)]
     pub fn seed_message(&mut self, message: crate::protocol::NewMessage) {
         self.seed(crate::tree::Node::of_message(&message));
     }
@@ -2449,8 +2449,8 @@ impl SessionState {
         }
         if let Trigger::ClientTranscript { messages, .. } = trigger {
             let messages = self.normalize_client_view(messages.clone());
-            let (landing, _) = self.landing_point(&messages, None);
-            return self.at(landing.as_deref()).active_interrupt_for();
+            let landing = self.landing_point(&messages, None);
+            return self.at(landing.node()).active_interrupt_for();
         }
         let at = match self.trigger_anchor(trigger) {
             Some(a) if !self.at_head().anchor_on_path(Some(a)) => self.at(Some(a)),
