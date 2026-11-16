@@ -84,6 +84,13 @@
           "model": {
             "type": "string"
           },
+          "parallel_branches": {
+            "description": "Ask the worker about each branch while others are still out, instead\nof one decision at a time.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "plugins": {
             "description": "Plugins this agent uses.",
             "items": {

@@ -7324,6 +7324,7 @@ fn agent_config(model: &str) -> AgentConfig {
         attachments: None,
         context: None,
         codemode: None,
+        parallel_branches: None,
     }
 }
 

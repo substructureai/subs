@@ -1056,6 +1056,10 @@ pub struct AgentConfig {
     /// calls the agent's tools.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codemode: Option<crate::codemode::Language>,
+    /// Ask the worker about each branch while others are still out, instead
+    /// of one decision at a time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_branches: Option<bool>,
 }
 
 /// Changes to an [`AgentConfig`]. A field left out keeps the base's value. A
@@ -1138,6 +1142,12 @@ pub struct AgentConfigPatch {
         skip_serializing_if = "Option::is_none"
     )]
     pub codemode: Option<Option<crate::codemode::Language>>,
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub parallel_branches: Option<Option<bool>>,
 }
 
 impl AgentConfigPatch {
@@ -1161,6 +1171,7 @@ impl AgentConfigPatch {
             attachments,
             context,
             codemode,
+            parallel_branches,
         } = self;
         AgentConfig {
             llm: llm.unwrap_or(base.llm),
@@ -1180,6 +1191,7 @@ impl AgentConfigPatch {
             attachments: attachments.unwrap_or(base.attachments),
             context: context.unwrap_or(base.context),
             codemode: codemode.unwrap_or(base.codemode),
+            parallel_branches: parallel_branches.unwrap_or(base.parallel_branches),
         }
     }
 }

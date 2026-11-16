@@ -100,23 +100,39 @@ fn is_resume_decision(state: &SessionState, entry: &QueueEntry) -> bool {
             .is_some_and(|d| matches!(d.trigger, Trigger::InterruptResumed { .. }))
 }
 
+/// Each queue runs in order and stops at its first entry that cannot go.
+/// There is one queue, or one for each branch when branches run in
+/// parallel.
 fn walk(state: &SessionState) -> Vec<ScheduleStep> {
     let mut steps = Vec::new();
-    let mut slot_taken = state.has_pending_worker_decision();
+    let lanes = |e: &crate::state::EffectState| state.lane(e.branch.as_deref());
+    let mut taken: std::collections::HashSet<Option<String>> = state
+        .effects_of(EffectKind::Decision)
+        .filter(|e| e.tracking.status() == EffectStatus::Pending)
+        .map(lanes)
+        .collect();
+    let mut stopped = std::collections::HashSet::new();
     for entry in walk_order(state) {
         if entry_parked(state, entry) {
             continue;
         }
+        let lane = state
+            .effect(entry.kind, &entry.id)
+            .map(lanes)
+            .unwrap_or_default();
+        if stopped.contains(&lane) {
+            continue;
+        }
         let takes_slot =
             entry.kind == EffectKind::Decision && state.has_effect(EffectKind::Decision, &entry.id);
-        if takes_slot && slot_taken {
-            break;
-        }
-        if entry_blocked(state, entry) {
-            break;
+        if (takes_slot && taken.contains(&lane)) || entry_blocked(state, entry) {
+            stopped.insert(lane);
+            continue;
         }
         steps.push(step_for(state, entry));
-        slot_taken |= takes_slot;
+        if takes_slot {
+            taken.insert(lane);
+        }
     }
     steps
 }

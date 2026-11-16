@@ -110,11 +110,13 @@ impl KindSpec for DecisionSpec {
     }
 
     fn deps(&self, state: &SessionState, entry: &QueueEntry) -> Vec<Dep> {
+        let lane = state.lane(state.decision_branch(&entry.id));
         let mut deps: Vec<Dep> = state
             .effects_of(EffectKind::Decision)
             .filter(|e| {
                 let Some(wd) = e.decision() else { return false };
-                e.tracking.status() == EffectStatus::Pending
+                (e.tracking.status() == EffectStatus::Pending
+                    && state.lane(wd.branch.as_deref()) == lane)
                     || (matches!(wd.trigger, Trigger::SessionStart)
                         && e.tracking.status() == EffectStatus::RetryScheduled
                         && e.id != entry.id)

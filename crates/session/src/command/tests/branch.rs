@@ -982,3 +982,97 @@ fn a_detached_subagent_on_a_branch_reports_back_as_a_message() {
     assert_eq!(notice.0, None);
     assert!(text_of(&notice.1[0].clone().recorded(String::new())).contains("Found it."));
 }
+
+fn pending_lanes(agg: &Session) -> Vec<Option<String>> {
+    let mut lanes: Vec<Option<String>> = agg
+        .state
+        .effects_of(EffectKind::Decision)
+        .filter(|e| e.tracking.status() == EffectStatus::Pending)
+        .map(|e| e.branch.clone())
+        .collect();
+    lanes.sort();
+    lanes
+}
+
+fn two_drafts(parallel: bool) -> Session {
+    let config = AgentConfig {
+        parallel_branches: parallel.then_some(true),
+        ..agent_config("m1")
+    };
+    let mut agg = create_session_with_config("sess-p", "tenant-a", "user-1", Some(config));
+    user_turn(&mut agg, "u1", "write a haiku", "turn-1");
+    let (d, _) = live_decision(&agg);
+    submit_decision(
+        &mut agg,
+        d,
+        vec![node_msg("u1", Role::User, "write a haiku")],
+        vec![
+            branch_call(
+                "a1",
+                start("draft-a", BranchFrom::Head, BranchMode::Blocking),
+                vec![],
+            ),
+            branch_call(
+                "b1",
+                start("draft-b", BranchFrom::Head, BranchMode::Blocking),
+                vec![],
+            ),
+        ],
+    );
+    reply(&mut agg, "a1", said("Leaves fall", 10));
+    reply(&mut agg, "b1", said("Waves fold", 10));
+    agg
+}
+
+#[test]
+fn branches_in_parallel_are_decided_at_once() {
+    let agg = two_drafts(true);
+    assert_eq!(
+        pending_lanes(&agg),
+        vec![Some("draft-a".to_string()), Some("draft-b".to_string())]
+    );
+}
+
+#[test]
+fn branches_are_decided_one_at_a_time_unless_asked() {
+    let mut agg = two_drafts(false);
+    assert_eq!(pending_lanes(&agg), vec![Some("draft-a".to_string())]);
+    echo(&mut agg);
+    assert_eq!(pending_lanes(&agg), vec![Some("draft-b".to_string())]);
+}
+
+#[test]
+fn an_interrupt_on_one_branch_holds_only_that_branch() {
+    let mut agg = two_drafts(true);
+    let a = agg
+        .state
+        .effects_of(EffectKind::Decision)
+        .find(|e| {
+            e.branch.as_deref() == Some("draft-a") && e.tracking.status() == EffectStatus::Pending
+        })
+        .map(|e| e.id.clone())
+        .unwrap();
+    let a_view = agg
+        .state
+        .at_scope(Some("draft-a"))
+        .transcript()
+        .into_iter()
+        .map(DraftMessage::from)
+        .chain([node_msg("a1", Role::Assistant, "Leaves fall")])
+        .collect();
+    submit_decision(
+        &mut agg,
+        a,
+        a_view,
+        vec![Action::Interrupt {
+            interrupt_id: "approve-a".to_string(),
+            reason: "check the draft".to_string(),
+            payload: serde_json::Value::Null,
+        }],
+    );
+    assert_eq!(pending_lanes(&agg), vec![Some("draft-b".to_string())]);
+    assert!(
+        agg.state.open_branch("draft-a").is_some(),
+        "held, not ended"
+    );
+}

@@ -1144,6 +1144,22 @@ impl SessionState {
         self.branches.get(id).filter(|b| b.is_open())
     }
 
+    /// Whether the worker is asked about branches in parallel.
+    pub fn parallel_branches(&self) -> bool {
+        self.at_head()
+            .resolve_agent_for()
+            .and_then(|c| c.parallel_branches)
+            .unwrap_or(false)
+    }
+
+    /// The queue work on `branch` waits in: its own when branches run in
+    /// parallel, else the one every decision shares.
+    pub fn lane(&self, branch: Option<&str>) -> Option<String> {
+        branch
+            .filter(|_| self.parallel_branches())
+            .map(str::to_string)
+    }
+
     /// Whether `branch`, or a branch above it, outlives its turn.
     pub fn detached(&self, branch: Option<&str>) -> bool {
         let mut cursor = branch;
@@ -1684,9 +1700,16 @@ impl SessionState {
                 anchor: payload.anchor.clone(),
             });
         }
-        self.effects.retain(|(kind, _), e| {
-            *kind != EffectKind::Decision || e.tracking.status() != EffectStatus::Pending
-        });
+        let lane = self.lane(payload.anchor.as_deref().and_then(|a| self.node_branch(a)));
+        let held: Vec<(EffectKind, String)> = self
+            .effects_of(EffectKind::Decision)
+            .filter(|e| e.tracking.status() == EffectStatus::Pending)
+            .filter(|e| self.lane(e.branch.as_deref()) == lane)
+            .map(|e| (EffectKind::Decision, e.id.clone()))
+            .collect();
+        for key in held {
+            self.effects.remove(&key);
+        }
     }
 
     fn apply_decision_errored(&mut self, p: &DecisionErrored, now: DateTime<Utc>) {
@@ -2277,12 +2300,16 @@ impl SessionState {
     }
 
     pub fn check_invariants(&self) -> Result<(), String> {
-        let live = self
+        let mut lanes: BTreeMap<Option<String>, usize> = BTreeMap::new();
+        for e in self
             .effects_of(EffectKind::Decision)
             .filter(|e| e.tracking.status == EffectStatus::Pending)
-            .count();
-        if live > 1 {
-            return Err(format!("decision slot violated: {live} live decisions"));
+        {
+            *lanes.entry(self.lane(e.branch.as_deref())).or_default() += 1;
+        }
+        let live = lanes.get(&None).copied().unwrap_or_default();
+        if lanes.values().any(|n| *n > 1) {
+            return Err(format!("decision slot violated: {lanes:?} live decisions"));
         }
         if live > 0 && self.at_head().has_pending_connector_sync() {
             return Err(
