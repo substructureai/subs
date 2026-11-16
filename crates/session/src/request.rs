@@ -416,6 +416,9 @@ pub fn wire_trigger(
             cost,
             usage,
         },
+        Trigger::BranchStarted { id, name, mode } => {
+            DecisionTrigger::BranchStarted { id, name, mode }
+        }
         Trigger::BranchFinished {
             id,
             name,

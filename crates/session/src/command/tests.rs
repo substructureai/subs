@@ -69,6 +69,7 @@ fn spawn_as(agent: &str, call: &str) -> CommandPayload {
         retry: RetryPolicy::no_retry(),
         decision_id: SPAWN_DECISION.to_string(),
         mode: None,
+        config: None,
     }
 }
 
@@ -81,6 +82,7 @@ fn continue_as(agent: &str, child: &str, call: &str) -> CommandPayload {
         retry: RetryPolicy::no_retry(),
         decision_id: SPAWN_DECISION.to_string(),
         mode: None,
+        config: None,
     }
 }
 
@@ -2707,6 +2709,7 @@ fn request_subagent_holds_the_opening_message() {
             }),
             retry: RetryPolicy::no_retry(),
             decision_id: SPAWN_DECISION.to_string(),
+            config: None,
         },
         &Caller::System {
             tenant_id: "tenant-a".to_string(),
@@ -3195,6 +3198,7 @@ fn spawn_detached(call: &str) -> CommandPayload {
         retry,
         decision_id,
         mode: Some(SpawnMode::Detached),
+        config: None,
     }
 }
 
@@ -3404,6 +3408,7 @@ fn a_wait_withdraws_that_childs_pending_message_and_keeps_the_rest() {
             retry: RetryPolicy::no_retry(),
             decision_id: SPAWN_DECISION.to_string(),
             mode: Some(SpawnMode::Wait),
+            config: None,
         },
         &system(),
     );
@@ -3449,6 +3454,7 @@ fn wait_answers_at_once_when_the_detached_result_is_in() {
             retry: RetryPolicy::no_retry(),
             decision_id: SPAWN_DECISION.to_string(),
             mode: Some(SpawnMode::Wait),
+            config: None,
         },
         &system(),
     );
@@ -3490,6 +3496,7 @@ fn wait_holds_until_the_next_detached_result() {
             retry: RetryPolicy::no_retry(),
             decision_id: SPAWN_DECISION.to_string(),
             mode: Some(SpawnMode::Wait),
+            config: None,
         },
         &system(),
     );
@@ -3574,6 +3581,7 @@ fn a_configured_mode_overrides_the_requested_one() {
                 defer: None,
                 prefix: None,
                 mode: Some(crate::protocol::SubagentMode::Detached),
+                branch: None,
             }],
             ..agent_config("m1")
         }),
@@ -4058,6 +4066,7 @@ fn tool_and_subagent_from_one_turn_dispatch_concurrently() {
                     message: None,
                     retry: RetryPolicy::no_retry(),
                     mode: None,
+                    config: None,
                 },
             ],
             state: None,
@@ -8531,6 +8540,7 @@ fn subagent_cfg(defer: Option<bool>, prefix: Option<bool>) -> AgentConfig {
             defer,
             prefix,
             mode: None,
+            branch: None,
         }],
         ..agent_config("m1")
     }
@@ -12646,6 +12656,7 @@ fn a_subagent_retry_is_a_new_attempt_and_a_stale_answer_is_ignored() {
             retry: retrying,
             decision_id,
             mode,
+            config: None,
         },
         other => other,
     };
@@ -13827,6 +13838,7 @@ fn a_script_starts_a_subagent_and_reads_its_answer() {
         defer: None,
         prefix: None,
         mode: None,
+        branch: None,
     }];
     let mut agg = create_session_with_config("sess-1", "tenant-a", "user-1", Some(agent));
     run_code(&mut agg, "...");
@@ -13854,6 +13866,7 @@ fn a_script_starts_a_subagent_and_reads_its_answer() {
             message: Some(node_msg("m", Role::User, "check the logs")),
             retry: RetryPolicy::no_retry(),
             mode: None,
+            config: None,
         }],
     );
     assert!(script_work(&agg).is_none(), "the script waits on the child");

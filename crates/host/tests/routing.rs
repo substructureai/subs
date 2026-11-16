@@ -219,6 +219,7 @@ fn helper(defer: Option<bool>) -> Subagent {
         defer,
         prefix: None,
         mode: None,
+        branch: None,
     }
 }
 
@@ -1398,6 +1399,7 @@ async fn a_session_of_another_agent_is_a_tool_error() {
         defer: None,
         prefix: None,
         mode: None,
+        branch: None,
     });
     let mut agents = team(boss);
     agents.insert("other".to_string(), engine_hosted("claude"));

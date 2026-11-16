@@ -426,6 +426,7 @@ pub(in crate::transport::slack) mod tests {
                     retry: retry(),
                     mode: Default::default(),
                     branch: None,
+                    on_branch: None,
                 }),
             ),
         ];

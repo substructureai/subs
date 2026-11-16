@@ -566,6 +566,9 @@ pub(crate) fn is_zero(n: &u64) -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubagentCallState {
+    /// It runs on the branch named `session_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_branch: Option<SubagentOnBranch>,
     pub agent_id: String,
     #[serde(default)]
     pub session_id: String,
@@ -748,6 +751,9 @@ pub struct BranchState {
     pub turn_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closed: Option<BranchEnd>,
+    /// The subagent call it answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent: Option<String>,
 }
 
 impl BranchState {
@@ -1650,6 +1656,7 @@ impl SessionState {
                 &payload.id,
                 EffectTracking::new_queued(payload.retry.clone()),
                 EffectPayload::Subagent(SubagentCallState {
+                    on_branch: payload.on_branch.clone(),
                     agent_id: payload.agent_id.clone(),
                     session_id: payload.session_id.clone(),
                     message: payload.message.clone(),
@@ -1796,17 +1803,32 @@ impl SessionState {
                         l.summary = Some(p.id.clone());
                     }
                 }
-                self.branches.entry(p.id.clone()).or_insert(BranchState {
-                    from: p.from.clone(),
-                    parent: p.parent.clone(),
-                    agent: p.agent.clone(),
-                    name: p.name.clone(),
-                    mode: p.mode,
-                    seq: ctx.sequence,
-                    leaf: None,
-                    turn_id: p.turn_id.clone(),
-                    closed: None,
-                });
+                match self.branches.get_mut(&p.id) {
+                    Some(b) if !b.is_open() => {
+                        b.closed = None;
+                        b.mode = p.mode;
+                        b.turn_id = p.turn_id.clone();
+                        b.subagent = p.subagent.clone();
+                    }
+                    Some(_) => {}
+                    None => {
+                        self.branches.insert(
+                            p.id.clone(),
+                            BranchState {
+                                from: p.from.clone(),
+                                parent: p.parent.clone(),
+                                agent: p.agent.clone(),
+                                name: p.name.clone(),
+                                mode: p.mode,
+                                seq: ctx.sequence,
+                                leaf: None,
+                                turn_id: p.turn_id.clone(),
+                                closed: None,
+                                subagent: p.subagent.clone(),
+                            },
+                        );
+                    }
+                }
             }
             EventPayload::BranchClosed(p) => {
                 if let Some(b) = self.branches.get_mut(&p.id) {

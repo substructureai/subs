@@ -69,6 +69,10 @@ struct Run {
 
 impl Run {
     fn new() -> Self {
+        Self::with(config())
+    }
+
+    fn with(config: AgentConfig) -> Self {
         let store = MemoryStore::new();
         let session = Session::load(&store, "s1", TENANT, Settings::default()).unwrap();
         let mut run = Self {
@@ -88,7 +92,7 @@ impl Run {
             },
             ancestry: vec![],
             worker_retry: RetryPolicy::no_retry(),
-            agent: Some(Box::new(config())),
+            agent: Some(Box::new(config)),
             worker: None,
             events: None,
             state: None,
@@ -303,4 +307,134 @@ fn a_session_loaded_from_an_old_snapshot_drops_the_prompts_of_settled_calls() {
         serde_json::to_value(run.session.state()).unwrap(),
         "an old snapshot settles to what replaying it now gives"
     );
+}
+
+fn calling(id: &str, arguments: serde_json::Value) -> LlmResponse {
+    serde_json::from_value(serde_json::json!({
+        "model": "m1",
+        "tool_calls": [{
+            "id": id,
+            "type": "function",
+            "function": { "name": "researcher", "arguments": arguments.to_string() },
+        }],
+        "finish_reason": "tool_calls",
+    }))
+    .unwrap()
+}
+
+fn spawn(call: &str, task: &str, session: Option<&str>) -> Action {
+    Action::SpawnSubagent {
+        session_id: session.map(str::to_string),
+        agent_id: "researcher".into(),
+        tool_call_id: call.into(),
+        message: Some(text(None, Role::User, task)),
+        retry: RetryPolicy::no_retry(),
+        mode: None,
+        config: None,
+    }
+}
+
+fn assistant(id: &str, response: &LlmResponse) -> DraftMessage {
+    DraftMessage {
+        id: Some(id.to_string()),
+        role: Role::Assistant,
+        content: response.content.clone().map(Content::Text),
+        tool_calls: (!response.tool_calls.is_empty()).then(|| response.tool_calls.clone()),
+        tool_call_id: None,
+        name: None,
+        reasoning: None,
+    }
+}
+
+#[test]
+fn a_subagent_on_a_branch_goes_on_from_the_log_where_it_left_off() {
+    let config = serde_json::from_value(serde_json::json!({
+        "llm": "claude",
+        "model": "m1",
+        "subagents": [{ "id": "researcher", "branch": "head" }],
+    }))
+    .unwrap();
+    let mut run = Run::with(config);
+    run.send(CommandPayload::SubmitClientPayload {
+        payload: ClientPayload::Message(ClientMessage {
+            message: text(Some("u1"), Role::User, "why did it fail?"),
+            stream: false,
+        }),
+        turn: TurnTarget::Open("turn-1".into()),
+        queue: QueueMode::Refuse,
+        metadata: Default::default(),
+    });
+    let d = run.live();
+    run.decide(d, run.path(None), vec![call("c1", vec![], None)]);
+
+    let asked = calling("tc-r", serde_json::json!({ "message": "dig" }));
+    run.send(CommandPayload::settle(
+        EffectKind::LlmCall,
+        "c1",
+        Some(0),
+        Outcome::Llm(Box::new(asked.clone())),
+    ));
+    let d = run.live();
+    let mut view = run.path(None);
+    view.push(assistant("c1", &asked));
+    run.decide(d, view, vec![spawn("tc-r", "dig", None)]);
+    let branch = run
+        .session
+        .state()
+        .subagent("tc-r")
+        .unwrap()
+        .session_id
+        .clone();
+    assert!(matches!(run.live_trigger(), Trigger::BranchStarted { .. }));
+    let d = run.live();
+    run.decide(d, run.path(Some(&branch)), vec![call("b1", vec![], None)]);
+
+    run.reply("b1", "Three causes.");
+    let d = run.live();
+    let mut view = run.path(Some(&branch));
+    view.push(text(Some("b1"), Role::Assistant, "Three causes."));
+    run.decide(
+        d,
+        view,
+        vec![Action::Done {
+            data: serde_json::json!("Three causes."),
+        }],
+    );
+    assert!(matches!(
+        run.live_trigger(),
+        Trigger::SubagentFinished { ok: true, .. }
+    ));
+    let d = run.live();
+    let mut view = run.path(None);
+    view.push(DraftMessage {
+        tool_call_id: Some("tc-r".into()),
+        ..text(None, Role::Tool, "Three causes.")
+    });
+    run.decide(d, view, vec![call("c2", vec![], None)]);
+    assert!(
+        !run.session.state().has_node("b1"),
+        "the finished branch is unloaded"
+    );
+
+    let again = calling(
+        "tc-r2",
+        serde_json::json!({ "message": "And the fix?", "session": branch }),
+    );
+    run.send(CommandPayload::settle(
+        EffectKind::LlmCall,
+        "c2",
+        Some(0),
+        Outcome::Llm(Box::new(again.clone())),
+    ));
+    let d = run.live();
+    let mut view = run.path(None);
+    view.push(assistant("c2", &again));
+    let events = run.decide(d, view, vec![spawn("tc-r2", "And the fix?", Some(&branch))]);
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, EventPayload::BranchLoaded(_))));
+    let path = texts(&run.path(Some(&branch)));
+    assert!(path.contains(&"Three causes.".to_string()), "{path:?}");
+    assert_eq!(path.last().map(String::as_str), Some("And the fix?"));
+    assert!(matches!(run.live_trigger(), Trigger::BranchStarted { .. }));
 }

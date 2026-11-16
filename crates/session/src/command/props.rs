@@ -349,6 +349,7 @@ impl World {
                     message: None,
                     retry: policy(),
                     mode: None,
+                    config: None,
                 },
                 ActOp::Interrupt => Action::Interrupt {
                     interrupt_id: self.mint(),

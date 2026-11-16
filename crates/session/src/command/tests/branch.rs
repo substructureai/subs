@@ -116,12 +116,14 @@ fn lower(action: DecisionAction) -> Option<Action> {
             id,
             messages,
             tools,
+            model,
             ..
         } => Action::CallLlm {
             id: id.unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
             llm: "claude".to_string(),
             request: LlmRequest {
                 tools,
+                model: model.unwrap_or_else(|| "test-model".to_string()),
                 ..request_with(messages.clone().unwrap_or_default())
             },
             source: match messages {
@@ -156,6 +158,27 @@ fn lower(action: DecisionAction) -> Option<Action> {
         },
         DecisionAction::Done { data } => Action::Done { data },
         DecisionAction::Fail { error } => Action::Fail { error },
+        DecisionAction::SpawnSubagent {
+            session_id,
+            agent_id,
+            tool_call_id,
+            message,
+            mode,
+            ..
+        } => Action::SpawnSubagent {
+            config: (agent_id == "poet").then(|| {
+                Box::new(AgentConfig {
+                    system: Some("You write poems.".to_string()),
+                    ..agent_config("m-poet")
+                })
+            }),
+            session_id,
+            agent_id,
+            tool_call_id,
+            message,
+            retry: RetryPolicy::no_retry(),
+            mode,
+        },
         other => panic!("not lowered here: {other:?}"),
     })
 }
@@ -747,4 +770,215 @@ fn a_settled_call_keeps_no_prompt_and_builds_the_one_it_sent() {
             "{id}"
         );
     }
+}
+
+fn with_subagents(branch: crate::protocol::SubagentBranch, id: &str) -> Session {
+    let config = AgentConfig {
+        system: Some("be brief".to_string()),
+        subagents: vec![crate::protocol::Subagent {
+            id: id.to_string(),
+            description: "Looks into things.".to_string(),
+            defer: None,
+            prefix: None,
+            mode: None,
+            branch: Some(branch),
+        }],
+        ..agent_config("m1")
+    };
+    create_session_with_config("sess-s", "tenant-a", "user-1", Some(config))
+}
+
+fn delegating(agent: &str, call: &str, task: &str) -> LlmResponse {
+    LlmResponse {
+        tool_calls: vec![ToolCall {
+            id: call.to_string(),
+            call_type: "function".to_string(),
+            function: ToolCallFunction {
+                name: agent.to_string(),
+                arguments: serde_json::json!({ "message": task }).to_string(),
+            },
+        }],
+        ..calling(agent, call)
+    }
+}
+
+/// A turn whose model call hands `task` to the subagent, up to the
+/// branch's own first call.
+fn delegated(agent: &str, branch: crate::protocol::SubagentBranch) -> (Session, String) {
+    let mut agg = with_subagents(branch, agent);
+    user_turn(&mut agg, "u1", "why did the deploy fail?", "turn-1");
+    let (d, _) = live_decision(&agg);
+    submit_decision(
+        &mut agg,
+        d,
+        vec![node_msg("u1", Role::User, "why did the deploy fail?")],
+        vec![tree_call("c1")],
+    );
+    reply(
+        &mut agg,
+        "c1",
+        delegating(agent, "tc-r", "Find the causes."),
+    );
+    echo(&mut agg);
+    let sa = agg
+        .state
+        .subagent("tc-r")
+        .expect("the call started a subagent");
+    let branch = sa.session_id.clone();
+    assert!(sa.on_branch.is_some(), "on a branch, not a session");
+    let (d, trigger) = live_decision(&agg);
+    assert!(matches!(trigger, Trigger::BranchStarted { .. }));
+    assert_eq!(agg.state.decision_branch(&d), Some(branch.as_str()));
+    echo(&mut agg);
+    (agg, branch)
+}
+
+fn branch_call_id(agg: &Session, branch: &str) -> String {
+    agg.state
+        .effects_of(EffectKind::LlmCall)
+        .find(|e| e.branch.as_deref() == Some(branch))
+        .map(|e| e.id.clone())
+        .expect("the branch calls the model")
+}
+
+#[test]
+fn a_forked_subagent_reads_the_conversation_and_answers_its_call() {
+    let (mut agg, branch) = delegated("researcher", crate::protocol::SubagentBranch::Head);
+    let b = agg.state.open_branch(&branch).unwrap();
+    assert_eq!(b.from.as_deref(), Some("c1"), "it forks at the call");
+    assert_eq!(b.agent, BranchConfig::Inherit);
+
+    let call = branch_call_id(&agg, &branch);
+    let side = prompt_texts(&agg, &call);
+    let chat = prompt_texts(&agg, "c1");
+    assert_eq!(
+        side[..chat.len()],
+        chat[..],
+        "the fork keeps the cached prefix"
+    );
+    assert_eq!(
+        side[chat.len()..],
+        ["", crate::prompts::answers::FORKED, "Find the causes.",],
+        "the call it answers, then its task"
+    );
+
+    reply(&mut agg, &call, said("Three causes.", 100));
+    let events = echo(&mut agg);
+    assert_eq!(branch_closed(&events, &branch), Some(BranchEnd::Done));
+    let (_, trigger) = live_decision(&agg);
+    assert!(matches!(
+        trigger,
+        Trigger::SubagentFinished { ok: true, ref result, .. } if result.as_deref() == Some("Three causes.")
+    ));
+    echo(&mut agg);
+    let chat = agg.state.at_head().transcript();
+    let answered = chat
+        .iter()
+        .find(|m| m.tool_call_id.as_deref() == Some("tc-r"))
+        .unwrap();
+    assert!(text_of(answered).contains("Three causes."));
+    assert!(
+        text_of(answered).contains(&branch),
+        "it names the branch to continue"
+    );
+    let again = agg
+        .state
+        .effects_of(EffectKind::LlmCall)
+        .any(|e| e.branch.is_none() && e.id != "c1");
+    assert!(again, "the conversation goes on with the answer");
+}
+
+#[test]
+fn a_root_subagent_runs_clean_as_its_own_config() {
+    let (agg, branch) = delegated("poet", crate::protocol::SubagentBranch::Root);
+    let b = agg.state.open_branch(&branch).unwrap();
+    assert_eq!(b.from, None);
+    let call = branch_call_id(&agg, &branch);
+    assert_eq!(
+        prompt_texts(&agg, &call),
+        ["You write poems.", "Find the causes."]
+    );
+    assert_eq!(agg.state.llm_call(&call).unwrap().spec.model, "m-poet");
+}
+
+#[test]
+fn a_subagent_on_a_branch_ends_with_its_turn() {
+    let (mut agg, branch) = delegated("researcher", crate::protocol::SubagentBranch::Head);
+    dispatch(
+        &mut agg,
+        CommandPayload::CancelSession { drop_queued: false },
+        &frontend(),
+    );
+    assert!(agg.state.open_branch(&branch).is_none());
+    assert_eq!(
+        agg.state
+            .tracking(EffectKind::Subagent, "tc-r")
+            .unwrap()
+            .status(),
+        EffectStatus::Failed
+    );
+}
+
+#[test]
+fn a_detached_subagent_on_a_branch_reports_back_as_a_message() {
+    let mut agg = with_subagents(crate::protocol::SubagentBranch::Head, "researcher");
+    user_turn(&mut agg, "u1", "look into it", "turn-1");
+    let (d, _) = live_decision(&agg);
+    submit_decision(
+        &mut agg,
+        d,
+        vec![node_msg("u1", Role::User, "look into it")],
+        vec![tree_call("c1")],
+    );
+    let call = LlmResponse {
+        tool_calls: vec![ToolCall {
+            id: "tc-r".to_string(),
+            call_type: "function".to_string(),
+            function: ToolCallFunction {
+                name: "researcher".to_string(),
+                arguments: serde_json::json!({ "message": "dig", "mode": "detached" }).to_string(),
+            },
+        }],
+        ..calling("researcher", "tc-r")
+    };
+    reply(&mut agg, "c1", call);
+    echo(&mut agg);
+    let branch = agg.state.subagent("tc-r").unwrap().session_id.clone();
+    assert_eq!(
+        agg.state.open_branch(&branch).unwrap().mode,
+        BranchMode::Detached
+    );
+
+    for _ in 0..8 {
+        let Some(trigger) = live_decision_kind(&agg) else {
+            break;
+        };
+        let on_branch = {
+            let (d, _) = live_decision(&agg);
+            agg.state.decision_branch(&d).is_some()
+        };
+        if on_branch && matches!(trigger, Trigger::BranchStarted { .. }) {
+            echo(&mut agg);
+            continue;
+        }
+        if on_branch {
+            break;
+        }
+        echo(&mut agg);
+    }
+    let call = branch_call_id(&agg, &branch);
+    reply(&mut agg, &call, said("Found it.", 100));
+    echo(&mut agg);
+    assert!(agg.state.open_branch(&branch).is_none());
+    let notice = agg
+        .state
+        .queued_decisions()
+        .into_iter()
+        .find_map(|e| match &e.decision()?.trigger {
+            Trigger::SubagentNotice { messages, .. } => Some((e.branch.clone(), messages.clone())),
+            _ => None,
+        })
+        .expect("the result waits for the conversation's turn");
+    assert_eq!(notice.0, None);
+    assert!(text_of(&notice.1[0].clone().recorded(String::new())).contains("Found it."));
 }

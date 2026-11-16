@@ -1669,6 +1669,7 @@ fn flow_subagent_call() -> Trace {
             message: None,
             retry: RetryPolicy::no_retry(),
             mode: None,
+            config: None,
         }],
     );
     let child = t
@@ -1714,6 +1715,7 @@ fn flow_subagent_call() -> Trace {
             retry: RetryPolicy::no_retry(),
             decision_id: "d-2".to_string(),
             mode: None,
+            config: None,
         },
         &system(),
     );

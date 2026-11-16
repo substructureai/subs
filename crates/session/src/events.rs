@@ -151,6 +151,9 @@ pub struct BranchStarted {
     /// The turn a blocking branch belongs to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
+    /// The subagent call it answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -446,6 +449,18 @@ pub struct SubagentRequested {
     pub mode: SpawnMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// It runs on a branch named `session_id`, not in a session of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_branch: Option<SubagentOnBranch>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SubagentOnBranch {
+    /// It forks the path the call was made on. Otherwise it starts a root.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fork: bool,
+    #[serde(default)]
+    pub agent: BranchConfig,
 }
 
 fn is_blocking(mode: &SpawnMode) -> bool {

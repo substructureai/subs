@@ -58,7 +58,7 @@ impl SessionState {
         (path.last().map(|id| id.to_string()), path.len())
     }
 
-    fn branch_depth(&self, branch: Option<&str>) -> usize {
+    pub fn branch_depth(&self, branch: Option<&str>) -> usize {
         let mut depth = 0;
         let mut cursor = branch;
         while let Some(b) = cursor.and_then(|id| self.branches.get(id)) {
@@ -142,6 +142,11 @@ impl SessionState {
             leaf: branch.leaf.clone(),
         };
         let parent = branch.parent.clone();
+        if let Some(call) = branch.subagent.clone() {
+            let mut events = self.close_branch(id, reason, data.clone(), error.clone());
+            events.extend(self.subagent_branch_answer(ids, &call, data, error));
+            return events;
+        }
         let mut events = self.close_branch(id, reason, data, error);
         let voided = parent
             .as_deref()
@@ -308,6 +313,7 @@ impl Working {
             name: start.name.clone(),
             mode: start.mode,
             turn_id,
+            subagent: None,
         })));
         let known: HashSet<String> = self.nodes.iter().map(|n| n.message.id.clone()).collect();
         let mut parent_id = from;
@@ -352,6 +358,138 @@ impl Working {
             mode: BranchMode::Blocking,
         };
         self.start_branch(start, messages.into_iter().skip(shared).collect())
+    }
+
+    /// A subagent call that runs on a branch: the branch starts, or one it ran
+    /// on before goes on, with its task last, and its first decision asks the
+    /// worker to run it.
+    pub(super) fn start_subagent_branch(&mut self, call: &str) {
+        let Some(effect) = self.effect(EffectKind::Subagent, call) else {
+            return;
+        };
+        let Some(sa) = effect.subagent() else {
+            return;
+        };
+        let Some(on) = sa.on_branch.clone() else {
+            return;
+        };
+        let (branch, agent_id, message) = (
+            sa.session_id.clone(),
+            sa.agent_id.clone(),
+            sa.message.clone(),
+        );
+        let mode = match sa.mode {
+            crate::protocol::SpawnMode::Detached => BranchMode::Detached,
+            _ => BranchMode::Blocking,
+        };
+        let (parent, anchor) = (effect.branch.clone(), effect.anchor.clone());
+        let started = EffectKind::Subagent.spec();
+        self.then(|s| started.settle(s, call, effects::Outcome::SubagentStarted));
+        let turn_id = match mode {
+            BranchMode::Blocking if !self.detached(parent.as_deref()) => {
+                self.phase.active_turn_id().map(str::to_string)
+            }
+            _ => None,
+        };
+        let task = message.unwrap_or_else(|| DraftMessage {
+            id: None,
+            role: crate::protocol::Role::User,
+            content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            reasoning: None,
+        });
+        let (from, agent, mut own) = match self.branches.get(&branch) {
+            Some(b) => {
+                let leaf = b.at().map(str::to_string);
+                if let Some(missing) = leaf.as_deref().filter(|l| !self.has_node(l)) {
+                    if let Some(loaded) = self.outside.branch_to(&[missing], &self.state) {
+                        self.emit(EventPayload::BranchLoaded(BranchLoaded {
+                            seqs: loaded.seqs(),
+                        }));
+                        self.state.load_branch(&loaded);
+                    }
+                }
+                let Some(b) = self.branches.get(&branch) else {
+                    return;
+                };
+                if leaf.as_deref().is_some_and(|l| !self.has_node(l)) {
+                    let error = ErrorInfo::new(
+                        ErrorCode::Unroutable,
+                        crate::prompts::errors::subagent_branch_unloaded(&agent_id),
+                    );
+                    self.then(|s| {
+                        s.subagent_branch_answer(
+                            s.ids(),
+                            call,
+                            serde_json::Value::Null,
+                            Some(error),
+                        )
+                    });
+                    return;
+                }
+                (b.from.clone(), b.agent.clone(), leaf)
+            }
+            None => (anchor.clone().filter(|_| on.fork), on.agent.clone(), None),
+        };
+        let fresh = own.is_none();
+        self.emit(EventPayload::BranchStarted(Box::new(BranchStarted {
+            id: branch.clone(),
+            from: from.clone(),
+            parent,
+            agent: agent.clone(),
+            name: Some(agent_id),
+            mode,
+            turn_id,
+            subagent: Some(call.to_string()),
+        })));
+        if let BranchConfig::Config(config) = &agent {
+            self.then(|s| effects::connector::sync(s, config));
+        }
+        let mut messages = Vec::new();
+        if fresh && on.fork {
+            let asked = from
+                .as_deref()
+                .and_then(|f| self.nodes.iter().find(|n| n.message.id == f))
+                .map(|n| n.message.tool_calls.clone())
+                .unwrap_or_default();
+            messages.extend(asked.into_iter().map(|c| DraftMessage {
+                id: None,
+                role: crate::protocol::Role::Tool,
+                content: Some(crate::protocol::Content::Text(match c.id == call {
+                    true => crate::prompts::answers::FORKED.to_string(),
+                    false => crate::prompts::answers::FORK_SIBLING.to_string(),
+                })),
+                tool_calls: None,
+                tool_call_id: Some(c.id.clone()),
+                name: Some(c.function.name.clone()),
+                reasoning: None,
+            }));
+        }
+        messages.push(task);
+        if fresh {
+            own = from;
+        }
+        for draft in messages {
+            let message = draft.record(&self.ids);
+            let id = message.id.clone();
+            self.emit(EventPayload::NewMessage(NewMessage {
+                message,
+                parent_id: own.replace(id),
+                copied_from: None,
+                branch: Some(branch.clone()),
+            }));
+        }
+        let name = self.branches.get(&branch).and_then(|b| b.name.clone());
+        self.queue_decision_on(
+            Trigger::BranchStarted {
+                id: branch.clone(),
+                name,
+                mode,
+            },
+            Some(branch),
+        );
     }
 
     /// Runs `cmd` as work on `branch`.

@@ -2471,6 +2471,34 @@
         },
         {
           "additionalProperties": false,
+          "description": "A branch a subagent runs on started, with its task as its last\nmessage. Echo the proposed `llm.call` to run it.",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "mode": {
+              "$ref": "#/$defs/BranchMode"
+            },
+            "name": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "branch.started",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "mode"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
           "description": "A branch this conversation or branch started ended. `data` is what\nits `done` carried.",
           "properties": {
             "data": {},
@@ -4134,6 +4162,17 @@
       "additionalProperties": false,
       "description": "A subagent the model can delegate to. `id` names the child agent; the model\ncalls the tool [`Subagent::offered_name`] gives. Its input is one `message`.",
       "properties": {
+        "branch": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SubagentBranch"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Run it on a branch of this session instead of a session of its own."
+        },
         "defer": {
           "description": "Keep this tool out of the request. See [`LlmTool::defer`]. Absent ⇒\nthe agent's `defer_tools`.",
           "type": [
@@ -4170,6 +4209,22 @@
       ],
       "title": "Subagent",
       "type": "object"
+    },
+    "SubagentBranch": {
+      "description": "Where a subagent's branch starts.",
+      "oneOf": [
+        {
+          "const": "head",
+          "description": "A fork of the conversation where the call was made, running as this\nagent. It reads what came before, and shares its cache.",
+          "type": "string"
+        },
+        {
+          "const": "root",
+          "description": "A root of its own, running as the subagent's config.",
+          "type": "string"
+        }
+      ],
+      "title": "SubagentBranch"
     },
     "SubagentMode": {
       "description": "How calls to a subagent return. Configuration; each call carries a\n[`SpawnMode`].",

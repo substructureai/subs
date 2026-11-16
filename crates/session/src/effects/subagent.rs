@@ -6,10 +6,11 @@ use uuid::Uuid;
 
 use super::{decision_queued, fail, mismatched, void_events, KindSpec, Outcome, SettleError};
 use crate::command::SessionError;
-use crate::decision::Trigger;
+use crate::decision::{BranchConfig, Trigger};
 use crate::events::*;
 use crate::protocol::{
-    Content, DraftMessage, ErrorCode, ErrorInfo, RetryPolicy, Role, SpawnMode, SubagentMode, Usage,
+    Content, DraftMessage, ErrorCode, ErrorInfo, RetryPolicy, Role, SpawnMode, SubagentBranch,
+    SubagentMode, Usage,
 };
 use crate::state::{json_to_string, EffectKind, SessionState};
 use crate::Caller;
@@ -106,6 +107,7 @@ impl KindSpec for SubagentSpec {
             retry: t.retry_policy.clone(),
             mode: sa.mode,
             branch: effect.branch.clone(),
+            on_branch: sa.on_branch.clone(),
         })]
     }
 }
@@ -156,6 +158,7 @@ pub struct Spawn {
     pub retry: RetryPolicy,
     pub decision_id: String,
     pub mode: Option<SpawnMode>,
+    pub config: Option<Box<crate::protocol::AgentConfig>>,
 }
 
 pub fn request(
@@ -188,7 +191,7 @@ pub fn request(
         .at_scope(state.scope())
         .resolve_agent_for()
         .unwrap_or_default();
-    if !config.may_spawn_subagent(state.depth()) {
+    if !config.may_spawn_subagent(state.depth() + state.branch_depth(state.scope()) as u32) {
         let limit = config.depth_limit();
         return answer(ErrorInfo::new(
             ErrorCode::BudgetExceeded,
@@ -252,6 +255,7 @@ pub fn request(
                 retry: spawn.retry,
                 mode: SpawnMode::Wait,
                 branch: state.scope_branch(),
+                on_branch: None,
             })]);
         };
         let mut events = withdraw_notice(state, &session_id);
@@ -287,6 +291,32 @@ pub fn request(
             errors::subagent_detached(&spawn.agent_id),
         ));
     }
+    let on_branch = match spawn
+        .session_id
+        .as_deref()
+        .and_then(|s| state.subagent_session(s))
+    {
+        Some(sa) => sa.on_branch.clone(),
+        None => match config.subagent_branch(&spawn.agent_id) {
+            None => None,
+            Some(SubagentBranch::Head) => Some(SubagentOnBranch {
+                fork: true,
+                agent: BranchConfig::Inherit,
+            }),
+            Some(SubagentBranch::Root) => match spawn.config {
+                Some(own) => Some(SubagentOnBranch {
+                    fork: false,
+                    agent: BranchConfig::Config(own),
+                }),
+                None => {
+                    return answer(ErrorInfo::new(
+                        ErrorCode::Unroutable,
+                        errors::no_subagent_config(&spawn.agent_id),
+                    ))
+                }
+            },
+        },
+    };
     Ok(vec![EventPayload::SubagentRequested(SubagentRequested {
         id: spawn.tool_call_id,
         agent_id: spawn.agent_id,
@@ -295,6 +325,7 @@ pub fn request(
         retry: spawn.retry,
         mode,
         branch: state.scope_branch(),
+        on_branch,
     })])
 }
 
@@ -329,6 +360,84 @@ pub fn complete_turn(
             },
         ),
     ]
+}
+
+impl SessionState {
+    /// A detached subagent's answer: its result, and a message that tells the
+    /// conversation, folded into one waiting to.
+    pub fn detached_answer(
+        &self,
+        ids: &Ids,
+        session_id: &str,
+        agent_id: &str,
+        completed: SubagentTurnCompleted,
+    ) -> Vec<EventPayload> {
+        let notice = notice(session_id, agent_id, &completed);
+        let mut events = vec![EventPayload::SubagentTurnCompleted(completed)];
+        let (mut messages, mut sessions, notice_turn) = match self.queued_subagent_notice() {
+            Some(prior) => {
+                let queued = prior.decision_id.to_string();
+                let held = (
+                    prior.messages.to_vec(),
+                    prior.sessions.to_vec(),
+                    prior.turn_id.to_string(),
+                );
+                events.push(self.decision_dropped(&queued));
+                held
+            }
+            None => (Vec::new(), Vec::new(), ids.next()),
+        };
+        messages.push(notice);
+        sessions.push(session_id.to_string());
+        events.push(decision_queued(
+            ids,
+            Trigger::SubagentNotice {
+                messages,
+                sessions,
+                turn_id: notice_turn,
+            },
+        ));
+        events
+    }
+
+    /// The answer of a subagent that ran on a branch, once the branch ends.
+    pub fn subagent_branch_answer(
+        &self,
+        ids: &Ids,
+        call: &str,
+        data: serde_json::Value,
+        error: Option<ErrorInfo>,
+    ) -> Vec<EventPayload> {
+        let Some(sa) = self.subagent(call) else {
+            return Vec::new();
+        };
+        let completed = SubagentTurnCompleted {
+            id: call.to_string(),
+            cost: Decimal::ZERO,
+            token_usage: Usage::default(),
+            data,
+            turn_id: None,
+            error,
+        };
+        if sa.mode == SpawnMode::Detached {
+            return self.detached_answer(ids, &sa.session_id, &sa.agent_id, completed);
+        }
+        let finished = Trigger::SubagentFinished {
+            id: call.to_string(),
+            ok: completed.error.is_none(),
+            session_id: sa.session_id.clone(),
+            agent_id: sa.agent_id.clone(),
+            result: completed
+                .error
+                .is_none()
+                .then(|| json_to_string(&completed.data)),
+            error: completed.error.clone(),
+        };
+        vec![
+            EventPayload::SubagentTurnCompleted(completed),
+            decision_queued(ids, finished),
+        ]
+    }
 }
 
 pub fn notice(session_id: &str, agent_id: &str, completed: &SubagentTurnCompleted) -> DraftMessage {

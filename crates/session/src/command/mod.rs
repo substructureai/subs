@@ -90,6 +90,8 @@ pub enum CommandPayload {
         retry: RetryPolicy,
         decision_id: String,
         mode: Option<SpawnMode>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        config: Option<Box<AgentConfig>>,
     },
     CompleteSubagentTurn {
         session_id: String,
@@ -268,6 +270,7 @@ impl Action {
                 message,
                 retry,
                 mode,
+                config,
             } => Some(CommandPayload::RequestSubagent {
                 session_id,
                 agent_id,
@@ -276,6 +279,7 @@ impl Action {
                 retry,
                 decision_id: decision_id.to_string(),
                 mode,
+                config,
             }),
             Action::ToolResult {
                 id,
@@ -656,7 +660,15 @@ impl Working {
 
     fn dispatch(&mut self, kind: EffectKind, id: String) {
         let spec = kind.spec();
+        let on_branch = self
+            .subagent(&id)
+            .filter(|_| kind == EffectKind::Subagent)
+            .is_some_and(|sa| sa.on_branch.is_some());
         self.then(|s| spec.dispatch(s, &id));
+        if on_branch {
+            self.start_subagent_branch(&id);
+            return;
+        }
         if let Some(trigger) = spec.execute_trigger(&self.state, &id) {
             let queued = decision_queued(&self.ids, trigger);
             self.emit(queued);
@@ -1284,6 +1296,7 @@ impl Working {
                 retry,
                 decision_id,
                 mode,
+                config,
             } => self
                 .try_then(|s| {
                     effects::subagent::request(
@@ -1296,6 +1309,7 @@ impl Working {
                             retry,
                             decision_id,
                             mode,
+                            config,
                         },
                         caller,
                     )
@@ -1352,33 +1366,7 @@ impl Working {
                     turn_id: Some(turn_id),
                     error,
                 };
-                let notice = effects::subagent::notice(&session_id, &agent_id, &completed);
-                let mut events = vec![EventPayload::SubagentTurnCompleted(completed)];
-                let (mut messages, mut sessions, notice_turn) =
-                    match self.state.queued_subagent_notice() {
-                        Some(prior) => {
-                            let queued = prior.decision_id.to_string();
-                            let held = (
-                                prior.messages.to_vec(),
-                                prior.sessions.to_vec(),
-                                prior.turn_id.to_string(),
-                            );
-                            events.push(self.state.decision_dropped(&queued));
-                            held
-                        }
-                        None => (Vec::new(), Vec::new(), self.ids.next()),
-                    };
-                messages.push(notice);
-                sessions.push(session_id);
-                events.push(decision_queued(
-                    &self.ids,
-                    Trigger::SubagentNotice {
-                        messages,
-                        sessions,
-                        turn_id: notice_turn,
-                    },
-                ));
-                self.then(|_| events);
+                self.then(|s| s.detached_answer(s.ids(), &session_id, &agent_id, completed));
                 Ok(())
             }
 

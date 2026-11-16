@@ -405,6 +405,7 @@ mod tests {
                 result: None,
                 is_error: false,
                 mode: Default::default(),
+                on_branch: None,
             }),
         ));
     }

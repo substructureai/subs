@@ -178,6 +178,16 @@ pub fn unapproved_detached(tool: &str) -> String {
     format!("`{tool}` needs a person's approval, and this work runs in the background where nobody can give it")
 }
 
+/// A subagent's earlier branch, not loaded to go on from.
+pub fn subagent_branch_unloaded(agent: &str) -> String {
+    format!("the earlier work of `{agent}` could not be loaded to continue; start it again without `session`")
+}
+
+/// A subagent set to run on a root branch with no config to run as.
+pub fn no_subagent_config(agent: &str) -> String {
+    format!("`{agent}` runs on a branch, but no [agent.{agent}] gives it a config")
+}
+
 /// A detached subagent asked for from a branch.
 pub const DETACHED_ON_BRANCH: &str = "a branch cannot start a detached subagent; call it blocking";
 

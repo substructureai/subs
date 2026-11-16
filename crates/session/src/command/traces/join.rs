@@ -356,6 +356,7 @@ fn a_joined_message_waits_for_a_subagent() {
             message: None,
             retry: RetryPolicy::no_retry(),
             mode: None,
+            config: None,
         }],
     );
     t.join(user_message("ask it briefly"), "turn-2", &[]);

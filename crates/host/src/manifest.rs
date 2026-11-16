@@ -670,6 +670,7 @@ impl AgentSection {
                 defer: sub.defer(),
                 prefix: sub.prefix(),
                 mode: sub.mode().or(self.subagent_mode),
+                branch: sub.branch(),
             })
             .collect()
     }
@@ -939,7 +940,7 @@ impl RefEntry for McpEntry {
 
 impl RefEntry for SubagentEntry {
     const EXPECTING: &'static str =
-        "an agent id, or a table with `id`, `defer`, `prefix`, and `mode`";
+        "an agent id, or a table with `id`, `defer`, `prefix`, `mode`, and `branch`";
     fn id(&self) -> &str {
         &self.id
     }
@@ -962,9 +963,17 @@ pub struct SubagentEntry {
     pub prefix: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<SubagentMode>,
+    /// Run it on a branch of the calling session: `head` forks the
+    /// conversation, `root` starts clean as the subagent's config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<crate::protocol::SubagentBranch>,
 }
 
 impl Ref<SubagentEntry> {
+    fn branch(&self) -> Option<crate::protocol::SubagentBranch> {
+        self.entry().and_then(|e| e.branch)
+    }
+
     fn defer(&self) -> Option<bool> {
         self.entry().and_then(|e| e.defer)
     }
@@ -1410,6 +1419,7 @@ fn check_subagent(sub: &SubagentRef, section: &AgentSection, manifest: &Manifest
         defer: sub.defer(),
         prefix: sub.prefix(),
         mode: None,
+        branch: None,
     };
     let offered = wire.offered_name();
     if section.tools.iter().any(|t| t.name == offered) {
@@ -1790,6 +1800,7 @@ mod tests {
                 mode: None,
                 id: "poet".to_string(),
                 description: "Writes a haiku.".to_string(),
+                branch: None
             }],
             "declared once, on the agent it describes"
         );
@@ -1823,6 +1834,18 @@ mod tests {
             vec![Some(SubagentMode::Detached), Some(SubagentMode::Any)],
             "the entry's own mode wins over the agent's default"
         );
+    }
+
+    #[test]
+    fn a_subagent_entry_can_run_it_on_a_branch() {
+        let m = team(
+            r#"subagents = [{ id = "poet", branch = "root" }]"#,
+            r#"description = "Writes a haiku.""#,
+        );
+        m.validate().unwrap();
+        let agents = m.agents();
+        let subs = &agents["assistant"].config.as_ref().unwrap().subagents;
+        assert_eq!(subs[0].branch, Some(crate::protocol::SubagentBranch::Root));
     }
 
     #[test]
@@ -1943,6 +1966,7 @@ mod tests {
                 defer: Some(true),
                 prefix: Some(true),
                 mode: None,
+                branch: None
             }]
         );
     }

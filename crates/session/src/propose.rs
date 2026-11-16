@@ -209,6 +209,7 @@ fn derive(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionRespon
             joining || pending_calls > 0,
             p.detached,
         )),
+        DecisionTrigger::BranchStarted { .. } => config.map(|c| resumed(transcript, c, false)),
         DecisionTrigger::BranchFinished { mode, .. } => Some(branch_finished(
             *mode,
             transcript,
@@ -1632,6 +1633,7 @@ mod tests {
                 defer: None,
                 prefix: None,
                 mode: None,
+                branch: None,
             }],
             ..Default::default()
         }

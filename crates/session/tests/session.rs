@@ -418,6 +418,7 @@ fn a_voided_subagent_call_mails_its_child_a_cancel() {
                     retry: RetryPolicy::no_retry(),
                     decision_id: "d-spawn".into(),
                     mode: None,
+                    config: None,
                 },
             ),
         )

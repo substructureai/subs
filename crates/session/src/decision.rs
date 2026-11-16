@@ -312,6 +312,14 @@ pub enum Trigger {
         #[serde(default)]
         usage: Usage,
     },
+    #[serde(rename = "branch.started")]
+    BranchStarted {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default)]
+        mode: BranchMode,
+    },
     #[serde(rename = "branch.finished")]
     BranchFinished {
         id: String,
@@ -563,6 +571,9 @@ pub enum Action {
         retry: RetryPolicy,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mode: Option<SpawnMode>,
+        /// The subagent's own config, for one that runs on a root branch.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        config: Option<Box<AgentConfig>>,
     },
     #[serde(rename = "system1.call")]
     CallSystem1 {

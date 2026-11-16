@@ -1393,6 +1393,7 @@ mod tests {
             defer,
             prefix,
             mode: None,
+            branch: None,
         }
     }
 

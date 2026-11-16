@@ -357,6 +357,7 @@ impl Session {
             }],
             EventPayload::CallVoided(v) if v.kind == EffectKind::Subagent => state
                 .subagent(&v.id)
+                .filter(|sa| sa.on_branch.is_none())
                 .map(|sa| Mail {
                     to: sa.session_id.clone(),
                     command: self
@@ -629,7 +630,7 @@ impl Session {
     fn subagent(&self, id: &str) -> Option<Work> {
         let state = &self.state;
         let effect = self.open(EffectKind::Subagent, id, None)?;
-        let sa = effect.subagent()?;
+        let sa = effect.subagent().filter(|sa| sa.on_branch.is_none())?;
         let mut ancestry = state.ancestry.clone();
         ancestry.push(self.id.clone());
         Some(Work::StartSubagent {

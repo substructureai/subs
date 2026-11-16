@@ -209,9 +209,11 @@ impl Session {
                     outside.load(store, state, id)?;
                 }
                 let promoted = actions.iter().filter_map(|a| match a {
-                    crate::decision::Action::PromoteBranch { id } => {
-                        state.branches.get(id)?.leaf.as_deref()
-                    }
+                    crate::decision::Action::PromoteBranch { id }
+                    | crate::decision::Action::SpawnSubagent {
+                        session_id: Some(id),
+                        ..
+                    } => state.branches.get(id)?.leaf.as_deref(),
                     _ => None,
                 });
                 for leaf in promoted {

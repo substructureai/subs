@@ -182,6 +182,7 @@ mod tests {
             defer: None,
             prefix: None,
             mode: None,
+            branch: None,
         }
     }
 

@@ -1335,6 +1335,10 @@ impl AgentConfig {
     pub fn subagent_mode(&self, agent_id: &str) -> Option<SubagentMode> {
         self.subagents.iter().find(|s| s.id == agent_id)?.mode
     }
+
+    pub fn subagent_branch(&self, agent_id: &str) -> Option<SubagentBranch> {
+        self.subagents.iter().find(|s| s.id == agent_id)?.branch
+    }
 }
 
 /// What shape an agent's subagents take as tools.
@@ -1817,6 +1821,21 @@ pub struct Subagent {
     pub prefix: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<SubagentMode>,
+    /// Run it on a branch of this session instead of a session of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<SubagentBranch>,
+}
+
+/// Where a subagent's branch starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(title = "SubagentBranch")]
+pub enum SubagentBranch {
+    /// A fork of the conversation where the call was made, running as this
+    /// agent. It reads what came before, and shares its cache.
+    Head,
+    /// A root of its own, running as the subagent's config.
+    Root,
 }
 
 impl Subagent {
@@ -2774,6 +2793,15 @@ pub enum DecisionTrigger {
         #[serde(flatten)]
         resumption: InterruptResumption,
     },
+    /// A branch a subagent runs on started, with its task as its last
+    /// message. Echo the proposed `llm.call` to run it.
+    #[serde(rename = "branch.started")]
+    BranchStarted {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        mode: BranchMode,
+    },
     /// A branch this conversation or branch started ended. `data` is what
     /// its `done` carried.
     #[serde(rename = "branch.finished")]
@@ -2826,6 +2854,7 @@ impl DecisionTrigger {
             Self::SubagentFinished { .. } => "subagent.finished",
             Self::System1Finished { .. } => "system1.finished",
             Self::InterruptResumed { .. } => "interrupt.resumed",
+            Self::BranchStarted { .. } => "branch.started",
             Self::BranchFinished { .. } => "branch.finished",
             Self::TurnFinished { .. } => "turn.finished",
         }

@@ -534,6 +534,11 @@ async fn lower_actions(
                     retry,
                     mode,
                 } => Action::SpawnSubagent {
+                    config: config
+                        .and_then(|c| c.subagent_branch(&agent_id))
+                        .filter(|b| *b == crate::protocol::SubagentBranch::Root)
+                        .and_then(|_| agents(&agent_id))
+                        .map(Box::new),
                     session_id,
                     agent_id,
                     tool_call_id,

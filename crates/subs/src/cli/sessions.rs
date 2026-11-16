@@ -841,6 +841,7 @@ mod cancel_tests {
                 retry: RetryPolicy::no_retry(),
                 decision_id: "d".into(),
                 mode: None,
+                config: None,
             },
         );
         let child = parent
@@ -869,6 +870,7 @@ mod cancel_tests {
                 retry: RetryPolicy::no_retry(),
                 decision_id: "d2".into(),
                 mode: None,
+                config: None,
             },
         )
         .state()
