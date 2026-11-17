@@ -693,6 +693,7 @@ mod tests {
     fn llm_requested(id: &str, branch: Option<&str>) -> EventPayload {
         let mut requested = json!({
             "type": "llm.call.requested",
+            "handler": "server", "defer_tools_strategy": crate::protocol::DeferToolsStrategy::default(),
             "id": id,
             "attempt": 0,
             "llm": "claude",
@@ -779,7 +780,7 @@ mod tests {
         assert_eq!(kinds(&c), ["TEXT_MESSAGE_END"]);
 
         let d = vals(t.on_event(
-            ev(json!({"type": "turn.completed", "turn_id": "r1"})),
+            ev(json!({"type": "turn.completed", "turn_id": "r1", "turn_cost": "0", "turn_token_usage": crate::protocol::Usage::default(), "turn_calls": substructure_session::events::TurnCalls::default()})),
             false,
         ));
         assert_eq!(kinds(&d), ["RUN_FINISHED"]);
@@ -895,7 +896,7 @@ mod tests {
         let mut t = AgUiTranslator::new("t1".into(), "r1".into());
         t.on_event(
             ev(json!({
-                "type": "llm.call.requested", "id": "c1", "attempt": 0, "llm": "claude",
+                "type": "llm.call.requested", "handler": "server", "defer_tools_strategy": crate::protocol::DeferToolsStrategy::default(), "id": "c1", "attempt": 0, "llm": "claude",
                 "request": {"model": "m", "messages": []}, "stream": true,
                 "retry": serde_json::from_str::<Value>(RETRY).unwrap(),
             })),
@@ -1000,6 +1001,7 @@ mod tests {
         let d = vals(t.on_event(
             ev(json!({
                 "type": "turn.completed", "turn_id": "r1", "data": {"answer": 42},
+                "turn_cost": "0", "turn_token_usage": crate::protocol::Usage::default(), "turn_calls": substructure_session::events::TurnCalls::default(),
             })),
             false,
         ));
@@ -1074,7 +1076,7 @@ mod tests {
         let mut t = AgUiTranslator::new("t1".into(), "r1".into());
         t.on_event(
             ev(json!({
-                "type": "llm.call.requested", "id": "c9", "attempt": 0, "llm": "claude",
+                "type": "llm.call.requested", "handler": "server", "defer_tools_strategy": crate::protocol::DeferToolsStrategy::default(), "id": "c9", "attempt": 0, "llm": "claude",
                 "request": {"model": "m", "messages": []}, "stream": true,
                 "retry": serde_json::from_str::<Value>(RETRY).unwrap(),
             })),
@@ -1248,7 +1250,7 @@ mod tests {
         assert_eq!(kinds(&r2), ["TOOL_CALL_RESULT"]);
         assert!(!t.terminated());
         let end = vals(t.on_event(
-            ev(json!({"type": "turn.completed", "turn_id": "r1"})),
+            ev(json!({"type": "turn.completed", "turn_id": "r1", "turn_cost": "0", "turn_token_usage": crate::protocol::Usage::default(), "turn_calls": substructure_session::events::TurnCalls::default()})),
             false,
         ));
         assert_eq!(kinds(&end), ["RUN_FINISHED"]);
@@ -1304,14 +1306,14 @@ mod tests {
     fn nothing_emitted_after_termination() {
         let mut t = AgUiTranslator::new("t1".into(), "r1".into());
         let _ = t.on_event(
-            ev(json!({"type": "turn.completed", "turn_id": "r1"})),
+            ev(json!({"type": "turn.completed", "turn_id": "r1", "turn_cost": "0", "turn_token_usage": crate::protocol::Usage::default(), "turn_calls": substructure_session::events::TurnCalls::default()})),
             false,
         );
         assert!(t.terminated());
         assert!(t.on_delta(delta("c1", "r1", "late")).is_empty());
         assert!(t
             .on_event(
-                ev(json!({"type": "turn.completed", "turn_id": "r1"})),
+                ev(json!({"type": "turn.completed", "turn_id": "r1", "turn_cost": "0", "turn_token_usage": crate::protocol::Usage::default(), "turn_calls": substructure_session::events::TurnCalls::default()})),
                 false
             )
             .is_empty());
@@ -1360,6 +1362,8 @@ mod tests {
     fn subagent_turn_completed(tool_id: &str, data: Value) -> EventPayload {
         ev(json!({
             "type": "subagent.turn_completed",
+            "cost": "0",
+            "token_usage": crate::protocol::Usage::default(),
             "id": tool_id,
             "data": data,
         }))
@@ -1393,7 +1397,7 @@ mod tests {
         assert!(!t.terminated());
 
         let end = vals(t.on_event(
-            ev(json!({"type": "turn.completed", "turn_id": "r1"})),
+            ev(json!({"type": "turn.completed", "turn_id": "r1", "turn_cost": "0", "turn_token_usage": crate::protocol::Usage::default(), "turn_calls": substructure_session::events::TurnCalls::default()})),
             false,
         ));
         assert_eq!(kinds(&end), ["RUN_FINISHED"]);
@@ -1461,6 +1465,7 @@ mod tests {
         let err = vals(t.on_event(
             ev(json!({
                 "type": "subagent.errored",
+                "retryable": false,
                 "id": "call-1",
                 "error": {"message": "child boom", "code": "internal"},
             })),
@@ -1526,7 +1531,7 @@ mod tests {
     fn normal_completion_has_no_outcome() {
         let mut t = AgUiTranslator::new("t1".into(), "r1".into());
         let e = vals(t.on_event(
-            ev(json!({"type": "turn.completed", "turn_id": "r1"})),
+            ev(json!({"type": "turn.completed", "turn_id": "r1", "turn_cost": "0", "turn_token_usage": crate::protocol::Usage::default(), "turn_calls": substructure_session::events::TurnCalls::default()})),
             false,
         ));
         assert_eq!(kinds(&e), ["RUN_FINISHED"]);

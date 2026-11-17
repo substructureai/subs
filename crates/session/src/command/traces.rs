@@ -437,7 +437,6 @@ impl Trace {
 
 fn call_llm(id: &str, retry: RetryPolicy) -> Action {
     Action::CallLlm {
-        source: Default::default(),
         llm: "claude".to_string(),
         format: None,
         id: id.to_string(),
@@ -1800,7 +1799,6 @@ fn flow_direct_commands_then_cancel() -> Trace {
 
     t.run(
         CommandPayload::RequestLlmCall {
-            source: Default::default(),
             llm: "claude".to_string(),
             call_id: "call-1".to_string(),
             request: llm_request(),

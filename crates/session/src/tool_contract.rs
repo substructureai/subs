@@ -230,7 +230,6 @@ mod tests {
             "call-1",
             EffectTracking::new(RetryPolicy::no_retry(), chrono::Utc::now()),
             EffectPayload::LlmCall(LlmCallState {
-                source: Default::default(),
                 defer_tools_strategy: Default::default(),
                 reads_from: None,
                 sent_tools: None,

@@ -325,7 +325,6 @@ fn settle_with_output_contract(result: &str) -> (Session, Vec<EventPayload>) {
     dispatch(
         &mut agg,
         CommandPayload::RequestLlmCall {
-            source: Default::default(),
             llm: "claude".to_string(),
             call_id: "call-1".to_string(),
             request: LlmRequest {
@@ -1172,7 +1171,6 @@ fn request_llm_call_emits_requested() {
     let events = dispatch(
         &mut agg,
         CommandPayload::RequestLlmCall {
-            source: Default::default(),
             llm: "claude".to_string(),
             call_id: "llm-1".to_string(),
             request: LlmRequest {
@@ -1275,7 +1273,6 @@ fn a_call_that_brings_messages_reads_them_on_a_branch_of_its_own() {
     let events = dispatch(
         &mut agg,
         CommandPayload::RequestLlmCall {
-            source: Default::default(),
             llm: "claude".to_string(),
             call_id: "llm-1".to_string(),
             request: request_with(vec![
@@ -2054,7 +2051,6 @@ fn complete_llm_call_emits_completed() {
     dispatch(
         &mut agg,
         CommandPayload::RequestLlmCall {
-            source: Default::default(),
             llm: "claude".to_string(),
             call_id: "llm-1".to_string(),
             request: LlmRequest {
@@ -2212,7 +2208,6 @@ fn fail_llm_call_emits_errored() {
     dispatch(
         &mut agg,
         CommandPayload::RequestLlmCall {
-            source: Default::default(),
             llm: "claude".to_string(),
             call_id: "llm-1".to_string(),
             request: LlmRequest {
@@ -2285,7 +2280,6 @@ fn a_retried_call_sends_what_it_sent_before() {
     dispatch(
         &mut agg,
         CommandPayload::RequestLlmCall {
-            source: Default::default(),
             llm: "claude".to_string(),
             call_id: "llm-1".to_string(),
             request: test_llm_request(),
@@ -2353,7 +2347,6 @@ fn worker_handled_llm_call_emits_request_trigger() {
     let events = dispatch(
         &mut agg,
         CommandPayload::RequestLlmCall {
-            source: Default::default(),
             llm: "claude".to_string(),
             call_id: "llm-1".to_string(),
             request: test_llm_request(),
@@ -2408,7 +2401,6 @@ fn server_handled_llm_call_does_not_emit_request_trigger() {
     let events = dispatch(
         &mut agg,
         CommandPayload::RequestLlmCall {
-            source: Default::default(),
             llm: "claude".to_string(),
             call_id: "llm-1".to_string(),
             request: test_llm_request(),
@@ -2446,7 +2438,6 @@ fn return_llm_result_completes_worker_handled_call() {
     let request_events = dispatch(
         &mut agg,
         CommandPayload::RequestLlmCall {
-            source: Default::default(),
             llm: "claude".to_string(),
             call_id: "llm-1".to_string(),
             request: test_llm_request(),
@@ -4879,7 +4870,6 @@ fn a_failed_action_decision_does_not_end_the_running_turn() {
             decision_id: first,
             transcript: vec![],
             actions: vec![Action::CallLlm {
-                source: Default::default(),
                 id: "call-1".to_string(),
                 llm: "claude".to_string(),
                 request: LlmRequest {
@@ -5057,7 +5047,6 @@ fn interrupt_action_voids_llm_calls_requested_in_the_same_submit() {
             transcript: vec![node_msg("u1", Role::User, "hi")],
             actions: vec![
                 Action::CallLlm {
-                    source: Default::default(),
                     llm: "claude".to_string(),
                     id: "llm-1".to_string(),
                     request: request_with(vec![]),
@@ -6132,7 +6121,6 @@ fn an_in_flight_async_sibling_keeps_a_fast_tool_from_prompting() {
 
 fn call_llm_action(id: &str, handler: LlmHandler) -> Action {
     Action::CallLlm {
-        source: Default::default(),
         llm: "claude".to_string(),
         format: None,
         id: id.to_string(),
@@ -6161,7 +6149,6 @@ fn request_llm(agg: &mut Session, id: &str, handler: LlmHandler) -> Vec<EventPay
     dispatch(
         agg,
         CommandPayload::RequestLlmCall {
-            source: Default::default(),
             llm: "claude".to_string(),
             call_id: id.to_string(),
             request: request_with(vec![]),
@@ -7938,7 +7925,6 @@ fn connector_tools_reach_the_model_and_route_to_the_engine() {
     let events = dispatch(
         &mut agg,
         CommandPayload::RequestLlmCall {
-            source: Default::default(),
             llm: "claude".to_string(),
             call_id: "call-1".to_string(),
             request: LlmRequest {
@@ -8126,7 +8112,6 @@ fn a_connection_is_announced_once_in_the_system_prefix() {
         dispatch(
             agg,
             CommandPayload::RequestLlmCall {
-                source: Default::default(),
                 llm: "claude".to_string(),
                 call_id: id.to_string(),
                 request: request_with(vec![]),
@@ -8174,7 +8159,6 @@ fn send_at_head(agg: &mut Session, id: &str) -> Vec<Message> {
     dispatch(
         agg,
         CommandPayload::RequestLlmCall {
-            source: PromptSource::tree(),
             llm: "claude".to_string(),
             call_id: id.to_string(),
             request: request_with(Vec::new()),
@@ -8312,7 +8296,6 @@ fn announce_never_says_nothing() {
     dispatch(
         &mut agg,
         CommandPayload::RequestLlmCall {
-            source: Default::default(),
             llm: "claude".to_string(),
             call_id: "call-1".to_string(),
             request: request_with(vec![]),
@@ -8336,7 +8319,6 @@ fn a_searched_connector_offers_two_tools_however_many_it_has() {
     let events = dispatch(
         &mut agg,
         CommandPayload::RequestLlmCall {
-            source: Default::default(),
             llm: "claude".to_string(),
             call_id: "call-1".to_string(),
             request: LlmRequest {
@@ -9536,7 +9518,6 @@ fn a_re_prompt_does_not_offer_a_connector_tool_twice() {
     let events = dispatch(
         &mut agg,
         CommandPayload::RequestLlmCall {
-            source: Default::default(),
             llm: "claude".to_string(),
             call_id: "call-1".to_string(),
             request: already,
@@ -11389,15 +11370,15 @@ fn interrupt_voiding_is_scoped_to_the_parked_path() {
             branch: None,
         })
     };
-    let llm = |id: &str| {
+    let llm = |id: &str, at: &str| {
         EventPayload::LlmCallRequested(LlmCallRequested {
-            source: Default::default(),
             defer_tools_strategy: Default::default(),
             llm: "claude".to_string(),
             format: None,
             id: id.to_string(),
             attempt: 0,
             request: request_with(vec![]),
+            at: Some(at.to_string()),
             stream: false,
             retry: RetryPolicy::no_retry(),
             handler: LlmHandler::Server,
@@ -11405,9 +11386,9 @@ fn interrupt_voiding_is_scoped_to_the_parked_path() {
         })
     };
     agg.commit(vec![msg("u1", None), msg("a1", Some("u1"))], &ctx);
-    agg.commit(vec![llm("L1")], &ctx);
+    agg.commit(vec![llm("L1", "a1")], &ctx);
     agg.commit(vec![msg("e1", Some("u1"))], &ctx);
-    agg.commit(vec![llm("L2")], &ctx);
+    agg.commit(vec![llm("L2", "e1")], &ctx);
 
     let events = interrupt(&mut agg, "int-1");
     assert_eq!(
@@ -12469,7 +12450,6 @@ fn the_catalog_rides_the_first_prompt_once() {
         dispatch(
             agg,
             CommandPayload::RequestLlmCall {
-                source: Default::default(),
                 llm: "claude".to_string(),
                 call_id: id.to_string(),
                 request: request_with(vec![]),
@@ -12821,7 +12801,6 @@ fn an_open_system1_call_holds_the_turn_until_done_voids_it() {
         vec![
             system1_call("s1-1"),
             Action::CallLlm {
-                source: Default::default(),
                 id: "llm-1".to_string(),
                 llm: "claude".to_string(),
                 request: request_with(vec![]),
@@ -12926,7 +12905,6 @@ fn a_call_with_a_temperature_reads_back_from_the_log_and_the_snapshot() {
     let events = dispatch(
         &mut agg,
         CommandPayload::RequestLlmCall {
-            source: Default::default(),
             llm: "claude".to_string(),
             call_id: "llm-1".to_string(),
             request: LlmRequest {
@@ -12994,7 +12972,6 @@ fn dispatched_tools(agg: &mut Session, call_id: &str) -> Vec<String> {
     dispatch(
         agg,
         CommandPayload::RequestLlmCall {
-            source: Default::default(),
             llm: "claude".to_string(),
             call_id: call_id.to_string(),
             request: LlmRequest {
@@ -13618,8 +13595,7 @@ fn work_from(agg: &Session, events: Vec<EventPayload>) -> Vec<crate::Work> {
             span: SpanContext::root(),
             occurred_at: at,
             payload,
-            meta: serde_json::from_value(serde_json::json!({ "status": SessionStatus::Idle }))
-                .unwrap(),
+            meta: agg.state.event_meta(at),
             start_time: at,
             end_time: at,
             command_id: None,
@@ -14012,7 +13988,6 @@ fn code_mode_sends_the_same_tools_on_every_call() {
     dispatch(
         &mut agg,
         CommandPayload::RequestLlmCall {
-            source: Default::default(),
             llm: "claude".to_string(),
             call_id: "call-2".to_string(),
             request: LlmRequest {
@@ -14460,11 +14435,10 @@ fn leaving_a_branch_voids_a_script_and_its_calls() {
     assert_script_gone(&mut agg, &events, &child);
 }
 
-fn send(agg: &mut Session, id: &str, source: PromptSource, messages: Vec<DraftMessage>) {
+fn send(agg: &mut Session, id: &str, messages: Vec<DraftMessage>) {
     dispatch(
         agg,
         CommandPayload::RequestLlmCall {
-            source,
             llm: "claude".to_string(),
             call_id: id.to_string(),
             request: request_with(messages),
@@ -14527,7 +14501,7 @@ fn a_tree_call_reads_the_config_the_context_and_the_path() {
     let requested = send_events(&mut agg, "call-1");
     assert!(
         matches!(&requested, Some(r) if r.request.messages.is_empty()
-            && r.source == PromptSource::Tree { at: Some("u1".to_string()) }),
+            && r.at.as_deref() == Some("u1")),
         "the request names the node it reads from and holds no prompt: {requested:?}"
     );
     let first = sent(&agg, "call-1");
@@ -14540,7 +14514,7 @@ fn a_tree_call_reads_the_config_the_context_and_the_path() {
     assert_eq!(placed_by(&agg, "call-1")[0].ids, ["skill.visits"]);
 
     record(&mut agg, "more", vec![u1, a1, u2]);
-    send(&mut agg, "call-2", PromptSource::tree(), vec![]);
+    send(&mut agg, "call-2", vec![]);
     let second = sent(&agg, "call-2");
     assert_eq!(second[..3], first[..], "the next turn reads the same start");
     assert_eq!(
@@ -14560,7 +14534,6 @@ fn send_events(agg: &mut Session, id: &str) -> Option<LlmCallRequested> {
     dispatch(
         agg,
         CommandPayload::RequestLlmCall {
-            source: PromptSource::tree(),
             llm: "claude".to_string(),
             call_id: id.to_string(),
             request: request_with(vec![]),
@@ -14583,13 +14556,13 @@ fn an_explicit_call_is_sent_as_written_and_tells_the_path_nothing() {
     let mut agg = skilled_session();
     let u1 = node_msg("u1", Role::User, "hi");
     record(&mut agg, "hi", vec![u1.clone()]);
-    send(&mut agg, "call-1", PromptSource::tree(), vec![]);
+    send(&mut agg, "call-1", vec![]);
 
     let a1 = node_msg("a1", Role::Assistant, "hello");
     let u2 = node_msg("u2", Role::User, "more");
     record(&mut agg, "more", vec![u1, a1, u2]);
     let title = vec![node_msg("", Role::User, "write a 3-word title")];
-    send(&mut agg, "title-1", PromptSource::Explicit, title);
+    send(&mut agg, "title-1", title);
     assert_eq!(
         sent(&agg, "title-1"),
         [(Role::User, "write a 3-word title".to_string())],
@@ -14603,11 +14576,11 @@ fn an_explicit_call_first_leaves_the_context_for_the_tree_call() {
     let mut agg = skilled_session();
     record(&mut agg, "hi", vec![node_msg("u1", Role::User, "hi")]);
     let title = vec![node_msg("", Role::User, "write a 3-word title")];
-    send(&mut agg, "title-1", PromptSource::Explicit, title);
+    send(&mut agg, "title-1", title);
     assert_eq!(sent(&agg, "title-1").len(), 1, "nothing is merged");
     assert!(agg.state.placed().is_empty(), "nothing is said");
 
-    send(&mut agg, "call-1", PromptSource::tree(), vec![]);
+    send(&mut agg, "call-1", vec![]);
     let first = sent(&agg, "call-1");
     assert_eq!(first[1].0, Role::System, "the system prompt was still open");
     assert!(first[1].1.contains("\"skill\":\"visits\""), "{first:?}");
@@ -14618,7 +14591,7 @@ fn a_continuation_of_a_tree_call_leaves_the_prompt_to_the_tree() {
     let mut agg = skilled_session();
     let u1 = node_msg("u1", Role::User, "hi");
     record(&mut agg, "hi", vec![u1.clone()]);
-    send(&mut agg, "call-1", PromptSource::tree(), vec![]);
+    send(&mut agg, "call-1", vec![]);
     let first = sent(&agg, "call-1");
 
     let a1 = DraftMessage {
@@ -14645,7 +14618,7 @@ fn a_continuation_of_a_tree_call_leaves_the_prompt_to_the_tree() {
     };
     assert!(messages.is_none(), "an echo carries no prompt");
 
-    send(&mut agg, "call-2", PromptSource::tree(), vec![]);
+    send(&mut agg, "call-2", vec![]);
     let second = sent(&agg, "call-2");
     assert_eq!(second[..first.len()], first[..], "the same start");
     assert_eq!(second.len(), first.len() + 2);
@@ -14653,49 +14626,37 @@ fn a_continuation_of_a_tree_call_leaves_the_prompt_to_the_tree() {
 }
 
 #[test]
-fn a_tree_call_survives_a_snapshot_and_an_older_one_loads_as_legacy() {
+fn a_call_survives_a_snapshot() {
     let mut agg = skilled_session();
     let u1 = node_msg("u1", Role::User, "hi");
     record(&mut agg, "hi", vec![u1.clone()]);
-    send(&mut agg, "call-1", PromptSource::tree(), vec![]);
+    send(&mut agg, "call-1", vec![]);
     let first = sent(&agg, "call-1");
 
     let snapshot = serde_json::to_value(&agg.state).unwrap();
     let tree = agg.state.tree.clone();
     agg.state = serde_json::from_value(snapshot.clone()).unwrap();
     agg.state.tree = tree;
-    assert!(agg.state.llm_call("call-1").unwrap().source.is_tree());
     let a1 = node_msg("a1", Role::Assistant, "hello");
     let u2 = node_msg("u2", Role::User, "more");
     record(&mut agg, "more", vec![u1, a1, u2]);
-    send(&mut agg, "call-2", PromptSource::tree(), vec![]);
+    send(&mut agg, "call-2", vec![]);
     assert_eq!(sent(&agg, "call-2")[..first.len()], first[..]);
     assert!(placed_by(&agg, "call-2").is_empty());
-
-    let mut old = snapshot.to_string();
-    old = old.replace(r#""source":{"at":"u1","kind":"tree"},"#, "");
-    old = old.replace(r#""source":{"kind":"tree","at":"u1"},"#, "");
-    assert!(!old.contains("\"kind\":\"tree\""), "the source is cut out");
-    let old: SessionState = serde_json::from_str(&old).unwrap();
-    assert_eq!(
-        old.llm_call("call-1").unwrap().source,
-        PromptSource::Legacy,
-        "a call recorded without a source is a legacy call"
-    );
 }
 
 #[test]
 fn a_retried_tree_call_is_built_again_and_places_nothing_twice() {
     let mut agg = skilled_session();
     record(&mut agg, "hi", vec![node_msg("u1", Role::User, "hi")]);
-    send(&mut agg, "call-1", PromptSource::tree(), vec![]);
+    send(&mut agg, "call-1", vec![]);
     let first = sent(&agg, "call-1");
     let again =
         crate::effects::KindSpec::retry(&crate::effects::llm::LlmSpec, &agg.state, "call-1");
     let [EventPayload::LlmCallRequested(r)] = &again[..] else {
         panic!("a request: {again:?}");
     };
-    assert!(r.source.is_tree() && r.request.messages.is_empty());
+    assert!(r.at.is_some() && r.request.messages.is_empty());
     let out = agg.state.outgoing("call-1").expect("the call");
     assert!(out.placed.is_empty(), "its context is on the tree already");
     let texts: Vec<_> = out
@@ -14718,7 +14679,6 @@ fn a_dispatch_records_a_fingerprint_of_the_prompt() {
     let events = dispatch(
         &mut agg,
         CommandPayload::RequestLlmCall {
-            source: PromptSource::tree(),
             llm: "claude".to_string(),
             call_id: "call-1".to_string(),
             request: request_with(vec![]),

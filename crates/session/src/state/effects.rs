@@ -534,20 +534,15 @@ impl EffectState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmCallState {
-    #[serde(default)]
     pub prompt: Vec<Message>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatched_seq: Option<u64>,
-    #[serde(default)]
-    pub source: PromptSource,
     pub llm: String,
     pub spec: LlmCallSpec,
     pub stream: bool,
-    #[serde(default)]
     pub handler: LlmHandler,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<LlmFormat>,
-    #[serde(default)]
     pub defer_tools_strategy: DeferToolsStrategy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reads_from: Option<String>,
@@ -624,20 +619,16 @@ impl From<&LlmRequest> for LlmCallSpec {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallState {
     pub name: String,
-    #[serde(default)]
     pub handler: ToolHandler,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<ConnectorTarget>,
-    #[serde(default)]
     pub arguments: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
-    #[serde(default)]
     pub is_error: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub script: Option<ScriptCaller>,
     /// For `run_code`: the language its script is in.
-    #[serde(default)]
     pub script_language: crate::codemode::Language,
     /// For `run_code`: CPU its script's runs have used.
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -666,15 +657,12 @@ pub struct SubagentCallState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_branch: Option<SubagentOnBranch>,
     pub agent_id: String,
-    #[serde(default)]
     pub session_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<DraftMessage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
-    #[serde(default)]
     pub is_error: bool,
-    #[serde(default)]
     pub mode: SpawnMode,
 }
 
@@ -686,7 +674,6 @@ pub struct System1CallState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectorSyncState {
-    #[serde(default)]
     pub tools: Vec<RemoteTool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix: Option<String>,
@@ -717,7 +704,6 @@ pub struct WorkerDecisionState {
     pub trigger: Trigger,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
-    #[serde(default)]
     pub source_event_sequence: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatched_seq: Option<u64>,

@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 
-use super::decision::{Action, LlmHandler, PromptSource, Trigger};
+use super::decision::{Action, LlmHandler, Trigger};
 use super::effects::{self, decision_queued, void_events, Settle};
 use super::events::*;
 use super::schedule::{self, ScheduleStep};
@@ -56,8 +56,6 @@ pub enum CommandPayload {
         call_id: String,
         llm: String,
         request: LlmRequest,
-        #[serde(default)]
-        source: PromptSource,
         stream: bool,
         retry: RetryPolicy,
         handler: LlmHandler,
@@ -224,7 +222,6 @@ impl Action {
                 id,
                 llm,
                 request,
-                source,
                 stream,
                 retry,
                 handler,
@@ -234,7 +231,6 @@ impl Action {
                 call_id: id,
                 llm,
                 request,
-                source,
                 stream,
                 retry,
                 handler,
@@ -833,7 +829,6 @@ impl Working {
                     id,
                     llm,
                     request,
-                    source: _,
                     stream,
                     retry,
                     handler,
@@ -851,7 +846,6 @@ impl Working {
                                     messages: Vec::new(),
                                     ..request
                                 },
-                                source: PromptSource::tree(),
                                 stream,
                                 retry,
                                 handler,
@@ -1129,7 +1123,6 @@ impl Working {
                 call_id,
                 llm,
                 mut request,
-                source: _,
                 stream,
                 retry,
                 handler,
@@ -1151,7 +1144,6 @@ impl Working {
                             call_id,
                             llm,
                             request,
-                            source: PromptSource::tree(),
                             stream,
                             retry,
                             handler,
@@ -1160,14 +1152,13 @@ impl Working {
                         caller,
                     );
                 }
-                let source = self.held_source(&call_id, PromptSource::tree());
                 let held = HeldCall {
                     id: call_id,
                     llm,
                     request,
                     stream,
                 };
-                if self.scope.is_none() && self.held_for_room(&held, &source) {
+                if self.scope.is_none() && self.held_for_room(&held) {
                     return Ok(());
                 }
                 self.try_then(|s| {
@@ -1176,7 +1167,6 @@ impl Working {
                         held.id,
                         held.llm,
                         held.request,
-                        source,
                         held.stream,
                         retry,
                         handler,

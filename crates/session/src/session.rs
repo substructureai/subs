@@ -97,7 +97,6 @@ pub struct Session {
     pub(crate) first_event_at: Option<DateTime<Utc>>,
     pub(crate) last_event_at: Option<DateTime<Utc>>,
     pub(crate) wake_at: Option<DateTime<Utc>>,
-    #[serde(default)]
     pub(crate) version: u64,
     #[serde(skip)]
     settings: Settings,
@@ -515,7 +514,6 @@ mod ends_run_tests {
                 turn_id: None,
                 cost: Default::default(),
                 subagent_cost: Default::default(),
-                head_id: None,
                 calls,
                 decisions: Vec::new(),
             },

@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use super::decision::{BranchConfig, LlmHandler, PromptSource, ToolHandler, Trigger};
+use super::decision::{BranchConfig, LlmHandler, ToolHandler, Trigger};
 use crate::connectors::ConnectionPath;
 use crate::connectors::{AuthNeed, RemoteTool};
 pub use crate::protocol::EffectKind;
@@ -93,8 +93,6 @@ pub enum EventPayload {
     DecisionAmended(DecisionAmended),
     #[serde(rename = "call.voided")]
     CallVoided(CallVoided),
-    #[serde(rename = "channels.updated")]
-    ChannelsUpdated(serde_json::Value),
     #[serde(rename = "session.cancelled")]
     SessionCancelled,
     #[serde(rename = "session.done")]
@@ -139,11 +137,9 @@ pub struct BranchStarted {
     pub from: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
-    #[serde(default)]
     pub agent: BranchConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    #[serde(default)]
     pub mode: BranchMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
@@ -184,8 +180,6 @@ pub struct ContextLimited {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<u64>,
     pub call: HeldCall,
-    #[serde(default)]
-    pub source: PromptSource,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -301,15 +295,13 @@ pub struct LlmCallRequested {
     pub attempt: u32,
     pub llm: String,
     pub request: LlmRequest,
-    #[serde(default)]
-    pub source: PromptSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<String>,
     pub stream: bool,
     pub retry: RetryPolicy,
-    #[serde(default)]
     pub handler: LlmHandler,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<LlmFormat>,
-    #[serde(default)]
     pub defer_tools_strategy: DeferToolsStrategy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
@@ -419,7 +411,6 @@ pub struct ConnectorSyncCompleted {
 pub struct ConnectorSyncErrored {
     pub path: ConnectionPath,
     pub error: ErrorInfo,
-    #[serde(default)]
     pub retryable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<AuthNeed>,
@@ -435,7 +426,6 @@ pub struct ConnectorAuthFailed {
 pub struct SubagentRequested {
     pub id: String,
     pub agent_id: String,
-    #[serde(default)]
     pub session_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<DraftMessage>,
@@ -452,7 +442,6 @@ pub struct SubagentRequested {
 pub struct SubagentOnBranch {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fork: bool,
-    #[serde(default)]
     pub agent: BranchConfig,
 }
 
@@ -469,7 +458,6 @@ pub struct SubagentStarted {
 pub struct SubagentErrored {
     pub id: String,
     pub error: ErrorInfo,
-    #[serde(default)]
     pub retryable: bool,
 }
 
@@ -524,7 +512,6 @@ pub struct ToolCallRequested {
     pub attempt: u32,
     pub name: String,
     pub arguments: String,
-    #[serde(default)]
     pub handler: ToolHandler,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<ConnectorTarget>,
@@ -595,7 +582,6 @@ pub struct ToolCallErrored {
     pub id: String,
     pub name: String,
     pub error: ErrorInfo,
-    #[serde(default)]
     pub retryable: bool,
 }
 
@@ -689,11 +675,8 @@ pub struct TurnCompleted {
     pub turn_id: String,
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub data: serde_json::Value,
-    #[serde(default)]
     pub turn_cost: Decimal,
-    #[serde(default)]
     pub turn_token_usage: Usage,
-    #[serde(default)]
     pub turn_calls: Box<TurnCalls>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_started_at: Option<DateTime<Utc>>,
@@ -708,7 +691,6 @@ pub struct TurnCalls {
     pub llm: CallTotals,
     pub tool: CallTotals,
     pub subagent: CallTotals,
-    #[serde(default)]
     pub system1: CallTotals,
 }
 
@@ -743,7 +725,6 @@ pub struct DecisionDropped {
 pub struct DecisionAmended {
     pub id: String,
     pub messages: Vec<DraftMessage>,
-    #[serde(default)]
     pub client: ClientContext,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, String>,
@@ -758,9 +739,7 @@ pub struct CallVoided {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubagentTurnCompleted {
     pub id: String,
-    #[serde(default)]
     pub cost: Decimal,
-    #[serde(default)]
     pub token_usage: Usage,
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub data: serde_json::Value,
@@ -773,19 +752,6 @@ pub struct SubagentTurnCompleted {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn an_old_channels_event_still_reads_and_writes_back_unchanged() {
-        let old = serde_json::json!({
-            "type": "channels.updated",
-            "decision_id": "d1",
-            "finishes_turn": true,
-            "channels": { "slack": { "status": "is working…" } },
-        });
-        let payload: EventPayload = serde_json::from_value(old.clone()).unwrap();
-        assert!(matches!(payload, EventPayload::ChannelsUpdated(_)));
-        assert_eq!(serde_json::to_value(&payload).unwrap(), old);
-    }
 
     #[test]
     fn a_kind_of_call_without_cost_or_tokens_writes_only_its_counts() {
@@ -814,14 +780,5 @@ mod tests {
         );
         assert_eq!(written["llm"]["tokens"]["total"], 15);
         assert_eq!(serde_json::from_value::<TurnCalls>(written).unwrap(), calls);
-    }
-
-    #[test]
-    fn a_turn_written_before_its_calls_were_counted_still_reads() {
-        let old = serde_json::json!({ "type": "turn.completed", "turn_id": "t1" });
-        let payload: EventPayload = serde_json::from_value(old).unwrap();
-        assert!(
-            matches!(payload, EventPayload::TurnCompleted(t) if *t.turn_calls == TurnCalls::default())
-        );
     }
 }

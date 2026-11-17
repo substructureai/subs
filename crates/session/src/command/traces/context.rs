@@ -58,7 +58,6 @@ fn listings(t: &Trace, id: &str) -> usize {
 
 fn reading(id: &str) -> Action {
     Action::CallLlm {
-        source: PromptSource::tree(),
         llm: "claude".to_string(),
         format: None,
         id: id.to_string(),
@@ -153,10 +152,6 @@ fn lowered(action: DecisionAction, id: &str) -> Action {
             branch,
             ..
         } => Action::CallLlm {
-            source: match (&messages, &branch) {
-                (Some(_), None) => PromptSource::Explicit,
-                _ => PromptSource::tree(),
-            },
             llm: "claude".to_string(),
             format: None,
             id: given.unwrap_or_else(|| id.to_string()),
@@ -497,10 +492,6 @@ fn a_held_tree_call_shows_the_prompt_it_would_send() {
     assert_eq!(held[0], "be brief");
     assert!(held[1].contains("\"skill\":\"visits\""), "{held:?}");
     assert_eq!(held[2..], ["q1", "a1", "q2", "a2", "q3"]);
-    assert!(
-        t.agg.state.limited.as_ref().unwrap().source.is_tree(),
-        "and is held as a tree call"
-    );
 }
 
 #[test]
@@ -547,8 +538,12 @@ fn a_held_tree_call_runs_on_the_new_branch_and_is_told_its_context_once() {
         .get(&head)
         .and_then(|n| n.parent().map(str::to_string));
     assert_eq!(
-        t.agg.state.llm_call("call-3").unwrap().source,
-        PromptSource::Tree { at: read_at }
+        t.agg
+            .state
+            .effect(EffectKind::LlmCall, "call-3")
+            .unwrap()
+            .asked_at,
+        read_at
     );
 
     answered(&mut t, "call-3", "a3", 100);
@@ -610,7 +605,6 @@ fn a_held_tree_call_kept_as_it_was_stays_a_tree_call() {
     ask(&mut t, 2);
     plan(&mut t, "");
     assert_eq!(emitted(&t), ["context.limited", "context.kept"]);
-    assert!(t.agg.state.llm_call("call-2").unwrap().source.is_tree());
     assert_eq!(listings(&t, "call-2"), 1);
     assert_eq!(requested(&t, "call-2")[2..], ["q1", "a1", "q2"]);
 }

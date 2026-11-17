@@ -96,23 +96,12 @@ impl SessionState {
     }
 
     fn apply_llm_requested(&mut self, payload: &LlmCallRequested, ctx: &ApplyContext) {
-        let prompt: Vec<Message> = payload
-            .request
-            .messages
-            .iter()
-            .cloned()
-            .enumerate()
-            .map(|(i, m)| m.recorded(format!("{}:{i}", payload.id)))
-            .collect();
         let spec = LlmCallSpec::from(&payload.request);
         if let Some(existing) = self.effect_mut(EffectKind::LlmCall, &payload.id) {
             existing.tracking.requeue();
-            if let PromptSource::Tree { at } = &payload.source {
-                existing.asked_at = at.clone();
-            }
+            existing.asked_at = payload.at.clone();
             if let Some(call) = existing.llm_mut() {
-                call.prompt = prompt;
-                call.source = payload.source.clone();
+                call.prompt = Vec::new();
                 call.llm = payload.llm.clone();
                 call.spec = spec;
                 call.stream = payload.stream;
@@ -128,8 +117,7 @@ impl SessionState {
                 &payload.id,
                 EffectTracking::new_queued(payload.retry.clone()),
                 EffectPayload::LlmCall(LlmCallState {
-                    prompt,
-                    source: payload.source.clone(),
+                    prompt: Vec::new(),
                     llm: payload.llm.clone(),
                     spec,
                     stream: payload.stream,
@@ -143,19 +131,12 @@ impl SessionState {
                 }),
                 payload.branch.as_deref(),
             );
-            if let (Some(e), PromptSource::Tree { at }) = (
-                self.effect_mut(EffectKind::LlmCall, &payload.id),
-                &payload.source,
-            ) {
-                e.asked_at = at.clone();
+            if let Some(e) = self.effect_mut(EffectKind::LlmCall, &payload.id) {
+                e.asked_at = payload.at.clone();
             }
         }
-        match &mut self.limited {
-            Some(l) if l.open() && l.call.id != payload.id && payload.branch.is_none() => {
-                l.summary = Some(payload.id.clone())
-            }
-            _ if payload.branch.is_none() => self.turn_called = true,
-            _ => {}
+        if payload.branch.is_none() {
+            self.turn_called = true;
         }
         self.enqueue(ctx.sequence, EffectKind::LlmCall, &payload.id);
     }
@@ -487,7 +468,7 @@ impl SessionState {
             EventPayload::LlmCallCompleted(payload) => {
                 let branch = self.effect_branch(EffectKind::LlmCall, &payload.id);
                 match &payload.response.usage {
-                    Some(usage) if branch.is_none() && !self.is_summary_call(&payload.id) => {
+                    Some(usage) if branch.is_none() => {
                         self.last_read = Some(LastRead {
                             call_id: payload.id.clone(),
                             tokens: usage.input,
@@ -812,7 +793,6 @@ impl SessionState {
                 }
                 self.dequeue(EffectKind::Subagent, &payload.id);
             }
-            EventPayload::ChannelsUpdated(_) => {}
             EventPayload::TurnJoined(p) => self.turn_metadata.extend(p.metadata.clone()),
             EventPayload::TurnStarted(p) => {
                 self.phase = TurnPhase::Active {
@@ -889,7 +869,6 @@ impl SessionState {
                 self.limited = Some(Limited {
                     reason: p.reason,
                     call: p.call.clone(),
-                    source: p.source.clone(),
                     summary: None,
                     released: false,
                 });
@@ -991,10 +970,13 @@ mod summary_fold_tests {
         let mut s = SessionState::new("sess-1".to_string());
         apply(
             &mut s,
-            json!({"type": "turn.completed", "turn_id": "t1", "error": {"message": "boom", "code": "invalid_response"}}),
+            json!({"type": "turn.completed", "turn_id": "t1", "turn_cost": "0", "turn_token_usage": crate::protocol::Usage::default(), "turn_calls": crate::events::TurnCalls::default(), "error": {"message": "boom", "code": "invalid_response"}}),
         );
         assert!(s.last_turn_failed);
-        apply(&mut s, json!({"type": "turn.completed", "turn_id": "t2"}));
+        apply(
+            &mut s,
+            json!({"type": "turn.completed", "turn_id": "t2", "turn_cost": "0", "turn_token_usage": crate::protocol::Usage::default(), "turn_calls": crate::events::TurnCalls::default()}),
+        );
         assert!(!s.last_turn_failed);
     }
 }

@@ -734,7 +734,6 @@ mod tests {
                 turn_id: turn_id.map(str::to_string),
                 cost: Default::default(),
                 subagent_cost: Default::default(),
-                head_id: None,
                 calls: Vec::new(),
                 decisions: Vec::new(),
             },

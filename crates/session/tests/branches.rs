@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use chrono::Utc;
 use substructure_session::command::{CommandPayload, TurnTarget};
-use substructure_session::decision::{Action, BranchConfig, BranchFrom, BranchStart, PromptSource};
+use substructure_session::decision::{Action, BranchConfig, BranchFrom, BranchStart};
 use substructure_session::decision::{LlmHandler, Trigger};
 use substructure_session::effects::Outcome;
 use substructure_session::events::EventPayload;
@@ -43,7 +43,6 @@ fn call(id: &str, messages: Vec<DraftMessage>, branch: Option<BranchStart>) -> A
             max_completion_tokens: None,
             reasoning: None,
         },
-        source: PromptSource::tree(),
         stream: false,
         retry: RetryPolicy::no_retry(),
         handler: LlmHandler::Server,

@@ -26,14 +26,8 @@ impl SessionState {
     pub fn outgoing(&self, id: &str) -> Option<Outgoing> {
         let effect = self.effect(EffectKind::LlmCall, id)?;
         let call = effect.llm()?;
-        let node = call.reads_from.clone().or_else(|| match &call.source {
-            PromptSource::Tree { at } => at.clone(),
-            _ => effect.asked_at.clone().or_else(|| self.head_id.clone()),
-        });
-        Some(
-            self.at(node.as_deref())
-                .outgoing(id, &call.source, &call.prompt),
-        )
+        let node = call.reads_from.clone().or_else(|| effect.asked_at.clone());
+        Some(self.at(node.as_deref()).outgoing(id))
     }
 
     pub fn path_ids(&self, node: &str) -> std::collections::HashSet<String> {
@@ -449,59 +443,36 @@ impl<'a, 'n> At<'a, 'n> {
             .collect()
     }
 
-    pub fn outgoing(&self, id: &str, source: &PromptSource, given: &[Message]) -> Outgoing {
-        let node = self.node.map(str::to_string);
+    pub fn outgoing(&self, id: &str) -> Outgoing {
+        let view: Vec<DraftMessage> = self
+            .transcript()
+            .into_iter()
+            .map(DraftMessage::from)
+            .collect();
+        let prompt = match self.config() {
+            Some(config) => config.prompt_for(&view),
+            None => view,
+        };
         let mut out = Outgoing {
-            node,
-            prompt: given.to_vec(),
+            node: self.node.map(str::to_string),
+            prompt: prompt
+                .into_iter()
+                .enumerate()
+                .map(|(i, m)| m.recorded(format!("{id}:{i}")))
+                .collect(),
             placed: Vec::new(),
             places: false,
         };
-        match source {
-            PromptSource::Explicit => return out,
-            PromptSource::Tree { .. } => {
-                let view: Vec<DraftMessage> = self
-                    .transcript()
-                    .into_iter()
-                    .map(DraftMessage::from)
-                    .collect();
-                let prompt = match self.config() {
-                    Some(config) => config.prompt_for(&view),
-                    None => view,
-                };
-                out.prompt = prompt
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, m)| m.recorded(format!("{id}:{i}")))
-                    .collect();
-                prompt_context::restore(&mut out.prompt, &self.placed_on_path());
-                let open = self.system_prefix_open(id);
-                prompt_context::merge(
-                    &mut out.prompt,
-                    &mut Vec::new(),
-                    &mut out.placed,
-                    id,
-                    open,
-                    prompt_context::owed(*self),
-                );
-                out.places = open || !out.placed.is_empty();
-            }
-            PromptSource::Legacy => {
-                if !self.state.is_summary_call(id) {
-                    prompt_context::carry(&mut out.prompt, &self.placed_on_path());
-                }
-                let open = self.system_prefix_open(id);
-                prompt_context::merge(
-                    &mut out.prompt,
-                    &mut Vec::new(),
-                    &mut out.placed,
-                    id,
-                    open,
-                    prompt_context::owed(*self),
-                );
-                out.places = open || !out.placed.is_empty();
-            }
-        }
+        prompt_context::restore(&mut out.prompt, &self.placed_on_path());
+        let open = self.system_prefix_open(id);
+        prompt_context::merge(
+            &mut out.prompt,
+            &mut out.placed,
+            id,
+            open,
+            prompt_context::owed(*self),
+        );
+        out.places = open || !out.placed.is_empty();
         out
     }
 
@@ -517,8 +488,7 @@ impl<'a, 'n> At<'a, 'n> {
         }
         !self.state.effects.values().any(|e| {
             e.id != exclude
-                && e.llm()
-                    .is_some_and(|c| c.source != PromptSource::Explicit && c.reads_from.is_none())
+                && e.llm().is_some_and(|c| c.reads_from.is_none())
                 && SessionState::anchored_on(&path, e.asked_at.as_deref())
                 && e.tracking.status() != EffectStatus::Queued
         })
@@ -702,7 +672,6 @@ mod open_llm_calls_tests {
             call_id,
             EffectTracking::new(RetryPolicy::no_retry(), Utc::now()),
             EffectPayload::LlmCall(LlmCallState {
-                source: Default::default(),
                 defer_tools_strategy: Default::default(),
                 reads_from: None,
                 sent_tools: None,

@@ -4,7 +4,7 @@ use substructure_session::request::PendingPrompt;
 use crate::llm::LlmCallError;
 use crate::providers::format::Wire as _;
 
-use super::decision::{Action, BranchConfig, BranchFrom, BranchStart, PromptSource, ToolHandler};
+use super::decision::{Action, BranchConfig, BranchFrom, BranchStart, ToolHandler};
 
 pub async fn finish_prompt(
     trigger: &mut DecisionTrigger,
@@ -350,11 +350,7 @@ async fn lower_actions(
                     let model = model
                         .or_else(|| config.map(|c| c.model.clone()))
                         .ok_or(ResolveError::MissingModel)?;
-                    let (messages, source) = match (messages, &branch) {
-                        (messages, Some(_)) => (messages.unwrap_or_default(), PromptSource::tree()),
-                        (Some(messages), None) => (messages, PromptSource::Explicit),
-                        (None, None) => (Vec::new(), PromptSource::tree()),
-                    };
+                    let messages = messages.unwrap_or_default();
                     let tools = tools.or_else(|| config.and_then(|c| c.tools_as_llm()));
                     let stream = stream.unwrap_or(true);
                     let retry =
@@ -379,7 +375,6 @@ async fn lower_actions(
                             max_completion_tokens,
                             reasoning,
                         },
-                        source,
                         stream,
                         retry,
                         handler: block.handler,
@@ -1150,14 +1145,10 @@ mod tests {
             .unwrap();
         match action {
             Action::CallLlm {
-                request,
-                source,
-                stream,
-                ..
+                request, stream, ..
             } => {
                 assert_eq!(request.model, "m1");
                 assert!(stream, "stream comes from config");
-                assert_eq!(source, PromptSource::tree());
                 assert!(
                     request.messages.is_empty(),
                     "omitted messages ⇒ the session builds the prompt from the tree"
@@ -1187,15 +1178,12 @@ mod tests {
             .await
             .unwrap();
         match action {
-            Action::CallLlm {
-                request, source, ..
-            } => {
+            Action::CallLlm { request, .. } => {
                 let roles: Vec<_> = request.messages.iter().map(|m| &m.role).collect();
                 assert!(
                     matches!(roles[..], [Role::User]),
                     "explicit messages are verbatim, no system; got {roles:?}"
                 );
-                assert_eq!(source, PromptSource::Explicit);
             }
             other => panic!("expected llm.call; got {other:?}"),
         }
@@ -1474,7 +1462,6 @@ mod tests {
             "call-1",
             EffectTracking::new(RetryPolicy::no_retry(), chrono::Utc::now()),
             EffectPayload::LlmCall(LlmCallState {
-                source: Default::default(),
                 defer_tools_strategy: Default::default(),
                 reads_from: None,
                 sent_tools: None,

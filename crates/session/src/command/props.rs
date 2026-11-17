@@ -57,7 +57,7 @@ struct Fork {
 #[derive(Debug, Clone)]
 enum ActOp {
     CallLlm { worker: bool, fork: Option<Fork> },
-    CallWith { explicit: bool },
+    CallWith { fork: Option<Fork> },
     CallSystem1 { given: bool },
     CloseBranch { index: usize },
     PromoteBranch { index: usize },
@@ -136,7 +136,7 @@ fn fork() -> impl Strategy<Value = Option<Fork>> {
 fn act_op() -> impl Strategy<Value = ActOp> {
     prop_oneof![
         3 => (any::<bool>(), fork()).prop_map(|(worker, fork)| ActOp::CallLlm { worker, fork }),
-        1 => any::<bool>().prop_map(|explicit| ActOp::CallWith { explicit }),
+        1 => fork().prop_map(|fork| ActOp::CallWith { fork }),
         1 => any::<bool>().prop_map(|given| ActOp::CallSystem1 { given }),
         1 => any::<usize>().prop_map(|index| ActOp::CloseBranch { index }),
         2 => any::<usize>().prop_map(|index| ActOp::PromoteBranch { index }),
@@ -323,10 +323,7 @@ impl World {
         let mut sent: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
         for (seq, occurred_at, payload) in &self.log {
             if let EventPayload::LlmCallDispatched(d) = payload {
-                let tree_call = state.llm_call(&d.id).is_some_and(|c| {
-                    matches!(c.source, crate::decision::PromptSource::Tree { .. })
-                });
-                if let Some(out) = state.outgoing(&d.id).filter(|_| tree_call) {
+                if let Some(out) = state.outgoing(&d.id) {
                     let prompt = bare(&out.prompt);
                     for node in state.tree.up(out.node.as_deref()) {
                         match &node.fact {
@@ -470,11 +467,9 @@ impl World {
         &mut self,
         worker: bool,
         messages: Vec<DraftMessage>,
-        source: crate::decision::PromptSource,
         branch: Option<crate::decision::BranchStart>,
     ) -> Action {
         Action::CallLlm {
-            source,
             llm: "claude".to_string(),
             format: None,
             id: self.mint(),
@@ -497,34 +492,35 @@ impl World {
         }
     }
 
+    fn start(&mut self, f: Fork) -> crate::decision::BranchStart {
+        crate::decision::BranchStart {
+            id: self.branch_id(f.index, f.new),
+            from: crate::decision::BranchFrom::Head,
+            agent: match f.agent {
+                0 => crate::decision::BranchConfig::Inherit,
+                1 => crate::decision::BranchConfig::None,
+                _ => crate::decision::BranchConfig::Config(Box::new(self.config())),
+            },
+            name: None,
+            mode: match f.detached {
+                true => crate::protocol::BranchMode::Detached,
+                false => crate::protocol::BranchMode::Blocking,
+            },
+        }
+    }
+
     fn actions(&mut self, acts: Vec<ActOp>) -> Vec<Action> {
         acts.into_iter()
             .map(|a| match a {
                 ActOp::CallLlm { worker, fork } => {
-                    let branch = fork.map(|f| crate::decision::BranchStart {
-                        id: self.branch_id(f.index, f.new),
-                        from: crate::decision::BranchFrom::Head,
-                        agent: match f.agent {
-                            0 => crate::decision::BranchConfig::Inherit,
-                            1 => crate::decision::BranchConfig::None,
-                            _ => crate::decision::BranchConfig::Config(Box::new(self.config())),
-                        },
-                        name: None,
-                        mode: match f.detached {
-                            true => crate::protocol::BranchMode::Detached,
-                            false => crate::protocol::BranchMode::Blocking,
-                        },
-                    });
-                    self.llm(worker, Vec::new(), Default::default(), branch)
+                    let branch = fork.map(|f| self.start(f));
+                    self.llm(worker, Vec::new(), branch)
                 }
-                ActOp::CallWith { explicit } => {
+                ActOp::CallWith { fork } => {
                     let mut messages = self.recorded();
                     messages.push(self.message(Role::User));
-                    let source = match explicit {
-                        true => crate::decision::PromptSource::Explicit,
-                        false => Default::default(),
-                    };
-                    self.llm(false, messages, source, None)
+                    let branch = fork.map(|f| self.start(f));
+                    self.llm(false, messages, branch)
                 }
                 ActOp::CallSystem1 { given } => Action::CallSystem1 {
                     id: self.mint(),

@@ -57,28 +57,6 @@ pub enum LlmHandler {
     Worker,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum PromptSource {
-    Tree {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        at: Option<String>,
-    },
-    Explicit,
-    #[default]
-    Legacy,
-}
-
-impl PromptSource {
-    pub fn tree() -> Self {
-        Self::Tree { at: None }
-    }
-
-    pub fn is_tree(&self) -> bool {
-        matches!(self, Self::Tree { .. })
-    }
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "config", rename_all = "snake_case")]
 pub enum BranchConfig {
@@ -496,8 +474,6 @@ pub enum Action {
         id: String,
         llm: String,
         request: LlmRequest,
-        #[serde(default)]
-        source: PromptSource,
         #[serde(default)]
         stream: bool,
         #[serde(default = "RetryPolicy::no_retry")]

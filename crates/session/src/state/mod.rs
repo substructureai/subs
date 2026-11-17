@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 
 use serde::{Deserialize, Serialize};
 
-use super::decision::{BranchConfig, LlmHandler, PromptSource, ToolHandler, Trigger};
+use super::decision::{BranchConfig, LlmHandler, ToolHandler, Trigger};
 
 use super::events::*;
 
@@ -66,8 +66,6 @@ pub struct LastRead {
 pub struct Limited {
     pub reason: ContextReason,
     pub call: HeldCall,
-    #[serde(default)]
-    pub source: PromptSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -161,11 +159,9 @@ pub struct BranchState {
     pub from: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
-    #[serde(default)]
     pub agent: BranchConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    #[serde(default)]
     pub mode: BranchMode,
     pub seq: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -174,7 +170,6 @@ pub struct BranchState {
     pub turn_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent: Option<String>,
-    #[serde(default)]
     pub depth: usize,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub detached: bool,
@@ -226,9 +221,7 @@ pub struct TurnEnd {
     pub turn_id: String,
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub data: serde_json::Value,
-    #[serde(default)]
     pub cost: Decimal,
-    #[serde(default)]
     pub usage: Usage,
 }
 
@@ -280,12 +273,8 @@ pub struct EventMeta {
     pub ancestry: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
-    #[serde(default)]
     pub cost: Decimal,
-    #[serde(default)]
     pub subagent_cost: Decimal,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub head_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub calls: Vec<Effect>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -374,22 +363,16 @@ pub struct SessionState {
     pub status: SessionStatus,
     pub agent_id: Option<String>,
     pub owner: Option<SessionOwner>,
-    #[serde(default)]
     pub token_usage: Usage,
 
-    #[serde(default)]
     pub cost: Decimal,
 
-    #[serde(default)]
     pub subagent_cost: Decimal,
 
-    #[serde(default)]
     pub turn_cost: Decimal,
 
-    #[serde(default)]
     pub turn_token_usage: Usage,
 
-    #[serde(default)]
     pub turn_calls: TurnCalls,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -419,7 +402,6 @@ pub struct SessionState {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub context_kept: bool,
 
-    #[serde(default)]
     pub subagent_token_usage: Usage,
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -442,13 +424,11 @@ pub struct SessionState {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub schedule_queue: Vec<QueueEntry>,
 
-    #[serde(default)]
     pub phase: TurnPhase,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_started_seq: Option<u64>,
 
-    #[serde(default)]
     pub turns: u64,
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -476,7 +456,6 @@ pub struct SessionState {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub open_interrupts: Vec<OpenInterrupt>,
 
-    #[serde(default)]
     pub session_start_failed: bool,
 
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -1062,7 +1041,6 @@ impl SessionState {
             turn_id: self.turn_id().map(str::to_string),
             cost: self.cost,
             subagent_cost: self.subagent_cost,
-            head_id: self.head_id.clone(),
             calls: self.effects(),
             decisions,
         }

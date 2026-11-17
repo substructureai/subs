@@ -137,6 +137,10 @@ An `llm.call` with `messages` and no `branch` runs on a branch of its own, with
 no config. The model reads the messages as written. The branch forks where its
 leading messages already are in the tree, so only the rest are stored.
 
+Made from inside a branch, the call starts a child of that branch. A branch
+that cannot start, too deep or forked at unanswered tool calls, answers the
+call with an `unroutable` error on the branch that made it.
+
 Its reply stays on the branch, and reaches the conversation as
 `branch.finished`. To put it in the conversation, write it there.
 

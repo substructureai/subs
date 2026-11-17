@@ -27,7 +27,6 @@ fn tree_call(id: &str) -> Action {
         id: id.to_string(),
         llm: "claude".to_string(),
         request: request_with(vec![]),
-        source: PromptSource::tree(),
         stream: false,
         retry: RetryPolicy::no_retry(),
         handler: LlmHandler::Server,
@@ -51,7 +50,6 @@ fn branch_call(id: &str, start: BranchStart, messages: Vec<DraftMessage>) -> Act
         id: id.to_string(),
         llm: "claude".to_string(),
         request: request_with(messages),
-        source: PromptSource::tree(),
         stream: false,
         retry: RetryPolicy::no_retry(),
         handler: LlmHandler::Server,
@@ -123,10 +121,6 @@ fn lower(action: DecisionAction) -> Option<Action> {
                 tools,
                 model: model.unwrap_or_else(|| "test-model".to_string()),
                 ..request_with(messages.clone().unwrap_or_default())
-            },
-            source: match messages {
-                Some(_) => PromptSource::Explicit,
-                None => PromptSource::tree(),
             },
             stream: false,
             retry: RetryPolicy::no_retry(),
@@ -600,7 +594,6 @@ fn explicit(id: &str, messages: Vec<DraftMessage>) -> Action {
         id: id.to_string(),
         llm: "claude".to_string(),
         request: request_with(messages),
-        source: PromptSource::Explicit,
         stream: false,
         retry: RetryPolicy::no_retry(),
         handler: LlmHandler::Server,
@@ -1117,7 +1110,6 @@ fn a_settled_call_stays_until_its_calls_are_answered() {
             id,
             llm,
             request,
-            source,
             stream,
             retry,
             handler,
@@ -1130,7 +1122,6 @@ fn a_settled_call_stays_until_its_calls_are_answered() {
                 tools: tools.clone(),
                 ..request
             },
-            source,
             stream,
             retry,
             handler,
@@ -1239,7 +1230,6 @@ fn a_call_with_messages_asked_again_after_its_branch_ended_does_nothing() {
         dispatch(
             agg,
             CommandPayload::RequestLlmCall {
-                source: PromptSource::tree(),
                 llm: "claude".to_string(),
                 call_id: "x1".to_string(),
                 request: request_with(vec![node_msg("", Role::User, "a title")]),

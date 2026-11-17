@@ -362,7 +362,6 @@ mod tests {
             id,
             tracking(status),
             EffectPayload::LlmCall(LlmCallState {
-                source: Default::default(),
                 defer_tools_strategy: Default::default(),
                 reads_from: None,
                 sent_tools: None,

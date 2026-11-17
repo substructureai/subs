@@ -245,47 +245,8 @@ pub fn fingerprint(prompt: &[Message]) -> String {
     format!("{:016x}", hasher.digest())
 }
 
-pub fn carry(prompt: &mut Vec<Message>, placed: &[Placed]) {
-    let mut system_at = None;
-    for p in placed {
-        match p.placement {
-            Placement::System => {
-                if let Some(i) = prompt.iter().position(|m| same(m, p)) {
-                    system_at = Some(i + 1);
-                    continue;
-                }
-                let at = system_at.unwrap_or_else(|| leading_system(prompt));
-                prompt.insert(at, message(&p.message, Role::System, &p.content));
-                system_at = Some(at + 1);
-            }
-            Placement::Inline => {
-                if let Some(m) = prompt.iter_mut().find(|m| m.id == p.message) {
-                    if !holds(m, &p.content) {
-                        append(m, &p.content);
-                    }
-                }
-            }
-            Placement::Own => {
-                if prompt.iter().any(|m| same(m, p)) {
-                    continue;
-                }
-                let Some(start) = start(prompt, p) else {
-                    continue;
-                };
-                let at = start
-                    + prompt[start..]
-                        .iter()
-                        .take_while(|m| m.role == Role::User && m.id.contains("-ctx-"))
-                        .count();
-                prompt.insert(at, message(&p.message, Role::User, &p.content));
-            }
-        }
-    }
-}
-
 pub fn merge(
     prompt: &mut Vec<Message>,
-    applied: &mut Vec<String>,
     placed: &mut Vec<Placed>,
     call_id: &str,
     system_open: bool,
@@ -293,7 +254,7 @@ pub fn merge(
 ) {
     let mut groups: Vec<(Placement, Vec<PromptContext>)> = Vec::new();
     for c in owed {
-        if applied.contains(&c.id) || groups.iter().any(|(_, g)| g.iter().any(|o| o.id == c.id)) {
+        if groups.iter().any(|(_, g)| g.iter().any(|o| o.id == c.id)) {
             continue;
         }
         let placement = resolve(c.placement, prompt, system_open);
@@ -316,7 +277,6 @@ pub fn merge(
                 ..p
             }),
         );
-        applied.extend(ids);
     }
 }
 
@@ -379,15 +339,6 @@ fn start(prompt: &[Message], p: &Placed) -> Option<usize> {
     }
 }
 
-fn same(m: &Message, p: &Placed) -> bool {
-    let role = match p.placement {
-        Placement::System => Role::System,
-        _ => Role::User,
-    };
-    m.role == role
-        && (m.id == p.message || matches!(&m.content, Some(Content::Text(t)) if *t == p.content))
-}
-
 fn leading_system(prompt: &[Message]) -> usize {
     prompt
         .iter()
@@ -406,16 +357,6 @@ fn append(m: &mut Message, content: &str) {
         Some(Content::Text(head)) => Content::Text(format!("{head}\n\n{content}")),
         None => Content::Text(format!("\n\n{content}")),
     });
-}
-
-fn holds(m: &Message, content: &str) -> bool {
-    match &m.content {
-        Some(Content::Parts(parts)) => parts
-            .iter()
-            .any(|p| matches!(p, StoredContent::Text { text } if text == content)),
-        Some(Content::Text(text)) => text.contains(&format!("\n\n{content}")),
-        None => false,
-    }
 }
 
 fn message(id: &str, role: Role, content: &str) -> Message {
@@ -737,14 +678,7 @@ mod tests {
             placement: Placement::System,
             content: "gone".into(),
         };
-        merge(
-            &mut prompt,
-            &mut Vec::new(),
-            &mut Vec::new(),
-            "call-2",
-            false,
-            vec![c],
-        );
+        merge(&mut prompt, &mut Vec::new(), "call-2", false, vec![c]);
         assert_eq!(prompt.len(), 1, "it rode the user turn, not the prefix");
         assert!(matches!(
             prompt[0].content.as_ref().expect("content"),
@@ -846,7 +780,7 @@ mod tests {
             text("sys", Role::System, "be brief"),
             text("u1", Role::User, "hi"),
         ];
-        let (mut applied, mut placed) = (Vec::new(), Vec::new());
+        let mut placed = Vec::new();
         let ctx = |id: &str, placement| PromptContext {
             id: id.into(),
             placement,
@@ -854,7 +788,6 @@ mod tests {
         };
         merge(
             &mut prompt,
-            &mut applied,
             &mut placed,
             "c1",
             true,
@@ -862,7 +795,6 @@ mod tests {
         );
         merge(
             &mut prompt,
-            &mut applied,
             &mut placed,
             "c1",
             false,
@@ -872,7 +804,6 @@ mod tests {
         prompt.push(text("t1", Role::Tool, "done"));
         merge(
             &mut prompt,
-            &mut applied,
             &mut placed,
             "c2",
             false,
@@ -894,11 +825,11 @@ mod tests {
             state,
             seq,
             EventPayload::LlmCallRequested(crate::events::LlmCallRequested {
-                source: Default::default(),
                 id: id.to_string(),
                 attempt: 0,
                 llm: "claude".to_string(),
                 request,
+                at: state.head_id.clone(),
                 stream: false,
                 retry: RetryPolicy::no_retry(),
                 handler: Default::default(),
@@ -952,30 +883,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_new_turn_reads_the_prefix_the_last_turn_read() {
-        let (sent, placed) = first_turn();
-        let mut next = vec![
-            text("sys", Role::System, "be brief"),
-            text("u1", Role::User, "hi"),
-            text("a1", Role::Assistant, "calling"),
-            text("t1", Role::Tool, "done"),
-            text("a2", Role::Assistant, "all done"),
-            text("u2", Role::User, "thanks"),
-        ];
-        carry(&mut next, &placed);
-        assert_eq!(
-            shape(&next[..sent.len()]),
-            shape(&sent),
-            "the new turn starts with everything the last call sent"
-        );
-        assert_eq!(
-            shape(&next[sent.len()..]).len(),
-            2,
-            "then the turn's own messages"
-        );
-    }
-
     fn notice() -> Vec<PromptContext> {
         vec![PromptContext {
             id: "notice".into(),
@@ -988,14 +895,7 @@ mod tests {
     fn context_placed_after_only_a_system_prompt_is_rebuilt_for_the_next_call() {
         let mut sent = vec![text("c1:0", Role::System, "be brief")];
         let mut placed = Vec::new();
-        merge(
-            &mut sent,
-            &mut Vec::new(),
-            &mut placed,
-            "c1",
-            false,
-            notice(),
-        );
+        merge(&mut sent, &mut placed, "c1", false, notice());
         let mut next = vec![text("c2:0", Role::System, "be brief")];
         restore(&mut next, &placed);
         assert_eq!(fingerprint(&next), fingerprint(&sent));
@@ -1005,14 +905,7 @@ mod tests {
     fn context_placed_into_an_empty_prompt_is_rebuilt_after_a_system_prompt() {
         let mut sent = Vec::new();
         let mut placed = Vec::new();
-        merge(
-            &mut sent,
-            &mut Vec::new(),
-            &mut placed,
-            "c1",
-            false,
-            notice(),
-        );
+        merge(&mut sent, &mut placed, "c1", false, notice());
         let mut next = vec![
             text("c2:0", Role::System, "be brief"),
             text("u1", Role::User, "hi"),
@@ -1064,102 +957,6 @@ mod tests {
     }
 
     #[test]
-    fn carrying_twice_changes_nothing() {
-        let (sent, placed) = first_turn();
-        let mut again = sent.clone();
-        carry(&mut again, &placed);
-        assert_eq!(
-            shape(&again),
-            shape(&sent),
-            "a continuation already holds its context"
-        );
-    }
-
-    #[test]
-    fn a_copy_under_another_name_is_not_carried_again() {
-        let (_, placed) = first_turn();
-        let mut renamed = vec![
-            text("sys", Role::System, "be brief"),
-            text("c1-ctx-plugin:a", Role::System, "about plugin.a"),
-            text("u1", Role::User, "hi"),
-        ];
-        carry(&mut renamed, &placed);
-        assert_eq!(
-            renamed.iter().filter(|m| m.role == Role::System).count(),
-            2,
-            "the same words under an older id are the same context: {:?}",
-            shape(&renamed)
-        );
-    }
-
-    #[test]
-    fn two_contexts_on_one_message_are_carried_once_each() {
-        let mut prompt = vec![
-            text("sys", Role::System, "be brief"),
-            text("u1", Role::User, "hi"),
-        ];
-        let (mut applied, mut placed) = (Vec::new(), Vec::new());
-        for id in ["mcp.b", "mcp.c"] {
-            merge(
-                &mut prompt,
-                &mut applied,
-                &mut placed,
-                "c1",
-                false,
-                vec![PromptContext {
-                    id: id.into(),
-                    placement: Placement::Inline,
-                    content: format!("about {id}"),
-                }],
-            );
-        }
-        let sent = prompt.clone();
-        carry(&mut prompt, &placed);
-        carry(&mut prompt, &placed);
-        assert_eq!(
-            shape(&prompt),
-            shape(&sent),
-            "the earlier of two appended contexts is found too, so nothing grows"
-        );
-    }
-
-    #[test]
-    fn a_system_context_is_not_found_in_a_conversation_message() {
-        let (_, placed) = first_turn();
-        let mut prompt = vec![
-            text("sys", Role::System, "be brief"),
-            text("u0", Role::User, "about plugin.a"),
-            text("u1", Role::User, "hi"),
-        ];
-        carry(&mut prompt, &placed);
-        assert_eq!(
-            prompt.iter().position(|m| m.id == "c1-ctx-plugin.a"),
-            Some(1),
-            "a user message with the same words is not the system context: {:?}",
-            shape(&prompt)
-        );
-    }
-
-    #[test]
-    fn context_whose_message_left_the_prompt_is_not_carried() {
-        let (_, placed) = first_turn();
-        let mut trimmed = vec![
-            text("sys", Role::System, "be brief"),
-            text("u9", Role::User, "start over"),
-        ];
-        carry(&mut trimmed, &placed);
-        assert_eq!(
-            shape(&trimmed),
-            [
-                ("sys".into(), "be brief".into()),
-                ("c1-ctx-plugin.a".into(), "about plugin.a".into()),
-                ("u9".into(), "start over".into()),
-            ],
-            "the system context stays; what rode a message the prompt dropped goes with it"
-        );
-    }
-
-    #[test]
     fn contexts_placed_together_share_one_message() {
         let ctx = |id: &str| PromptContext {
             id: id.into(),
@@ -1167,21 +964,18 @@ mod tests {
             content: format!("{{\"about\":\"{id}\"}}"),
         };
         let mut prompt = Vec::new();
-        let mut applied = vec!["told".to_string()];
         let mut placed = Vec::new();
         merge(
             &mut prompt,
-            &mut applied,
             &mut placed,
             "c1",
             true,
-            vec![ctx("a"), ctx("told"), ctx("b"), ctx("a")],
+            vec![ctx("a"), ctx("b"), ctx("a")],
         );
         assert_eq!(prompt.len(), 1);
         assert_eq!(prompt[0].id, "c1-ctx-a");
         assert!(matches!(&prompt[0].content,
             Some(Content::Text(t)) if t == "{\"about\":\"a\"}\n{\"about\":\"b\"}"));
-        assert_eq!(applied, ["told", "a", "b"]);
         assert_eq!(
             placed,
             [Placed {

@@ -1,6 +1,5 @@
 use chrono::{DateTime, Utc};
 
-use crate::decision::PromptSource;
 use crate::events::ContextLimited;
 use crate::prompts::context as prompts;
 use crate::protocol::{
@@ -106,11 +105,8 @@ pub fn strategy(config: Option<&AgentConfig>, kind: ContextStrategyKind) -> Cont
         })
 }
 
-fn held(state: &SessionState, call: &HeldCall, source: &PromptSource) -> HeldCall {
-    if !source.is_tree() {
-        return call.clone();
-    }
-    let out = state.at_head().outgoing(&call.id, source, &[]);
+fn held(state: &SessionState, call: &HeldCall) -> HeldCall {
+    let out = state.at_head().outgoing(&call.id);
     HeldCall {
         request: LlmRequest {
             messages: out.prompt.into_iter().map(DraftMessage::from).collect(),
@@ -120,12 +116,7 @@ fn held(state: &SessionState, call: &HeldCall, source: &PromptSource) -> HeldCal
     }
 }
 
-pub fn limit(
-    state: &SessionState,
-    call: &HeldCall,
-    source: &PromptSource,
-    now: DateTime<Utc>,
-) -> Option<ContextLimited> {
+pub fn limit(state: &SessionState, call: &HeldCall, now: DateTime<Utc>) -> Option<ContextLimited> {
     let passes = state
         .limited
         .as_ref()
@@ -138,7 +129,7 @@ pub fn limit(
     let context = context_of(config.as_ref())?;
     let path = at.transcript();
     let window = context.window;
-    let call = held(state, call, source);
+    let call = held(state, call);
     let tokens = read_tokens(state, &call.request);
     let idle_for = match (state.turn_called, state.last_turn_at) {
         (false, Some(at)) => Some(u64::try_from((now - at).num_seconds()).unwrap_or_default()),
@@ -152,7 +143,6 @@ pub fn limit(
             tokens,
             window,
             call: call.clone(),
-            source: source.clone(),
         })
     })
 }
@@ -182,7 +172,6 @@ pub fn overflow(state: &SessionState, id: &str) -> Option<ContextLimited> {
             request,
             stream: call.stream,
         },
-        source: call.source.clone(),
     })
 }
 

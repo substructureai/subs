@@ -30,7 +30,6 @@ pub enum Fact {
         state: WorkerState,
     },
     Config {
-        #[serde(default)]
         config: Option<AgentConfig>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         root: bool,
