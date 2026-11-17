@@ -123,7 +123,7 @@ impl Session {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn with_state(id: String, tenant_id: String, state: SessionState) -> Self {
         Self {
             state,
@@ -411,7 +411,7 @@ impl Session {
         self.version = entry.version;
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn handle(
         &self,
         cmd: CommandPayload,
@@ -437,7 +437,7 @@ impl Session {
         self.handle(cmd, caller, Utc::now())
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn commit(
         &mut self,
         events: Vec<EventPayload>,
@@ -452,6 +452,7 @@ impl Session {
                     sequence: seq,
                 },
             );
+            #[cfg(test)]
             if let EventPayload::LlmCallDispatched(d) = &payload {
                 if let Some(call) = self.state.llm_call(&d.id) {
                     self.sent.insert(d.id.clone(), call.prompt.clone());

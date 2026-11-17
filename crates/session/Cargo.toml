@@ -25,6 +25,10 @@ tracing = "0.1"
 jsonschema = { version = "0.47.0", default-features = false }
 uuid = { version = "1", features = ["serde", "v5", "v7"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+proptest = { version = "1.11.0", optional = true }
+
+[features]
+testing = ["dep:proptest"]
 
 [dev-dependencies]
 proptest = "1.11.0"

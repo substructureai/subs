@@ -1377,3 +1377,34 @@ mod cold {
         );
     }
 }
+
+#[cfg(test)]
+mod laws {
+    use std::time::Duration;
+
+    use proptest::prelude::*;
+    use proptest::test_runner::FileFailurePersistence;
+    use substructure_session::testing;
+
+    use super::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 128,
+            failure_persistence: Some(Box::new(FileFailurePersistence::SourceParallel(
+                "proptest-regressions"
+            ))),
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn a_session_reloaded_from_sqlite_is_the_session_that_ran(ops in testing::ops()) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("subs.db");
+            let db = SqliteDb::open(path.to_str().unwrap(), Duration::from_secs(5)).unwrap();
+            let store = SqliteSessionStores::with_node_cache(db, 0)
+                .open(testing::TENANT, testing::SESSION);
+            testing::check(ops, store)?;
+        }
+    }
+}

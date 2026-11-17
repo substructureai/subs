@@ -31,6 +31,8 @@ pub mod span;
 pub mod state;
 pub mod store;
 pub mod system1;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 pub mod tool_contract;
 pub mod tree;
 pub mod work;
