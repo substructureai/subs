@@ -72,8 +72,13 @@ The client API does not take `state`. A browser must not write agent state.
 
 ## State on a branch
 
-The engine attaches state to the message tree. If you edit an earlier message or
-branch the conversation, the engine reads the state as it was at that point.
+The engine keeps state in the message tree, after the messages of the
+response that wrote it. Edit an earlier message, and the request reads the
+state as it was at that point. Switch back to an earlier version, and you get
+that version's state.
+
+When your reply branches off the path and omits `state`, the state you were sent
+goes with it to the new branch.
 
 `DecisionRequest.state` is always correct for the active path. See
 [Conversations](./120-conversations.md).

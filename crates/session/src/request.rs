@@ -12,7 +12,6 @@ use crate::protocol::{
     DecisionTurn, DeferToolsStrategy, DraftMessage, Effect, InterruptResumption, LlmFormat,
     LlmRequest, Message, MessageTree, SessionOwner, WorkerIdentity, WorkerRef, WorkerState,
 };
-use crate::reconcile::news_start;
 use crate::session::Session;
 use crate::span::SpanContext;
 use crate::state::{EffectState, EventMeta};
@@ -123,10 +122,8 @@ impl Session {
         let worker = self.state.worker.clone();
         let branch_id = worker_decision.branch.as_deref();
         let branch = branch_id.and_then(|b| Some(self.state.branches.get(b)?.view(b)));
-        let at = match branch_id {
-            Some(_) => self.state.at_scope(branch_id),
-            None => self.state.at(meta.head_id.as_deref()),
-        };
+        let read = self.state.read_point(&trigger, branch_id);
+        let at = self.state.at(read.at.as_deref());
         let _ = seq;
         let message_tree = at.message_tree();
         let transcript = at.transcript();
@@ -145,6 +142,9 @@ impl Session {
         }
         let (mut trigger, prompt) =
             wire_trigger(trigger, &transcript, &message_tree, &open_llm_calls);
+        if let DecisionTrigger::ClientTranscript { new_from, .. } = &mut trigger {
+            *new_from = read.shared;
+        }
         if let DecisionTrigger::BranchFinished {
             from: Some(from),
             stale,
@@ -253,17 +253,12 @@ pub fn wire_trigger(
         }
         Trigger::ClientTranscript {
             messages, client, ..
-        } => {
-            let known: std::collections::HashSet<&str> =
-                tree.nodes.iter().map(|n| n.message.id.as_str()).collect();
-            let new_from = news_start(&known, &messages);
-            DecisionTrigger::ClientTranscript {
-                messages,
-                new_from,
-                client,
-                join: false,
-            }
-        }
+        } => DecisionTrigger::ClientTranscript {
+            messages,
+            new_from: 0,
+            client,
+            join: false,
+        },
         Trigger::ClientAction { name, args, .. } => DecisionTrigger::ClientAction { name, args },
         Trigger::ContextLimit {
             reason,

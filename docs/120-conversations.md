@@ -16,9 +16,10 @@ the head to the root is the conversation that the model sees.
 
 A decision request holds that path as `messages`.
 
-The engine keeps the active branch in memory. Every other branch stays in the
-session log. When a view names a message on another branch, the engine loads
-that branch again. The [client API](./250-api.md) returns the whole tree.
+The engine keeps the active branch in memory, and the last message of every
+earlier version. Everything else stays in the session log. When a view names a
+message on another branch, the engine loads that branch again. The
+[client API](./250-api.md) returns the whole tree.
 
 ## Submit input
 
@@ -30,9 +31,15 @@ A client sends input in one of three ways.
 | `client.append` | Adds several messages at the head. It never branches. Use it to sync an outside conversation. |
 | `client.messages` | Sends the full conversation view. The engine merges edits and branches into the tree. |
 
-The engine matches a `client.messages` view against the tree by message `id`.
-Known IDs at the start match existing nodes. The first message that is new or
-has no ID starts a branch. `new_from` on the trigger gives its index.
+A view is merged into the tree. The engine matches it, message by message,
+along the conversation and each earlier version, and takes the longest match,
+the conversation first. The first message that does not continue that path
+starts a branch there. A known ID after it is recorded again as a copy.
+
+The worker's reply is a view too, merged the same way. The decision request
+reads where the client's view lands: its `messages`, `state` and `agent` are
+as they were at that point. `new_from` on the trigger gives the index of the
+first new message.
 
 ## Edit and branch
 
@@ -43,16 +50,18 @@ The engine starts a branch at the last matching node, records the changed
 message and everything after it, and moves the head to the end. The original
 branch stays in the tree.
 
-To regenerate, send the view without the last assistant reply. The engine
-records a new reply beside the old one.
+To regenerate, send the view up to the user message to answer again. User
+messages at the end of a view are always new input, so the worker answers
+them again. The new reply branches beside the old one, and both share the user
+message.
 
 Sending a message again under its existing ID changes nothing. The engine
 matches on ID, not on content.
 
-A view that stops at an earlier node writes nothing. It moves the head to that
-node and emits `head.moved`. The next reply branches there, and the engine
-cancels work in flight on the branch that you left. This is how a client changes
-branches.
+To switch back to an earlier version, send its view. The head moves to it,
+and the version keeps its own state. A view that stops partway along a path
+moves the head there, and the next reply branches. Either way the engine emits
+`head.moved` and cancels work in flight that is not on the new path.
 
 ## Example: edit an earlier message
 

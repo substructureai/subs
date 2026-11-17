@@ -345,10 +345,6 @@ struct Completion {
 }
 
 impl SessionState {
-    fn stale_decision(&self, node: Option<&str>, trigger: &Trigger) -> bool {
-        !self.at(node).anchor_on_path(self.trigger_anchor(trigger))
-    }
-
     pub fn void_effects(
         &self,
         stranded: impl Fn(EffectKind, &EffectTracking, Option<&str>) -> bool,
@@ -383,24 +379,31 @@ impl SessionState {
             .collect()
     }
 
-    fn void_stranded_work(&self, node: Option<&str>) -> Vec<EventPayload> {
-        let at = self.at(node);
-        let mut events = self.void_effects(|kind, tracking, anchor| {
-            crate::effects::stops(kind, tracking) && !at.anchor_on_path(anchor)
+    fn void_stranded_work(&self, scope: Option<&str>) -> Vec<EventPayload> {
+        let node = self.scope_node(scope);
+        let path = node
+            .as_deref()
+            .map(|n| self.path_ids(n))
+            .unwrap_or_default();
+        let on_path = |anchor: Option<&str>| SessionState::anchored_on(&path, anchor);
+        let mut events = self.void_effects_where(|e| {
+            e.branch.as_deref() == scope
+                && crate::effects::stops(e.kind(), &e.tracking)
+                && !on_path(e.anchor.as_deref())
         });
         for e in self.effects_of(EffectKind::Decision) {
             let Some(wd) = e.decision() else { continue };
-            if wd.branch.is_none()
+            if wd.branch.as_deref() == scope
                 && matches!(
                     e.tracking.status(),
                     EffectStatus::Queued | EffectStatus::RetryScheduled
                 )
-                && self.stale_decision(node, &wd.trigger)
+                && !on_path(self.trigger_anchor(&wd.trigger))
             {
                 events.push(self.decision_dropped(&e.id));
             }
         }
-        events.extend(self.void_stranded_branches(node));
+        events.extend(self.void_stranded_branches(scope));
         events
     }
 
@@ -514,6 +517,15 @@ impl Working {
         let events = step(&self.cx())?;
         self.emit_all(events);
         Ok(self)
+    }
+
+    fn load_outside(&mut self, ids: &[&str]) {
+        if let Some(loaded) = self.outside.branch_to(ids, &self.state) {
+            self.emit(EventPayload::BranchLoaded(BranchLoaded {
+                seqs: loaded.seqs(),
+            }));
+            self.state.load_branch(&loaded);
+        }
     }
 
     pub fn with_outside(mut self, outside: Outside) -> Self {
@@ -1036,14 +1048,7 @@ impl Working {
                     events,
                 })));
                 self.then(|s| {
-                    s.write_response(
-                        s.ids(),
-                        Vec::new(),
-                        state,
-                        agent.map(|a| *a),
-                        None,
-                        Writes::Setup,
-                    )
+                    s.write_response(s.ids(), Vec::new(), state, agent.map(|a| *a), None, None)
                 });
                 self.queue_decision(Trigger::SessionStart);
             }
@@ -1072,9 +1077,17 @@ impl Working {
                 metadata,
             } => {
                 self.ensure_owns_session(caller)?;
-                let Some(payload) = self.outside.drop_known(payload) else {
+                let Some(payload) = self.outside.drop_known(payload, &self.state) else {
                     return Ok(());
                 };
+                if let ClientPayload::Messages(view) = &payload {
+                    let ids: Vec<&str> = view
+                        .messages
+                        .iter()
+                        .filter_map(|m| m.id.as_deref())
+                        .collect();
+                    self.load_outside(&ids);
+                }
                 let joins = queue == QueueMode::Join
                     && self.phase.turn_id().is_some()
                     && matches!(
@@ -1384,48 +1397,35 @@ impl Working {
                 let answered = self
                     .worker_decision(&decision_id)
                     .map(|d| d.trigger.clone());
-                if let Some(branch) = self.decision_branch(&decision_id).map(str::to_string) {
-                    let completed = EventPayload::DecisionCompleted(DecisionCompleted {
-                        id: decision_id.clone(),
-                    });
-                    if self.open_branch(&branch).is_none() {
-                        self.emit(completed);
-                        return Ok(());
-                    }
-                    let on = Some(branch.as_str());
-                    self.then(|_| vec![completed]).then(|s| {
-                        s.write_response(s.ids(), transcript, state, agent, on, Writes::Turn)
-                    });
-                    let outer = self.scope.replace(branch.clone());
-                    self.apply_actions(actions, &decision_id, answered);
-                    self.scope = outer;
-                    self.then(|s| effects::tool::unanswered(s));
-                    self.then(|s| s.quiet_branch(s.ids(), &branch));
+                let scope = self.decision_branch(&decision_id).map(str::to_string);
+                let completed = EventPayload::DecisionCompleted(DecisionCompleted {
+                    id: decision_id.clone(),
+                });
+                if scope
+                    .as_deref()
+                    .is_some_and(|b| self.open_branch(b).is_none())
+                {
+                    self.emit(completed);
                     return Ok(());
                 }
                 let ids: Vec<&str> = transcript.iter().filter_map(|m| m.id.as_deref()).collect();
-                if let Some(loaded) = self.outside.branch_to(&ids, &self.state) {
-                    self.emit(EventPayload::BranchLoaded(BranchLoaded {
-                        seqs: loaded.seqs(),
-                    }));
-                    self.state.load_branch(&loaded);
-                }
-                self.then(|_| {
-                    vec![EventPayload::DecisionCompleted(DecisionCompleted {
-                        id: decision_id.clone(),
-                    })]
-                })
-                .then(|s| {
-                    let kind = match answered {
-                        Some(Trigger::SessionStart) => Writes::Setup,
-                        _ => Writes::Turn,
-                    };
-                    s.write_response(s.ids(), transcript, state, agent, None, kind)
-                })
-                .then(|s| s.void_stranded_work(s.head_id.as_deref()));
-
+                self.load_outside(&ids);
+                let read = answered
+                    .as_ref()
+                    .and_then(|t| self.read_point(t, scope.as_deref()).at);
+                let on = scope.clone();
+                self.then(|_| vec![completed])
+                    .then(|s| {
+                        s.write_response(s.ids(), transcript, state, agent, on.as_deref(), read)
+                    })
+                    .then(|s| s.void_stranded_work(scope.as_deref()));
+                let outer = std::mem::replace(&mut self.scope, scope.clone());
                 self.apply_actions(actions, &decision_id, answered);
+                self.scope = outer;
                 self.then(|s| effects::tool::unanswered(s));
+                if let Some(branch) = scope {
+                    self.then(|s| s.quiet_branch(s.ids(), &branch));
+                }
                 Ok(())
             }
 
@@ -1490,8 +1490,7 @@ mod authorize;
 pub mod branch;
 mod context;
 mod delivery;
-mod transcript;
-use transcript::Writes;
+pub(crate) mod transcript;
 
 #[cfg(test)]
 mod tests;

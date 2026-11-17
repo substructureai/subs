@@ -24,7 +24,6 @@ pub mod prompt_context;
 pub mod prompts;
 pub mod propose;
 pub mod protocol;
-pub mod reconcile;
 pub mod retry;
 pub mod schedule;
 pub mod session;

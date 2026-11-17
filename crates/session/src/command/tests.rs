@@ -7,7 +7,6 @@ use crate::protocol::{
     ClientAppend, ClientContext, ClientMessage, ClientMessages, DeferTools, McpAnnounce,
     NewMessage, Role,
 };
-use crate::reconcile::plan_reconcile;
 use chrono::Utc;
 
 use super::*;
@@ -1706,14 +1705,11 @@ fn normalize_folds_a_client_tool_echo_onto_its_recorded_node() {
         Some("w1"),
         "tool echo adopts the recorded node id"
     );
-    let known: std::collections::HashSet<&str> = agg.state.known_messages();
-    let plan = plan_reconcile(&known, &messages);
     assert_eq!(
-        plan.len(),
-        1,
-        "only the new user turn is news; got {plan:?}"
+        agg.state.land(&messages, None).shared,
+        3,
+        "only the new user turn is news"
     );
-    assert_eq!(plan.first().map(|w| w.index), Some(3));
 }
 
 #[test]
@@ -1787,16 +1783,10 @@ fn edit_with_tail_replay_keeps_the_tool_result() {
         Some("w1"),
         "the replayed tool result folds onto w1"
     );
-    let known: std::collections::HashSet<&str> = agg.state.known_messages();
-    let plan = plan_reconcile(&known, &messages);
     assert_eq!(
-        plan.len(),
-        4,
-        "the whole edited branch is news; got {plan:?}"
-    );
-    assert!(
-        plan.iter().any(|w| w.index == 2),
-        "the tool result is part of the re-recorded branch"
+        agg.state.land(&messages, None).shared,
+        0,
+        "the whole edited branch is news, the tool result with it"
     );
 }
 
@@ -1968,7 +1958,7 @@ fn queued_client_message_stays_a_delta_until_delivery() {
 }
 
 #[test]
-fn reconcile_re_records_known_ids_past_the_first_new_node() {
+fn a_merge_re_records_known_ids_past_the_first_new_node() {
     let mut agg = create_session("sess-1", "tenant-a", "user-1");
     let events = dispatch(
         &mut agg,
@@ -2210,14 +2200,11 @@ fn a_resend_of_a_prior_assistant_turn_appends_without_forking() {
         ],
     );
     let messages = transcript_messages(&events).expect("a transcript decision");
-    let known: std::collections::HashSet<&str> = agg.state.known_messages();
-    let plan = plan_reconcile(&known, &messages);
     assert_eq!(
-        plan.len(),
-        1,
-        "only the new user turn is news; got {plan:?}"
+        agg.state.land(&messages, None).shared,
+        2,
+        "only the new user turn is news"
     );
-    assert_eq!(plan.first().map(|w| w.index), Some(2));
 }
 
 #[test]
@@ -7145,6 +7132,25 @@ fn open_decision(agg: &mut Session, text: &str) -> String {
         .expect("user message opens a decision")
 }
 
+fn open_view(agg: &mut Session, messages: Vec<DraftMessage>) -> String {
+    let setup = dispatch(
+        agg,
+        CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Messages(ClientMessages {
+                messages,
+                stream: false,
+                client: Default::default(),
+            }),
+            turn: TurnTarget::Detached,
+            queue: QueueMode::Refuse,
+            metadata: Default::default(),
+        },
+        &system(),
+    );
+    decision_with(&setup, |t| matches!(t, Trigger::ClientTranscript { .. }))
+        .expect("a view opens a decision")
+}
+
 fn submit_state(
     agg: &mut Session,
     decision_id: String,
@@ -7234,7 +7240,7 @@ fn null_valued_key_differs_from_absent_key() {
 }
 
 #[test]
-fn changed_state_anchors_at_the_post_reconcile_head() {
+fn changed_state_anchors_at_the_merged_head() {
     let mut agg = create_session("sess-1", "tenant-a", "user-1");
     let d1 = open_decision(&mut agg, "hi");
     let events = submit_state(
@@ -7249,9 +7255,9 @@ fn changed_state_anchors_at_the_post_reconcile_head() {
     let updates = state_updates(&events);
     assert_eq!(updates.len(), 1);
     assert_eq!(
-        agg.state.tree.get("u1").and_then(|n| n.parent()),
-        Some(updates[0].node.id.as_str()),
-        "the version precedes the response's messages"
+        updates[0].node.parent_id.as_deref(),
+        Some("a1"),
+        "the version follows the response's messages"
     );
     assert_eq!(agg.state.at_head().resolve_state_for().0, json!({"v": 1}));
 }
@@ -8223,6 +8229,15 @@ fn starts_with(prompt: &[Message], prefix: &[Message]) -> bool {
             == serde_json::to_value(prefix).unwrap()
 }
 
+fn kept_nodes(agg: &Session, ids: &[&str]) -> crate::branch::Loaded {
+    crate::branch::Loaded {
+        nodes: ids
+            .iter()
+            .filter_map(|id| agg.state.tree.get(id).cloned())
+            .collect(),
+    }
+}
+
 #[test]
 fn context_follows_the_branch_a_prompt_is_on() {
     let mut agg = session_with_searched_connector("sentry", &["search_issues"]);
@@ -8243,10 +8258,12 @@ fn context_follows_the_branch_a_prompt_is_on() {
         "the next turn reads the last call's prompt first: {second:?}"
     );
 
+    let first_branch = kept_nodes(&agg, &["u1", "a1"]);
     let d = open_decision(&mut agg, "start over");
     let x1 = node_msg("x1", Role::User, "start over");
     submit_state(&mut agg, d, vec![x1.clone()], None);
     assert!(!agg.state.has_node("u1"), "the first branch is unloaded");
+    assert!(agg.state.versions.contains_key("u2"), "its leaf is kept");
     let other = send_at_head(&mut agg, "call-3", vec![x1]);
     assert_eq!(
         context_ids(&other),
@@ -8255,6 +8272,7 @@ fn context_follows_the_branch_a_prompt_is_on() {
     );
 
     let d = open_decision(&mut agg, "back");
+    agg.state.load_branch(&first_branch);
     let u3 = node_msg("u3", Role::User, "back");
     submit_state(
         &mut agg,
@@ -8262,7 +8280,11 @@ fn context_follows_the_branch_a_prompt_is_on() {
         vec![u1.clone(), a1.clone(), u2.clone(), u3.clone()],
         None,
     );
-    assert!(agg.state.has_node("u1"), "the first branch is loaded again");
+    assert_eq!(
+        agg.state.tree.get("u3").and_then(|n| n.parent()),
+        Some("u2"),
+        "the view lands on the first branch"
+    );
     let back = send_at_head(&mut agg, "call-4", vec![u1, a1, u2, u3]);
     assert_eq!(
         context_ids(&back),
@@ -8303,7 +8325,10 @@ fn a_fork_after_the_context_was_placed_keeps_it() {
     let d = open_decision(&mut agg, "instead");
     let z2 = node_msg("z2", Role::User, "instead");
     submit_state(&mut agg, d, vec![u1.clone(), a1.clone(), z2.clone()], None);
-    assert!(!agg.state.has_node("u2"), "the sibling is unloaded");
+    assert!(
+        agg.state.versions.contains_key("u2"),
+        "the sibling is kept as a version"
+    );
     let fork = send_at_head(&mut agg, "call-3", vec![u1, a1, z2]);
     assert!(
         starts_with(&fork, &first),
@@ -9663,9 +9688,9 @@ fn changed_agent_config_anchors_at_head_and_dedups() {
     let updates = agent_updates(&events);
     assert_eq!(updates.len(), 1, "the first write records a config version");
     assert_eq!(
-        agg.state.tree.get("u1").and_then(|n| n.parent()),
-        Some(updates[0].node.id.as_str()),
-        "the config precedes the response's messages"
+        updates[0].node.parent_id.as_deref(),
+        Some("a1"),
+        "the config follows the response's messages"
     );
     assert_eq!(
         agg.state.at_head().resolve_agent_for(),
@@ -10234,7 +10259,7 @@ fn terminal_session_start_failure_restarts_on_the_next_message() {
 }
 
 #[test]
-fn fork_anchors_new_state_and_resolves_as_of_the_prefix_without_one() {
+fn a_fork_writes_its_state_after_its_messages_and_an_omitted_state_carries() {
     let mut agg = create_session("sess-1", "tenant-a", "user-1");
     let d1 = open_decision(&mut agg, "hi");
     submit_state(
@@ -10268,10 +10293,16 @@ fn fork_anchors_new_state_and_resolves_as_of_the_prefix_without_one() {
     );
     let updates = state_updates(&events);
     assert_eq!(updates.len(), 1);
-    assert_eq!(updates[0].node.parent_id.as_deref(), Some("u1"));
+    assert_eq!(updates[0].node.parent_id.as_deref(), Some("x1"));
     assert_eq!(
-        agg.state.tree.get("x1").and_then(|n| n.parent()),
-        Some(updates[0].node.id.as_str())
+        agg.state
+            .tree
+            .get("x1")
+            .and_then(|n| n.parent())
+            .and_then(|p| agg.state.tree.get(p))
+            .and_then(|n| n.parent()),
+        Some("u1"),
+        "the fork keeps the state saved after u1"
     );
     assert_eq!(agg.state.at_head().resolve_state_for().0, json!({"v": 3}));
 
@@ -10285,12 +10316,16 @@ fn fork_anchors_new_state_and_resolves_as_of_the_prefix_without_one() {
         ],
         None,
     );
-    assert!(state_updates(&events).is_empty());
-    assert_eq!(agg.state.head_id.as_deref(), Some("y1"));
+    assert_eq!(state_updates(&events).len(), 1);
+    assert_eq!(
+        agg.state.tree.get("y1").and_then(|n| n.parent()),
+        agg.state.tree.get("x1").and_then(|n| n.parent()),
+        "both forks hang after the state saved with u1"
+    );
     assert_eq!(
         agg.state.at_head().resolve_state_for().0,
-        json!({"v": 1}),
-        "the fork is uncontaminated by the abandoned branches"
+        json!({"v": 3}),
+        "an omitted state keeps what the worker saw"
     );
 }
 
@@ -10335,7 +10370,7 @@ fn long_chat(agg: &mut Session) {
 }
 
 #[test]
-fn a_reset_lands_on_the_start_and_keeps_the_state_sent_with_it() {
+fn a_reset_lands_before_the_first_message_and_keeps_the_state_sent_with_it() {
     let mut agg =
         create_session_with_config("sess-1", "tenant-a", "user-1", Some(agent_config("m1")));
     long_chat(&mut agg);
@@ -10361,14 +10396,13 @@ fn a_reset_lands_on_the_start_and_keeps_the_state_sent_with_it() {
         })
         .collect();
     assert_eq!(texts, ["latest"], "the view replaces the conversation");
-    assert_eq!(starts(&agg), 1, "the reset lands on the one start");
     assert!(
         events
             .iter()
             .any(|e| matches!(e, EventPayload::BranchUnloaded(_))),
         "the old branch leaves memory; it stays in the log"
     );
-    assert!(!agg.state.has_node("u2"));
+    assert!(!agg.state.has_node("u1"));
     assert_eq!(agg.state.at_head().resolve_state_for().0, json!({"v": 3}));
 }
 
@@ -10432,13 +10466,9 @@ fn an_edit_of_the_first_message_reads_the_setup() {
         Some("m2".to_string())
     );
 
-    let d3 = open_decision(&mut agg, "edit");
-    submit_state(
-        &mut agg,
-        d3,
-        vec![node_msg("e1", Role::User, "hi, edited")],
-        None,
-    );
+    let edit = vec![node_msg("e1", Role::User, "hi, edited")];
+    let d3 = open_view(&mut agg, edit.clone());
+    submit_state(&mut agg, d3, edit, None);
 
     let edited = agg.state.tree.get("e1").expect("the edit is recorded");
     assert!(
@@ -10458,15 +10488,6 @@ fn an_edit_of_the_first_message_reads_the_setup() {
         Some("m1".to_string()),
         "the session.start config holds on every branch"
     );
-    assert_eq!(starts(&agg), 1, "the edit lands on the one start");
-}
-
-fn starts(agg: &Session) -> usize {
-    agg.state
-        .tree
-        .iter()
-        .filter(|n| matches!(n.fact, crate::tree::Fact::Start))
-        .count()
 }
 
 #[test]
@@ -10490,7 +10511,7 @@ fn a_reset_that_sends_config_keeps_it() {
 }
 
 #[test]
-fn effect_anchor_is_the_post_reconcile_head() {
+fn effect_anchor_is_the_merged_head() {
     let mut agg = create_session("sess-1", "tenant-a", "user-1");
     let d1 = open_decision(&mut agg, "hi");
     dispatch(
@@ -10625,7 +10646,14 @@ fn truncation_voids_work_anchored_on_the_abandoned_branch() {
 
     let d2 = open_decision(&mut agg, "regen");
     let events = submit_state(&mut agg, d2, vec![node_msg("u1", Role::User, "hi")], None);
-    assert_eq!(head_moves(&events), ["u1"]);
+    let path: Vec<String> = agg
+        .state
+        .at_head()
+        .transcript()
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    assert_eq!(path, ["u1"]);
     assert_eq!(voided_ids(&events), ["tc-1"], "got {events:?}");
 }
 
@@ -11454,7 +11482,7 @@ fn interrupt_voiding_is_scoped_to_the_parked_path() {
 }
 
 #[test]
-fn worker_interrupt_anchors_at_the_post_reconcile_head() {
+fn worker_interrupt_anchors_at_the_merged_head() {
     let mut agg = create_session("sess-1", "tenant-a", "user-1");
     let d1 = open_decision(&mut agg, "hi");
     let events = dispatch(

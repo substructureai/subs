@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::decision::BranchConfig;
-use crate::protocol::{AgentConfig, Message, NewMessage, WorkerState};
+use crate::protocol::{AgentConfig, DraftMessage, Message, NewMessage, WorkerState};
 use crate::state::Logged;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -33,7 +33,6 @@ pub enum Fact {
         #[serde(default)]
         agent: BranchConfig,
     },
-    Start,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,10 +131,45 @@ impl Tree {
         path
     }
 
-    pub fn start_of<'a>(&'a self, node: Option<&'a str>) -> Option<&'a str> {
-        self.up(node)
-            .find(|n| matches!(n.fact, Fact::Start))
-            .map(Node::id)
+    pub fn shared(
+        &self,
+        view: &[DraftMessage],
+        matches: impl Fn(&DraftMessage, &Node) -> bool,
+    ) -> usize {
+        let mut last = None;
+        let mut count = 0;
+        for draft in view {
+            let Some(node) = draft.id.as_deref().and_then(|id| self.get(id)) else {
+                break;
+            };
+            if node.message().is_none()
+                || self.message_at(node.parent()) != last
+                || !matches(draft, node)
+            {
+                break;
+            }
+            last = Some(node.id());
+            count += 1;
+        }
+        count
+    }
+
+    pub fn fork_on(
+        &self,
+        leaf: Option<&str>,
+        message: Option<&str>,
+        floor: Option<&str>,
+    ) -> Option<Option<String>> {
+        let mut fork = leaf;
+        for node in self.up(leaf) {
+            if Some(node.id()) == message || Some(node.id()) == floor {
+                return Some(fork.map(str::to_string));
+            }
+            if node.message().is_some() {
+                fork = node.parent();
+            }
+        }
+        message.is_none().then(|| fork.map(str::to_string))
     }
 
     pub fn message_at<'a>(&'a self, node: Option<&'a str>) -> Option<&'a str> {
@@ -238,10 +272,6 @@ impl Node {
                 fact: Fact::Config {
                     config: v.config.clone(),
                 },
-            },
-            EventPayload::ConversationStarted(c) => Node {
-                place: c.node.clone(),
-                fact: Fact::Start,
             },
             EventPayload::BranchStarted(b) => Node {
                 place: Place {

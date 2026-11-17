@@ -25,8 +25,6 @@ pub enum EventPayload {
     NewMessage(NewMessage),
     #[serde(rename = "head.moved")]
     HeadMoved(HeadMoved),
-    #[serde(rename = "conversation.started")]
-    ConversationStarted(ConversationStarted),
     #[serde(rename = "llm.call.requested")]
     LlmCallRequested(LlmCallRequested),
     #[serde(rename = "llm.call.dispatched")]
@@ -279,14 +277,10 @@ pub struct SessionCreated {
 pub struct SessionDone {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConversationStarted {
-    #[serde(flatten)]
-    pub node: crate::tree::Place,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeadMoved {
     pub head_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
 }
 
 impl MessageTree {

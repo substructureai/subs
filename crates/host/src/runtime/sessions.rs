@@ -1299,6 +1299,7 @@ mod tests {
         decide(vec![
             draft("u1", Role::User, "hi"),
             draft("a1", Role::Assistant, "hello"),
+            draft("x1", Role::Assistant, "and more"),
         ])
         .await;
         s.execute(say("t2", "edit")).await.unwrap();
@@ -1316,7 +1317,7 @@ mod tests {
             .unwrap();
         let mut ids: Vec<&str> = tree.nodes.iter().map(|n| n.message.id.as_str()).collect();
         ids.sort();
-        assert_eq!(ids, vec!["a1", "b1", "u1"]);
+        assert_eq!(ids, vec!["a1", "b1", "u1", "x1"]);
         assert_eq!(tree.head_id.as_deref(), Some("b1"));
     }
 

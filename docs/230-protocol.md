@@ -174,7 +174,7 @@ type DecisionResponse = {
 
 | Field | Meaning |
 | --- | --- |
-| `messages` | Messages to record on the active path, or on the decision's branch. |
+| `messages` | Your view of the path: the conversation, or the decision's branch. Messages the path already has are skipped, and the rest are recorded after them. A view that leaves the path starts a branch where it leaves. Omit it to change nothing. |
 | `actions` | What the engine does next. See [Actions](#actions). |
 | `state` | Replaces your state. Omit or send `null` to keep it. Send `{}` to clear it. |
 | `agent` | Replaces the config. Omit to keep it. |

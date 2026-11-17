@@ -1005,6 +1005,9 @@ pub struct SessionState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_id: Option<String>,
 
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub versions: BTreeMap<String, String>,
+
     #[serde(default, skip_serializing_if = "crate::tree::Tree::is_empty")]
     pub tree: crate::tree::Tree,
 
@@ -1057,6 +1060,7 @@ impl SessionState {
             title: None,
             detached_turns: BTreeSet::new(),
             head_id: None,
+            versions: BTreeMap::new(),
             tree: crate::tree::Tree::default(),
             open_interrupts: Vec::new(),
             session_start_failed: false,
@@ -1159,16 +1163,42 @@ impl SessionState {
     fn grow(&mut self, node: crate::tree::Node, seq: u64) {
         let id = node.id().to_string();
         let user = node.message().is_some_and(|m| m.role == Role::User);
-        match node.branch().and_then(|b| self.branches.get_mut(b)) {
+        let follows = node.parent() == self.head_id.as_deref();
+        let branch = node.branch().map(str::to_string);
+        self.tree.push(Logged { seq, entry: node });
+        match branch.and_then(|b| self.branches.get_mut(&b)) {
             Some(branch) => branch.leaf = Some(id),
             None => {
                 if user {
                     self.status = SessionStatus::Idle;
                 }
-                self.head_id = Some(id);
+                match follows {
+                    true => self.head_id = Some(id),
+                    false => self.move_head(id),
+                }
             }
         }
-        self.tree.push(Logged { seq, entry: node });
+    }
+
+    fn move_head(&mut self, to: String) {
+        if self.head_id.as_deref() == Some(to.as_str()) {
+            return;
+        }
+        let path = self.tree.path_ids(&to);
+        let left = self
+            .head_id
+            .as_deref()
+            .filter(|old| !path.contains(old))
+            .and_then(|old| {
+                Some((
+                    self.tree.message_at(Some(old))?.to_string(),
+                    old.to_string(),
+                ))
+            });
+        self.versions
+            .retain(|_, leaf| !path.contains(leaf.as_str()));
+        self.versions.extend(left);
+        self.head_id = Some(to);
     }
 
     pub fn decision_branch(&self, id: &str) -> Option<&str> {
@@ -1864,7 +1894,14 @@ impl SessionState {
                 }
             }
             EventPayload::HeadMoved(payload) => {
-                self.head_id = Some(payload.head_id.clone());
+                match payload
+                    .branch
+                    .as_deref()
+                    .and_then(|b| self.branches.get_mut(b))
+                {
+                    Some(branch) => branch.leaf = Some(payload.head_id.clone()),
+                    None => self.move_head(payload.head_id.clone()),
+                }
             }
             EventPayload::BranchLoaded(_) => {}
             EventPayload::BranchUnloaded(_) => self.unload_off_path(),
@@ -2141,9 +2178,7 @@ impl SessionState {
                     sync.auth = Some(p.auth);
                 }
             }
-            EventPayload::WorkerStateUpdated(_)
-            | EventPayload::AgentConfigUpdated(_)
-            | EventPayload::ConversationStarted(_) => {
+            EventPayload::WorkerStateUpdated(_) | EventPayload::AgentConfigUpdated(_) => {
                 if let Some(node) = crate::tree::Node::of_event(event) {
                     self.grow(node, ctx.sequence);
                 }
@@ -2447,10 +2482,10 @@ impl SessionState {
         if matches!(trigger, Trigger::ClientAction { .. }) {
             return None;
         }
-        if let Trigger::ClientTranscript { messages, .. } = trigger {
-            let messages = self.normalize_client_view(messages.clone());
-            let landing = self.landing_point(&messages, None);
-            return self.at(landing.node()).active_interrupt_for();
+        if let Trigger::ClientTranscript { .. } = trigger {
+            return self
+                .at(self.read_point(trigger, None).at.as_deref())
+                .active_interrupt_for();
         }
         let at = match self.trigger_anchor(trigger) {
             Some(a) if !self.at_head().anchor_on_path(Some(a)) => self.at(Some(a)),
@@ -2696,7 +2731,10 @@ impl SessionState {
         })
     }
 
-    fn anchored_on(path: &std::collections::HashSet<&str>, anchor: Option<&str>) -> bool {
+    pub(crate) fn anchored_on(
+        path: &std::collections::HashSet<&str>,
+        anchor: Option<&str>,
+    ) -> bool {
         anchor.is_none_or(|a| path.contains(a))
     }
 
@@ -2741,7 +2779,39 @@ impl SessionState {
         for leaf in leaves {
             live.extend(self.path_ids(leaf));
         }
+        for view in self.open_views() {
+            for id in view.iter().rev().filter_map(|m| m.id.as_deref()) {
+                for node in self.tree.up(Some(id)) {
+                    if !live.insert(node.id()) {
+                        break;
+                    }
+                }
+            }
+        }
+        for leaf in self.versions.values() {
+            let mut messages = 0;
+            for node in self.tree.up(Some(leaf)) {
+                messages += usize::from(node.message().is_some());
+                if messages > 1 {
+                    break;
+                }
+                live.insert(node.id());
+            }
+        }
         live
+    }
+
+    fn open_views(&self) -> impl Iterator<Item = &[DraftMessage]> {
+        self.effects_of(EffectKind::Decision)
+            .filter(|e| e.tracking.is_unsettled())
+            .filter_map(|e| match &e.decision()?.trigger {
+                Trigger::ClientTranscript { messages, .. } => Some(messages.as_slice()),
+                _ => None,
+            })
+    }
+
+    pub fn versions_hold(&self, id: &str) -> bool {
+        self.versions.contains_key(id)
     }
 
     pub fn off_path(&self) -> bool {

@@ -10,29 +10,32 @@ use crate::protocol::{
     ClientAppend, ClientContext, ClientMessage, ClientMessages, ClientPayload, Content,
     DraftMessage, EffectStatus, NewMessage, QueueMode, Role,
 };
-use crate::reconcile::{landing_leaf, plan_reconcile};
 use crate::state::{EffectKind, SessionState};
 use crate::Caller;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Writes {
-    Setup,
-    Turn,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Landing {
-    Follows(Option<String>),
-    Forks(Option<String>),
-    Strays(Option<String>),
+pub struct Landed {
+    pub at: Option<String>,
+    pub shared: usize,
+    pub forks: bool,
 }
 
-impl Landing {
-    pub fn node(&self) -> Option<&str> {
-        match self {
-            Landing::Follows(n) | Landing::Forks(n) | Landing::Strays(n) => n.as_deref(),
+impl Landed {
+    fn stay(at: Option<String>) -> Self {
+        Landed {
+            at,
+            shared: 0,
+            forks: false,
         }
     }
+}
+
+fn settled(view: &[DraftMessage]) -> &[DraftMessage] {
+    let end = view
+        .iter()
+        .rposition(|m| m.role != Role::User)
+        .map_or(0, |i| i + 1);
+    &view[..end]
 }
 
 impl SessionState {
@@ -43,20 +46,35 @@ impl SessionState {
         state: Option<WorkerState>,
         config: Option<AgentConfig>,
         scope: Option<&str>,
-        kind: Writes,
+        read: Option<String>,
     ) -> Vec<EventPayload> {
         let leaf = self.scope_node(scope);
         let transcript = match scope {
             None => self.normalize_client_view(transcript),
             Some(_) => transcript,
         };
-        let known = self.known_messages();
-        let plan = plan_reconcile(&known, &transcript);
-        let landing = self.landing_point(&transcript, scope);
-        let parent = landing.node().map(str::to_string);
+        let landed = match transcript.is_empty() {
+            true => Landed::stay(leaf.clone()),
+            false => self.land(&transcript, scope),
+        };
+        let moved = landed.at != leaf;
         let branch = scope.map(str::to_string);
-        let mut cursor = parent.clone();
+        let mut cursor = landed.at.clone();
         let mut events = Vec::new();
+        for draft in transcript.into_iter().skip(landed.shared) {
+            let copied_from = draft.id.clone().filter(|id| self.has_node(id));
+            let message = match copied_from {
+                Some(_) => draft.rerecord(ids),
+                None => draft.record(ids),
+            };
+            let id = message.id.clone();
+            events.push(EventPayload::NewMessage(NewMessage {
+                message,
+                parent_id: cursor.replace(id),
+                copied_from,
+                branch: branch.clone(),
+            }));
+        }
         let place = |cursor: &mut Option<String>| {
             let id = ids.next();
             crate::tree::Place {
@@ -65,19 +83,14 @@ impl SessionState {
                 branch: branch.clone(),
             }
         };
-        let base = self.at(parent.as_deref());
-        let state = state.filter(|s| *s != base.resolve_state_for());
-        let config = config.filter(|c| Some(c) != base.resolve_agent_for().as_ref());
-        let messages = !matches!(landing, Landing::Strays(_)) && !plan.is_empty();
-        let opens = kind == Writes::Turn
-            && scope.is_none()
-            && self.tree.start_of(parent.as_deref()).is_none()
-            && (state.is_some() || config.is_some() || messages);
-        if opens {
-            events.push(EventPayload::ConversationStarted(ConversationStarted {
-                node: place(&mut cursor),
-            }));
-        }
+        let base = self.at(landed.at.as_deref());
+        let read = self.at(read.as_deref());
+        let state = state
+            .or_else(|| landed.forks.then(|| read.resolve_state_for()))
+            .filter(|s| *s != base.resolve_state_for());
+        let config = config
+            .or_else(|| landed.forks.then(|| read.resolve_agent_for()).flatten())
+            .filter(|c| Some(c) != base.resolve_agent_for().as_ref());
         if let Some(state) = state {
             events.push(EventPayload::WorkerStateUpdated(WorkerStateUpdated {
                 state,
@@ -91,66 +104,59 @@ impl SessionState {
                 node: place(&mut cursor),
             }));
         }
-        if messages {
-            let mut plan = plan.iter().peekable();
-            for (index, msg) in transcript.into_iter().enumerate() {
-                if plan.peek().is_none_or(|w| w.index != index) {
-                    continue;
-                }
-                let rerecord = plan.next().is_some_and(|w| w.rerecord);
-                let copied_from = rerecord.then(|| msg.id.clone()).flatten();
-                let message = match rerecord {
-                    true => msg.rerecord(ids),
-                    false => msg.record(ids),
-                };
-                let id = message.id.clone();
-                events.push(EventPayload::NewMessage(NewMessage {
-                    message,
-                    parent_id: cursor.replace(id),
-                    copied_from,
-                    branch: branch.clone(),
-                }));
-            }
-        }
-        if events.is_empty() && scope.is_none() && parent != leaf {
-            if let Some(head_id) = parent {
-                events.push(EventPayload::HeadMoved(HeadMoved { head_id }));
+        if events.is_empty() && moved {
+            if let Some(head_id) = landed.at {
+                events.push(EventPayload::HeadMoved(HeadMoved { head_id, branch }));
             }
         }
         events
     }
 
-    pub(crate) fn landing_point(
-        &self,
-        transcript: &[DraftMessage],
-        scope: Option<&str>,
-    ) -> Landing {
+    pub(crate) fn land(&self, view: &[DraftMessage], scope: Option<&str>) -> Landed {
+        self.land_view(view, scope, false)
+    }
+
+    fn land_view(&self, view: &[DraftMessage], scope: Option<&str>, regenerate: bool) -> Landed {
+        let full = self
+            .tree
+            .shared(view, |_, node| scope.is_some() || node.branch().is_none());
+        let shared = match regenerate && full == view.len() {
+            true => settled(view).len(),
+            false => full,
+        };
+        let last = |n: usize| n.checked_sub(1).and_then(|i| view[i].id.as_deref());
         let leaf = self.scope_node(scope);
-        let known = self.known_messages();
-        let plan = plan_reconcile(&known, transcript);
-        let landing = landing_leaf(transcript, &plan);
-        let at_leaf =
-            transcript.is_empty() || self.tree.message_at(leaf.as_deref()) == landing.as_deref();
-        let on_open_branch = landing
-            .as_deref()
-            .and_then(|l| self.node_branch(l))
-            .is_some_and(|b| self.open_branch(b).is_some());
-        match (scope, at_leaf) {
-            (_, true) => Landing::Follows(leaf),
-            (None, false) if !on_open_branch => match landing {
-                Some(landing) => Landing::Forks(Some(landing)),
-                None => match self.tree.start_of(leaf.as_deref()) {
-                    Some(start) => Landing::Forks(Some(start.to_string())),
-                    None => Landing::Follows(leaf),
-                },
-            },
-            _ => {
-                tracing::warn!(
-                    ?scope,
-                    "a response that does not follow its path; messages not written"
-                );
-                Landing::Strays(leaf)
-            }
+        let floor = scope
+            .and_then(|b| self.branches.get(b))
+            .map(|b| b.node.as_str());
+        let version = scope
+            .is_none()
+            .then(|| last(full).and_then(|m| self.versions.get(m)))
+            .flatten()
+            .map(String::as_str);
+        let line = [leaf.as_deref(), version]
+            .into_iter()
+            .find(|&line| self.tree.fork_on(line, last(full), floor).is_some());
+        let at = match line {
+            Some(line) => self.tree.fork_on(line, last(shared), floor).flatten(),
+            None if scope.is_some() => self.tree.fork_on(leaf.as_deref(), None, floor).flatten(),
+            None => last(shared).map(str::to_string),
+        };
+        Landed {
+            forks: line.is_none_or(|line| at.as_deref() != line),
+            at,
+            shared,
+        }
+    }
+
+    fn view_point(&self, view: &[DraftMessage]) -> Landed {
+        self.land_view(view, None, true)
+    }
+
+    pub fn read_point(&self, trigger: &Trigger, branch: Option<&str>) -> Landed {
+        match (branch, trigger) {
+            (None, Trigger::ClientTranscript { messages, .. }) => self.view_point(messages),
+            _ => Landed::stay(self.scope_node(branch)),
         }
     }
 
@@ -195,29 +201,28 @@ impl SessionState {
     }
 
     pub fn normalize_client_view(&self, messages: Vec<DraftMessage>) -> Vec<DraftMessage> {
-        let known = self.known_messages();
-        let on_path: std::collections::HashSet<&str> = self
-            .head_id
-            .as_deref()
-            .map(|h| self.path_ids(h))
-            .unwrap_or_default();
+        let mut on_path = None;
         messages
             .into_iter()
             .map(|m| {
-                let is_known = m.id.as_deref().is_some_and(|id| known.contains(id));
-                if m.role == Role::Tool && !is_known {
-                    if let Some(node_id) = m
-                        .tool_call_id
-                        .as_deref()
-                        .and_then(|tcid| self.recorded_result_node(tcid, &on_path))
-                    {
-                        return DraftMessage {
-                            id: Some(node_id),
-                            ..m
-                        };
-                    }
+                let unknown = m.id.as_deref().is_none_or(|id| !self.has_node(id));
+                let tool_call = m.tool_call_id.as_deref().filter(|_| m.role == Role::Tool);
+                let recorded = tool_call.filter(|_| unknown).and_then(|tcid| {
+                    let path = on_path.get_or_insert_with(|| {
+                        self.head_id
+                            .as_deref()
+                            .map(|h| self.path_ids(h))
+                            .unwrap_or_default()
+                    });
+                    self.recorded_result_node(tcid, path)
+                });
+                match recorded {
+                    Some(node_id) => DraftMessage {
+                        id: Some(node_id),
+                        ..m
+                    },
+                    None => m,
                 }
-                m
             })
             .collect()
     }
@@ -403,18 +408,14 @@ impl SessionState {
             .filter(|c| seen.insert(c.tool_call_id.clone()))
             .collect();
 
-        let (landing, single_answer) = {
-            let known = self.known_messages();
-            let plan = plan_reconcile(&known, &messages);
-            let landing = self
-                .landing_point(&messages, None)
-                .node()
-                .map(str::to_string);
-            let single_answer = plan.len() == 1
-                && completions.len() == 1
-                && plan.first().map(|w| w.index) == completions.first().map(|c| c.index);
-            (landing, single_answer)
-        };
+        let landing = self.view_point(&messages).at;
+        let single_answer = completions.len() == 1
+            && completions[0].index + 1 == messages.len()
+            && self
+                .tree
+                .shared(&messages, |_, node| node.branch().is_none())
+                + 1
+                == messages.len();
 
         if completions.is_empty() && self.at(landing.as_deref()).active_interrupt_for().is_some() {
             return Err(SessionError::SessionInterrupted);

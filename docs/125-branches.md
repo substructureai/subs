@@ -60,7 +60,8 @@ branch's.
 
 The response applies to the branch:
 
-- `messages` extend the branch. The head does not move.
+- `messages` extend the branch. A view that leaves the branch's path moves
+  the branch's leaf where it leaves. The head does not move.
 - An `llm.call` without `branch` goes on on the branch.
 - Tool calls run on the branch, and their results land there.
 - `done` ends the branch with its `data`.
@@ -115,8 +116,9 @@ it.
 
 `branch.close` stops a branch, and cancels its calls. `branch.promote` makes a
 branch the conversation: the head moves to its newest node. A branch that
-finished, or one with no call out, can be promoted. A response that would land
-the conversation on an open branch is not written.
+finished, or one with no call out, can be promoted. A conversation response
+never lands on a branch: a branch message in its view is copied into the
+conversation.
 
 Best of two:
 

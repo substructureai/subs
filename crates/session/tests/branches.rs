@@ -438,3 +438,137 @@ fn a_subagent_on_a_branch_goes_on_from_the_log_where_it_left_off() {
     assert_eq!(path.last().map(String::as_str), Some("And the fix?"));
     assert!(matches!(run.live_trigger(), Trigger::BranchStarted { .. }));
 }
+
+#[test]
+fn a_diverging_reply_on_a_branch_moves_its_leaf_and_stays_off_the_chat() {
+    let mut run = Run::new();
+    run.send(CommandPayload::SubmitClientPayload {
+        payload: ClientPayload::Message(ClientMessage {
+            message: text(Some("u1"), Role::User, "Write me a haiku."),
+            stream: false,
+        }),
+        turn: TurnTarget::Open("turn-1".into()),
+        queue: QueueMode::Refuse,
+        metadata: Default::default(),
+    });
+    let d = run.live();
+    run.decide(
+        d,
+        vec![text(Some("u1"), Role::User, "Write me a haiku.")],
+        vec![call(
+            "b1",
+            vec![text(None, Role::User, "Make it about the sea.")],
+            Some(BranchStart {
+                id: "draft".into(),
+                from: BranchFrom::Head,
+                agent: BranchConfig::Inherit,
+                name: None,
+                mode: BranchMode::Blocking,
+            }),
+        )],
+    );
+    run.reply("b1", "Waves fold into foam");
+    let head = run.session.state().head_id.clone();
+
+    let d = run.live();
+    let mut view = run.path(Some("draft"));
+    assert_eq!(
+        texts(&view),
+        ["Write me a haiku.", "Make it about the sea."]
+    );
+    view.truncate(1);
+    view.push(text(Some("x1"), Role::Assistant, "Tides pull at the moon"));
+    let start = run.session.state().branches["draft"].node.clone();
+    let events = run.decide(d, view, vec![]);
+
+    let written: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            EventPayload::NewMessage(m) => Some(m),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(written.len(), 1, "got {events:?}");
+    assert_eq!(written[0].message.id, "x1");
+    assert_eq!(written[0].parent_id.as_deref(), Some(start.as_str()));
+    assert_eq!(written[0].branch.as_deref(), Some("draft"));
+    assert_eq!(run.session.state().head_id, head, "the chat does not move");
+    assert_eq!(
+        run.session.state().branches["draft"].leaf.as_deref(),
+        Some("x1")
+    );
+}
+
+fn drafting() -> (Run, String) {
+    let mut run = Run::new();
+    run.send(CommandPayload::SubmitClientPayload {
+        payload: ClientPayload::Message(ClientMessage {
+            message: text(Some("u1"), Role::User, "Write me a haiku."),
+            stream: false,
+        }),
+        turn: TurnTarget::Open("turn-1".into()),
+        queue: QueueMode::Refuse,
+        metadata: Default::default(),
+    });
+    let d = run.live();
+    run.decide(
+        d,
+        vec![text(Some("u1"), Role::User, "Write me a haiku.")],
+        vec![call(
+            "b1",
+            vec![text(None, Role::User, "Make it about the sea.")],
+            Some(BranchStart {
+                id: "draft".into(),
+                from: BranchFrom::Head,
+                agent: BranchConfig::Inherit,
+                name: None,
+                mode: BranchMode::Blocking,
+            }),
+        )],
+    );
+    run.reply("b1", "Waves fold into foam");
+    let start = run.session.state().branches["draft"].node.clone();
+    (run, start)
+}
+
+#[test]
+fn a_branch_reply_that_only_drops_messages_moves_its_leaf_back() {
+    let (mut run, start) = drafting();
+    let d = run.live();
+    let mut view = run.path(Some("draft"));
+    view.truncate(1);
+    let events = run.decide(d, view, vec![]);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            EventPayload::HeadMoved(h) if h.branch.as_deref() == Some("draft") && h.head_id == start
+        )),
+        "got {events:?}"
+    );
+    assert_eq!(
+        run.session.state().branches["draft"].leaf.as_deref(),
+        Some(start.as_str())
+    );
+}
+
+#[test]
+fn a_branch_reply_never_forks_above_the_branch() {
+    let (mut run, start) = drafting();
+    let head = run.session.state().head_id.clone();
+    let d = run.live();
+    let events = run.decide(
+        d,
+        vec![text(Some("x1"), Role::Assistant, "Only this")],
+        vec![],
+    );
+    let written: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            EventPayload::NewMessage(m) => Some(m),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(written.len(), 1, "got {events:?}");
+    assert_eq!(written[0].parent_id.as_deref(), Some(start.as_str()));
+    assert_eq!(run.session.state().head_id, head);
+}

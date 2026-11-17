@@ -29,18 +29,13 @@ impl SessionState {
     }
 
     pub fn recorded_prefix(&self, messages: &[DraftMessage]) -> (Option<String>, usize) {
-        let mut path: Vec<&str> = Vec::new();
-        for draft in messages {
-            let Some(node) = draft.id.as_deref().and_then(|id| self.tree.get(id)) else {
-                break;
-            };
-            let Some(message) = node.message() else { break };
-            if self.tree.message_at(node.parent()) != path.last().copied() || !same(draft, message)
-            {
-                break;
-            }
-            path.push(node.id());
-        }
+        let shared = self.tree.shared(messages, |draft, node| {
+            node.message().is_some_and(|m| same(draft, m))
+        });
+        let mut path: Vec<&str> = messages[..shared]
+            .iter()
+            .filter_map(|m| m.id.as_deref())
+            .collect();
         while let Some(last) = path.last() {
             let answered = self
                 .tree
@@ -163,11 +158,12 @@ impl SessionState {
             .collect()
     }
 
-    pub fn void_stranded_branches(&self, node: Option<&str>) -> Vec<EventPayload> {
-        let at = self.at(node);
+    pub fn void_stranded_branches(&self, scope: Option<&str>) -> Vec<EventPayload> {
+        let node = self.scope_node(scope);
+        let at = self.at(node.as_deref());
         self.branches
             .iter()
-            .filter(|(_, b)| b.is_open() && b.parent.is_none())
+            .filter(|(_, b)| b.is_open() && b.parent.as_deref() == scope)
             .filter(|(_, b)| b.mode == BranchMode::Blocking)
             .filter(|(_, b)| b.from.is_some() && !at.anchor_on_path(b.from.as_deref()))
             .flat_map(|(id, _)| {
@@ -496,8 +492,11 @@ impl Working {
             data: serde_json::Value::Null,
             error: None,
         }));
-        self.emit(EventPayload::HeadMoved(HeadMoved { head_id: leaf }));
-        self.then(|s| s.void_stranded_work(s.head_id.as_deref()));
+        self.emit(EventPayload::HeadMoved(HeadMoved {
+            head_id: leaf,
+            branch: None,
+        }));
+        self.then(|s| s.void_stranded_work(None));
     }
 
     pub(super) fn fail_branch(&mut self, id: &str, error: ErrorInfo) {

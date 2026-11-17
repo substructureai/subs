@@ -52,7 +52,7 @@ impl Working {
             .count()
             - usize::from(summary.is_some());
         self.emit_all(written);
-        self.then(|s| s.void_stranded_work(s.head_id.as_deref()));
+        self.then(|s| s.void_stranded_work(None));
         let dropped = before
             .iter()
             .filter(|m| m.role != Role::System)
@@ -98,9 +98,6 @@ impl SessionState {
                 node: place(&mut parent),
             }));
         }
-        events.push(EventPayload::ConversationStarted(ConversationStarted {
-            node: place(&mut parent),
-        }));
         let mut copies = 0;
         let mut write = |draft: DraftMessage| {
             let copied_from = draft.id.clone().filter(|id| self.has_node(id));

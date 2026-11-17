@@ -1292,10 +1292,6 @@ mod tests {
         }
     }
 
-    fn wire_view(messages: &[Message]) -> Vec<DraftMessage> {
-        messages.iter().cloned().map(DraftMessage::from).collect()
-    }
-
     #[tokio::test]
     async fn materializes_a_client_message_onto_the_active_path() {
         let path = vec![
@@ -1368,94 +1364,6 @@ mod tests {
             vec![Some("u1"), Some("a1"), Some("u2"), Some("u3")]
         );
         assert_eq!(new_from, 2);
-    }
-
-    #[tokio::test]
-    async fn annotates_an_appending_full_view() {
-        let path = vec![
-            msg("u1", Role::User, "hi"),
-            msg("a1", Role::Assistant, "yo"),
-        ];
-        let tree = linear_tree(&path);
-        let view = wire_view(&[
-            msg("u1", Role::User, "hi"),
-            msg("a1", Role::Assistant, "yo"),
-            msg("u2", Role::User, "more"),
-        ]);
-
-        let (_, new_from) = transcript_of(
-            to_wire_trigger(
-                Trigger::ClientTranscript {
-                    messages: view,
-                    new_from: 0,
-                    client: ClientContext::default(),
-                },
-                &path,
-                &tree,
-                &HashMap::new(),
-                &crate::runtime::blob::NOWHERE,
-                "t1",
-            )
-            .await
-            .expect("resolves"),
-        );
-        assert_eq!(new_from, 2);
-    }
-
-    #[tokio::test]
-    async fn annotates_an_edit_at_its_divergence_point() {
-        let path = vec![
-            msg("u1", Role::User, "hi"),
-            msg("a1", Role::Assistant, "yo"),
-            msg("u2", Role::User, "more"),
-        ];
-        let tree = linear_tree(&path);
-        let view = wire_view(&[msg("u1", Role::User, "hi"), msg("e1", Role::User, "edited")]);
-
-        let (_, new_from) = transcript_of(
-            to_wire_trigger(
-                Trigger::ClientTranscript {
-                    messages: view,
-                    new_from: 0,
-                    client: ClientContext::default(),
-                },
-                &path,
-                &tree,
-                &HashMap::new(),
-                &crate::runtime::blob::NOWHERE,
-                "t1",
-            )
-            .await
-            .expect("resolves"),
-        );
-        assert_eq!(new_from, 1);
-    }
-
-    #[tokio::test]
-    async fn annotates_a_no_op_resend_as_all_recorded() {
-        let path = vec![
-            msg("u1", Role::User, "hi"),
-            msg("a1", Role::Assistant, "yo"),
-        ];
-        let tree = linear_tree(&path);
-
-        let (_, new_from) = transcript_of(
-            to_wire_trigger(
-                Trigger::ClientTranscript {
-                    messages: wire_view(&path),
-                    new_from: 0,
-                    client: ClientContext::default(),
-                },
-                &path,
-                &tree,
-                &HashMap::new(),
-                &crate::runtime::blob::NOWHERE,
-                "t1",
-            )
-            .await
-            .expect("resolves"),
-        );
-        assert_eq!(new_from, 2, "empty news: nothing to write");
     }
 
     #[tokio::test]

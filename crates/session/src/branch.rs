@@ -101,8 +101,15 @@ impl Outside {
         Some(Loaded { nodes })
     }
 
-    pub fn drop_known(&self, payload: ClientPayload) -> Option<ClientPayload> {
-        let fresh = |m: &DraftMessage| m.id.as_deref().is_none_or(|id| !self.knows(id));
+    pub fn drop_known(
+        &self,
+        payload: ClientPayload,
+        state: &SessionState,
+    ) -> Option<ClientPayload> {
+        let fresh = |m: &DraftMessage| {
+            m.id.as_deref()
+                .is_none_or(|id| !self.knows(id) && !state.versions_hold(id))
+        };
         match payload {
             ClientPayload::Message(message) => {
                 fresh(&message.message).then_some(ClientPayload::Message(message))
@@ -197,7 +204,10 @@ impl Session {
                         a.messages.iter().filter_map(|m| m.id.as_deref()).collect()
                     }
                     ClientPayload::Messages(v) => {
-                        v.messages.iter().filter_map(|m| m.id.as_deref()).collect()
+                        for id in v.messages.iter().filter_map(|m| m.id.as_deref()) {
+                            outside.load(store, state, id)?;
+                        }
+                        Vec::new()
                     }
                     ClientPayload::Action(_) => Vec::new(),
                 };

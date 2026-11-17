@@ -9,7 +9,10 @@ use substructure_session::protocol::{
     AgentConfig, ClientMessage, ClientPayload, Content, DraftMessage, EffectKind, ErrorInfo,
     Issuer, QueueMode, Requester, RetryPolicy, Role, SessionOwner, Subject,
 };
-use substructure_session::protocol::{ClientAction, ClientAppend, WorkerState};
+use substructure_session::protocol::{
+    ClientAction, ClientAppend, ClientMessages, DecisionTrigger, Message, WorkerState,
+};
+use substructure_session::request::WorkerDecisionRequest;
 use substructure_session::{settle, Command, MemoryStore, Session, Settings, Store, Work};
 
 const TENANT: &str = "tenant-a";
@@ -1324,20 +1327,373 @@ mod branches {
         session.state().at_head().resolve_state_for().0
     }
 
+    fn view(store: &MemoryStore, session: &mut Session, n: usize, messages: Vec<DraftMessage>) {
+        let payload = CommandPayload::SubmitClientPayload {
+            payload: ClientPayload::Messages(ClientMessages {
+                messages,
+                stream: false,
+                client: Default::default(),
+            }),
+            turn: TurnTarget::Open(format!("v{n}")),
+            queue: QueueMode::Refuse,
+            metadata: Default::default(),
+        };
+        let ran = session
+            .run(
+                store,
+                Utc::now(),
+                Command::system(format!("view-{n}"), TENANT, payload),
+            )
+            .unwrap();
+        assert!(ran.result.is_ok(), "{:?}", ran.result);
+    }
+
+    fn drain(store: &MemoryStore, session: &mut Session) {
+        for n in 0..10 {
+            let Some(decision_id) = session.open_work().into_iter().find_map(|w| match w {
+                Work::AskWorker { work, .. } => Some(work.id),
+                _ => None,
+            }) else {
+                return;
+            };
+            let payload = CommandPayload::SubmitWorkerDecision {
+                decision_id,
+                transcript: vec![],
+                actions: vec![],
+                state: None,
+                agent: None,
+            };
+            session
+                .run(
+                    store,
+                    Utc::now(),
+                    Command::system(format!("drain-{n}-{}", session.seq()), TENANT, payload),
+                )
+                .unwrap();
+        }
+    }
+
+    fn settled(
+        store: &MemoryStore,
+        session: &mut Session,
+        n: usize,
+        transcript: Vec<DraftMessage>,
+        state: Option<serde_json::Value>,
+    ) -> Vec<Logged> {
+        let events = decide(store, session, n, transcript, state);
+        drain(store, session);
+        events
+    }
+
+    fn asked(session: &Session) -> WorkerDecisionRequest {
+        session
+            .open_work()
+            .into_iter()
+            .find_map(|w| match w {
+                Work::AskWorker { request, .. } => Some(*request),
+                _ => None,
+            })
+            .expect("a decision is open")
+    }
+
+    fn ids(messages: &[Message]) -> Vec<&str> {
+        messages.iter().map(|m| m.id.as_str()).collect()
+    }
+
+    fn head_ids(session: &Session) -> Vec<String> {
+        session
+            .state()
+            .at_head()
+            .transcript()
+            .into_iter()
+            .map(|m| m.id)
+            .collect()
+    }
+
+    fn two_turns() -> (MemoryStore, Session) {
+        let store = MemoryStore::new();
+        let mut session = load(&store, Settings::default());
+        session.run(&store, Utc::now(), create("c1")).unwrap();
+        drain(&store, &mut session);
+        turn(&store, &mut session, 1);
+        let first = vec![
+            draft("u1", Role::User, "hi"),
+            draft("a1", Role::Assistant, "hello"),
+        ];
+        settled(
+            &store,
+            &mut session,
+            1,
+            first.clone(),
+            Some(serde_json::json!({ "turns": 1 })),
+        );
+        turn(&store, &mut session, 2);
+        let second = [
+            first,
+            vec![
+                draft("u2", Role::User, "more"),
+                draft("a2", Role::Assistant, "ok"),
+            ],
+        ]
+        .concat();
+        settled(
+            &store,
+            &mut session,
+            2,
+            second,
+            Some(serde_json::json!({ "turns": 2 })),
+        );
+        (store, session)
+    }
+
+    #[test]
+    fn an_edited_old_message_reads_the_state_as_it_was_then_and_switching_back_restores_its_own() {
+        let (store, mut session) = two_turns();
+        let u1 = draft("u1", Role::User, "hi");
+        let a1 = draft("a1", Role::Assistant, "hello");
+
+        view(
+            &store,
+            &mut session,
+            3,
+            vec![
+                u1.clone(),
+                a1.clone(),
+                draft("e2", Role::User, "more, edited"),
+            ],
+        );
+        let request = asked(&session);
+        assert_eq!(request.state.0, serde_json::json!({ "turns": 1 }));
+        assert_eq!(ids(&request.transcript), ["u1", "a1"]);
+        assert!(matches!(
+            request.trigger,
+            DecisionTrigger::ClientTranscript { new_from: 2, .. }
+        ));
+        settled(
+            &store,
+            &mut session,
+            3,
+            vec![
+                u1.clone(),
+                a1.clone(),
+                draft("e2", Role::User, "more, edited"),
+                draft("b2", Role::Assistant, "sure"),
+            ],
+            Some(serde_json::json!({ "turns": 2, "edited": true })),
+        );
+        assert_eq!(head_ids(&session), ["u1", "a1", "e2", "b2"]);
+        assert!(
+            !session.state().has_node("u2"),
+            "the old version leaves memory"
+        );
+
+        let back = vec![
+            u1,
+            a1,
+            draft("u2", Role::User, "more"),
+            draft("a2", Role::Assistant, "ok"),
+        ];
+        view(&store, &mut session, 4, back.clone());
+        let request = asked(&session);
+        assert_eq!(request.state.0, serde_json::json!({ "turns": 2 }));
+        assert_eq!(ids(&request.transcript), ["u1", "a1", "u2", "a2"]);
+        settled(&store, &mut session, 4, back, None);
+        assert_eq!(head_ids(&session), ["u1", "a1", "u2", "a2"]);
+        assert_eq!(state_value(&session), serde_json::json!({ "turns": 2 }));
+
+        let reloaded = load(&store, Settings::default());
+        assert_eq!(head_ids(&reloaded), ["u1", "a1", "u2", "a2"]);
+        assert_eq!(state_value(&reloaded), serde_json::json!({ "turns": 2 }));
+    }
+
+    #[test]
+    fn a_save_between_turns_survives_an_edit_after_it() {
+        let (store, mut session) = two_turns();
+        let path: Vec<DraftMessage> = session
+            .state()
+            .at_head()
+            .transcript()
+            .into_iter()
+            .map(DraftMessage::from)
+            .collect();
+        turn(&store, &mut session, 3);
+        settled(
+            &store,
+            &mut session,
+            3,
+            path.clone(),
+            Some(serde_json::json!({ "turns": 2, "approved": true })),
+        );
+        turn(&store, &mut session, 4);
+        let third = [
+            path.clone(),
+            vec![
+                draft("u3", Role::User, "go"),
+                draft("a3", Role::Assistant, "done"),
+            ],
+        ]
+        .concat();
+        settled(
+            &store,
+            &mut session,
+            4,
+            third,
+            Some(serde_json::json!({ "turns": 3, "approved": true })),
+        );
+
+        view(
+            &store,
+            &mut session,
+            5,
+            [path, vec![draft("e3", Role::User, "go, edited")]].concat(),
+        );
+        assert_eq!(
+            asked(&session).state.0,
+            serde_json::json!({ "turns": 2, "approved": true })
+        );
+    }
+
+    #[test]
+    fn switching_back_finds_a_save_just_before_the_versions_last_message() {
+        let (store, mut session) = two_turns();
+        let path: Vec<DraftMessage> = session
+            .state()
+            .at_head()
+            .transcript()
+            .into_iter()
+            .map(DraftMessage::from)
+            .collect();
+        let u3 = draft("u3", Role::User, "go");
+        turn(&store, &mut session, 3);
+        let open = [path.clone(), vec![u3.clone()]].concat();
+        settled(
+            &store,
+            &mut session,
+            3,
+            open.clone(),
+            Some(serde_json::json!({ "turns": 2, "asked": true })),
+        );
+        turn(&store, &mut session, 4);
+        let answered = [open, vec![draft("a3", Role::Assistant, "done")]].concat();
+        settled(&store, &mut session, 4, answered.clone(), None);
+
+        let edit = [path, vec![draft("e3", Role::User, "go, edited")]].concat();
+        view(&store, &mut session, 5, edit.clone());
+        settled(
+            &store,
+            &mut session,
+            5,
+            edit,
+            Some(serde_json::json!({ "turns": 3 })),
+        );
+
+        view(&store, &mut session, 6, answered.clone());
+        let request = asked(&session);
+        assert_eq!(
+            request.state.0,
+            serde_json::json!({ "turns": 2, "asked": true })
+        );
+        assert_eq!(request.transcript.last().map(|m| m.id.as_str()), Some("a3"));
+        let events = settled(&store, &mut session, 6, answered, None);
+        assert!(
+            !events.iter().any(|e| matches!(e, Logged::NewMessage(_))),
+            "the old version is reused, not copied"
+        );
+    }
+
+    #[test]
+    fn a_regenerate_shares_the_user_message() {
+        let (store, mut session) = two_turns();
+        let asked_again = vec![
+            draft("u1", Role::User, "hi"),
+            draft("a1", Role::Assistant, "hello"),
+            draft("u2", Role::User, "more"),
+        ];
+        view(&store, &mut session, 3, asked_again.clone());
+        let request = asked(&session);
+        assert_eq!(request.state.0, serde_json::json!({ "turns": 1 }));
+        assert!(matches!(
+            request.trigger,
+            DecisionTrigger::ClientTranscript { new_from: 2, .. }
+        ));
+
+        let events = settled(
+            &store,
+            &mut session,
+            3,
+            [asked_again, vec![draft("r2", Role::Assistant, "ok, again")]].concat(),
+            Some(serde_json::json!({ "turns": 2 })),
+        );
+        assert_eq!(head_ids(&session), ["u1", "a1", "u2", "r2"]);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Logged::NewMessage(m) if m.copied_from.is_some())),
+            "nothing is copied"
+        );
+        assert_eq!(
+            session.state().tree.get("r2").and_then(|n| n.parent()),
+            Some("u2")
+        );
+    }
+
+    #[test]
+    fn a_reply_naming_another_versions_message_copies_it() {
+        let (store, mut session) = two_turns();
+        let u1 = draft("u1", Role::User, "hi");
+        let a1 = draft("a1", Role::Assistant, "hello");
+        view(
+            &store,
+            &mut session,
+            3,
+            vec![u1.clone(), a1.clone(), draft("e2", Role::User, "edited")],
+        );
+        settled(
+            &store,
+            &mut session,
+            3,
+            vec![u1.clone(), a1.clone(), draft("e2", Role::User, "edited")],
+            None,
+        );
+
+        turn(&store, &mut session, 4);
+        let events = settled(
+            &store,
+            &mut session,
+            4,
+            vec![
+                u1,
+                a1,
+                draft("e2", Role::User, "edited"),
+                draft("a2", Role::Assistant, "ok"),
+            ],
+            None,
+        );
+        let copied: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                Logged::NewMessage(m) => m.copied_from.as_deref(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(copied, ["a2"]);
+        assert_eq!(&head_ids(&session)[..3], ["u1", "a1", "e2"]);
+    }
+
     #[test]
     fn an_edit_leaves_only_the_active_branch_in_memory() {
         let (store, session) = started();
 
-        assert_eq!(session.state().head_id.as_deref(), Some("b1"));
+        let tree = session.state().message_tree();
+        assert_eq!(tree.head_id.as_deref(), Some("b1"));
         assert!(session.state().has_node("u1"));
         assert!(
-            !session.state().has_node("a1"),
-            "the old branch is unloaded"
+            session.state().has_node("a1"),
+            "the old branch keeps its last message"
         );
         let a1 = store.tied("a1").unwrap();
         assert_eq!(a1.len(), 1, "its message is in the log");
-        let above = a1[0].parent.clone().expect("a1 hangs below its state");
-        assert_eq!(store.tied(&above).unwrap().len(), 1, "and so is its state");
+        assert_eq!(a1[0].parent.as_deref(), Some("u1"));
         assert_eq!(
             state_value(&session),
             serde_json::json!({ "branch": "edited" })
@@ -1349,7 +1705,7 @@ mod branches {
         let (store, mut session) = started();
         turn(&store, &mut session, 3);
 
-        let events = decide(
+        let events = settled(
             &store,
             &mut session,
             3,
@@ -1360,19 +1716,21 @@ mod branches {
             None,
         );
 
-        assert!(events.iter().any(|e| matches!(e, Logged::BranchLoaded(_))));
-        assert_eq!(session.state().head_id.as_deref(), Some("a1"));
-        assert!(session.state().has_node("a1"));
-        assert!(
-            !session.state().has_node("b1"),
-            "the edited branch is unloaded in turn"
+        assert!(events.iter().any(|e| matches!(e, Logged::HeadMoved(_))));
+        assert_eq!(
+            session.state().message_tree().head_id.as_deref(),
+            Some("a1")
         );
+        assert!(session.state().has_node("b1"), "the edited branch is kept");
         assert_eq!(
             state_value(&session),
             serde_json::json!({ "branch": "first" })
         );
         let reloaded = load(&store, Settings::default());
-        assert_eq!(reloaded.state().head_id.as_deref(), Some("a1"));
+        assert_eq!(
+            reloaded.state().message_tree().head_id.as_deref(),
+            Some("a1")
+        );
         assert_eq!(
             state_value(&reloaded),
             serde_json::json!({ "branch": "first" })
@@ -1425,12 +1783,12 @@ mod branches {
                     draft(&format!("r{n}"), Role::Assistant, "ok"),
                 ])
                 .collect();
-            decide(&store, &mut session, n, path, None);
+            settled(&store, &mut session, n, path, None);
         }
         assert!(session.state().message_tree().nodes.len() > 40);
 
         turn(&store, &mut session, 30);
-        decide(
+        settled(
             &store,
             &mut session,
             30,
@@ -1441,9 +1799,10 @@ mod branches {
             Some(serde_json::json!({ "reset": true })),
         );
 
-        assert_eq!(session.state().message_tree().nodes.len(), 2);
+        let kept = 2 + session.state().versions.len();
+        assert_eq!(session.state().message_tree().nodes.len(), kept);
         let reloaded = load(&store, Settings::default());
-        assert_eq!(reloaded.state().message_tree().nodes.len(), 2);
+        assert_eq!(reloaded.state().message_tree().nodes.len(), kept);
         assert_eq!(state_value(&reloaded), serde_json::json!({ "reset": true }));
     }
 }

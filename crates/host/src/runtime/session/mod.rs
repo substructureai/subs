@@ -5,7 +5,7 @@ pub mod wire;
 
 pub use substructure_session::{
     agent_config, command, decision, effects, engine_tools, events, interrupts, message,
-    prompt_context, propose, reconcile, schedule, state, tool_contract,
+    prompt_context, propose, schedule, state, tool_contract,
 };
 
 pub use crate::runtime::sessions::{execute, ExecuteError, ExecuteInput, ExecuteOutput};
