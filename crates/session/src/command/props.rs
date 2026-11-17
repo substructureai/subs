@@ -618,7 +618,9 @@ fn pick(ids: &[String], index: usize) -> Option<String> {
 
 fn round_trip(state: &SessionState) -> SessionState {
     let json = serde_json::to_string(state).expect("a session state serializes");
-    serde_json::from_str(&json).expect("and deserializes")
+    let mut back: SessionState = serde_json::from_str(&json).expect("and deserializes");
+    back.tree = state.tree.clone();
+    back
 }
 
 proptest! {

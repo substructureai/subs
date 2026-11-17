@@ -1236,7 +1236,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_whole_tree_comes_from_the_log_when_only_the_active_branch_is_loaded() {
+    async fn the_whole_tree_comes_from_the_log() {
         let disk = testing::disk();
         use crate::protocol::{
             ClientMessage, ClientPayload, Content, DraftMessage, QueueMode, Role,
@@ -1310,7 +1310,7 @@ mod tests {
         .await;
 
         let session = s.load("t", "s1").await.unwrap().unwrap();
-        assert!(!session.state().has_node("a1"));
+        assert_eq!(session.state().tree.fresh().count(), 0);
         let tree = s
             .whole_tree("t", "s1", session.state().head_id.clone())
             .await

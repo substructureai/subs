@@ -1,24 +1,38 @@
 use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use rusqlite::{params, OptionalExtension, TransactionBehavior};
-use substructure_session::branch::Tie;
+use quick_cache::sync::Cache;
+use quick_cache::{Equivalent, Weighter};
+use rusqlite::{params, OptionalExtension, Row, Transaction, TransactionBehavior};
 use substructure_session::delivery::Start;
 use substructure_session::events::EventPayload;
-use substructure_session::protocol::NewMessage;
-use substructure_session::{Entry, Session, SessionEvent, Store, StoreError};
+use substructure_session::protocol::{NewMessage, Role};
+use substructure_session::state::Logged;
+use substructure_session::tree::{Fact, Node, Nodes, Shared};
+use substructure_session::{Entry, Handled, Session, SessionEvent, Store, StoreError};
 
 use super::SqliteDb;
 use crate::runtime::sessions::{SessionKey, SessionStores, SharedStore};
 
+const NODE_CACHE_BYTES: u64 = 64 << 20;
+
 #[derive(Clone)]
 pub struct SqliteSessionStores {
     db: SqliteDb,
+    nodes: Arc<NodeCache>,
 }
 
 impl SqliteSessionStores {
     pub fn new(db: SqliteDb) -> Self {
-        Self { db }
+        Self::with_node_cache(db, NODE_CACHE_BYTES)
+    }
+
+    pub fn with_node_cache(db: SqliteDb, bytes: u64) -> Self {
+        Self {
+            db,
+            nodes: Arc::new(Cache::with_weighter(4096, bytes, ByBytes)),
+        }
     }
 }
 
@@ -26,6 +40,8 @@ impl SessionStores for SqliteSessionStores {
     fn open(&self, tenant_id: &str, session_id: &str) -> SharedStore {
         Arc::new(SqliteSessionStore {
             db: self.db.clone(),
+            nodes: self.nodes.clone(),
+            session: Arc::from(format!("{tenant_id}\0{session_id}")),
             tenant_id: tenant_id.to_string(),
             session_id: session_id.to_string(),
         })
@@ -37,23 +53,17 @@ impl SessionStores for SqliteSessionStores {
             .map(|(name, start)| (name.clone(), (*start == Start::Joined).into()))
             .collect();
         let followers = serde_json::Value::Object(followers).to_string();
-        let conn = self
-            .db
-            .reader
-            .open()
-            .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+        let conn = self.db.reader.open()?;
         let mut stmt = conn
             .prepare(
-                "SELECT h.tenant_id, h.session_id
-                   FROM (SELECT tenant_id, session_id, MAX(last_seq) AS head
-                           FROM session_entries GROUP BY tenant_id, session_id) h
-                  WHERE h.head IS NOT NULL AND EXISTS (
+                "SELECT h.tenant_id, h.session_id FROM session_heads h
+                  WHERE h.seq > 0 AND EXISTS (
                         SELECT 1 FROM json_each(?1) f
                           LEFT JOIN session_cursors c
                             ON c.tenant_id = h.tenant_id
                            AND c.session_id = h.session_id
                            AND c.consumer = f.key
-                         WHERE COALESCE(c.seq, CASE WHEN f.value THEN h.head ELSE 0 END) < h.head)",
+                         WHERE COALESCE(c.seq, CASE WHEN f.value THEN h.seq ELSE 0 END) < h.seq)",
             )
             .map_err(unavailable)?;
         let rows = stmt
@@ -63,8 +73,62 @@ impl SessionStores for SqliteSessionStores {
     }
 }
 
+type NodeCache = Cache<NodeKey, Cached, ByBytes>;
+
+#[derive(Clone)]
+struct Cached {
+    node: Shared,
+    bytes: u64,
+}
+
+#[derive(Clone)]
+struct ByBytes;
+
+impl Weighter<NodeKey, Cached> for ByBytes {
+    fn weight(&self, _: &NodeKey, cached: &Cached) -> u64 {
+        cached.bytes
+    }
+}
+
+#[derive(PartialEq, Eq)]
+struct NodeKey {
+    session: Arc<str>,
+    node: String,
+}
+
+impl Hash for NodeKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        NodeRef {
+            session: &self.session,
+            node: &self.node,
+        }
+        .hash(state);
+    }
+}
+
+struct NodeRef<'a> {
+    session: &'a str,
+    node: &'a str,
+}
+
+impl Hash for NodeRef<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.session.hash(state);
+        self.node.hash(state);
+    }
+}
+
+impl Equivalent<NodeKey> for NodeRef<'_> {
+    fn equivalent(&self, key: &NodeKey) -> bool {
+        *key.session == *self.session && key.node == self.node
+    }
+}
+
+#[derive(Clone)]
 pub struct SqliteSessionStore {
     db: SqliteDb,
+    nodes: Arc<NodeCache>,
+    session: Arc<str>,
     tenant_id: String,
     session_id: String,
 }
@@ -77,28 +141,178 @@ impl SqliteSessionStore {
             .map_err(|e| StoreError::Unavailable(e.to_string()))
     }
 
-    fn entries(&self, sql: &str, after: u64, max: usize) -> Result<Vec<Entry>, StoreError> {
+    fn cached(&self, id: &str) -> Option<Shared> {
+        let key = NodeRef {
+            session: &self.session,
+            node: id,
+        };
+        self.nodes.get(&key).map(|c| c.node)
+    }
+
+    fn keep(&self, node: Shared, bytes: u64) -> Shared {
+        let key = NodeKey {
+            session: self.session.clone(),
+            node: node.id().to_string(),
+        };
+        self.nodes.insert(
+            key,
+            Cached {
+                node: node.clone(),
+                bytes,
+            },
+        );
+        node
+    }
+
+    fn node_of(&self, seq: i64, payload: &[u8]) -> Result<Option<Shared>, StoreError> {
+        if let Some(node) = Node::of_event(&parse(payload)?) {
+            let logged = Arc::new(Logged {
+                seq: seq as u64,
+                entry: node,
+            });
+            return Ok(Some(self.keep(logged, payload.len() as u64)));
+        }
+        Ok(None)
+    }
+
+    fn select_nodes(
+        &self,
+        sql: &str,
+        params: impl rusqlite::Params,
+    ) -> Result<Vec<Shared>, StoreError> {
         let conn = self.reader()?;
         let mut stmt = conn.prepare_cached(sql).map_err(unavailable)?;
         let rows = stmt
-            .query_map(
-                params![
-                    self.tenant_id,
-                    self.session_id,
-                    after as i64,
-                    max.min(i64::MAX as usize) as i64
-                ],
-                |row| row.get::<_, Vec<u8>>(0),
+            .query_map(params, |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(unavailable)?;
+        let mut nodes = Vec::new();
+        for row in rows {
+            let (seq, payload) = row.map_err(unavailable)?;
+            nodes.extend(self.node_of(seq, &payload)?);
+        }
+        Ok(nodes)
+    }
+
+    fn select_events(
+        &self,
+        sql: &str,
+        params: impl rusqlite::Params,
+    ) -> Result<Vec<SessionEvent>, StoreError> {
+        let conn = self.reader()?;
+        let mut stmt = conn.prepare_cached(sql).map_err(unavailable)?;
+        let rows = stmt
+            .query_map(params, |row| self.event(row))
+            .map_err(unavailable)?;
+        rows.map(|row| row.map_err(unavailable)?).collect()
+    }
+
+    fn event(&self, row: &Row) -> rusqlite::Result<Result<SessionEvent, StoreError>> {
+        let seq: i64 = row.get(0)?;
+        let envelope: Vec<u8> = row.get(1)?;
+        let payload: Vec<u8> = row.get(2)?;
+        Ok(joined(
+            &self.tenant_id,
+            &self.session_id,
+            seq as u64,
+            &envelope,
+            &payload,
+        ))
+    }
+
+    fn write_events(&self, tx: &Transaction, entry: &Entry) -> Result<(), StoreError> {
+        let mut insert = tx
+            .prepare_cached(
+                "INSERT INTO session_events
+                    (tenant_id, session_id, seq, version, node_id, parent_id, kind, branch,
+                     answers, envelope, payload)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             )
             .map_err(unavailable)?;
-        rows.map(|body| Entry::from_json(&body.map_err(unavailable)?))
-            .collect()
+        for event in &entry.events {
+            let (envelope, payload) = split(event)?;
+            let node = Node::of_event(&event.payload);
+            let answers = node.as_ref().and_then(|n| {
+                n.message()
+                    .filter(|m| m.role == Role::Tool)
+                    .and_then(|m| m.tool_call_id.clone())
+            });
+            insert
+                .execute(params![
+                    self.tenant_id,
+                    self.session_id,
+                    event.seq as i64,
+                    entry.version as i64,
+                    node.as_ref().map(Node::id),
+                    node.as_ref().and_then(Node::parent),
+                    node.as_ref().map(kind),
+                    node.as_ref().and_then(Node::branch),
+                    answers,
+                    envelope,
+                    payload,
+                ])
+                .map_err(unavailable)?;
+        }
+        Ok(())
     }
+}
+
+fn kind(node: &Node) -> i64 {
+    match node.fact {
+        Fact::Message { .. } => 0,
+        Fact::State { .. } => 1,
+        Fact::Config { .. } => 2,
+        Fact::BranchStart { .. } => 3,
+    }
+}
+
+fn parse(payload: &[u8]) -> Result<EventPayload, StoreError> {
+    serde_json::from_slice(payload).map_err(|e| StoreError::Corrupt(e.to_string()))
+}
+
+fn split(event: &SessionEvent) -> Result<(Vec<u8>, Vec<u8>), StoreError> {
+    let corrupt = |e: serde_json::Error| StoreError::Corrupt(e.to_string());
+    let mut value = serde_json::to_value(event).map_err(corrupt)?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| StoreError::Corrupt("an event is an object".into()))?;
+    let payload = object.remove("payload").unwrap_or_default();
+    for key in ["tenant_id", "session_id", "seq"] {
+        object.remove(key);
+    }
+    Ok((
+        serde_json::to_vec(&value).map_err(corrupt)?,
+        serde_json::to_vec(&payload).map_err(corrupt)?,
+    ))
+}
+
+fn joined(
+    tenant_id: &str,
+    session_id: &str,
+    seq: u64,
+    envelope: &[u8],
+    payload: &[u8],
+) -> Result<SessionEvent, StoreError> {
+    let corrupt = |e: serde_json::Error| StoreError::Corrupt(e.to_string());
+    let mut value: serde_json::Value = serde_json::from_slice(envelope).map_err(corrupt)?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| StoreError::Corrupt("an envelope is an object".into()))?;
+    object.insert(
+        "payload".into(),
+        serde_json::from_slice(payload).map_err(corrupt)?,
+    );
+    object.insert("tenant_id".into(), tenant_id.into());
+    object.insert("session_id".into(), session_id.into());
+    object.insert("seq".into(), seq.into());
+    serde_json::from_value(value).map_err(corrupt)
 }
 
 impl Store for SqliteSessionStore {
     fn append(&self, entry: &Entry) -> Result<(), StoreError> {
-        let body = entry.to_json()?;
+        let commands =
+            serde_json::to_vec(&entry.commands).map_err(|e| StoreError::Corrupt(e.to_string()))?;
         let mut conn = self
             .db
             .writer
@@ -109,142 +323,132 @@ impl Store for SqliteSessionStore {
             .map_err(unavailable)?;
         let head: i64 = tx
             .query_row(
-                "SELECT COALESCE(MAX(version), 0) FROM session_entries
-                  WHERE tenant_id = ?1 AND session_id = ?2",
+                "SELECT version FROM session_heads WHERE tenant_id = ?1 AND session_id = ?2",
                 params![self.tenant_id, self.session_id],
                 |row| row.get(0),
             )
-            .map_err(unavailable)?;
+            .optional()
+            .map_err(unavailable)?
+            .unwrap_or(0);
         if entry.version != head as u64 + 1 {
             return Err(StoreError::VersionTaken(entry.version));
         }
         tx.execute(
-            "INSERT INTO session_entries
-                (tenant_id, session_id, version, first_seq, last_seq, body)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO session_entries (tenant_id, session_id, version, at, commands)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 self.tenant_id,
                 self.session_id,
                 entry.version as i64,
-                entry.first_seq().map(|s| s as i64),
-                entry.last_seq().map(|s| s as i64),
-                body
+                entry.at.to_rfc3339(),
+                commands
             ],
         )
         .map_err(unavailable)?;
-        for tie in entry.ties() {
-            tx.execute(
-                "INSERT OR IGNORE INTO session_ties
-                    (tenant_id, session_id, node_id, seq, parent_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    self.tenant_id,
-                    self.session_id,
-                    tie.node,
-                    tie.seq as i64,
-                    tie.parent
-                ],
-            )
-            .map_err(unavailable)?;
-        }
+        self.write_events(&tx, entry)?;
+        tx.execute(
+            "INSERT INTO session_heads (tenant_id, session_id, version, seq)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (tenant_id, session_id) DO UPDATE SET
+                version = excluded.version,
+                seq = MAX(session_heads.seq, excluded.seq)",
+            params![
+                self.tenant_id,
+                self.session_id,
+                entry.version as i64,
+                entry.last_seq().map_or(0, |s| s as i64)
+            ],
+        )
+        .map_err(unavailable)?;
         tx.commit().map_err(unavailable)
     }
 
-    fn tied(&self, node: &str) -> Result<Vec<Tie>, StoreError> {
+    fn read(&self, after_version: u64) -> Result<Vec<Entry>, StoreError> {
         let conn = self.reader()?;
         let mut stmt = conn
             .prepare_cached(
-                "SELECT seq, parent_id FROM session_ties
-                  WHERE tenant_id = ?1 AND session_id = ?2 AND node_id = ?3
+                "SELECT version, at, commands FROM session_entries
+                  WHERE tenant_id = ?1 AND session_id = ?2 AND version > ?3
+                  ORDER BY version",
+            )
+            .map_err(unavailable)?;
+        let rows = stmt
+            .query_map(
+                params![self.tenant_id, self.session_id, after_version as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                },
+            )
+            .map_err(unavailable)?;
+        let mut entries: Vec<Entry> = Vec::new();
+        for row in rows {
+            let (version, at, commands) = row.map_err(unavailable)?;
+            let commands: Vec<Handled> = serde_json::from_slice(&commands)
+                .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+            entries.push(Entry {
+                version: version as u64,
+                at: super::parse_dt(&at)
+                    .ok_or_else(|| StoreError::Corrupt(format!("entry time {at}")))?,
+                commands,
+                events: Vec::new(),
+            });
+        }
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT seq, envelope, payload, version FROM session_events
+                  WHERE tenant_id = ?1 AND session_id = ?2 AND version > ?3
                   ORDER BY seq",
             )
             .map_err(unavailable)?;
         let rows = stmt
-            .query_map(params![self.tenant_id, self.session_id, node], |row| {
-                Ok(Tie {
-                    node: node.to_string(),
-                    seq: row.get::<_, i64>(0)? as u64,
-                    parent: row.get(1)?,
-                })
-            })
-            .map_err(unavailable)?;
-        rows.collect::<Result<_, _>>().map_err(unavailable)
-    }
-
-    fn events_at(&self, seqs: &[u64]) -> Result<Vec<SessionEvent>, StoreError> {
-        let wanted: std::collections::BTreeSet<u64> = seqs.iter().copied().collect();
-        let list =
-            serde_json::to_string(&wanted).map_err(|e| StoreError::Corrupt(e.to_string()))?;
-        let conn = self.reader()?;
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT body FROM session_entries e
-                  WHERE e.tenant_id = ?1 AND e.session_id = ?2
-                    AND EXISTS (SELECT 1 FROM json_each(?3) s
-                                 WHERE s.value BETWEEN e.first_seq AND e.last_seq)
-                  ORDER BY e.version",
+            .query_map(
+                params![self.tenant_id, self.session_id, after_version as i64],
+                |row| Ok((self.event(row)?, row.get::<_, i64>(3)? as u64)),
             )
             .map_err(unavailable)?;
-        let bodies = stmt
-            .query_map(params![self.tenant_id, self.session_id, list], |row| {
-                row.get::<_, Vec<u8>>(0)
-            })
-            .map_err(unavailable)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(unavailable)?;
-        let mut events = Vec::new();
-        for body in bodies {
-            let entry = Entry::from_json(&body)?;
-            events.extend(entry.events.into_iter().filter(|e| wanted.contains(&e.seq)));
-        }
-        Ok(events)
-    }
-
-    fn messages(&self) -> Result<Vec<NewMessage>, StoreError> {
-        let conn = self.reader()?;
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT json_extract(j.value, '$.payload')
-                   FROM session_entries e, json_each(CAST(e.body AS TEXT), '$.events') j
-                  WHERE e.tenant_id = ?1 AND e.session_id = ?2
-                    AND json_extract(j.value, '$.payload.type') = 'message.new'
-                  ORDER BY e.version, j.key",
-            )
-            .map_err(unavailable)?;
-        let rows = stmt
-            .query_map(params![self.tenant_id, self.session_id], |row| {
-                row.get::<_, String>(0)
-            })
-            .map_err(unavailable)?;
-        let mut nodes = Vec::new();
+        let mut at = 0;
         for row in rows {
-            let payload = row.map_err(unavailable)?;
-            match serde_json::from_str::<EventPayload>(&payload) {
-                Ok(EventPayload::NewMessage(node)) => nodes.push(node),
-                Ok(_) => {}
-                Err(e) => return Err(StoreError::Corrupt(e.to_string())),
+            let (event, version) = row.map_err(unavailable)?;
+            while entries.get(at).is_some_and(|e| e.version < version) {
+                at += 1;
             }
+            let entry = entries
+                .get_mut(at)
+                .filter(|e| e.version == version)
+                .ok_or_else(|| {
+                    StoreError::Corrupt(format!("an event of missing entry {version}"))
+                })?;
+            entry.events.push(event?);
         }
-        Ok(nodes)
+        Ok(entries)
     }
 
-    fn read(&self, after_version: u64) -> Result<Vec<Entry>, StoreError> {
-        self.entries(
-            "SELECT body FROM session_entries
-              WHERE tenant_id = ?1 AND session_id = ?2 AND version > ?3
-              ORDER BY version LIMIT ?4",
-            after_version,
-            usize::MAX,
+    fn events(&self, after_seq: u64, max: usize) -> Result<Vec<SessionEvent>, StoreError> {
+        self.select_events(
+            "SELECT seq, envelope, payload FROM session_events
+              WHERE tenant_id = ?1 AND session_id = ?2 AND seq > ?3
+              ORDER BY seq LIMIT ?4",
+            params![
+                self.tenant_id,
+                self.session_id,
+                after_seq as i64,
+                max.min(i64::MAX as usize) as i64
+            ],
         )
     }
 
-    fn read_after_seq(&self, after_seq: u64, max: usize) -> Result<Vec<Entry>, StoreError> {
-        self.entries(
-            "SELECT body FROM session_entries
-              WHERE tenant_id = ?1 AND session_id = ?2 AND last_seq > ?3
-              ORDER BY last_seq LIMIT ?4",
-            after_seq,
-            max,
+    fn events_at(&self, seqs: &[u64]) -> Result<Vec<SessionEvent>, StoreError> {
+        let list = serde_json::to_string(seqs).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+        self.select_events(
+            "SELECT seq, envelope, payload FROM session_events
+              WHERE tenant_id = ?1 AND session_id = ?2
+                AND seq IN (SELECT value FROM json_each(?3))
+              ORDER BY seq",
+            params![self.tenant_id, self.session_id, list],
         )
     }
 
@@ -255,8 +459,11 @@ impl Store for SqliteSessionStore {
             .lock()
             .map_err(|e| StoreError::Unavailable(e.to_string()))?
             .execute(
-                "INSERT OR REPLACE INTO session_snapshots (tenant_id, session_id, version, body)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO session_snapshots (tenant_id, session_id, version, body)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (tenant_id, session_id) DO UPDATE SET
+                    version = excluded.version, body = excluded.body
+                  WHERE excluded.version > session_snapshots.version",
                 params![
                     self.tenant_id,
                     self.session_id,
@@ -272,9 +479,7 @@ impl Store for SqliteSessionStore {
         let body: Option<Vec<u8>> = self
             .reader()?
             .query_row(
-                "SELECT body FROM session_snapshots
-                  WHERE tenant_id = ?1 AND session_id = ?2
-                  ORDER BY version DESC LIMIT 1",
+                "SELECT body FROM session_snapshots WHERE tenant_id = ?1 AND session_id = ?2",
                 params![self.tenant_id, self.session_id],
                 |row| row.get(0),
             )
@@ -313,6 +518,108 @@ impl Store for SqliteSessionStore {
             )
             .map(|_| ())
             .map_err(unavailable)
+    }
+
+    fn nodes(&self) -> Arc<dyn Nodes> {
+        Arc::new(self.clone())
+    }
+
+    fn messages(&self) -> Result<Vec<NewMessage>, StoreError> {
+        let conn = self.reader()?;
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT payload FROM session_events
+                  WHERE tenant_id = ?1 AND session_id = ?2 AND kind = 0
+                  ORDER BY seq",
+            )
+            .map_err(unavailable)?;
+        let rows = stmt
+            .query_map(params![self.tenant_id, self.session_id], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })
+            .map_err(unavailable)?;
+        let mut nodes = Vec::new();
+        for row in rows {
+            if let EventPayload::NewMessage(node) = parse(&row.map_err(unavailable)?)? {
+                nodes.push(node);
+            }
+        }
+        Ok(nodes)
+    }
+}
+
+impl Nodes for SqliteSessionStore {
+    fn node(&self, id: &str) -> Result<Option<Shared>, StoreError> {
+        if let Some(node) = self.cached(id) {
+            return Ok(Some(node));
+        }
+        Ok(self
+            .select_nodes(
+                "SELECT seq, payload FROM session_events
+                  WHERE tenant_id = ?1 AND session_id = ?2 AND node_id = ?3
+                  ORDER BY seq LIMIT 1",
+                params![self.tenant_id, self.session_id, id],
+            )?
+            .into_iter()
+            .next())
+    }
+
+    fn ancestors(&self, id: &str) -> Result<Vec<Shared>, StoreError> {
+        let mut found = Vec::new();
+        let mut cursor = Some(id.to_string());
+        while let Some(node) = cursor.as_deref().and_then(|id| self.cached(id)) {
+            cursor = node.parent().map(str::to_string);
+            found.push(node);
+        }
+        let Some(missing) = cursor else {
+            return Ok(found);
+        };
+        found.extend(self.select_nodes(
+            "WITH RECURSIVE up(seq, parent_id, depth) AS (
+                SELECT seq, parent_id, 0 FROM session_events
+                 WHERE tenant_id = ?1 AND session_id = ?2 AND node_id = ?3
+                 ORDER BY seq LIMIT 1
+                UNION ALL
+                SELECT e.seq, e.parent_id, up.depth + 1 FROM up
+                  JOIN session_events e
+                    ON e.tenant_id = ?1 AND e.session_id = ?2
+                   AND e.seq = (SELECT MIN(seq) FROM session_events
+                                 WHERE tenant_id = ?1 AND session_id = ?2
+                                   AND node_id = up.parent_id)
+                 WHERE up.depth < 1000000
+             )
+             SELECT e.seq, e.payload FROM up
+               JOIN session_events e
+                 ON e.tenant_id = ?1 AND e.session_id = ?2 AND e.seq = up.seq
+              ORDER BY up.depth",
+            params![self.tenant_id, self.session_id, missing],
+        )?);
+        Ok(found)
+    }
+
+    fn children(&self, parent: &str, branch: Option<&str>) -> Result<Vec<Shared>, StoreError> {
+        self.select_nodes(
+            "SELECT seq, payload FROM session_events
+              WHERE tenant_id = ?1 AND session_id = ?2 AND parent_id = ?3 AND branch IS ?4
+              ORDER BY seq",
+            params![self.tenant_id, self.session_id, parent, branch],
+        )
+    }
+
+    fn answers(&self, tool_call_id: &str) -> Result<Vec<Shared>, StoreError> {
+        self.select_nodes(
+            "SELECT seq, payload FROM session_events
+              WHERE tenant_id = ?1 AND session_id = ?2 AND answers = ?3
+              ORDER BY seq",
+            params![self.tenant_id, self.session_id, tool_call_id],
+        )
+    }
+
+    fn remember(&self, nodes: Vec<Shared>) {
+        for node in nodes {
+            let bytes = serde_json::to_vec(&node.entry).map_or(0, |b| b.len() as u64);
+            self.keep(node, bytes);
+        }
     }
 }
 
@@ -369,7 +676,7 @@ mod tests {
     }
 
     #[test]
-    fn the_index_finds_what_a_scan_of_the_log_finds() {
+    fn the_node_index_finds_what_the_log_holds() {
         use substructure_session::command::{CommandPayload, TurnTarget};
         use substructure_session::protocol::{
             ClientMessage, ClientPayload, Content, DraftMessage, QueueMode, Role, WorkerState,
@@ -437,26 +744,36 @@ mod tests {
             .unwrap();
         decide(&mut session, "echo", vec![hi]);
 
-        let indexed = store.tied("u1").unwrap();
-        assert_eq!(indexed.len(), 1, "the message is indexed by its node");
-        assert_eq!(
-            indexed,
-            substructure_session::branch::scan_ties(store.as_ref(), "u1").unwrap()
-        );
-        assert!(store.tied("nobody").unwrap().is_empty());
-        assert!(
-            indexed.iter().all(|t| t.parent.is_some()),
-            "it hangs below the start"
-        );
+        let nodes = store.nodes();
+        let u1 = nodes
+            .node("u1")
+            .unwrap()
+            .expect("the message is indexed by its node");
+        assert!(nodes.node("nobody").unwrap().is_none());
+        let parent = u1.parent().expect("it hangs below the setup").to_string();
+        let path: Vec<String> = nodes
+            .ancestors("u1")
+            .unwrap()
+            .iter()
+            .map(|n| n.id().to_string())
+            .collect();
+        assert_eq!(path.first().map(String::as_str), Some("u1"));
+        assert_eq!(path.get(1), Some(&parent));
+        let below: Vec<String> = nodes
+            .children(&parent, None)
+            .unwrap()
+            .iter()
+            .map(|n| n.id().to_string())
+            .collect();
+        assert!(below.contains(&"u1".to_string()));
 
-        let seqs: Vec<u64> = indexed.iter().map(|t| t.seq).collect();
         let found: Vec<u64> = store
-            .events_at(&seqs)
+            .events_at(&[u1.seq])
             .unwrap()
             .iter()
             .map(|e| e.seq)
             .collect();
-        assert_eq!(found, seqs);
+        assert_eq!(found, vec![u1.seq]);
 
         let scanned: Vec<String> = Session::events(store.as_ref(), 0, usize::MAX)
             .unwrap()

@@ -898,7 +898,7 @@ mod tests {
         let text: String = std::iter::once("n,sq\n".to_string())
             .chain((0..30_000).map(|i| format!("{i},{}\n", i * i)))
             .collect();
-        let jsonl = format!("\n{{\"n\":0}}\n\n{{\"n\":1}}\n{{\"n\":2}}\n");
+        let jsonl = "\n{\"n\":0}\n\n{\"n\":1}\n{\"n\":2}\n".to_string();
         let mut f = files(&[("sq.csv", &text), ("e.jsonl", &jsonl)], Limits::default());
 
         let rows = f

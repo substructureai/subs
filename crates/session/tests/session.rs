@@ -1482,9 +1482,10 @@ mod branches {
             Some(serde_json::json!({ "turns": 2, "edited": true })),
         );
         assert_eq!(head_ids(&session), ["u1", "a1", "e2", "b2"]);
-        assert!(
-            !session.state().has_node("u2"),
-            "the old version leaves memory"
+        assert_eq!(
+            session.state().tree.fresh().count(),
+            0,
+            "the session holds no nodes between commands"
         );
 
         let back = vec![
@@ -1632,7 +1633,12 @@ mod branches {
             "nothing is copied"
         );
         assert_eq!(
-            session.state().tree.get("r2").and_then(|n| n.parent()),
+            session
+                .state()
+                .tree
+                .get("r2")
+                .and_then(|n| n.parent().map(str::to_string))
+                .as_deref(),
             Some("u2")
         );
     }
@@ -1691,9 +1697,12 @@ mod branches {
             session.state().has_node("a1"),
             "the old branch keeps its last message"
         );
-        let a1 = store.tied("a1").unwrap();
-        assert_eq!(a1.len(), 1, "its message is in the log");
-        assert_eq!(a1[0].parent.as_deref(), Some("u1"));
+        let a1 = store
+            .nodes()
+            .node("a1")
+            .unwrap()
+            .expect("its message is in the log");
+        assert_eq!(a1.parent(), Some("u1"));
         assert_eq!(
             state_value(&session),
             serde_json::json!({ "branch": "edited" })
@@ -1799,10 +1808,9 @@ mod branches {
             Some(serde_json::json!({ "reset": true })),
         );
 
-        let kept = 2 + session.state().versions.len();
-        assert_eq!(session.state().message_tree().nodes.len(), kept);
+        assert_eq!(session.state().message_tree().nodes.len(), 2);
         let reloaded = load(&store, Settings::default());
-        assert_eq!(reloaded.state().message_tree().nodes.len(), kept);
+        assert_eq!(reloaded.state().message_tree().nodes.len(), 2);
         assert_eq!(state_value(&reloaded), serde_json::json!({ "reset": true }));
     }
 }

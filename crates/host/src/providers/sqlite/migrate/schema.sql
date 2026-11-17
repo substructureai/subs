@@ -6,8 +6,18 @@ CREATE INDEX idx_engine_queue_receipt ON engine_queue (receipt);
 
 CREATE INDEX idx_engine_queue_topic ON engine_queue (topic, visible_at, enqueued_at);
 
-CREATE INDEX idx_session_entries_seq
-            ON session_entries (tenant_id, session_id, last_seq);
+CREATE INDEX idx_session_events_answers
+            ON session_events (tenant_id, session_id, answers) WHERE answers IS NOT NULL;
+
+CREATE INDEX idx_session_events_children
+            ON session_events (tenant_id, session_id, parent_id, branch, seq)
+            WHERE node_id IS NOT NULL;
+
+CREATE INDEX idx_session_events_node
+            ON session_events (tenant_id, session_id, node_id) WHERE node_id IS NOT NULL;
+
+CREATE INDEX idx_session_events_version
+            ON session_events (tenant_id, session_id, version);
 
 CREATE INDEX idx_session_index_activity
              ON session_index (tenant_id, top_level, activity, last_event_at DESC, session_id DESC);
@@ -101,11 +111,33 @@ CREATE TABLE session_entries (
             tenant_id  TEXT NOT NULL,
             session_id TEXT NOT NULL,
             version    INTEGER NOT NULL,
-            first_seq  INTEGER,
-            last_seq   INTEGER,
-            body       BLOB NOT NULL,
+            at         TEXT NOT NULL,
+            commands   BLOB NOT NULL,
             PRIMARY KEY (tenant_id, session_id, version)
-        ) WITHOUT ROWID;
+         ) WITHOUT ROWID;
+
+CREATE TABLE session_events (
+            tenant_id  TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            seq        INTEGER NOT NULL,
+            version    INTEGER NOT NULL,
+            node_id    TEXT,
+            parent_id  TEXT,
+            kind       INTEGER,
+            branch     TEXT,
+            answers    TEXT,
+            envelope   BLOB NOT NULL,
+            payload    BLOB NOT NULL,
+            PRIMARY KEY (tenant_id, session_id, seq)
+         );
+
+CREATE TABLE session_heads (
+            tenant_id  TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            version    INTEGER NOT NULL,
+            seq        INTEGER NOT NULL,
+            PRIMARY KEY (tenant_id, session_id)
+         ) WITHOUT ROWID;
 
 CREATE TABLE session_index (
     tenant_id       TEXT NOT NULL,
@@ -129,17 +161,8 @@ CREATE TABLE session_snapshots (
             session_id TEXT NOT NULL,
             version    INTEGER NOT NULL,
             body       BLOB NOT NULL,
-            PRIMARY KEY (tenant_id, session_id, version)
-        ) WITHOUT ROWID;
-
-CREATE TABLE session_ties (
-            tenant_id  TEXT NOT NULL,
-            session_id TEXT NOT NULL,
-            node_id    TEXT NOT NULL,
-            seq        INTEGER NOT NULL,
-            parent_id  TEXT,
-            PRIMARY KEY (tenant_id, session_id, node_id, seq)
-        ) WITHOUT ROWID;
+            PRIMARY KEY (tenant_id, session_id)
+         ) WITHOUT ROWID;
 
 CREATE TABLE slack_files (
     tenant_id  TEXT NOT NULL,

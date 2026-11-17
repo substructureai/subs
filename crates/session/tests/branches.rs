@@ -220,23 +220,20 @@ fn a_finished_draft_is_promoted_from_the_log_and_a_reload_agrees() {
     let d = run.live();
     let mut branch = run.path(Some("draft-b"));
     branch.push(text(Some("b1"), Role::Assistant, "Waves fold into foam"));
-    let events = run.decide(
+    run.decide(
         d,
         branch,
         vec![Action::Done {
             data: serde_json::json!("Waves fold into foam"),
         }],
     );
-    assert!(events
-        .iter()
-        .any(|e| matches!(e, EventPayload::BranchUnloaded(_))));
     assert!(matches!(run.live_trigger(), Trigger::BranchFinished { .. }));
     let d = run.live();
     run.decide(d, run.path(None), vec![]);
 
     run.reply("a1", "Leaves drift on the pond");
     let d = run.live();
-    let events = run.decide(
+    run.decide(
         d,
         vec![],
         vec![
@@ -248,9 +245,6 @@ fn a_finished_draft_is_promoted_from_the_log_and_a_reload_agrees() {
             },
         ],
     );
-    assert!(events
-        .iter()
-        .any(|e| matches!(e, EventPayload::BranchLoaded(_))));
     assert_eq!(
         texts(&run.path(None)),
         vec![
@@ -411,10 +405,6 @@ fn a_subagent_on_a_branch_goes_on_from_the_log_where_it_left_off() {
         ..text(None, Role::Tool, "Three causes.")
     });
     run.decide(d, view, vec![call("c2", vec![], None)]);
-    assert!(
-        !run.session.state().has_node("b1"),
-        "the finished branch is unloaded"
-    );
 
     let again = calling(
         "tc-r2",
@@ -429,10 +419,7 @@ fn a_subagent_on_a_branch_goes_on_from_the_log_where_it_left_off() {
     let d = run.live();
     let mut view = run.path(None);
     view.push(assistant("c2", &again));
-    let events = run.decide(d, view, vec![spawn("tc-r2", "And the fix?", Some(&branch))]);
-    assert!(events
-        .iter()
-        .any(|e| matches!(e, EventPayload::BranchLoaded(_))));
+    run.decide(d, view, vec![spawn("tc-r2", "And the fix?", Some(&branch))]);
     let path = texts(&run.path(Some(&branch)));
     assert!(path.contains(&"Three causes.".to_string()), "{path:?}");
     assert_eq!(path.last().map(String::as_str), Some("And the fix?"));

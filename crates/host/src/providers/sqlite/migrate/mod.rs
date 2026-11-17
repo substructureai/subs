@@ -9,6 +9,7 @@ mod m008_session_index_summary;
 mod m009_session_index_usage;
 mod m010_queue_leases;
 mod m011_tie_nodes;
+mod m012_session_events;
 
 use chrono::Utc;
 use rusqlite::{Connection, Transaction, TransactionBehavior};
@@ -80,6 +81,11 @@ pub const CORE_MIGRATIONS: &[Migration] = &[
         version: 11,
         name: "tie_nodes",
         up: m011_tie_nodes::up,
+    },
+    Migration {
+        version: 12,
+        name: "session_events",
+        up: m012_session_events::up,
     },
 ];
 

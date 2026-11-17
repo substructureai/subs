@@ -117,10 +117,6 @@ pub enum EventPayload {
     DeliveryParked(DeliveryParked),
     #[serde(rename = "delivery.resumed")]
     DeliveryResumed(DeliveryResumed),
-    #[serde(rename = "branch.loaded")]
-    BranchLoaded(BranchLoaded),
-    #[serde(rename = "branch.unloaded")]
-    BranchUnloaded(BranchUnloaded),
     #[serde(rename = "context.limited")]
     ContextLimited(Box<ContextLimited>),
     #[serde(rename = "context.replaced")]
@@ -200,17 +196,6 @@ pub struct ContextReplaced {
 pub struct ContextSummary {
     pub id: String,
     pub text: String,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct BranchLoaded {
-    pub seqs: Vec<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BranchUnloaded {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub head_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

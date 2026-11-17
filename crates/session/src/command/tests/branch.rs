@@ -242,7 +242,7 @@ fn a_fork_reads_the_conversation_and_then_its_own_messages() {
     assert_eq!(branch.from.as_deref(), Some("u1"));
     assert_eq!(agg.state.head_id.as_deref(), Some("u1"), "the head stays");
     let own = branch.leaf.clone().expect("its message is its own node");
-    assert_eq!(agg.state.node_branch(&own), Some("title"));
+    assert_eq!(agg.state.node_branch(&own).as_deref(), Some("title"));
 
     let call = agg.state.effect(EffectKind::LlmCall, "t1").unwrap();
     assert_eq!(call.branch.as_deref(), Some("title"));
@@ -570,7 +570,6 @@ fn an_open_branch_stays_loaded_when_the_conversation_moves_on() {
         .clone()
         .unwrap();
     assert!(agg.state.has_node(&own));
-    assert!(!agg.state.off_path(), "nothing waits to be unloaded");
 }
 
 #[test]
@@ -678,7 +677,7 @@ fn an_explicit_prompt_that_starts_with_the_conversation_forks_from_it() {
     let copies = agg
         .state
         .tree
-        .iter()
+        .fresh()
         .filter_map(|n| n.message())
         .filter(|m| {
             m.content.as_ref().map(Content::text_owned).as_deref() == Some("what time is it?")

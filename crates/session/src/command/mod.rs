@@ -8,7 +8,6 @@ use super::effects::{self, decision_queued, void_events, Settle};
 use super::events::*;
 use super::schedule::{self, ScheduleStep};
 use super::state::{EffectKind, EffectTracking, EventMeta, SessionState, TurnPhase};
-use crate::branch::Outside;
 use crate::cx::Cx;
 use crate::ids::Ids;
 use crate::protocol::{
@@ -444,7 +443,6 @@ pub struct Working {
     events: Vec<(EventPayload, EventMeta)>,
     waiting: Option<String>,
     joining: Option<String>,
-    outside: Outside,
     scope: Option<String>,
 }
 
@@ -467,7 +465,6 @@ impl Working {
             events: Vec::new(),
             waiting: None,
             joining: None,
-            outside: Outside::default(),
             scope: None,
         }
     }
@@ -519,26 +516,8 @@ impl Working {
         Ok(self)
     }
 
-    fn load_outside(&mut self, ids: &[&str]) {
-        if let Some(loaded) = self.outside.branch_to(ids, &self.state) {
-            self.emit(EventPayload::BranchLoaded(BranchLoaded {
-                seqs: loaded.seqs(),
-            }));
-            self.state.load_branch(&loaded);
-        }
-    }
-
-    pub fn with_outside(mut self, outside: Outside) -> Self {
-        self.outside = outside;
-        self
-    }
-
-    fn unload_off_path(&mut self) {
-        if self.state.off_path() {
-            self.emit(EventPayload::BranchUnloaded(BranchUnloaded {
-                head_id: self.state.head_id.clone(),
-            }));
-        }
+    pub fn tree_failed(&self) -> Option<crate::store::StoreError> {
+        self.state.tree.failed()
     }
 
     pub fn waiting_turn(&self) -> Option<&str> {
@@ -1059,7 +1038,6 @@ impl Working {
             (true, cmd) => self.run_active(cmd, caller)?,
         }
         self.schedule();
-        self.unload_off_path();
         Ok(())
     }
 
@@ -1077,17 +1055,9 @@ impl Working {
                 metadata,
             } => {
                 self.ensure_owns_session(caller)?;
-                let Some(payload) = self.outside.drop_known(payload, &self.state) else {
+                let Some(payload) = self.drop_recorded(payload) else {
                     return Ok(());
                 };
-                if let ClientPayload::Messages(view) = &payload {
-                    let ids: Vec<&str> = view
-                        .messages
-                        .iter()
-                        .filter_map(|m| m.id.as_deref())
-                        .collect();
-                    self.load_outside(&ids);
-                }
                 let joins = queue == QueueMode::Join
                     && self.phase.turn_id().is_some()
                     && matches!(
@@ -1357,8 +1327,7 @@ impl Working {
                     .anchor
                     .as_deref()
                     .and_then(|a| self.node_branch(a))
-                    .filter(|b| self.open_branch(b).is_some())
-                    .map(str::to_string);
+                    .filter(|b| self.open_branch(b).is_some());
                 self.emit(EventPayload::InterruptResumed(InterruptResumed {
                     interrupt_id: interrupt_id.clone(),
                     payload: payload.clone(),
@@ -1408,8 +1377,6 @@ impl Working {
                     self.emit(completed);
                     return Ok(());
                 }
-                let ids: Vec<&str> = transcript.iter().filter_map(|m| m.id.as_deref()).collect();
-                self.load_outside(&ids);
                 let read = answered
                     .as_ref()
                     .and_then(|t| self.read_point(t, scope.as_deref()).at);

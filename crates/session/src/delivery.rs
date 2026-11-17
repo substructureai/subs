@@ -166,10 +166,6 @@ impl EventPayload {
 
     pub fn is_bookkeeping(&self) -> bool {
         self.is_delivery()
-            || matches!(
-                self,
-                EventPayload::BranchLoaded(_) | EventPayload::BranchUnloaded(_)
-            )
     }
 }
 

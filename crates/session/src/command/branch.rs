@@ -40,8 +40,7 @@ impl SessionState {
             let answered = self
                 .tree
                 .get(last)
-                .and_then(|n| n.message())
-                .is_none_or(|m| m.tool_calls.is_empty());
+                .is_none_or(|n| n.message().is_none_or(|m| m.tool_calls.is_empty()));
             if answered {
                 break;
             }
@@ -223,9 +222,8 @@ impl Working {
             let open = self
                 .tree
                 .message_at(Some(node))
-                .and_then(|m| self.tree.get(m))
-                .and_then(|n| n.message())
-                .is_some_and(|m| !m.tool_calls.is_empty());
+                .and_then(|m| self.tree.get(&m))
+                .is_some_and(|n| n.message().is_some_and(|m| !m.tool_calls.is_empty()));
             if open {
                 tracing::warn!(
                     branch = %start.id,
@@ -344,17 +342,6 @@ impl Working {
         let (from, agent, mut own, node) = match self.branches.get(&branch) {
             Some(b) => {
                 let leaf = b.at().map(str::to_string);
-                if let Some(missing) = leaf.as_deref().filter(|l| !self.has_node(l)) {
-                    if let Some(loaded) = self.outside.branch_to(&[missing], &self.state) {
-                        self.emit(EventPayload::BranchLoaded(BranchLoaded {
-                            seqs: loaded.seqs(),
-                        }));
-                        self.state.load_branch(&loaded);
-                    }
-                }
-                let Some(b) = self.branches.get(&branch) else {
-                    return;
-                };
                 if leaf.as_deref().is_some_and(|l| !self.has_node(l)) {
                     let error = ErrorInfo::new(
                         ErrorCode::Unroutable,
@@ -399,9 +386,8 @@ impl Working {
             let asked = self
                 .tree
                 .message_at(from.as_deref())
-                .and_then(|m| self.tree.get(m))
-                .and_then(|n| n.message())
-                .map(|m| m.tool_calls.clone())
+                .and_then(|m| self.tree.get(&m))
+                .and_then(|n| n.message().map(|m| m.tool_calls.clone()))
                 .unwrap_or_default();
             messages.extend(asked.into_iter().map(|c| DraftMessage {
                 id: None,
@@ -477,14 +463,8 @@ impl Working {
             return;
         }
         if !self.has_node(&leaf) {
-            let Some(loaded) = self.outside.branch_to(&[leaf.as_str()], &self.state) else {
-                tracing::warn!(branch = id, "the branch's messages could not be loaded");
-                return;
-            };
-            self.emit(EventPayload::BranchLoaded(BranchLoaded {
-                seqs: loaded.seqs(),
-            }));
-            self.state.load_branch(&loaded);
+            tracing::warn!(branch = id, "the branch's messages are not in the log");
+            return;
         }
         self.emit(EventPayload::BranchClosed(BranchClosed {
             id: id.to_string(),

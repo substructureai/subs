@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use crate::branch::Tie;
 use crate::entry::Entry;
 use crate::protocol::NewMessage;
 use crate::session::{Session, SessionEvent};
+use crate::state::Logged;
+use crate::tree::{Node, Nodes, Shared};
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum StoreError {
@@ -21,13 +22,13 @@ pub enum StoreError {
 pub trait Store {
     fn append(&self, entry: &Entry) -> Result<(), StoreError>;
     fn read(&self, after_version: u64) -> Result<Vec<Entry>, StoreError>;
-    fn read_after_seq(&self, after_seq: u64, max: usize) -> Result<Vec<Entry>, StoreError>;
+    fn events(&self, after_seq: u64, max: usize) -> Result<Vec<SessionEvent>, StoreError>;
+    fn events_at(&self, seqs: &[u64]) -> Result<Vec<SessionEvent>, StoreError>;
     fn snapshot(&self, session: &Session) -> Result<(), StoreError>;
     fn latest(&self) -> Result<Option<Session>, StoreError>;
     fn cursors(&self) -> Result<BTreeMap<String, u64>, StoreError>;
     fn set_cursor(&self, consumer: &str, seq: u64) -> Result<(), StoreError>;
-    fn tied(&self, node: &str) -> Result<Vec<Tie>, StoreError>;
-    fn events_at(&self, seqs: &[u64]) -> Result<Vec<SessionEvent>, StoreError>;
+    fn nodes(&self) -> Arc<dyn Nodes>;
     fn messages(&self) -> Result<Vec<NewMessage>, StoreError>;
 }
 
@@ -56,7 +57,8 @@ struct Space {
     log: BTreeMap<u64, Entry>,
     snapshot: Option<Session>,
     cursors: BTreeMap<String, u64>,
-    ties: BTreeMap<String, Vec<Tie>>,
+    nodes: BTreeMap<u64, Shared>,
+    ids: BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Default)]
@@ -79,8 +81,18 @@ impl Store for MemoryStore {
         if entry.version != head + 1 {
             return Err(StoreError::VersionTaken(entry.version));
         }
-        for tie in entry.ties() {
-            space.ties.entry(tie.node.clone()).or_default().push(tie);
+        for event in &entry.events {
+            let Some(node) = Node::of_event(&event.payload) else {
+                continue;
+            };
+            space.ids.entry(node.id().to_string()).or_insert(event.seq);
+            space.nodes.insert(
+                event.seq,
+                Arc::new(Logged {
+                    seq: event.seq,
+                    entry: node,
+                }),
+            );
         }
         space.log.insert(entry.version, entry.clone());
         Ok(())
@@ -95,12 +107,13 @@ impl Store for MemoryStore {
             .collect())
     }
 
-    fn read_after_seq(&self, after_seq: u64, max: usize) -> Result<Vec<Entry>, StoreError> {
+    fn events(&self, after_seq: u64, max: usize) -> Result<Vec<SessionEvent>, StoreError> {
         Ok(self
             .space()
             .log
             .values()
-            .filter(|entry| entry.last_seq().is_some_and(|s| s > after_seq))
+            .flat_map(|entry| entry.events.iter())
+            .filter(|event| event.seq > after_seq)
             .take(max)
             .cloned()
             .collect())
@@ -126,8 +139,8 @@ impl Store for MemoryStore {
         Ok(self.space().cursors.clone())
     }
 
-    fn tied(&self, node: &str) -> Result<Vec<Tie>, StoreError> {
-        Ok(self.space().ties.get(node).cloned().unwrap_or_default())
+    fn nodes(&self) -> Arc<dyn Nodes> {
+        Arc::new(self.clone())
     }
 
     fn events_at(&self, seqs: &[u64]) -> Result<Vec<SessionEvent>, StoreError> {
@@ -160,5 +173,55 @@ impl Store for MemoryStore {
         let cursor = space.cursors.entry(consumer.to_string()).or_default();
         *cursor = (*cursor).max(seq);
         Ok(())
+    }
+}
+
+impl Nodes for MemoryStore {
+    fn node(&self, id: &str) -> Result<Option<Shared>, StoreError> {
+        let space = self.space();
+        Ok(space
+            .ids
+            .get(id)
+            .and_then(|seq| space.nodes.get(seq))
+            .cloned())
+    }
+
+    fn ancestors(&self, id: &str) -> Result<Vec<Shared>, StoreError> {
+        let space = self.space();
+        let mut found = Vec::new();
+        let mut cursor = Some(id.to_string());
+        while let Some(node) = cursor
+            .take()
+            .and_then(|id| space.ids.get(&id))
+            .and_then(|seq| space.nodes.get(seq))
+            .filter(|_| found.len() < space.nodes.len())
+        {
+            cursor = node.parent().map(str::to_string);
+            found.push(node.clone());
+        }
+        Ok(found)
+    }
+
+    fn children(&self, parent: &str, branch: Option<&str>) -> Result<Vec<Shared>, StoreError> {
+        Ok(self
+            .space()
+            .nodes
+            .values()
+            .filter(|n| n.parent() == Some(parent) && n.branch() == branch)
+            .cloned()
+            .collect())
+    }
+
+    fn answers(&self, tool_call_id: &str) -> Result<Vec<Shared>, StoreError> {
+        Ok(self
+            .space()
+            .nodes
+            .values()
+            .filter(|n| {
+                n.message()
+                    .is_some_and(|m| m.tool_call_id.as_deref() == Some(tool_call_id))
+            })
+            .cloned()
+            .collect())
     }
 }

@@ -144,18 +144,24 @@ impl Session {
         tenant_id: impl Into<String>,
         settings: Settings,
     ) -> Result<Self, Error> {
-        let mut session = match store.latest()? {
-            Some(mut session) => {
-                session.state.settle_prompts();
-                session
-            }
-            None => Self::new(id, tenant_id, Settings::default()),
-        };
+        let mut session = store
+            .latest()?
+            .unwrap_or_else(|| Self::new(id, tenant_id, Settings::default()));
         session.settings = settings;
+        session.state.tree = crate::tree::Tree::over(store.nodes());
+        session.state.settle_prompts();
         for entry in store.read(session.version)? {
-            session.apply(store, &entry)?;
+            session.apply(&entry);
         }
-        Ok(session)
+        session.state.tree.flush();
+        session.checked()
+    }
+
+    fn checked(self) -> Result<Self, Error> {
+        match self.state.tree.failed() {
+            Some(error) => Err(error.into()),
+            None => Ok(self),
+        }
     }
 
     pub fn id(&self) -> &str {
@@ -204,10 +210,7 @@ impl Session {
         now: DateTime<Utc>,
         command: Command,
     ) -> Result<Ran, Error> {
-        self.write(store, |session| {
-            let outside = session.outside(store, &command.payload)?;
-            Ok(session.propose(now, &command, outside))
-        })
+        self.write(store, |session| session.propose(now, &command))
     }
 
     pub fn wake(&mut self, store: &dyn Store, now: DateTime<Utc>) -> Result<Option<Entry>, Error> {
@@ -218,7 +221,7 @@ impl Session {
                 queued: false,
                 next_turn_id: None,
             });
-            Ok((session.woken(now), accepted))
+            Ok((session.woken(now)?, accepted))
         })?;
         Ok(ran.written)
     }
@@ -228,15 +231,7 @@ impl Session {
         after_seq: u64,
         limit: usize,
     ) -> Result<Vec<SessionEvent>, Error> {
-        let mut events = Vec::new();
-        for entry in store.read_after_seq(after_seq, limit)? {
-            events.extend(entry.events.into_iter().filter(|e| e.seq > after_seq));
-            if events.len() >= limit {
-                break;
-            }
-        }
-        events.truncate(limit);
-        Ok(events)
+        Ok(store.events(after_seq, limit)?)
     }
 
     pub fn wake_at(&self) -> Option<DateTime<Utc>> {
@@ -272,8 +267,9 @@ impl Session {
                     self.state = state;
                     self.record(&entry);
                 }
-                None => self.apply(store, &entry)?,
+                None => self.apply(&entry),
             }
+            self.state.tree.flush();
             if entry.version % self.settings.snapshot_every.max(1) == 0 {
                 if let Err(error) = store.snapshot(self) {
                     tracing::warn!(session_id = %self.id, %error, "writing a snapshot failed");
@@ -292,13 +288,16 @@ impl Session {
         &self,
         now: DateTime<Utc>,
         command: &Command,
-        outside: crate::branch::Outside,
-    ) -> (Option<Draft>, CommandResult) {
+    ) -> Result<(Option<Draft>, CommandResult), Error> {
         if let Some(result) = self.seen(&command.id) {
-            return (None, result.clone());
+            return Ok((None, result.clone()));
         }
-        let mut working = Working::new(self.state.clone(), self.seq, now).with_outside(outside);
-        let (state, events, result) = match working.run(command.payload.clone(), &command.caller) {
+        let mut working = Working::new(self.state.clone(), self.seq, now);
+        let ran = working.run(command.payload.clone(), &command.caller);
+        if let Some(error) = working.tree_failed() {
+            return Err(error.into());
+        }
+        let (state, events, result) = match ran {
             Ok(()) => {
                 let waiting = working.waiting_turn().map(str::to_string);
                 let next_turn_id = working.joining_turn().map(str::to_string);
@@ -315,7 +314,7 @@ impl Session {
             Err(error) => (None, Vec::new(), Err(Rejected { error })),
         };
         if events.is_empty() && !self.exists() {
-            return (None, result);
+            return Ok((None, result));
         }
         let entry = Entry {
             version: self.version + 1,
@@ -328,22 +327,28 @@ impl Session {
             }],
             events,
         };
-        (Some(Draft { entry, state }), result)
+        Ok((Some(Draft { entry, state }), result))
     }
 
-    fn woken(&self, now: DateTime<Utc>) -> Option<Draft> {
+    fn woken(&self, now: DateTime<Utc>) -> Result<Option<Draft>, Error> {
         let caller = Caller::System {
             tenant_id: self.tenant_id.clone(),
         };
         let mut working = Working::new(self.state.clone(), self.seq, now);
-        working.run(CommandPayload::Wake { now }, &caller).ok()?;
+        let ran = working.run(CommandPayload::Wake { now }, &caller);
+        if let Some(error) = working.tree_failed() {
+            return Err(error.into());
+        }
+        if ran.is_err() {
+            return Ok(None);
+        }
         let (state, emitted) = working.finish();
         if emitted.is_empty() {
-            return None;
+            return Ok(None);
         }
         let span = Ids::new(&self.id, self.seq, now).span("wake");
         let events = self.stamp(emitted, &span, now, None);
-        Some(Draft {
+        Ok(Some(Draft {
             entry: Entry {
                 version: self.version + 1,
                 at: now,
@@ -351,7 +356,7 @@ impl Session {
                 events,
             },
             state: Some(state),
-        })
+        }))
     }
 
     fn stamp(
@@ -380,12 +385,8 @@ impl Session {
             .collect()
     }
 
-    fn apply(&mut self, store: &dyn Store, entry: &Entry) -> Result<(), Error> {
+    fn apply(&mut self, entry: &Entry) {
         for event in &entry.events {
-            if let EventPayload::BranchLoaded(branch) = &event.payload {
-                let loaded = crate::branch::resolve(store, &branch.seqs)?;
-                self.state.load_branch(&loaded);
-            }
             self.state.apply(
                 &event.payload,
                 &ApplyContext {
@@ -395,7 +396,6 @@ impl Session {
             );
         }
         self.record(entry);
-        Ok(())
     }
 
     fn record(&mut self, entry: &Entry) {

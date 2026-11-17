@@ -1,7 +1,6 @@
 pub mod agent_config;
 pub mod attachments;
 pub mod blob;
-pub mod branch;
 pub mod caller;
 pub mod codemode;
 pub mod command;

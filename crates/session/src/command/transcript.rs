@@ -117,35 +117,52 @@ impl SessionState {
     }
 
     fn land_view(&self, view: &[DraftMessage], scope: Option<&str>, regenerate: bool) -> Landed {
-        let full = self
-            .tree
-            .shared(view, |_, node| scope.is_some() || node.branch().is_none());
+        let leaf = self.scope_node(scope);
+        let line = match scope {
+            Some(_) => None,
+            None => leaf.as_deref().map(|h| self.path_ids(h)),
+        };
+        let full = self.tree.shared(view, |_, node| {
+            scope.is_some()
+                || node.branch().is_none()
+                || line.as_ref().is_some_and(|l| l.contains(node.id()))
+        });
         let shared = match regenerate && full == view.len() {
             true => settled(view).len(),
             false => full,
         };
         let last = |n: usize| n.checked_sub(1).and_then(|i| view[i].id.as_deref());
-        let leaf = self.scope_node(scope);
         let floor = scope
             .and_then(|b| self.branches.get(b))
             .map(|b| b.node.as_str());
-        let version = scope
-            .is_none()
-            .then(|| last(full).and_then(|m| self.versions.get(m)))
-            .flatten()
-            .map(String::as_str);
-        let line = [leaf.as_deref(), version]
-            .into_iter()
-            .find(|&line| self.tree.fork_on(line, last(full), floor).is_some());
-        let at = match line {
-            Some(line) => self.tree.fork_on(line, last(shared), floor).flatten(),
-            None if scope.is_some() => self.tree.fork_on(leaf.as_deref(), None, floor).flatten(),
-            None => last(shared).map(str::to_string),
-        };
-        Landed {
-            forks: line.is_none_or(|line| at.as_deref() != line),
-            at,
-            shared,
+        if let Some(at) = self.tree.fork_on(leaf.as_deref(), last(full), floor) {
+            let at = match shared == full {
+                true => at,
+                false => self
+                    .tree
+                    .fork_on(leaf.as_deref(), last(shared), floor)
+                    .flatten(),
+            };
+            return Landed {
+                forks: at != leaf,
+                at,
+                shared,
+            };
+        }
+        match (scope, last(shared)) {
+            (None, Some(message)) => {
+                let (at, forks) = self.tree.tail(message);
+                Landed {
+                    at: Some(at),
+                    shared,
+                    forks,
+                }
+            }
+            _ => Landed {
+                at: self.tree.fork_on(leaf.as_deref(), None, floor).flatten(),
+                shared,
+                forks: true,
+            },
         }
     }
 
@@ -157,6 +174,25 @@ impl SessionState {
         match (branch, trigger) {
             (None, Trigger::ClientTranscript { messages, .. }) => self.view_point(messages),
             _ => Landed::stay(self.scope_node(branch)),
+        }
+    }
+
+    pub(super) fn drop_recorded(&self, payload: ClientPayload) -> Option<ClientPayload> {
+        let head = self.head_id.as_deref().map(|h| self.path_ids(h));
+        let fresh = |m: &DraftMessage| {
+            m.id.as_deref().is_none_or(|id| {
+                !self.has_node(id) || head.as_ref().is_some_and(|path| path.contains(id))
+            })
+        };
+        match payload {
+            ClientPayload::Message(message) => {
+                fresh(&message.message).then_some(ClientPayload::Message(message))
+            }
+            ClientPayload::Append(mut append) => {
+                append.messages.retain(fresh);
+                (!append.messages.is_empty()).then_some(ClientPayload::Append(append))
+            }
+            other => Some(other),
         }
     }
 
@@ -181,23 +217,14 @@ impl SessionState {
     fn recorded_result_node(
         &self,
         tool_call_id: &str,
-        on_path: &std::collections::HashSet<&str>,
+        on_path: &std::collections::HashSet<String>,
     ) -> Option<String> {
-        let mut best: Option<&str> = None;
-        let mut best_on_path = false;
-        for m in self.tree.iter().filter_map(|n| n.message()) {
-            if m.role != Role::Tool || m.tool_call_id.as_deref() != Some(tool_call_id) {
-                continue;
-            }
-            let on = on_path.contains(m.id.as_str());
-            if on {
-                best = Some(&m.id);
-                best_on_path = true;
-            } else if !best_on_path {
-                best = Some(&m.id);
-            }
-        }
-        best.map(str::to_string)
+        let answers = self.tree.answers(tool_call_id);
+        answers
+            .iter()
+            .find(|n| on_path.contains(n.id()))
+            .or(answers.first())
+            .map(|n| n.id().to_string())
     }
 
     pub fn normalize_client_view(&self, messages: Vec<DraftMessage>) -> Vec<DraftMessage> {
@@ -368,13 +395,12 @@ impl SessionState {
             .map(|m| {
                 let edited = m.role == Role::User
                     && m.id.as_deref().is_some_and(|id| {
-                        self.tree
-                            .get(id)
-                            .and_then(|n| n.message())
-                            .is_some_and(|n| {
+                        self.tree.get(id).is_some_and(|node| {
+                            node.message().is_some_and(|n| {
                                 n.role == Role::User
                                     && text(n.content.as_ref()) != text(m.content.as_ref())
                             })
+                        })
                     });
                 match edited {
                     true => DraftMessage { id: None, ..m },

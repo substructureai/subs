@@ -943,6 +943,7 @@ mod tests {
         let first = request_and_send(&mut state, 10, "call-1");
         let mut loaded: SessionState =
             serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+        loaded.tree = state.tree.clone();
         let next = request_and_send(&mut loaded, 20, "call-2");
         assert_eq!(
             shape(&next),

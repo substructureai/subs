@@ -283,10 +283,16 @@ fn a_quiet_session_starts_over_with_the_turns_own_messages() {
     plan(&mut t, "");
     assert_eq!(path(&t), ["q2"]);
     assert_eq!(requested(&t, "call-2"), ["be brief", "q2"]);
-    let copied = t.agg.state.tree.iter().rev().find_map(|n| match &n.fact {
-        crate::tree::Fact::Message { copied_from, .. } => Some(copied_from.clone()),
-        _ => None,
-    });
+    let copied = t
+        .agg
+        .state
+        .tree
+        .fresh()
+        .max_by_key(|n| n.seq)
+        .and_then(|n| match &n.fact {
+            crate::tree::Fact::Message { copied_from, .. } => Some(copied_from.clone()),
+            _ => None,
+        });
     assert!(copied.flatten().is_some(), "the turn's message is a copy");
     assert!(
         t.agg.state.at_head().resolve_agent_for().is_some(),

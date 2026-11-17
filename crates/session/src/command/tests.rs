@@ -8229,13 +8229,11 @@ fn starts_with(prompt: &[Message], prefix: &[Message]) -> bool {
             == serde_json::to_value(prefix).unwrap()
 }
 
-fn kept_nodes(agg: &Session, ids: &[&str]) -> crate::branch::Loaded {
-    crate::branch::Loaded {
-        nodes: ids
-            .iter()
-            .filter_map(|id| agg.state.tree.get(id).cloned())
-            .collect(),
-    }
+fn parent_of(agg: &Session, id: &str) -> Option<String> {
+    agg.state
+        .tree
+        .get(id)
+        .and_then(|n| n.parent().map(str::to_string))
 }
 
 #[test]
@@ -8258,12 +8256,9 @@ fn context_follows_the_branch_a_prompt_is_on() {
         "the next turn reads the last call's prompt first: {second:?}"
     );
 
-    let first_branch = kept_nodes(&agg, &["u1", "a1"]);
     let d = open_decision(&mut agg, "start over");
     let x1 = node_msg("x1", Role::User, "start over");
     submit_state(&mut agg, d, vec![x1.clone()], None);
-    assert!(!agg.state.has_node("u1"), "the first branch is unloaded");
-    assert!(agg.state.versions.contains_key("u2"), "its leaf is kept");
     let other = send_at_head(&mut agg, "call-3", vec![x1]);
     assert_eq!(
         context_ids(&other),
@@ -8272,7 +8267,6 @@ fn context_follows_the_branch_a_prompt_is_on() {
     );
 
     let d = open_decision(&mut agg, "back");
-    agg.state.load_branch(&first_branch);
     let u3 = node_msg("u3", Role::User, "back");
     submit_state(
         &mut agg,
@@ -8281,7 +8275,7 @@ fn context_follows_the_branch_a_prompt_is_on() {
         None,
     );
     assert_eq!(
-        agg.state.tree.get("u3").and_then(|n| n.parent()),
+        parent_of(&agg, "u3").as_deref(),
         Some("u2"),
         "the view lands on the first branch"
     );
@@ -8325,10 +8319,6 @@ fn a_fork_after_the_context_was_placed_keeps_it() {
     let d = open_decision(&mut agg, "instead");
     let z2 = node_msg("z2", Role::User, "instead");
     submit_state(&mut agg, d, vec![u1.clone(), a1.clone(), z2.clone()], None);
-    assert!(
-        agg.state.versions.contains_key("u2"),
-        "the sibling is kept as a version"
-    );
     let fork = send_at_head(&mut agg, "call-3", vec![u1, a1, z2]);
     assert!(
         starts_with(&fork, &first),
@@ -10295,12 +10285,9 @@ fn a_fork_writes_its_state_after_its_messages_and_an_omitted_state_carries() {
     assert_eq!(updates.len(), 1);
     assert_eq!(updates[0].node.parent_id.as_deref(), Some("x1"));
     assert_eq!(
-        agg.state
-            .tree
-            .get("x1")
-            .and_then(|n| n.parent())
-            .and_then(|p| agg.state.tree.get(p))
-            .and_then(|n| n.parent()),
+        parent_of(&agg, "x1")
+            .and_then(|p| parent_of(&agg, &p))
+            .as_deref(),
         Some("u1"),
         "the fork keeps the state saved after u1"
     );
@@ -10318,8 +10305,8 @@ fn a_fork_writes_its_state_after_its_messages_and_an_omitted_state_carries() {
     );
     assert_eq!(state_updates(&events).len(), 1);
     assert_eq!(
-        agg.state.tree.get("y1").and_then(|n| n.parent()),
-        agg.state.tree.get("x1").and_then(|n| n.parent()),
+        parent_of(&agg, "y1"),
+        parent_of(&agg, "x1"),
         "both forks hang after the state saved with u1"
     );
     assert_eq!(
@@ -10397,12 +10384,9 @@ fn a_reset_lands_before_the_first_message_and_keeps_the_state_sent_with_it() {
         .collect();
     assert_eq!(texts, ["latest"], "the view replaces the conversation");
     assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, EventPayload::BranchUnloaded(_))),
-        "the old branch leaves memory; it stays in the log"
+        events.is_empty() || agg.state.has_node("u1"),
+        "the old line stays in the tree"
     );
-    assert!(!agg.state.has_node("u1"));
     assert_eq!(agg.state.at_head().resolve_state_for().0, json!({"v": 3}));
 }
 
@@ -14729,7 +14713,9 @@ fn a_tree_call_survives_a_snapshot_and_an_older_one_loads_as_legacy() {
     let first = sent(&agg, "call-1");
 
     let snapshot = serde_json::to_value(&agg.state).unwrap();
+    let tree = agg.state.tree.clone();
     agg.state = serde_json::from_value(snapshot.clone()).unwrap();
+    agg.state.tree = tree;
     assert!(agg.state.llm_call("call-1").unwrap().source.is_tree());
     let a1 = node_msg("a1", Role::Assistant, "hello");
     let u2 = node_msg("u2", Role::User, "more");

@@ -49,6 +49,7 @@ rquickjs = { version = "0.14", features = ["allocator"] }
 libc = "0.2"
 calamine = { version = "0.38", default-features = false, features = ["dates"] }
 ouroboros = "0.18"
+quick_cache = "0.6"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 seccompiler = "0.5"
