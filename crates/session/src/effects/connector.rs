@@ -7,7 +7,7 @@ use crate::protocol::{AgentConfig, RetryPolicy};
 use crate::retry::RetryTarget;
 use crate::schedule::Dep;
 use crate::state::EffectTracking;
-use crate::state::{EffectKind, SessionState, SessionStateAtNode};
+use crate::state::{At, EffectKind, SessionState};
 
 pub struct ConnectorSpec;
 
@@ -91,16 +91,16 @@ impl KindSpec for ConnectorSpec {
     }
 }
 
-pub fn owed(at: SessionStateAtNode) -> Vec<Dep> {
+pub fn owed(at: At) -> Vec<Dep> {
     let mut deps: Vec<Dep> = at
         .unsynced_connectors()
         .into_iter()
         .map(|connection_id| Dep::ConnectorSettled { connection_id })
         .collect();
-    if let Some(config) = at.resolve_agent_for() {
-        for c in at.state().servers_for(&config) {
+    if let Some(config) = at.config() {
+        for c in at.session().servers_for(&config) {
             if at
-                .state()
+                .session()
                 .tracking(EffectKind::ConnectorSync, &c.path.to_string())
                 .is_some_and(EffectTracking::is_in_flight)
             {
@@ -162,7 +162,7 @@ impl SessionState {
         offered: &[RemoteTool],
         prefix: Option<&str>,
     ) {
-        let Some(config) = self.at_head().resolve_agent_for() else {
+        let Some(config) = self.at_head().config() else {
             return;
         };
         let Some(connector) = self

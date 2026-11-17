@@ -85,7 +85,7 @@ impl Node {
     }
 }
 
-pub type Shared = Arc<Logged<Node>>;
+pub type NodeRef = Arc<Logged<Node>>;
 
 #[derive(Debug, Clone)]
 pub struct BranchRecord {
@@ -94,31 +94,34 @@ pub struct BranchRecord {
 }
 
 pub trait Nodes: Send + Sync {
-    fn node(&self, id: &str) -> Result<Option<Shared>, StoreError>;
-    fn ancestors(&self, id: &str, limit: usize) -> Result<Vec<Shared>, StoreError>;
-    fn children(&self, parent: &str, branch: Option<&str>) -> Result<Vec<Shared>, StoreError>;
-    fn answers(&self, tool_call_id: &str) -> Result<Vec<Shared>, StoreError>;
+    fn node(&self, id: &str) -> Result<Option<NodeRef>, StoreError>;
+    fn ancestors(&self, id: &str, limit: usize) -> Result<Vec<NodeRef>, StoreError>;
+    fn children(&self, parent: &str, branch: Option<&str>) -> Result<Vec<NodeRef>, StoreError>;
+    fn answers(&self, tool_call_id: &str) -> Result<Vec<NodeRef>, StoreError>;
     fn branch(&self, id: &str) -> Result<Option<BranchRecord>, StoreError>;
-    fn versions(&self, prev: Option<&str>, branch: Option<&str>)
-        -> Result<Vec<Shared>, StoreError>;
-    fn remember(&self, _nodes: Vec<Shared>) {}
+    fn versions(
+        &self,
+        prev: Option<&str>,
+        branch: Option<&str>,
+    ) -> Result<Vec<NodeRef>, StoreError>;
+    fn cache(&self, _nodes: Vec<NodeRef>) {}
 }
 
 #[derive(Default)]
 pub struct Tree {
     source: Option<Arc<dyn Nodes>>,
-    fresh: HashMap<String, Shared>,
+    unwritten: HashMap<String, NodeRef>,
     branches: HashMap<String, BranchRecord>,
-    failed: Mutex<Option<StoreError>>,
+    poisoned: Mutex<Option<StoreError>>,
 }
 
 impl Clone for Tree {
     fn clone(&self) -> Self {
         Tree {
             source: self.source.clone(),
-            fresh: self.fresh.clone(),
+            unwritten: self.unwritten.clone(),
             branches: self.branches.clone(),
-            failed: Mutex::default(),
+            poisoned: Mutex::default(),
         }
     }
 }
@@ -127,7 +130,7 @@ impl std::fmt::Debug for Tree {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Tree")
             .field("stored", &self.source.is_some())
-            .field("fresh", &self.fresh.len())
+            .field("unwritten", &self.unwritten.len())
             .finish()
     }
 }
@@ -140,12 +143,14 @@ impl Tree {
         }
     }
 
-    pub fn failed(&self) -> Option<StoreError> {
-        self.failed.lock().ok()?.take()
+    pub fn poisoned(&self) -> Option<StoreError> {
+        self.poisoned.lock().ok()?.take()
     }
 
-    pub fn failing(&self) -> bool {
-        self.failed.lock().is_ok_and(|failed| failed.is_some())
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+            .lock()
+            .is_ok_and(|poisoned| poisoned.is_some())
     }
 
     fn read<T: Default>(&self, read: impl FnOnce(&dyn Nodes) -> Result<T, StoreError>) -> T {
@@ -153,15 +158,15 @@ impl Tree {
             return T::default();
         };
         read(source.as_ref()).unwrap_or_else(|error| {
-            if let Ok(mut failed) = self.failed.lock() {
-                failed.get_or_insert(error);
+            if let Ok(mut poisoned) = self.poisoned.lock() {
+                poisoned.get_or_insert(error);
             }
             T::default()
         })
     }
 
-    pub fn get(&self, id: &str) -> Option<Shared> {
-        match self.fresh.get(id) {
+    pub fn get(&self, id: &str) -> Option<NodeRef> {
+        match self.unwritten.get(id) {
             Some(node) => Some(node.clone()),
             None => self.read(|s| s.node(id)),
         }
@@ -172,7 +177,7 @@ impl Tree {
     }
 
     pub fn push(&mut self, node: Logged<Node>) {
-        self.fresh
+        self.unwritten
             .entry(node.id().to_string())
             .or_insert_with(|| Arc::new(node));
     }
@@ -189,20 +194,20 @@ impl Tree {
         }
     }
 
-    pub fn flush(&mut self) {
+    pub fn written(&mut self) {
         let Some(source) = &self.source else {
             return;
         };
         self.branches.clear();
-        source.remember(self.fresh.drain().map(|(_, node)| node).collect());
+        source.cache(self.unwritten.drain().map(|(_, node)| node).collect());
     }
 
-    pub fn fresh(&self) -> impl Iterator<Item = &Shared> {
-        self.fresh.values()
+    pub fn unwritten(&self) -> impl Iterator<Item = &NodeRef> {
+        self.unwritten.values()
     }
 
-    pub fn up(&self, from: Option<&str>) -> Up<'_> {
-        Up {
+    pub fn up(&self, from: Option<&str>) -> Ancestors<'_> {
+        Ancestors {
             tree: self,
             cursor: from.map(str::to_string),
             stored: Vec::new().into_iter(),
@@ -210,10 +215,10 @@ impl Tree {
         }
     }
 
-    pub fn children(&self, parent: &str, branch: Option<&str>) -> Vec<Shared> {
+    pub fn children(&self, parent: &str, branch: Option<&str>) -> Vec<NodeRef> {
         let mut found = self.read(|s| s.children(parent, branch));
         found.extend(
-            self.fresh
+            self.unwritten
                 .values()
                 .filter(|n| n.parent() == Some(parent) && n.branch() == branch)
                 .cloned(),
@@ -222,10 +227,10 @@ impl Tree {
         found
     }
 
-    pub fn answers(&self, tool_call_id: &str) -> Vec<Shared> {
+    pub fn answers(&self, tool_call_id: &str) -> Vec<NodeRef> {
         let mut found = self.read(|s| s.answers(tool_call_id));
         found.extend(
-            self.fresh
+            self.unwritten
                 .values()
                 .filter(|n| {
                     n.message()
@@ -245,7 +250,7 @@ impl Tree {
         let branch = node.branch().map(str::to_string);
         let mut found = self.read(|s| s.versions(prev.as_deref(), branch.as_deref()));
         found.extend(
-            self.fresh
+            self.unwritten
                 .values()
                 .filter(|n| n.message().is_some() && n.branch() == branch.as_deref())
                 .filter(|n| self.message_at(n.parent()) == prev)
@@ -340,25 +345,25 @@ impl Tree {
 
 const ANCESTORS: usize = 256;
 
-pub struct Up<'a> {
+pub struct Ancestors<'a> {
     tree: &'a Tree,
     cursor: Option<String>,
-    stored: std::vec::IntoIter<Shared>,
+    stored: std::vec::IntoIter<NodeRef>,
     steps: usize,
 }
 
-impl Iterator for Up<'_> {
-    type Item = Shared;
+impl Iterator for Ancestors<'_> {
+    type Item = NodeRef;
 
-    fn next(&mut self) -> Option<Shared> {
+    fn next(&mut self) -> Option<NodeRef> {
         if let Some(node) = self.stored.next() {
             return Some(node);
         }
         let id = self.cursor.take()?;
-        match self.tree.fresh.get(&id) {
+        match self.tree.unwritten.get(&id) {
             Some(node) => {
                 self.steps += 1;
-                if self.steps <= self.tree.fresh.len() {
+                if self.steps <= self.tree.unwritten.len() {
                     self.cursor = node.parent().map(str::to_string);
                 }
                 Some(node.clone())

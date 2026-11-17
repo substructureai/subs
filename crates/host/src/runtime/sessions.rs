@@ -519,7 +519,7 @@ impl Sessions {
             let tree = state.at(at.as_deref()).message_tree();
             let versions = state.versions(&tree);
             let status = state.projected_status();
-            if let Some(error) = state.tree.failed() {
+            if let Some(error) = state.tree.poisoned() {
                 return Err(error.into());
             }
             Ok(Some(SessionView {
@@ -854,7 +854,7 @@ pub async fn read<T: Send + 'static>(
 ) -> Result<T, StoreError> {
     tokio::task::spawn_blocking(move || {
         let read = f(session.state());
-        match session.state().tree.failed() {
+        match session.state().tree.poisoned() {
             Some(error) => Err(error),
             None => Ok(read),
         }
@@ -1358,7 +1358,7 @@ mod tests {
         .await;
 
         let view = s.view("t", "s1", None).await.unwrap().unwrap();
-        assert_eq!(view.state.tree.fresh().count(), 0);
+        assert_eq!(view.state.tree.unwritten().count(), 0);
         let ids = |tree: &MessageTree| -> Vec<String> {
             tree.nodes.iter().map(|n| n.message.id.clone()).collect()
         };

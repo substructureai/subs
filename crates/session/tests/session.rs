@@ -1330,7 +1330,7 @@ mod branches {
     }
 
     fn state_value(session: &Session) -> serde_json::Value {
-        session.state().at_head().resolve_state_for().0
+        session.state().at_head().worker_state().0
     }
 
     fn view(store: &MemoryStore, session: &mut Session, n: usize, messages: Vec<DraftMessage>) {
@@ -1489,7 +1489,7 @@ mod branches {
         );
         assert_eq!(head_ids(&session), ["u1", "a1", "e2", "b2"]);
         assert_eq!(
-            session.state().tree.fresh().count(),
+            session.state().tree.unwritten().count(),
             0,
             "the session holds no nodes between commands"
         );

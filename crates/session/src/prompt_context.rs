@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::{Content, DraftMessage, McpAnnounce, Message, Role, StoredContent};
-use crate::state::SessionStateAtNode;
+use crate::state::At;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -30,7 +30,7 @@ pub struct PromptContext {
     pub content: String,
 }
 
-pub type Contributor = fn(SessionStateAtNode) -> Vec<PromptContext>;
+pub type Contributor = fn(At) -> Vec<PromptContext>;
 
 const CONTRIBUTORS: &[Contributor] = &[
     plugin_catalog,
@@ -39,7 +39,7 @@ const CONTRIBUTORS: &[Contributor] = &[
     announce_unavailable,
 ];
 
-pub fn owed(at: SessionStateAtNode) -> Vec<PromptContext> {
+pub fn owed(at: At) -> Vec<PromptContext> {
     let said = at.said();
     CONTRIBUTORS
         .iter()
@@ -48,14 +48,14 @@ pub fn owed(at: SessionStateAtNode) -> Vec<PromptContext> {
         .collect()
 }
 
-fn announce_servers(at: SessionStateAtNode) -> Vec<PromptContext> {
-    let Some(config) = at.resolve_agent_for() else {
+fn announce_servers(at: At) -> Vec<PromptContext> {
+    let Some(config) = at.config() else {
         return Vec::new();
     };
     if config.mcp_announce == McpAnnounce::Never {
         return Vec::new();
     }
-    at.state()
+    at.session()
         .servers_for(&config)
         .into_iter()
         .map(|server| (server.path.to_string(), server))
@@ -69,8 +69,8 @@ fn announce_servers(at: SessionStateAtNode) -> Vec<PromptContext> {
         .collect()
 }
 
-fn announce_unavailable(at: SessionStateAtNode) -> Vec<PromptContext> {
-    let Some(config) = at.resolve_agent_for() else {
+fn announce_unavailable(at: At) -> Vec<PromptContext> {
+    let Some(config) = at.config() else {
         return Vec::new();
     };
     let mut owed = Vec::new();
@@ -99,8 +99,8 @@ struct Unavailable<'a> {
     reason: &'static str,
 }
 
-fn plugin_catalog(at: SessionStateAtNode) -> Vec<PromptContext> {
-    let Some(config) = at.resolve_agent_for() else {
+fn plugin_catalog(at: At) -> Vec<PromptContext> {
+    let Some(config) = at.config() else {
         return Vec::new();
     };
     let code = config.codemode.is_some();
@@ -146,8 +146,8 @@ fn plugin_catalog(at: SessionStateAtNode) -> Vec<PromptContext> {
 
 /// One entry for each of the agent's own skills, so a skill the worker adds
 /// later lists itself without rewriting what the model has read.
-fn skill_catalog(at: SessionStateAtNode) -> Vec<PromptContext> {
-    let Some(config) = at.resolve_agent_for() else {
+fn skill_catalog(at: At) -> Vec<PromptContext> {
+    let Some(config) = at.config() else {
         return Vec::new();
     };
     if config.searches_skills() && config.codemode.is_none() {
@@ -620,7 +620,7 @@ mod tests {
     fn a_silent_connection_is_not_named() {
         let state = failed_state(McpToolSyncFailure::Silent, None);
         assert!(owed_ids(&state).is_empty());
-        let config = state.at_head().resolve_agent_for().expect("config");
+        let config = state.at_head().config().expect("config");
         assert!(
             state
                 .at_head()
@@ -633,7 +633,7 @@ mod tests {
     #[test]
     fn announcing_no_servers_still_reports_one_that_is_missing() {
         let mut s = failed_state(McpToolSyncFailure::Warn, None);
-        let mut config = s.at_head().resolve_agent_for().expect("config");
+        let mut config = s.at_head().config().expect("config");
         config.mcp_announce = McpAnnounce::Never;
         apply(
             &mut s,

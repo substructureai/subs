@@ -340,7 +340,7 @@ impl Session {
         let head = self.seq;
         if restarted && reader.restart == Restart::ResendOpen {
             let items = self.resend(store)?;
-            if let Some(error) = self.state.tree.failed() {
+            if let Some(error) = self.state.tree.poisoned() {
                 return Err(error.into());
             }
             if !items.is_empty() {
@@ -368,7 +368,7 @@ impl Session {
                 return Ok(Next::idle(Vec::new()));
             };
             let items = self.work(&read);
-            if let Some(error) = self.state.tree.failed() {
+            if let Some(error) = self.state.tree.poisoned() {
                 return Err(error.into());
             }
             if items.is_empty() {

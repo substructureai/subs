@@ -187,10 +187,7 @@ pub fn request(
             },
         )])
     };
-    let config = state
-        .at_scope(state.scope())
-        .resolve_agent_for()
-        .unwrap_or_default();
+    let config = state.at_scope(state.scope()).config().unwrap_or_default();
     if !config.may_spawn_subagent(state.depth() + state.branch_depth(state.scope()) as u32) {
         let limit = config.depth_limit();
         return answer(ErrorInfo::new(

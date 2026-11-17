@@ -129,8 +129,8 @@ impl Session {
         let transcript = at.transcript();
         let open_llm_calls = at.open_llm_calls();
         let pending_calls = meta.pending_work(decision_id) + self.state.held_by_branches(branch_id);
-        let worker_state = at.resolve_state_for();
-        let agent_config = at.resolve_agent_for();
+        let worker_state = at.worker_state();
+        let agent_config = at.config();
         if let (
             Some(rules),
             Trigger::ClientMessage { messages, .. } | Trigger::ClientTranscript { messages, .. },
@@ -190,7 +190,7 @@ impl Session {
             turn: worker_decision.turn.as_deref().cloned(),
             branch,
         };
-        if self.state.tree.failing() {
+        if self.state.tree.is_poisoned() {
             return None;
         }
         Some((request, prompt))

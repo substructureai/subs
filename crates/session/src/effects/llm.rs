@@ -79,7 +79,7 @@ impl KindSpec for LlmSpec {
             return void_events(EffectKind::LlmCall, id.to_string());
         };
         let out = state.outgoing(id);
-        let placed = effect.llm().is_some_and(|c| c.context.is_some());
+        let placed = effect.llm().is_some_and(|c| c.reads_from.is_some());
         let leaf = state.scope_node(effect.branch.as_deref());
         let mut events = Vec::new();
         if let Some(out) = out
@@ -124,7 +124,7 @@ impl KindSpec for LlmSpec {
             return super::connector::owed(state.at_scope(Some(branch)));
         }
         let node = effect
-            .and_then(|e| e.anchor.clone())
+            .and_then(|e| e.asked_at.clone())
             .or_else(|| state.head_id.clone());
         super::connector::owed(state.at(node.as_deref()))
     }
@@ -234,7 +234,7 @@ pub fn request(
     };
     let defer_tools_strategy = state
         .at_scope(state.scope())
-        .resolve_agent_for()
+        .config()
         .map(|c| c.defer_strategy())
         .unwrap_or_default();
     Ok(vec![EventPayload::LlmCallRequested(LlmCallRequested {

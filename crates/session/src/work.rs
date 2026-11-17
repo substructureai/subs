@@ -432,7 +432,7 @@ impl Session {
         let call = effect.system1()?;
         let mut request = call.request.clone();
         if request.state.is_none() {
-            let transcript = state.at(effect.anchor.as_deref()).transcript();
+            let transcript = state.at(effect.asked_at.as_deref()).transcript();
             request.state = Some(transcript_state(&transcript));
         }
         Some(Work::CallSystem1 {
@@ -570,7 +570,7 @@ impl Session {
         let Some(effect) = self.state.effect(EffectKind::ToolCall, id) else {
             return Vec::new();
         };
-        let Some(config) = self.state.at(effect.anchor.as_deref()).resolve_agent_for() else {
+        let Some(config) = self.state.at(effect.asked_at.as_deref()).config() else {
             return Vec::new();
         };
         config
@@ -599,7 +599,7 @@ impl Session {
             return Vec::new();
         };
         let attachments =
-            crate::attachments::on_path(&self.state.message_tree(), effect.anchor.as_deref())
+            crate::attachments::on_path(&self.state.message_tree(), effect.asked_at.as_deref())
                 .into_iter()
                 .filter_map(|a| {
                     let blob = crate::blob::BlobRef::parse(&a.uri)?;

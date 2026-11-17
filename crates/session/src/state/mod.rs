@@ -535,7 +535,7 @@ impl SessionState {
 
     pub fn parallel_branches(&self) -> bool {
         self.at_head()
-            .resolve_agent_for()
+            .config()
             .and_then(|c| c.parallel_branches)
             .unwrap_or(false)
     }
@@ -697,7 +697,7 @@ impl SessionState {
             Trigger::System1Finished { id, .. } => self.effect(EffectKind::System1Call, id),
             _ => None,
         }
-        .and_then(|e| e.anchor.as_deref())
+        .and_then(|e| e.asked_at.as_deref())
     }
 
     pub fn is_summary_call(&self, id: &str) -> bool {
@@ -926,7 +926,7 @@ impl SessionState {
 
     pub fn local_connector_answer(&self, tool_call_id: &str) -> Option<StoredResult> {
         let effect = self.effect(EffectKind::ToolCall, tool_call_id)?;
-        let node = effect.anchor.clone();
+        let node = effect.asked_at.clone();
         let tc = effect.tool()?;
         let target = tc.target.as_ref()?;
         let at = self.at(node.as_deref());
@@ -966,7 +966,7 @@ impl SessionState {
             arguments: tc.arguments.clone(),
             attachments: crate::attachments::on_path(
                 &self.message_tree(),
-                effect.anchor.as_deref(),
+                effect.asked_at.as_deref(),
             ),
         })
     }
@@ -978,7 +978,7 @@ impl SessionState {
             return None;
         };
         Some(SkillCall {
-            node: effect.anchor.clone(),
+            node: effect.asked_at.clone(),
             plugin_id: plugin.clone(),
             arguments: tc.arguments.clone(),
             scripted: tc.script.is_some(),

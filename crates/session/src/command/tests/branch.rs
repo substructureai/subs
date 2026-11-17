@@ -255,7 +255,7 @@ fn a_fork_reads_the_conversation_and_then_its_own_messages() {
 
     let call = agg.state.effect(EffectKind::LlmCall, "t1").unwrap();
     assert_eq!(call.branch.as_deref(), Some("title"));
-    assert_eq!(call.anchor.as_deref(), Some(own.as_str()));
+    assert_eq!(call.asked_at.as_deref(), Some(own.as_str()));
 
     let chat = prompt_texts(&agg, "c1");
     let side = prompt_texts(&agg, "t1");
@@ -433,7 +433,7 @@ fn a_branch_runs_its_tools_on_itself() {
         .clone()
         .unwrap();
     assert_eq!(
-        next.anchor,
+        next.asked_at,
         agg.state.tree.message_at(Some(&leaf)),
         "it reads the branch, tool result included"
     );
@@ -490,7 +490,7 @@ fn a_root_branch_with_no_config_sends_its_messages_as_written() {
     );
     assert_eq!(prompt_texts(&agg, "j1"), vec!["You judge.", "Is 2+2=4?"]);
     assert_eq!(
-        agg.state.at_scope(Some("judge")).resolve_agent_for(),
+        agg.state.at_scope(Some("judge")).config(),
         None,
         "a root runs with no config"
     );
@@ -519,14 +519,11 @@ fn a_fork_reads_the_config_as_it_was_when_it_started() {
         &machine(),
     );
     assert_eq!(
-        agg.state.at_head().resolve_agent_for().map(|c| c.model),
+        agg.state.at_head().config().map(|c| c.model),
         Some("m2".to_string())
     );
     assert_eq!(
-        agg.state
-            .at_scope(Some("title"))
-            .resolve_agent_for()
-            .map(|c| c.model),
+        agg.state.at_scope(Some("title")).config().map(|c| c.model),
         Some("m1".to_string()),
         "a later write on the conversation does not reach the branch"
     );
@@ -690,7 +687,7 @@ fn an_explicit_prompt_that_starts_with_the_conversation_forks_from_it() {
     let copies = agg
         .state
         .tree
-        .fresh()
+        .unwritten()
         .filter_map(|n| n.message())
         .filter(|m| {
             m.content.as_ref().map(Content::text_owned).as_deref() == Some("what time is it?")

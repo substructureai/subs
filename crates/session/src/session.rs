@@ -146,12 +146,12 @@ impl Session {
         for entry in store.read(session.version)? {
             session.apply(&entry);
         }
-        session.state.tree.flush();
+        session.state.tree.written();
         session.checked()
     }
 
     fn checked(self) -> Result<Self, Error> {
-        match self.state.tree.failed() {
+        match self.state.tree.poisoned() {
             Some(error) => Err(error.into()),
             None => Ok(self),
         }
@@ -276,7 +276,7 @@ impl Session {
                 }
                 None => self.apply(&entry),
             }
-            self.state.tree.flush();
+            self.state.tree.written();
             if entry.version % self.settings.snapshot_every.max(1) == 0 {
                 if let Err(error) = store.snapshot(self) {
                     tracing::warn!(session_id = %self.id, %error, "writing a snapshot failed");
@@ -485,7 +485,7 @@ mod ends_run_tests {
             status: EffectStatus::Pending,
             attempt: 0,
             deadline: None,
-            anchor: None,
+            asked_at: None,
             name: None,
             arguments: None,
             handler: Some(handler),

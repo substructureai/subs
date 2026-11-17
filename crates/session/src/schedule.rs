@@ -273,7 +273,7 @@ pub fn wake_at(state: &SessionState, now: DateTime<Utc>) -> Option<DateTime<Utc>
         .filter(|e| match &e.payload {
             EffectPayload::ConnectorSync(_) => true,
             EffectPayload::Decision(d) => !state.decision_parked(&d.trigger),
-            _ => !state.anchor_parked(e.anchor.as_deref()),
+            _ => !state.anchor_parked(e.asked_at.as_deref()),
         })
         .filter_map(|e| e.tracking.earliest_wake())
         .min()
@@ -364,7 +364,7 @@ mod tests {
             EffectPayload::LlmCall(LlmCallState {
                 source: Default::default(),
                 defer_tools_strategy: Default::default(),
-                context: None,
+                reads_from: None,
                 sent_tools: None,
                 unanswered: Vec::new(),
                 format: None,

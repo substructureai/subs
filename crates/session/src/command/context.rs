@@ -85,14 +85,14 @@ impl SessionState {
                 branch: None,
             }
         };
-        let state = here.resolve_state_for();
+        let state = here.worker_state();
         if state != WorkerState::default() {
             events.push(EventPayload::WorkerStateUpdated(WorkerStateUpdated {
                 state,
                 node: place(&mut parent),
             }));
         }
-        if let Some(config) = here.resolve_agent_for() {
+        if let Some(config) = here.config() {
             events.push(EventPayload::AgentConfigUpdated(AgentConfigUpdated {
                 config,
                 node: place(&mut parent),

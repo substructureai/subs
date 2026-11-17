@@ -111,7 +111,7 @@ impl SessionState {
     pub fn script_runs(&self, parent: &str) -> bool {
         let anchor = self
             .effect(EffectKind::ToolCall, parent)
-            .and_then(|e| e.anchor.as_deref());
+            .and_then(|e| e.asked_at.as_deref());
         !self.script_waits(parent) && !self.anchor_parked(anchor)
     }
 
@@ -215,7 +215,7 @@ impl SessionState {
                     status: e.tracking.status(),
                     attempt: e.tracking.retry.attempts,
                     deadline: e.tracking.deadline,
-                    anchor: e.anchor.clone(),
+                    asked_at: e.asked_at.clone(),
                     name: None,
                     arguments: None,
                     handler: None,
@@ -451,7 +451,7 @@ pub struct EffectState {
     pub id: String,
     pub tracking: EffectTracking,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub anchor: Option<String>,
+    pub asked_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     pub payload: EffectPayload,
@@ -520,14 +520,14 @@ impl EffectState {
         Self {
             id: id.into(),
             tracking,
-            anchor: None,
+            asked_at: None,
             branch: None,
             payload,
         }
     }
 
     pub fn at(mut self, anchor: Option<&str>) -> Self {
-        self.anchor = anchor.map(str::to_string);
+        self.asked_at = anchor.map(str::to_string);
         self
     }
 }
@@ -550,7 +550,7 @@ pub struct LlmCallState {
     #[serde(default)]
     pub defer_tools_strategy: DeferToolsStrategy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context: Option<String>,
+    pub reads_from: Option<String>,
     /// The tools the model gets, set at dispatch from `spec.tools`, which
     /// keeps the tools the call asked for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -743,7 +743,7 @@ mod effect_tests {
             status: EffectStatus::Pending,
             attempt: 0,
             deadline: None,
-            anchor: Some("n1".to_string()),
+            asked_at: Some("n1".to_string()),
             name: Some("get_weather".to_string()),
             arguments: Some("{}".to_string()),
             handler: Some(crate::protocol::Handler::Worker),

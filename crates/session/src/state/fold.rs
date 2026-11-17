@@ -3,14 +3,14 @@ use super::*;
 impl SessionState {
     #[cfg(test)]
     pub fn seed(&mut self, node: crate::tree::Node) {
-        let seq = self.tree.fresh().count() as u64;
+        let seq = self.tree.unwritten().count() as u64;
         self.grow(node, seq);
     }
 
     #[cfg(test)]
     pub fn seed_config(&mut self, config: AgentConfig) {
         let parent = self.head_id.clone();
-        let id = format!("seed-config-{}", self.tree.fresh().count());
+        let id = format!("seed-config-{}", self.tree.unwritten().count());
         self.seed(crate::tree::Node {
             place: crate::tree::Place {
                 id,
@@ -65,7 +65,7 @@ impl SessionState {
             EffectState {
                 id: id.to_string(),
                 tracking,
-                anchor,
+                asked_at: anchor,
                 branch: branch.map(str::to_string),
                 payload,
             },
@@ -108,7 +108,7 @@ impl SessionState {
         if let Some(existing) = self.effect_mut(EffectKind::LlmCall, &payload.id) {
             existing.tracking.requeue();
             if let PromptSource::Tree { at } = &payload.source {
-                existing.anchor = at.clone();
+                existing.asked_at = at.clone();
             }
             if let Some(call) = existing.llm_mut() {
                 call.prompt = prompt;
@@ -135,7 +135,7 @@ impl SessionState {
                     stream: payload.stream,
                     handler: payload.handler,
                     format: payload.format,
-                    context: None,
+                    reads_from: None,
                     dispatched_seq: None,
                     sent_tools: None,
                     unanswered: Vec::new(),
@@ -147,7 +147,7 @@ impl SessionState {
                 self.effect_mut(EffectKind::LlmCall, &payload.id),
                 &payload.source,
             ) {
-                e.anchor = at.clone();
+                e.asked_at = at.clone();
             }
         }
         match &mut self.limited {
@@ -216,7 +216,7 @@ impl SessionState {
             let script_language = match payload.target {
                 Some(ConnectorTarget::Code) => self
                     .at_scope(payload.branch.as_deref())
-                    .resolve_agent_for()
+                    .config()
                     .and_then(|c| c.codemode)
                     .unwrap_or_default(),
                 _ => Default::default(),
@@ -250,9 +250,9 @@ impl SessionState {
                 }
                 let anchor = self
                     .effect(EffectKind::ToolCall, &script.parent)
-                    .and_then(|e| e.anchor.clone());
+                    .and_then(|e| e.asked_at.clone());
                 if let Some(e) = self.effect_mut(EffectKind::ToolCall, &payload.id) {
-                    e.anchor = anchor;
+                    e.asked_at = anchor;
                 }
             }
         }
@@ -481,7 +481,7 @@ impl SessionState {
                     .effect_mut(EffectKind::LlmCall, &payload.call)
                     .and_then(|e| e.llm_mut())
                 {
-                    call.context = Some(payload.node.id.clone());
+                    call.reads_from = Some(payload.node.id.clone());
                 }
             }
             EventPayload::LlmCallCompleted(payload) => {

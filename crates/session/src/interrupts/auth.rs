@@ -2,7 +2,7 @@ use super::InterruptKind;
 use crate::connectors::ConnectionPath;
 use crate::connectors::{AuthNeed, Requester};
 use crate::protocol::{DecisionAction, McpAuthFailure};
-use crate::state::SessionStateAtNode;
+use crate::state::At;
 
 pub const PREFIX: &str = "mcp-auth:";
 
@@ -30,9 +30,9 @@ fn interrupt_id(connection: &ConnectionPath) -> String {
     format!("{PREFIX}{connection}")
 }
 
-fn needing(at: SessionStateAtNode) -> Option<(ConnectionPath, AuthNeed)> {
-    let state = at.state();
-    let config = at.resolve_agent_for()?;
+fn needing(at: At) -> Option<(ConnectionPath, AuthNeed)> {
+    let state = at.session();
+    let config = at.config()?;
     state.servers_for(&config).into_iter().find_map(|server| {
         if server.auth_failure == McpAuthFailure::Degrade {
             return None;
@@ -45,11 +45,11 @@ fn needing(at: SessionStateAtNode) -> Option<(ConnectionPath, AuthNeed)> {
     })
 }
 
-pub fn prompt(at: SessionStateAtNode) -> Option<DecisionAction> {
+pub fn prompt(at: At) -> Option<DecisionAction> {
     let (connection, need) = needing(at)?;
 
     let authorize = Authorize {
-        requester: Requester::of_owner(at.state().owner.as_ref()),
+        requester: Requester::of_owner(at.session().owner.as_ref()),
         connection: connection.clone(),
     };
 

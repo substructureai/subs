@@ -3764,7 +3764,7 @@ fn declare_client_tool(agg: &mut Session, name: &str) {
     let declared = agg
         .state
         .at_head()
-        .resolve_agent_for()
+        .config()
         .is_some_and(|c| c.tools.iter().any(|t| t.name == name));
     if declared {
         return;
@@ -5609,7 +5609,7 @@ fn a_session_opens_with_the_config_its_creation_carries() {
         "creation seeds the config: {events:#?}"
     );
     assert_eq!(
-        agg.state.at_head().resolve_agent_for().map(|c| c.model),
+        agg.state.at_head().config().map(|c| c.model),
         Some("inline-model".to_string())
     );
 }
@@ -7261,7 +7261,7 @@ fn changed_state_anchors_at_the_merged_head() {
         Some("a1"),
         "the version follows the response's messages"
     );
-    assert_eq!(agg.state.at_head().resolve_state_for().0, json!({"v": 1}));
+    assert_eq!(agg.state.at_head().worker_state().0, json!({"v": 1}));
 }
 
 #[test]
@@ -7285,7 +7285,7 @@ fn omitted_state_keeps_the_current_version() {
         None,
     );
     assert!(state_updates(&events).is_empty());
-    assert_eq!(agg.state.at_head().resolve_state_for().0, json!({"v": 1}));
+    assert_eq!(agg.state.at_head().worker_state().0, json!({"v": 1}));
 }
 
 fn agent_updates(events: &[EventPayload]) -> Vec<&AgentConfigUpdated> {
@@ -9684,10 +9684,7 @@ fn changed_agent_config_anchors_at_head_and_dedups() {
         Some("a1"),
         "the config follows the response's messages"
     );
-    assert_eq!(
-        agg.state.at_head().resolve_agent_for(),
-        Some(agent_config("m1"))
-    );
+    assert_eq!(agg.state.at_head().config(), Some(agent_config("m1")));
 
     let d2 = open_decision(&mut agg, "again");
     let events = submit_agent(
@@ -9727,10 +9724,7 @@ fn omitted_agent_keeps_the_current_config() {
         None,
     );
     assert!(agent_updates(&events).is_empty());
-    assert_eq!(
-        agg.state.at_head().resolve_agent_for(),
-        Some(agent_config("m1"))
-    );
+    assert_eq!(agg.state.at_head().config(), Some(agent_config("m1")));
 }
 
 #[test]
@@ -9815,7 +9809,7 @@ fn create_session_writes_seeded_state_before_session_start() {
         "the seed is written before session.start; got {events:?}"
     );
     assert_eq!(
-        agg.state.at_head().resolve_state_for().0,
+        agg.state.at_head().worker_state().0,
         json!({ "plan": "pro" }),
         "session.start reads the seeded state"
     );
@@ -9850,10 +9844,7 @@ fn create_session_without_a_seed_writes_no_state() {
         &system(),
     );
     assert!(state_updates(&events).is_empty());
-    assert_eq!(
-        agg.state.at_head().resolve_state_for(),
-        WorkerState::default()
-    );
+    assert_eq!(agg.state.at_head().worker_state(), WorkerState::default());
 }
 
 #[test]
@@ -9974,10 +9965,7 @@ fn session_start_config_is_visible_to_a_queued_client_decision() {
         )),
         "the queued client decision is promoted; got {events:?}"
     );
-    assert_eq!(
-        agg.state.at_head().resolve_agent_for(),
-        Some(agent_config("m1"))
-    );
+    assert_eq!(agg.state.at_head().config(), Some(agent_config("m1")));
 }
 
 #[test]
@@ -10105,10 +10093,7 @@ fn client_message_parks_while_session_start_retry_is_scheduled() {
         )),
         "the queued client decision is promoted; got {events:?}"
     );
-    assert_eq!(
-        agg.state.at_head().resolve_agent_for(),
-        Some(agent_config("m1"))
-    );
+    assert_eq!(agg.state.at_head().config(), Some(agent_config("m1")));
 }
 
 #[test]
@@ -10271,7 +10256,7 @@ fn a_fork_writes_its_state_after_its_messages_and_an_omitted_state_carries() {
         ],
         Some(json!({"v": 2})),
     );
-    assert_eq!(agg.state.at_head().resolve_state_for().0, json!({"v": 2}));
+    assert_eq!(agg.state.at_head().worker_state().0, json!({"v": 2}));
 
     let d3 = open_decision(&mut agg, "redo");
     let events = submit_state(
@@ -10293,7 +10278,7 @@ fn a_fork_writes_its_state_after_its_messages_and_an_omitted_state_carries() {
         Some("u1"),
         "the fork keeps the state saved after u1"
     );
-    assert_eq!(agg.state.at_head().resolve_state_for().0, json!({"v": 3}));
+    assert_eq!(agg.state.at_head().worker_state().0, json!({"v": 3}));
 
     let d4 = open_decision(&mut agg, "retry");
     let events = submit_state(
@@ -10312,7 +10297,7 @@ fn a_fork_writes_its_state_after_its_messages_and_an_omitted_state_carries() {
         "both forks hang after the state saved with u1"
     );
     assert_eq!(
-        agg.state.at_head().resolve_state_for().0,
+        agg.state.at_head().worker_state().0,
         json!({"v": 3}),
         "an omitted state keeps what the worker saw"
     );
@@ -10389,7 +10374,7 @@ fn a_reset_lands_before_the_first_message_and_keeps_the_state_sent_with_it() {
         events.is_empty() || agg.state.has_node("u1"),
         "the old line stays in the tree"
     );
-    assert_eq!(agg.state.at_head().resolve_state_for().0, json!({"v": 3}));
+    assert_eq!(agg.state.at_head().worker_state().0, json!({"v": 3}));
 }
 
 #[test]
@@ -10446,9 +10431,9 @@ fn an_edit_of_the_first_message_reads_the_setup() {
     let mut agg =
         create_session_with_config("sess-1", "tenant-a", "user-1", Some(agent_config("m1")));
     long_chat(&mut agg);
-    assert_eq!(agg.state.at_head().resolve_state_for().0, json!({"v": 1}));
+    assert_eq!(agg.state.at_head().worker_state().0, json!({"v": 1}));
     assert_eq!(
-        agg.state.at_head().resolve_agent_for().map(|c| c.model),
+        agg.state.at_head().config().map(|c| c.model),
         Some("m2".to_string())
     );
 
@@ -10466,11 +10451,11 @@ fn an_edit_of_the_first_message_reads_the_setup() {
     );
     assert_eq!(agg.state.at_head().transcript().len(), 1);
     assert!(
-        agg.state.at_head().resolve_state_for().0.is_null(),
+        agg.state.at_head().worker_state().0.is_null(),
         "state written on the old branch stays there"
     );
     assert_eq!(
-        agg.state.at_head().resolve_agent_for().map(|c| c.model),
+        agg.state.at_head().config().map(|c| c.model),
         Some("m1".to_string()),
         "the session.start config holds on every branch"
     );
@@ -10491,7 +10476,7 @@ fn a_reset_that_sends_config_keeps_it() {
     );
 
     assert_eq!(
-        agg.state.at_head().resolve_agent_for().map(|c| c.model),
+        agg.state.at_head().config().map(|c| c.model),
         Some("m2".to_string())
     );
 }
@@ -10520,7 +10505,7 @@ fn effect_anchor_is_the_merged_head() {
         agg.state
             .effect(EffectKind::ToolCall, "t1")
             .unwrap()
-            .anchor
+            .asked_at
             .as_deref(),
         Some("u1"),
         "the anchor is the head after this submit's appends"
@@ -13040,11 +13025,7 @@ fn skilled_config(source: crate::protocol::SkillSource) -> AgentConfig {
 }
 
 fn dispatched_tools(agg: &mut Session, call_id: &str) -> Vec<String> {
-    let tools = agg
-        .state
-        .at_head()
-        .resolve_agent_for()
-        .and_then(|c| c.tools_as_llm());
+    let tools = agg.state.at_head().config().and_then(|c| c.tools_as_llm());
     dispatch(
         agg,
         CommandPayload::RequestLlmCall {

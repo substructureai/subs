@@ -86,11 +86,11 @@ impl SessionState {
         let base = self.at(landed.at.as_deref());
         let read = self.at(read.as_deref());
         let state = state
-            .or_else(|| landed.forks.then(|| read.resolve_state_for()))
-            .filter(|s| *s != base.resolve_state_for());
+            .or_else(|| landed.forks.then(|| read.worker_state()))
+            .filter(|s| *s != base.worker_state());
         let config = config
-            .or_else(|| landed.forks.then(|| read.resolve_agent_for()).flatten())
-            .filter(|c| Some(c) != base.resolve_agent_for().as_ref());
+            .or_else(|| landed.forks.then(|| read.config()).flatten())
+            .filter(|c| Some(c) != base.config().as_ref());
         if let Some(state) = state {
             events.push(EventPayload::WorkerStateUpdated(WorkerStateUpdated {
                 state,

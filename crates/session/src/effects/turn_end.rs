@@ -124,7 +124,7 @@ impl SessionState {
                 )
             })
             .filter(|e| e.branch.is_none())
-            .filter(|e| closed.contains(&e.id) || at.anchor_on_path(e.anchor.as_deref()))
+            .filter(|e| closed.contains(&e.id) || at.anchor_on_path(e.asked_at.as_deref()))
             .filter(|e| e.tracking.is_unsettled())
             .map(|e| (e.kind(), e.id.clone()))
             .collect();

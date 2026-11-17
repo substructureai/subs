@@ -10,7 +10,7 @@ use substructure_session::delivery::Start;
 use substructure_session::events::{BranchClosed, BranchStarted, EventPayload};
 use substructure_session::protocol::Role;
 use substructure_session::state::{BranchState, Logged};
-use substructure_session::tree::{BranchRecord, Fact, Node, Nodes, Shared};
+use substructure_session::tree::{BranchRecord, Fact, Node, NodeRef, Nodes};
 use substructure_session::{
     CommandId, CommandResult, Entry, Handled, Session, SessionEvent, Store, StoreError,
 };
@@ -80,7 +80,7 @@ type NodeCache = Cache<NodeKey, Cached, ByBytes>;
 
 #[derive(Clone)]
 struct Cached {
-    node: Shared,
+    node: NodeRef,
     bytes: u64,
 }
 
@@ -101,7 +101,7 @@ struct NodeKey {
 
 impl Hash for NodeKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        NodeRef {
+        NodeKeyRef {
             session: &self.session,
             node: &self.node,
         }
@@ -109,19 +109,19 @@ impl Hash for NodeKey {
     }
 }
 
-struct NodeRef<'a> {
+struct NodeKeyRef<'a> {
     session: &'a str,
     node: &'a str,
 }
 
-impl Hash for NodeRef<'_> {
+impl Hash for NodeKeyRef<'_> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.session.hash(state);
         self.node.hash(state);
     }
 }
 
-impl Equivalent<NodeKey> for NodeRef<'_> {
+impl Equivalent<NodeKey> for NodeKeyRef<'_> {
     fn equivalent(&self, key: &NodeKey) -> bool {
         *key.session == *self.session && key.node == self.node
     }
@@ -144,15 +144,15 @@ impl SqliteSessionStore {
             .map_err(|e| StoreError::Unavailable(e.to_string()))
     }
 
-    fn cached(&self, id: &str) -> Option<Shared> {
-        let key = NodeRef {
+    fn cached(&self, id: &str) -> Option<NodeRef> {
+        let key = NodeKeyRef {
             session: &self.session,
             node: id,
         };
         self.nodes.get(&key).map(|c| c.node)
     }
 
-    fn keep(&self, node: Shared, bytes: u64) -> Shared {
+    fn keep(&self, node: NodeRef, bytes: u64) -> NodeRef {
         let key = NodeKey {
             session: self.session.clone(),
             node: node.id().to_string(),
@@ -167,7 +167,7 @@ impl SqliteSessionStore {
         node
     }
 
-    fn node_of(&self, seq: i64, payload: &[u8]) -> Result<Option<Shared>, StoreError> {
+    fn node_of(&self, seq: i64, payload: &[u8]) -> Result<Option<NodeRef>, StoreError> {
         if let Some(node) = Node::of_event(&parse(payload)?) {
             let logged = Arc::new(Logged {
                 seq: seq as u64,
@@ -182,7 +182,7 @@ impl SqliteSessionStore {
         &self,
         sql: &str,
         params: impl rusqlite::Params,
-    ) -> Result<Vec<Shared>, StoreError> {
+    ) -> Result<Vec<NodeRef>, StoreError> {
         let conn = self.reader()?;
         let mut stmt = conn.prepare_cached(sql).map_err(unavailable)?;
         let rows = stmt
@@ -641,7 +641,7 @@ impl Store for SqliteSessionStore {
 }
 
 impl Nodes for SqliteSessionStore {
-    fn node(&self, id: &str) -> Result<Option<Shared>, StoreError> {
+    fn node(&self, id: &str) -> Result<Option<NodeRef>, StoreError> {
         if let Some(node) = self.cached(id) {
             return Ok(Some(node));
         }
@@ -655,7 +655,7 @@ impl Nodes for SqliteSessionStore {
             .next())
     }
 
-    fn ancestors(&self, id: &str, limit: usize) -> Result<Vec<Shared>, StoreError> {
+    fn ancestors(&self, id: &str, limit: usize) -> Result<Vec<NodeRef>, StoreError> {
         let mut found = Vec::new();
         let mut cursor = Some(id.to_string());
         while let Some(node) = cursor
@@ -693,7 +693,7 @@ impl Nodes for SqliteSessionStore {
         Ok(found)
     }
 
-    fn children(&self, parent: &str, branch: Option<&str>) -> Result<Vec<Shared>, StoreError> {
+    fn children(&self, parent: &str, branch: Option<&str>) -> Result<Vec<NodeRef>, StoreError> {
         self.select_nodes(
             "SELECT seq, payload FROM session_events
               WHERE tenant_id = ?1 AND session_id = ?2 AND parent_id = ?3 AND branch IS ?4
@@ -702,7 +702,7 @@ impl Nodes for SqliteSessionStore {
         )
     }
 
-    fn answers(&self, tool_call_id: &str) -> Result<Vec<Shared>, StoreError> {
+    fn answers(&self, tool_call_id: &str) -> Result<Vec<NodeRef>, StoreError> {
         self.select_nodes(
             "SELECT seq, payload FROM session_events
               WHERE tenant_id = ?1 AND session_id = ?2 AND answers = ?3
@@ -745,7 +745,7 @@ impl Nodes for SqliteSessionStore {
         &self,
         prev: Option<&str>,
         branch: Option<&str>,
-    ) -> Result<Vec<Shared>, StoreError> {
+    ) -> Result<Vec<NodeRef>, StoreError> {
         self.select_nodes(
             "SELECT seq, payload FROM session_events
               WHERE tenant_id = ?1 AND session_id = ?2 AND prev IS ?3 AND branch IS ?4
@@ -755,7 +755,7 @@ impl Nodes for SqliteSessionStore {
         )
     }
 
-    fn remember(&self, nodes: Vec<Shared>) {
+    fn cache(&self, nodes: Vec<NodeRef>) {
         for node in nodes {
             let bytes = serde_json::to_vec(&node.entry).map_or(0, |b| b.len() as u64);
             self.keep(node, bytes);
@@ -1366,7 +1366,7 @@ mod cold {
         assert!(record.closed.is_some());
         let at = record.state.at().map(str::to_string);
         let read = c.session.state().at(at.as_deref());
-        assert_eq!(read.resolve_agent_for().map(|a| a.model), Some("m2".into()));
+        assert_eq!(read.config().map(|a| a.model), Some("m2".into()));
         let ancestors = c
             .store
             .nodes()

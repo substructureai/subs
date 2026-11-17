@@ -935,24 +935,24 @@ impl CountedNodes {
 }
 
 impl crate::tree::Nodes for CountedNodes {
-    fn node(&self, id: &str) -> Result<Option<crate::tree::Shared>, crate::StoreError> {
+    fn node(&self, id: &str) -> Result<Option<crate::tree::NodeRef>, crate::StoreError> {
         self.read().node(id)
     }
     fn ancestors(
         &self,
         id: &str,
         limit: usize,
-    ) -> Result<Vec<crate::tree::Shared>, crate::StoreError> {
+    ) -> Result<Vec<crate::tree::NodeRef>, crate::StoreError> {
         self.read().ancestors(id, limit)
     }
     fn children(
         &self,
         parent: &str,
         branch: Option<&str>,
-    ) -> Result<Vec<crate::tree::Shared>, crate::StoreError> {
+    ) -> Result<Vec<crate::tree::NodeRef>, crate::StoreError> {
         self.read().children(parent, branch)
     }
-    fn answers(&self, id: &str) -> Result<Vec<crate::tree::Shared>, crate::StoreError> {
+    fn answers(&self, id: &str) -> Result<Vec<crate::tree::NodeRef>, crate::StoreError> {
         self.read().answers(id)
     }
     fn branch(&self, id: &str) -> Result<Option<crate::tree::BranchRecord>, crate::StoreError> {
@@ -962,7 +962,7 @@ impl crate::tree::Nodes for CountedNodes {
         &self,
         prev: Option<&str>,
         branch: Option<&str>,
-    ) -> Result<Vec<crate::tree::Shared>, crate::StoreError> {
+    ) -> Result<Vec<crate::tree::NodeRef>, crate::StoreError> {
         self.read().versions(prev, branch)
     }
 }

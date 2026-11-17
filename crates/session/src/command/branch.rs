@@ -321,7 +321,7 @@ impl Working {
             crate::protocol::SpawnMode::Detached => BranchMode::Detached,
             _ => BranchMode::Blocking,
         };
-        let (parent, anchor) = (effect.branch.clone(), effect.anchor.clone());
+        let (parent, anchor) = (effect.branch.clone(), effect.asked_at.clone());
         let started = EffectKind::Subagent.spec();
         self.then(|s| started.settle(s, call, effects::Outcome::SubagentStarted));
         let turn_id = match mode {

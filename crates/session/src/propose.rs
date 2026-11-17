@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use super::context;
 use super::interrupts::{self, approval, auth};
-use super::state::{inner_arguments, EffectState, SessionStateAtNode};
+use super::state::{inner_arguments, At, EffectState};
 use super::tool_contract::{declared_tool, violates, DeclaredTool};
 use crate::protocol::StoredContent;
 use crate::protocol::{
@@ -12,7 +12,7 @@ use crate::protocol::{
 };
 
 pub struct Proposing<'a> {
-    pub state: SessionStateAtNode<'a, 'a>,
+    pub state: At<'a, 'a>,
     pub pending_calls: usize,
     pub scope: Option<&'a str>,
     pub detached: bool,
@@ -22,12 +22,12 @@ impl Proposing<'_> {
     /// A joined message calls the model next, so the step before it leaves
     /// the call to it.
     pub fn joining(&self) -> bool {
-        self.scope.is_none() && self.state.state().waiting_join().is_some()
+        self.scope.is_none() && self.state.session().waiting_join().is_some()
     }
 
     pub fn calling(&self) -> bool {
         self.state
-            .state()
+            .session()
             .effects_of(crate::state::EffectKind::LlmCall)
             .any(|e| e.branch.as_deref() == self.scope && e.tracking.is_unsettled())
     }
@@ -63,9 +63,9 @@ pub fn propose(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionR
 }
 
 fn for_room(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionResponse> {
-    let state = p.state.state();
+    let state = p.state.session();
     let path = p.state.transcript();
-    let config = p.state.resolve_agent_for();
+    let config = p.state.config();
     let config = config.as_ref();
     let summarize = || context::strategy(config, ContextStrategyKind::Summarize);
     if p.scope.is_some() {
@@ -173,7 +173,7 @@ fn derive(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionRespon
     let transcript = p.state.transcript();
     let transcript = transcript.as_slice();
     let llm_calls = &p.state.open_llm_calls();
-    let config = p.state.resolve_agent_for();
+    let config = p.state.config();
     let config = config.as_ref();
     let connector_tools = p.state.connector_tools().tools;
     let connector_tools = connector_tools.as_slice();
@@ -243,7 +243,7 @@ fn derive(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionRespon
             ..
         } if p
             .state
-            .state()
+            .session()
             .tool_call(id)
             .is_some_and(|t| t.script.is_some()) =>
         {
@@ -1065,7 +1065,7 @@ mod tests {
             EffectPayload::LlmCall(LlmCallState {
                 source: Default::default(),
                 defer_tools_strategy: Default::default(),
-                context: None,
+                reads_from: None,
                 sent_tools: None,
                 unanswered: Vec::new(),
                 format: None,

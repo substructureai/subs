@@ -287,7 +287,7 @@ fn a_quiet_session_starts_over_with_the_turns_own_messages() {
         .agg
         .state
         .tree
-        .fresh()
+        .unwritten()
         .filter(|n| n.message().is_some())
         .max_by_key(|n| n.seq)
         .and_then(|n| match &n.fact {
@@ -296,7 +296,7 @@ fn a_quiet_session_starts_over_with_the_turns_own_messages() {
         });
     assert!(copied.flatten().is_some(), "the turn's message is a copy");
     assert!(
-        t.agg.state.at_head().resolve_agent_for().is_some(),
+        t.agg.state.at_head().config().is_some(),
         "the config carries over"
     );
     assert_eq!(emitted(&t), ["context.limited", "context.replaced"]);
@@ -495,7 +495,7 @@ fn a_replace_sets_a_new_branch_any_time() {
         ]
     );
     assert_eq!(emitted(&t), ["context.replaced"]);
-    assert!(t.agg.state.at_head().resolve_agent_for().is_some());
+    assert!(t.agg.state.at_head().config().is_some());
 }
 
 fn summarizing() -> Vec<ContextStrategy> {
@@ -540,10 +540,7 @@ fn a_held_tree_call_runs_on_the_new_branch_and_is_told_its_context_once() {
         "a summary is written on its own branch"
     );
     assert_eq!(
-        t.agg
-            .state
-            .at_scope(summary.branch.as_deref())
-            .resolve_agent_for(),
+        t.agg.state.at_scope(summary.branch.as_deref()).config(),
         None
     );
     assert_eq!(

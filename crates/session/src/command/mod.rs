@@ -349,7 +349,7 @@ impl SessionState {
         stranded: impl Fn(EffectKind, &EffectTracking, Option<&str>) -> bool,
     ) -> Vec<EventPayload> {
         self.void_effects_where(|e| {
-            e.branch.is_none() && stranded(e.kind(), &e.tracking, e.anchor.as_deref())
+            e.branch.is_none() && stranded(e.kind(), &e.tracking, e.asked_at.as_deref())
         })
     }
 
@@ -388,7 +388,7 @@ impl SessionState {
         let mut events = self.void_effects_where(|e| {
             e.branch.as_deref() == scope
                 && crate::effects::stops(e.kind(), &e.tracking)
-                && !on_path(e.anchor.as_deref())
+                && !on_path(e.asked_at.as_deref())
         });
         for e in self.effects_of(EffectKind::Decision) {
             let Some(wd) = e.decision() else { continue };
@@ -517,7 +517,7 @@ impl Working {
     }
 
     pub fn tree_failed(&self) -> Option<crate::store::StoreError> {
-        self.state.tree.failed()
+        self.state.tree.poisoned()
     }
 
     pub fn waiting_turn(&self) -> Option<&str> {
@@ -790,7 +790,7 @@ impl Working {
                 )
             })
             .filter(|e| e.branch == scope)
-            .filter(|e| at.anchor_on_path(e.anchor.as_deref()))
+            .filter(|e| at.anchor_on_path(e.asked_at.as_deref()))
             .map(|e| e.id.clone())
             .collect();
         for id in ids {
@@ -934,7 +934,7 @@ impl Working {
                 Action::SyncConnector { path: id } => {
                     let named = self
                         .at_head()
-                        .resolve_agent_for()
+                        .config()
                         .is_some_and(|c| self.state.servers_for(&c).iter().any(|m| m.path == id));
                     let settled = self
                         .tracking(EffectKind::ConnectorSync, &id.to_string())

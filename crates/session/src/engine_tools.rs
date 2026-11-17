@@ -1,14 +1,10 @@
-use super::state::SessionStateAtNode;
+use super::state::At;
 use crate::connectors::filter;
 use crate::plugins::{FileRef, PluginBundle, Skill, SkillFile};
 use crate::prompts::{answers, errors};
 use crate::protocol::{AgentConfig, ConnectorToolKind, StoredContent, StoredResult};
 
-pub fn answer(
-    at: SessionStateAtNode,
-    kind: ConnectorToolKind,
-    arguments: &str,
-) -> Option<StoredResult> {
+pub fn answer(at: At, kind: ConnectorToolKind, arguments: &str) -> Option<StoredResult> {
     match kind {
         ConnectorToolKind::Remote => None,
         ConnectorToolKind::Find => Some(find(at, arguments)),
@@ -20,8 +16,8 @@ pub fn answer(
     }
 }
 
-fn find(at: SessionStateAtNode, arguments: &str) -> StoredResult {
-    let config = at.resolve_agent_for();
+fn find(at: At, arguments: &str) -> StoredResult {
+    let config = at.config();
     let skills = config
         .as_ref()
         .filter(|c| c.searches_skills())
@@ -44,12 +40,8 @@ fn find(at: SessionStateAtNode, arguments: &str) -> StoredResult {
 }
 
 /// A script's `tool_search`.
-pub fn script_find(
-    at: SessionStateAtNode,
-    language: crate::codemode::Language,
-    arguments: &str,
-) -> StoredResult {
-    let config = at.resolve_agent_for();
+pub fn script_find(at: At, language: crate::codemode::Language, arguments: &str) -> StoredResult {
+    let config = at.config();
     let max = config
         .as_ref()
         .map(AgentConfig::defer_settings)
@@ -69,7 +61,7 @@ pub fn script_find(
     ))
 }
 
-fn call(at: SessionStateAtNode, arguments: &str) -> StoredResult {
+fn call(at: At, arguments: &str) -> StoredResult {
     StoredResult::error(
         at.call_tool_fault(arguments)
             .unwrap_or_else(|| crate::prompts::errors::CALL_NOT_ROUTED.to_string()),
@@ -90,13 +82,13 @@ pub fn split_skill(named: &str) -> (&str, &str) {
 /// The skill a `skill` call names, by the name it gave, and the file it
 /// asks for, if any.
 fn requested<'b>(
-    at: SessionStateAtNode,
+    at: At,
     bundle: Option<&'b PluginBundle>,
     arguments: &str,
 ) -> Result<(String, &'b Skill, Option<String>), StoredResult> {
     let named = argument(arguments, "name");
     let file = Some(argument(arguments, "file")).filter(|f| !f.is_empty());
-    let Some(config) = at.resolve_agent_for() else {
+    let Some(config) = at.config() else {
         return Err(StoredResult::error(errors::NO_CONFIG));
     };
     let Some(found) = config.named_skill(&named) else {
@@ -113,11 +105,7 @@ fn requested<'b>(
 
 /// The stored text file a `skill` call asks for: the host reads it, and hands
 /// its text to [`skill_answer`].
-pub fn stored_file(
-    at: SessionStateAtNode,
-    bundle: Option<&PluginBundle>,
-    arguments: &str,
-) -> Option<FileRef> {
+pub fn stored_file(at: At, bundle: Option<&PluginBundle>, arguments: &str) -> Option<FileRef> {
     let (_, skill, file) = requested(at, bundle, arguments).ok()?;
     match skill.files.get(&file?)? {
         SkillFile::Stored(stored) => Some(stored.clone()),
@@ -129,7 +117,7 @@ pub fn stored_file(
 /// files, `<skill>/<path>`, so `scripted` names them that way. `stored` is the
 /// text of the [`stored_file`] the call asks for.
 pub fn skill_answer(
-    at: SessionStateAtNode,
+    at: At,
     bundle: Option<&PluginBundle>,
     arguments: &str,
     scripted: bool,

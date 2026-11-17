@@ -232,7 +232,7 @@ mod tests {
             EffectPayload::LlmCall(LlmCallState {
                 source: Default::default(),
                 defer_tools_strategy: Default::default(),
-                context: None,
+                reads_from: None,
                 sent_tools: None,
                 unanswered: Vec::new(),
                 format: None,

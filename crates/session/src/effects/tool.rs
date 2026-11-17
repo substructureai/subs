@@ -12,7 +12,7 @@ use crate::protocol::{
 };
 use crate::protocol::{RetryOverride, RetryPolicy};
 use crate::schedule::Dep;
-use crate::state::{inner_arguments, CallTarget, EffectKind, SessionState, SessionStateAtNode};
+use crate::state::{inner_arguments, At, CallTarget, EffectKind, SessionState};
 use crate::tool_contract::{classify_arguments, declared_tool, output_violation, DeclaredTool};
 use crate::Caller;
 
@@ -27,7 +27,7 @@ impl KindSpec for ToolSpec {
     fn park(&self, state: &SessionState, id: &str) -> Option<Dep> {
         let effect = state.effect(EffectKind::ToolCall, id)?;
         effect.tool()?.script.as_ref()?;
-        let interrupt = state.anchor_interrupt(effect.anchor.as_deref())?;
+        let interrupt = state.anchor_interrupt(effect.asked_at.as_deref())?;
         Some(Dep::InterruptResumed {
             interrupt_id: interrupt.interrupt_id.clone(),
         })
@@ -188,7 +188,7 @@ fn with_skill_tools(state: &SessionState, id: &str, mut result: StoredResult) ->
     };
     let anchor = state
         .effect(EffectKind::ToolCall, id)
-        .and_then(|e| e.anchor.clone());
+        .and_then(|e| e.asked_at.clone());
     let named = argument(&tc.arguments, "name").unwrap_or_default();
     let tools = state.at(anchor.as_deref()).skill_tools(&named);
     let language = tc
@@ -315,7 +315,7 @@ pub fn unanswered(state: &SessionState) -> Vec<EventPayload> {
     state
         .effects_of(EffectKind::ToolCall)
         .filter(|e| !deciding.contains(&e.id.as_str()))
-        .filter(|e| !state.anchor_parked(e.anchor.as_deref()))
+        .filter(|e| !state.anchor_parked(e.asked_at.as_deref()))
         .flat_map(|e| e.tool().map(|t| t.script_asked.clone()).unwrap_or_default())
         .flat_map(|ask| {
             answer_ask(
@@ -338,13 +338,13 @@ fn scripted(
     target: Option<ConnectorTarget>,
 ) -> EventPayload {
     let parent = state.effect(EffectKind::ToolCall, &script.parent);
-    let anchor = parent.and_then(|e| e.anchor.clone());
+    let anchor = parent.and_then(|e| e.asked_at.clone());
     let branch = parent.and_then(|e| e.branch.clone());
     let here = match &branch {
         Some(b) => state.at_scope(Some(b)),
         None => state.at(anchor.as_deref()),
     };
-    let config = here.resolve_agent_for();
+    let config = here.config();
     let tools = here.connector_tools().tools;
     let reach = codemode::reach(&name, config.as_ref(), &tools);
     let spawns = tools
@@ -489,9 +489,7 @@ fn requested(
         .connector_tool(&name)
         .filter(|t| t.kind != ConnectorToolKind::Subagent);
     let locked = here.locked_tools().contains_key(&name);
-    let in_code_mode = here
-        .resolve_agent_for()
-        .is_some_and(|c| c.codemode.is_some());
+    let in_code_mode = here.config().is_some_and(|c| c.codemode.is_some());
     let (name, arguments, handler, target) = match engine_tool {
         _ if in_code_mode && script.is_none() && name != crate::protocol::RUN_CODE => {
             let reason = crate::prompts::codemode::javascript::call_from_code(&name);
@@ -526,7 +524,7 @@ fn requested(
         ),
         Some(tool) if tool.kind == ConnectorToolKind::Skill => {
             let named = argument(&arguments, "name").unwrap_or_default();
-            let config = here.resolve_agent_for();
+            let config = here.config();
             let found = config.as_ref().and_then(|c| c.named_skill(&named));
             let (plugin, skill) = match &found {
                 Some(s) => (s.bundle, s.skill),
@@ -572,11 +570,7 @@ fn requested(
 
 /// `call_tool` that names `tool_search` or `skill` is that tool's call, as it
 /// is for any other tool.
-fn engine_call(
-    state: SessionStateAtNode<'_, '_>,
-    name: String,
-    arguments: String,
-) -> (String, String) {
+fn engine_call(state: At<'_, '_>, name: String, arguments: String) -> (String, String) {
     if name != CALL_TOOL {
         return (name, arguments);
     }
@@ -592,7 +586,7 @@ fn engine_call(
 }
 
 fn unwrap_call(
-    here: SessionStateAtNode<'_, '_>,
+    here: At<'_, '_>,
     name: String,
     arguments: String,
 ) -> (String, String, ToolHandler, Option<ConnectorTarget>) {
@@ -655,7 +649,7 @@ impl SessionState {
         let effect = self.effect(EffectKind::ToolCall, tool_call_id)?;
         if effect.tool()?.script.is_some() {
             return self
-                .at(effect.anchor.as_deref())
+                .at(effect.asked_at.as_deref())
                 .searchable_tools()
                 .into_iter()
                 .find(|t| t.name == name)?

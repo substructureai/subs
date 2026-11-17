@@ -134,7 +134,7 @@ pub fn limit(
         return None;
     }
     let at = state.at_head();
-    let config = at.resolve_agent_for();
+    let config = at.config();
     let context = context_of(config.as_ref())?;
     let path = at.transcript();
     let window = context.window;
@@ -170,7 +170,7 @@ pub fn overflow(state: &SessionState, id: &str) -> Option<ContextLimited> {
         .filter(|e| e.branch.is_none())?;
     let call = effect.llm()?;
     let request = call.sent_request();
-    let config = state.at_head().resolve_agent_for();
+    let config = state.at_head().config();
     Some(ContextLimited {
         reason: ContextReason::Overflow,
         strategy: Some(ContextStrategyKind::Summarize),

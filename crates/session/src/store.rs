@@ -7,7 +7,7 @@ use crate::entry::{CommandId, CommandResult, Entry};
 use crate::events::EventPayload;
 use crate::session::{Session, SessionEvent};
 use crate::state::Logged;
-use crate::tree::{BranchRecord, Node, Nodes, Shared};
+use crate::tree::{BranchRecord, Node, NodeRef, Nodes};
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum StoreError {
@@ -60,7 +60,7 @@ struct Space {
     log: BTreeMap<u64, Entry>,
     snapshot: Option<Session>,
     cursors: BTreeMap<String, u64>,
-    nodes: BTreeMap<u64, Shared>,
+    nodes: BTreeMap<u64, NodeRef>,
     ids: BTreeMap<String, u64>,
     handled: BTreeMap<CommandId, (CommandResult, DateTime<Utc>)>,
     branches: BTreeMap<String, BranchRecord>,
@@ -210,7 +210,7 @@ impl Store for MemoryStore {
 }
 
 impl Nodes for MemoryStore {
-    fn node(&self, id: &str) -> Result<Option<Shared>, StoreError> {
+    fn node(&self, id: &str) -> Result<Option<NodeRef>, StoreError> {
         let space = self.space();
         Ok(space
             .ids
@@ -219,7 +219,7 @@ impl Nodes for MemoryStore {
             .cloned())
     }
 
-    fn ancestors(&self, id: &str, limit: usize) -> Result<Vec<Shared>, StoreError> {
+    fn ancestors(&self, id: &str, limit: usize) -> Result<Vec<NodeRef>, StoreError> {
         let space = self.space();
         let mut found = Vec::new();
         let mut cursor = Some(id.to_string());
@@ -235,7 +235,7 @@ impl Nodes for MemoryStore {
         Ok(found)
     }
 
-    fn children(&self, parent: &str, branch: Option<&str>) -> Result<Vec<Shared>, StoreError> {
+    fn children(&self, parent: &str, branch: Option<&str>) -> Result<Vec<NodeRef>, StoreError> {
         Ok(self
             .space()
             .nodes
@@ -253,7 +253,7 @@ impl Nodes for MemoryStore {
         &self,
         prev: Option<&str>,
         branch: Option<&str>,
-    ) -> Result<Vec<Shared>, StoreError> {
+    ) -> Result<Vec<NodeRef>, StoreError> {
         let space = self.space();
         let message_at = |from: Option<&str>| -> Option<String> {
             let mut cursor = from.map(str::to_string);
@@ -278,7 +278,7 @@ impl Nodes for MemoryStore {
             .collect())
     }
 
-    fn answers(&self, tool_call_id: &str) -> Result<Vec<Shared>, StoreError> {
+    fn answers(&self, tool_call_id: &str) -> Result<Vec<NodeRef>, StoreError> {
         Ok(self
             .space()
             .nodes

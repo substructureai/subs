@@ -1,15 +1,15 @@
 use super::*;
 
 impl SessionState {
-    pub fn at<'a, 'n>(&'a self, node: Option<&'n str>) -> SessionStateAtNode<'a, 'n> {
-        SessionStateAtNode { state: self, node }
+    pub fn at<'a, 'n>(&'a self, node: Option<&'n str>) -> At<'a, 'n> {
+        At { state: self, node }
     }
 
-    pub fn at_head(&self) -> SessionStateAtNode<'_, '_> {
+    pub fn at_head(&self) -> At<'_, '_> {
         self.at(self.head_id.as_deref())
     }
 
-    pub fn at_scope<'a>(&'a self, branch: Option<&'a str>) -> SessionStateAtNode<'a, 'a> {
+    pub fn at_scope<'a>(&'a self, branch: Option<&'a str>) -> At<'a, 'a> {
         match branch.and_then(|b| self.branches.get(b)) {
             Some(b) => self.at(b.at()),
             None => self.at_head(),
@@ -26,9 +26,9 @@ impl SessionState {
     pub fn outgoing(&self, id: &str) -> Option<Outgoing> {
         let effect = self.effect(EffectKind::LlmCall, id)?;
         let call = effect.llm()?;
-        let node = call.context.clone().or_else(|| match &call.source {
+        let node = call.reads_from.clone().or_else(|| match &call.source {
             PromptSource::Tree { at } => at.clone(),
-            _ => effect.anchor.clone().or_else(|| self.head_id.clone()),
+            _ => effect.asked_at.clone().or_else(|| self.head_id.clone()),
         });
         Some(
             self.at(node.as_deref())
@@ -42,7 +42,7 @@ impl SessionState {
 
     #[cfg(test)]
     pub fn placed(&self) -> Vec<prompt_context::Placed> {
-        let mut nodes: Vec<&crate::tree::Shared> = self.tree.fresh().collect();
+        let mut nodes: Vec<&crate::tree::NodeRef> = self.tree.unwritten().collect();
         nodes.sort_by_key(|n| n.seq);
         nodes
             .into_iter()
@@ -130,13 +130,13 @@ pub struct Outgoing {
 }
 
 #[derive(Clone, Copy)]
-pub struct SessionStateAtNode<'a, 'n> {
+pub struct At<'a, 'n> {
     state: &'a SessionState,
     node: Option<&'n str>,
 }
 
-impl<'a, 'n> SessionStateAtNode<'a, 'n> {
-    pub fn state(&self) -> &'a SessionState {
+impl<'a, 'n> At<'a, 'n> {
+    pub fn session(&self) -> &'a SessionState {
         self.state
     }
 
@@ -144,7 +144,7 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
         self.node
     }
 
-    fn up(&self) -> crate::tree::Up<'a> {
+    fn up(&self) -> crate::tree::Ancestors<'a> {
         self.state.tree.up(self.node)
     }
 
@@ -207,7 +207,7 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
         SessionState::anchored_on(&self.path_set(), anchor)
     }
 
-    pub fn resolve_state_for(&self) -> WorkerState {
+    pub fn worker_state(&self) -> WorkerState {
         self.up()
             .find_map(|n| match &n.fact {
                 crate::tree::Fact::State { state } => Some(state.clone()),
@@ -216,7 +216,7 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
             .unwrap_or_default()
     }
 
-    pub fn resolve_agent_for(&self) -> Option<AgentConfig> {
+    pub fn config(&self) -> Option<AgentConfig> {
         self.up()
             .find_map(|n| match &n.fact {
                 crate::tree::Fact::Config { config, .. } => Some(config.clone()),
@@ -233,7 +233,7 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
     }
 
     pub fn tool_handler(&self, name: &str) -> ToolHandler {
-        let config = self.resolve_agent_for();
+        let config = self.config();
         let connector = || {
             self.connector_tool(name)
                 .is_some_and(|t| t.kind != ConnectorToolKind::Subagent)
@@ -246,11 +246,11 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
     }
 
     pub fn retry_config(&self) -> Option<RetryConfig> {
-        self.resolve_agent_for().and_then(|c| c.retry).map(|b| *b)
+        self.config().and_then(|c| c.retry).map(|b| *b)
     }
 
     pub fn connector_tools(&self) -> filter::Merged {
-        let Some(config) = self.resolve_agent_for() else {
+        let Some(config) = self.config() else {
             return filter::Merged {
                 tools: Vec::new(),
                 collisions: Vec::new(),
@@ -260,7 +260,7 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
     }
 
     fn connector_source(&self, connector_id: &ConnectionPath) -> Option<Source> {
-        let config = self.resolve_agent_for()?;
+        let config = self.config()?;
         let server = self
             .state
             .servers_for(&config)
@@ -275,7 +275,7 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
     }
 
     fn searchable_connectors(&self) -> Vec<Source> {
-        let Some(config) = self.resolve_agent_for() else {
+        let Some(config) = self.config() else {
             return Vec::new();
         };
         self.state
@@ -294,7 +294,7 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
     /// but those a skill holds back. In code mode, these are the tools a
     /// script calls.
     pub fn searchable_tools(&self) -> Vec<LlmTool> {
-        let Some(config) = self.resolve_agent_for() else {
+        let Some(config) = self.config() else {
             return Vec::new();
         };
         let locked = config.locked_tools(&self.loaded_skills());
@@ -322,7 +322,7 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
     /// tools a script calls that are not deferred. It does not change while
     /// the session runs, but for tools that connect later.
     pub fn run_code(&self) -> Option<LlmTool> {
-        let language = self.resolve_agent_for()?.codemode?;
+        let language = self.config()?.codemode?;
         let tools = self.searchable_tools();
         let direct: Vec<&LlmTool> = tools.iter().filter(|t| !t.defer).collect();
         Some(crate::codemode::offered(language, &direct))
@@ -330,7 +330,7 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
 
     /// The tools a script can call that the skill `named` names.
     pub fn skill_tools(&self, named: &str) -> Vec<LlmTool> {
-        let Some(config) = self.resolve_agent_for() else {
+        let Some(config) = self.config() else {
             return Vec::new();
         };
         let named_tools: Vec<String> = config
@@ -370,7 +370,7 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
             self.state
                 .effects
                 .values()
-                .filter(|e| SessionState::anchored_on(&path, e.anchor.as_deref()))
+                .filter(|e| SessionState::anchored_on(&path, e.asked_at.as_deref()))
                 .filter(|e| e.tracking.status() == EffectStatus::Completed)
                 .filter_map(EffectState::tool)
                 .filter(|tc| tc.name == SKILL)
@@ -380,7 +380,7 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
     }
 
     pub fn locked_tools(&self) -> BTreeMap<String, Vec<String>> {
-        self.resolve_agent_for()
+        self.config()
             .map(|config| config.locked_tools(&self.loaded_skills()))
             .unwrap_or_default()
     }
@@ -465,7 +465,7 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
                     .into_iter()
                     .map(DraftMessage::from)
                     .collect();
-                let prompt = match self.resolve_agent_for() {
+                let prompt = match self.config() {
                     Some(config) => config.prompt_for(&view),
                     None => view,
                 };
@@ -518,14 +518,14 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
         !self.state.effects.values().any(|e| {
             e.id != exclude
                 && e.llm()
-                    .is_some_and(|c| c.source != PromptSource::Explicit && c.context.is_none())
-                && SessionState::anchored_on(&path, e.anchor.as_deref())
+                    .is_some_and(|c| c.source != PromptSource::Explicit && c.reads_from.is_none())
+                && SessionState::anchored_on(&path, e.asked_at.as_deref())
                 && e.tracking.status() != EffectStatus::Queued
         })
     }
 
     pub fn call_tool_target(&self, named: &str) -> Option<CallTarget> {
-        let config = self.resolve_agent_for()?;
+        let config = self.config()?;
         if config
             .locked_tools(&self.loaded_skills())
             .contains_key(named)
@@ -557,7 +557,7 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
             return Some(fault);
         }
         let Some(target) = self.call_tool_target(&named) else {
-            let config = self.resolve_agent_for();
+            let config = self.config();
             let tools = self.searchable_tools();
             let cap = config
                 .as_ref()
@@ -586,7 +586,7 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
     }
 
     pub fn unsynced_connectors(&self) -> Vec<ConnectionPath> {
-        let Some(config) = self.resolve_agent_for() else {
+        let Some(config) = self.config() else {
             return Vec::new();
         };
         self.state
@@ -602,7 +602,7 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
     }
 
     pub fn has_pending_connector_sync(&self) -> bool {
-        let Some(config) = self.resolve_agent_for() else {
+        let Some(config) = self.config() else {
             return false;
         };
         self.state.servers_for(&config).iter().any(|c| {
@@ -704,7 +704,7 @@ mod open_llm_calls_tests {
             EffectPayload::LlmCall(LlmCallState {
                 source: Default::default(),
                 defer_tools_strategy: Default::default(),
-                context: None,
+                reads_from: None,
                 sent_tools: None,
                 unanswered: Vec::new(),
                 format: None,
@@ -785,7 +785,7 @@ mod tree_tests {
     }
 
     fn read(s: &SessionState, at: &str) -> serde_json::Value {
-        s.at(Some(at)).resolve_state_for().0
+        s.at(Some(at)).worker_state().0
     }
 
     #[test]
@@ -807,7 +807,7 @@ mod tree_tests {
         assert_eq!(read(&s, "u1"), serde_json::json!({ "v": 1 }));
         assert_eq!(read(&s, "u2"), serde_json::json!({ "v": 2 }));
         assert_eq!(
-            s.at(Some("u2")).resolve_agent_for().map(|c| c.model),
+            s.at(Some("u2")).config().map(|c| c.model),
             Some("m1".into())
         );
         assert_eq!(
@@ -844,7 +844,7 @@ mod tree_tests {
         let start = |config| Fact::Config { config, root: true };
         put(&mut s, "b1", Some("u1"), start(Some(config("m2"))));
         put(&mut s, "b2", Some("u1"), start(None));
-        let model = |at| s.at(Some(at)).resolve_agent_for().map(|c| c.model);
+        let model = |at| s.at(Some(at)).config().map(|c| c.model);
         assert_eq!(model("b1"), Some("m2".into()));
         assert_eq!(model("b2"), None);
         assert_eq!(model("u1"), Some("m1".into()));

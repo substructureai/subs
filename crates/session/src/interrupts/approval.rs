@@ -25,15 +25,15 @@ impl InterruptKind for Approval {
         let transcript = p.state.transcript();
         let transcript = transcript.as_slice();
         let llm_calls = &p.state.open_llm_calls();
-        let dispatched = p.state.state().dispatched_calls();
+        let dispatched = p.state.session().dispatched_calls();
         let dispatched = dispatched.as_slice();
-        let config = p.state.resolve_agent_for();
+        let config = p.state.config();
         let config = config.as_ref();
         let connector_tools = p.state.connector_tools().tools;
         let connector_tools = connector_tools.as_slice();
         let pending_calls = p.waiting_calls();
-        if let Some((parent, _)) = p.state.state().script_ask(tail) {
-            let asked = p.state.state().script_asked(parent);
+        if let Some((parent, _)) = p.state.session().script_ask(tail) {
+            let asked = p.state.session().script_asked(parent);
             return Some(script_resumed(
                 tail,
                 approved(payload),
