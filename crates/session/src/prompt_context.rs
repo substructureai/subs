@@ -219,13 +219,11 @@ pub fn restore(prompt: &mut Vec<Message>, placed: &[Placed]) {
                 }
             }
             Placement::Own => {
-                let after = p.after.as_ref();
-                let Some(i) = after.and_then(|a| prompt.iter().position(|m| &m.id == a)) else {
+                let Some(start) = start(prompt, p) else {
                     continue;
                 };
-                let at = i
-                    + 1
-                    + prompt[i + 1..]
+                let at = start
+                    + prompt[start..]
                         .iter()
                         .take_while(|m| own.contains(&m.id))
                         .count();
@@ -271,15 +269,11 @@ pub fn carry(prompt: &mut Vec<Message>, placed: &[Placed]) {
                 if prompt.iter().any(|m| same(m, p)) {
                     continue;
                 }
-                let Some(after) = p.after.as_ref() else {
+                let Some(start) = start(prompt, p) else {
                     continue;
                 };
-                let Some(i) = prompt.iter().position(|m| &m.id == after) else {
-                    continue;
-                };
-                let at = i
-                    + 1
-                    + prompt[i + 1..]
+                let at = start
+                    + prompt[start..]
                         .iter()
                         .take_while(|m| m.role == Role::User && m.id.contains("-ctx-"))
                         .count();
@@ -373,6 +367,13 @@ fn place(
         after,
         ids: Vec::new(),
     })
+}
+
+fn start(prompt: &[Message], p: &Placed) -> Option<usize> {
+    match &p.after {
+        None => Some(0),
+        Some(after) => prompt.iter().position(|m| &m.id == after).map(|i| i + 1),
+    }
 }
 
 fn same(m: &Message, p: &Placed) -> bool {

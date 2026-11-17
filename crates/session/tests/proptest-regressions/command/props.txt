@@ -5,3 +5,7 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 0f3795208b1d5d97e8ee8d3a61c6a3e2b831a5de6da901b61195418d5703d8ee # shrinks to ops = [Interrupt, Resume { index: 0 }, Decide { acts: [Interrupt, CallLlm { worker: true }], append: true, set_config: false }]
+cc fa8f4dd7aad7255c0eac75a4f72e307a1bfeddbececb1c36e9a8b4aeb5b60db0 # shrinks to ops = [Decide { acts: [CallLlm { worker: true, fork: None }], append: false, set_config: false }, Decide { acts: [CallLlm { worker: false, fork: None }], append: false, set_config: true }, SettleConnector { index: 0, ok: false, retryable: false }]
+cc 9115beb84c7500de57b499ce91ab02f4caa7b8b7d8b260ad125a417023eb9d9f # shrinks to ops = [Decide { acts: [CallLlm { worker: false, fork: None }], append: false, set_config: false }, ClientMessage { queue: Refuse }]
+cc bd731876cee5ae1b875b3b4a4eeedf0f2ba52ce6d0ff3017e6c45f4feb8c96cf # shrinks to ops = [Decide { acts: [CallLlm { worker: true, fork: Some(Fork { index: 0, new: false, detached: false, agent: 1 }) }], append: false, set_config: true }]
+cc 00eb6efdf127755bffe7022cf6c4f389a4c5390904199c67a0464adec153974b # shrinks to ops = [FailDecision { retryable: true }, Wake { advance_secs: 1 }, Decide { acts: [CallLlm { worker: false, fork: None }], append: false, set_config: false }, View { keep: 0 }, Resume { index: 0 }, Decide { acts: [CallWith { explicit: true }], append: false, set_config: true }, SettleLlm { index: 5986919070918927547, ok: true, retryable: false }, Cancel]

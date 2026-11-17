@@ -2265,11 +2265,24 @@ impl SessionState {
         {
             *lanes.entry(self.lane(e.branch.as_deref())).or_default() += 1;
         }
-        let live = lanes.get(&None).copied().unwrap_or_default();
         if lanes.values().any(|n| *n > 1) {
             return Err(format!("decision slot violated: {lanes:?} live decisions"));
         }
-        if live > 0 && self.at_head().has_pending_connector_sync() {
+        if self
+            .effects_of(EffectKind::Decision)
+            .filter(|e| e.tracking.status == EffectStatus::Pending)
+            .filter_map(|e| e.decision())
+            .any(|d| {
+                let node = match d.branch.as_deref() {
+                    Some(b) if !self.branches.contains_key(b) => self
+                        .tree
+                        .branch(b)
+                        .and_then(|r| r.state.at().map(str::to_string)),
+                    b => self.scope_node(b),
+                };
+                self.at(node.as_deref()).has_pending_connector_sync()
+            })
+        {
             return Err(
                 "a decision is live while a fetch its config owes is in flight".to_string(),
             );

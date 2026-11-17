@@ -47,8 +47,21 @@ fn policy() -> RetryPolicy {
 }
 
 #[derive(Debug, Clone)]
+struct Fork {
+    index: usize,
+    new: bool,
+    detached: bool,
+    agent: u8,
+}
+
+#[derive(Debug, Clone)]
 enum ActOp {
-    CallLlm { worker: bool },
+    CallLlm { worker: bool, fork: Option<Fork> },
+    CallWith { explicit: bool },
+    CallSystem1 { given: bool },
+    CloseBranch { index: usize },
+    PromoteBranch { index: usize },
+    ReplaceContext,
     CallTool,
     SpawnSubagent,
     Interrupt,
@@ -92,19 +105,46 @@ enum Op {
     Resume {
         index: usize,
     },
+    View {
+        keep: usize,
+        add: bool,
+    },
+    SettleSystem1 {
+        index: usize,
+        ok: bool,
+    },
+    Repeat,
     Wake {
         advance_secs: u32,
     },
     Cancel,
 }
 
+fn fork() -> impl Strategy<Value = Option<Fork>> {
+    proptest::option::of(
+        (any::<usize>(), any::<bool>(), any::<bool>(), 0u8..3).prop_map(
+            |(index, new, detached, agent)| Fork {
+                index,
+                new,
+                detached,
+                agent,
+            },
+        ),
+    )
+}
+
 fn act_op() -> impl Strategy<Value = ActOp> {
     prop_oneof![
-        any::<bool>().prop_map(|worker| ActOp::CallLlm { worker }),
-        Just(ActOp::CallTool),
-        Just(ActOp::SpawnSubagent),
-        Just(ActOp::Interrupt),
-        Just(ActOp::Done),
+        3 => (any::<bool>(), fork()).prop_map(|(worker, fork)| ActOp::CallLlm { worker, fork }),
+        1 => any::<bool>().prop_map(|explicit| ActOp::CallWith { explicit }),
+        1 => any::<bool>().prop_map(|given| ActOp::CallSystem1 { given }),
+        1 => any::<usize>().prop_map(|index| ActOp::CloseBranch { index }),
+        2 => any::<usize>().prop_map(|index| ActOp::PromoteBranch { index }),
+        1 => Just(ActOp::ReplaceContext),
+        1 => Just(ActOp::CallTool),
+        1 => Just(ActOp::SpawnSubagent),
+        1 => Just(ActOp::Interrupt),
+        1 => Just(ActOp::Done),
     ]
 }
 
@@ -131,6 +171,9 @@ fn op() -> impl Strategy<Value = Op> {
         1 => any::<bool>().prop_map(|retryable| Op::FailDecision { retryable }),
         1 => Just(Op::Interrupt),
         1 => any::<usize>().prop_map(|index| Op::Resume { index }),
+        2 => (any::<usize>(), any::<bool>()).prop_map(|(keep, add)| Op::View { keep, add }),
+        1 => (any::<usize>(), any::<bool>()).prop_map(|(index, ok)| Op::SettleSystem1 { index, ok }),
+        1 => Just(Op::Repeat),
         2 => (0u32..12).prop_map(|advance_secs| Op::Wake { advance_secs }),
         1 => Just(Op::Cancel),
     ]
@@ -139,6 +182,8 @@ fn op() -> impl Strategy<Value = Op> {
 struct World {
     agg: Session,
     store: Option<Counted>,
+    branch_ids: Vec<String>,
+    last: Option<(crate::Command, crate::CommandResult)>,
     now: DateTime<Utc>,
     log: Vec<(u64, DateTime<Utc>, EventPayload)>,
     next_id: u32,
@@ -168,6 +213,8 @@ impl World {
         let mut world = World {
             agg,
             store,
+            branch_ids: Vec::new(),
+            last: None,
             now: DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
@@ -216,14 +263,9 @@ impl World {
         self.trace.push(format!("{cmd:?}"));
         if let Some(store) = self.store.clone() {
             let id = format!("cmd-{}", self.trace.len());
-            let ran = self
-                .agg
-                .run(
-                    &store,
-                    self.now,
-                    crate::Command::new(id, caller.clone(), cmd),
-                )
-                .unwrap();
+            let command = crate::Command::new(id, caller.clone(), cmd);
+            let ran = self.agg.run(&store, self.now, command.clone()).unwrap();
+            self.last = Some((command, ran.result.clone()));
             for event in ran.written.map(|e| e.events).unwrap_or_default() {
                 self.log.push((event.seq, event.occurred_at, event.payload));
             }
@@ -242,6 +284,28 @@ impl World {
         for event in committed {
             self.log.push((event.seq, event.occurred_at, event.payload));
         }
+    }
+
+    fn unfingerprinted(&self) -> Option<String> {
+        let mut state = SessionState::new("sess-1".to_string());
+        for (seq, occurred_at, payload) in &self.log {
+            if let EventPayload::LlmCallDispatched(d) = payload {
+                let built = state
+                    .outgoing(&d.id)
+                    .map(|out| crate::prompt_context::fingerprint(&out.prompt));
+                if d.fingerprint.is_some() && d.fingerprint != built {
+                    return Some(d.id.clone());
+                }
+            }
+            state.apply(
+                payload,
+                &ApplyContext {
+                    occurred_at: *occurred_at,
+                    sequence: *seq,
+                },
+            );
+        }
+        None
     }
 
     fn replayed(&self) -> SessionState {
@@ -340,30 +404,107 @@ impl World {
         }
     }
 
+    fn branch_id(&mut self, index: usize, new: bool) -> String {
+        let mut known: Vec<String> = self.agg.state.branches.keys().cloned().collect();
+        known.extend(self.branch_ids.iter().cloned());
+        known.sort();
+        known.dedup();
+        match pick(&known, index).filter(|_| !new) {
+            Some(id) => id,
+            None => {
+                let id = format!("b-{}", self.mint());
+                self.branch_ids.push(id.clone());
+                id
+            }
+        }
+    }
+
+    fn llm(
+        &mut self,
+        worker: bool,
+        messages: Vec<DraftMessage>,
+        source: crate::decision::PromptSource,
+        branch: Option<crate::decision::BranchStart>,
+    ) -> Action {
+        Action::CallLlm {
+            source,
+            llm: "claude".to_string(),
+            format: None,
+            id: self.mint(),
+            request: LlmRequest {
+                model: "test-model".to_string(),
+                messages,
+                tools: None,
+                temperature: None,
+                max_completion_tokens: None,
+                reasoning: None,
+            },
+            stream: false,
+            retry: policy(),
+            handler: if worker {
+                LlmHandler::Worker
+            } else {
+                LlmHandler::Server
+            },
+            branch,
+        }
+    }
+
     fn actions(&mut self, acts: Vec<ActOp>) -> Vec<Action> {
         acts.into_iter()
             .map(|a| match a {
-                ActOp::CallLlm { worker } => Action::CallLlm {
-                    source: Default::default(),
-                    llm: "claude".to_string(),
-                    format: None,
+                ActOp::CallLlm { worker, fork } => {
+                    let branch = fork.map(|f| crate::decision::BranchStart {
+                        id: self.branch_id(f.index, f.new),
+                        from: crate::decision::BranchFrom::Head,
+                        agent: match f.agent {
+                            0 => crate::decision::BranchConfig::Inherit,
+                            1 => crate::decision::BranchConfig::None,
+                            _ => crate::decision::BranchConfig::Config(Box::new(self.config())),
+                        },
+                        name: None,
+                        mode: match f.detached {
+                            true => crate::protocol::BranchMode::Detached,
+                            false => crate::protocol::BranchMode::Blocking,
+                        },
+                    });
+                    self.llm(worker, Vec::new(), Default::default(), branch)
+                }
+                ActOp::CallWith { explicit } => {
+                    let mut messages = self.recorded();
+                    messages.push(self.message(Role::User));
+                    let source = match explicit {
+                        true => crate::decision::PromptSource::Explicit,
+                        false => Default::default(),
+                    };
+                    self.llm(false, messages, source, None)
+                }
+                ActOp::CallSystem1 { given } => Action::CallSystem1 {
                     id: self.mint(),
-                    request: LlmRequest {
-                        model: "test-model".to_string(),
-                        messages: vec![],
-                        tools: None,
-                        temperature: None,
-                        max_completion_tokens: None,
-                        reasoning: None,
+                    system1: "cf".to_string(),
+                    request: crate::system1::System1Request {
+                        model: "clef".to_string(),
+                        state: given.then(|| serde_json::json!({ "given": true })),
+                        questions: std::collections::BTreeMap::from([(
+                            "spam".to_string(),
+                            crate::system1::Question::Noul {
+                                instructions: Some(serde_json::json!("Is this spam?")),
+                                criteria: None,
+                            },
+                        )]),
+                        assets: Default::default(),
                     },
-                    stream: false,
                     retry: policy(),
-                    handler: if worker {
-                        LlmHandler::Worker
-                    } else {
-                        LlmHandler::Server
-                    },
-                    branch: None,
+                },
+                ActOp::CloseBranch { index } => Action::CloseBranch {
+                    id: self.branch_id(index, false),
+                },
+                ActOp::PromoteBranch { index } => Action::PromoteBranch {
+                    id: self.branch_id(index, false),
+                },
+                ActOp::ReplaceContext => Action::ReplaceContext {
+                    summary: Some(self.mint()),
+                    messages: Vec::new(),
                 },
                 ActOp::CallTool => Action::CallTool {
                     id: self.mint(),
@@ -625,7 +766,81 @@ impl World {
             Op::Wake { advance_secs } => {
                 self.now += Duration::seconds(i64::from(advance_secs));
                 let now = self.now;
-                self.run(CommandPayload::Wake { now }, &system());
+                match self.store.clone() {
+                    Some(store) => {
+                        self.plan_now = now;
+                        self.trace.push(format!("wake at {now}"));
+                        let written = self.agg.wake(&store, now).unwrap();
+                        for event in written.map(|e| e.events).unwrap_or_default() {
+                            self.log.push((event.seq, event.occurred_at, event.payload));
+                        }
+                    }
+                    None => self.run(CommandPayload::Wake { now }, &system()),
+                }
+            }
+            Op::View { keep, add } => {
+                let mut messages = self.recorded();
+                messages.truncate(keep % (messages.len() + 1));
+                if add || messages.is_empty() {
+                    messages.push(self.message(Role::User));
+                }
+                let turn_id = self.mint();
+                self.run(
+                    CommandPayload::SubmitClientPayload {
+                        payload: ClientPayload::Messages(crate::protocol::ClientMessages {
+                            messages,
+                            stream: false,
+                            client: Default::default(),
+                        }),
+                        turn: TurnTarget::Open(turn_id),
+                        queue: QueueMode::Refuse,
+                        metadata: Default::default(),
+                    },
+                    &frontend(),
+                );
+            }
+            Op::SettleSystem1 { index, ok } => {
+                let ids = self.pending(
+                    self.agg
+                        .state
+                        .effects_of(EffectKind::System1Call)
+                        .filter(|c| c.tracking.status() == EffectStatus::Pending)
+                        .map(|c| c.id.as_str()),
+                );
+                let Some(call_id) = pick(&ids, index) else {
+                    return;
+                };
+                let cmd = match ok {
+                    true => CommandPayload::settle(
+                        EffectKind::System1Call,
+                        call_id,
+                        None,
+                        Outcome::System1(Box::new(crate::system1::System1Response {
+                            model: "clef".to_string(),
+                            answers: Default::default(),
+                            usage: Default::default(),
+                            cost: None,
+                        })),
+                    ),
+                    false => CommandPayload::settle(
+                        EffectKind::System1Call,
+                        call_id,
+                        None,
+                        SettleError::new(ErrorInfo::internal("boom"), false),
+                    ),
+                };
+                self.run(cmd, &system());
+            }
+            Op::Repeat => {
+                let (Some(store), Some((command, result))) =
+                    (self.store.clone(), self.last.clone())
+                else {
+                    return;
+                };
+                self.trace.push(format!("repeat {}", command.id.0));
+                let ran = self.agg.run(&store, self.now, command).unwrap();
+                assert_eq!(ran.result, result, "a repeated command answers as it did");
+                assert!(ran.written.is_none(), "a repeated command writes nothing");
             }
             Op::Cancel => {
                 self.run(
@@ -830,7 +1045,7 @@ proptest! {
 
 proptest! {
     #![proptest_config(ProptestConfig {
-        cases: 64,
+        cases: 256,
         failure_persistence: Some(Box::new(FileFailurePersistence::SourceParallel(
             "tests/proptest-regressions"
         ))),
@@ -839,15 +1054,36 @@ proptest! {
 
     #[test]
     fn a_session_reloaded_from_its_log_is_the_session_that_ran(
-        ops in proptest::collection::vec(op(), 1..24)
+        ops in proptest::collection::vec(op(), 1..40)
     ) {
         let mut world = World::stored();
+        let mut sent: HashMap<String, serde_json::Value> = HashMap::new();
+        let mut reads = 0;
         for op in ops {
             world.step(op);
             let commands = world.trace.join("\n");
             let store = world.store.clone().expect("a stored world");
+            if let Some(call) = world.unfingerprinted() {
+                prop_assert!(false, "{call} sent other bytes than it fingerprinted\ncommands:\n{commands}");
+            }
+            for item in world.agg.open_work() {
+                let request = match &item {
+                    crate::Work::CallLlm { call, .. } => serde_json::to_value(&call.request),
+                    crate::Work::CallSystem1 { call, .. } => serde_json::to_value(&call.request),
+                    _ => continue,
+                }
+                .unwrap();
+                let first = sent
+                    .entry(serde_json::to_string(item.id()).unwrap())
+                    .or_insert_with(|| request.clone());
+                prop_assert_eq!(
+                    &*first, &request,
+                    "an open call's request changed after it was sent\ncommands:\n{}", commands
+                );
+            }
             store.reads.store(0, std::sync::atomic::Ordering::Relaxed);
             let loaded = Session::load(&store, "sess-1", TENANT, settings()).unwrap();
+            reads = reads.max(store.reads.load(std::sync::atomic::Ordering::Relaxed));
             prop_assert_eq!(
                 serde_json::to_value(loaded.state()).unwrap(),
                 serde_json::to_value(world.agg.state()).unwrap(),
@@ -859,7 +1095,8 @@ proptest! {
             );
             prop_assert_eq!(
                 work(&loaded), work(&world.agg),
-                "the work built from a reload differs\ncommands:\n{}", commands
+                "the work built from a reload differs (replay read the tree {} times)\ncommands:\n{}",
+                reads, commands
             );
         }
     }
