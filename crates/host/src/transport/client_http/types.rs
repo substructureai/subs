@@ -212,9 +212,9 @@ mod tests {
         };
         let mut s = SessionState::new("s1".to_string());
         s.status = SessionStatus::Idle;
-        s.tree.push(node("u1", Role::User, None));
-        s.tree.push(node("a1", Role::Assistant, Some("u1")));
-        s.tree.push(node("a2", Role::Assistant, Some("u1")));
+        s.tree.seed(node("u1", Role::User, None));
+        s.tree.seed(node("a1", Role::Assistant, Some("u1")));
+        s.tree.seed(node("a2", Role::Assistant, Some("u1")));
         s.head_id = Some("a1".to_string());
         let json = serde_json::to_value(session_response("s1".into(), &view_of(s))).unwrap();
         let ids: Vec<&str> = json["messages"]

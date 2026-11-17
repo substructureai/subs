@@ -4,7 +4,8 @@ impl SessionState {
     #[cfg(test)]
     pub fn seed(&mut self, node: crate::tree::Node) {
         let seq = self.tree.unwritten().count() as u64;
-        self.grow(node, seq);
+        self.grow(&node);
+        self.tree.seed(Logged { seq, entry: node });
     }
 
     #[cfg(test)]
@@ -29,14 +30,12 @@ impl SessionState {
         self.seed(crate::tree::Node::of_message(&message));
     }
 
-    fn grow(&mut self, node: crate::tree::Node, seq: u64) {
+    fn grow(&mut self, node: &crate::tree::Node) {
         let id = node.id().to_string();
         let user = node.message().is_some_and(|m| m.role == Role::User);
-        let branch = node.branch().map(str::to_string);
-        self.tree.push(Logged { seq, entry: node });
-        match branch {
+        match node.branch() {
             Some(b) => {
-                if let Some(branch) = self.branches.get_mut(&b) {
+                if let Some(branch) = self.branches.get_mut(b) {
                     branch.leaf = Some(id);
                 }
             }
@@ -425,7 +424,6 @@ impl SessionState {
             }
             EventPayload::NewMessage(payload) => {
                 self.answered(&payload.message, payload.branch.as_deref());
-                self.grow(crate::tree::Node::of_message(payload), ctx.sequence);
             }
             EventPayload::BranchStarted(p) => {
                 if let Some(l) = self.limited.as_mut().filter(|l| l.open()) {
@@ -434,22 +432,12 @@ impl SessionState {
                     }
                 }
                 if !self.branches.contains_key(&p.id) {
-                    let parent = p.parent.as_deref().and_then(|b| self.branches.get(b));
-                    let depth = parent.map_or(0, |b| b.depth) + 1;
-                    let detached =
-                        p.mode == BranchMode::Detached || parent.is_some_and(|b| b.detached);
-                    let branch = BranchState::started(p, ctx.sequence, depth, detached);
-                    self.tree.record(&p.id, branch.clone(), None);
-                    self.branches.insert(p.id.clone(), branch);
-                    if let Some(node) = crate::tree::Node::of_event(event) {
-                        self.grow(node, ctx.sequence);
-                    }
+                    self.branches
+                        .insert(p.id.clone(), BranchState::started(p, ctx.sequence));
                 }
             }
             EventPayload::BranchClosed(p) => {
-                if let Some(branch) = self.branches.remove(&p.id) {
-                    self.tree.record(&p.id, branch, Some(p.reason));
-                }
+                self.branches.remove(&p.id);
             }
             EventPayload::BranchMoved(payload) => match payload.branch.as_deref() {
                 Some(b) => {
@@ -461,10 +449,8 @@ impl SessionState {
             },
             EventPayload::LlmCallRequested(payload) => self.apply_llm_requested(payload, ctx),
             EventPayload::LlmCallDispatched(payload) => self.apply_llm_dispatched(payload, ctx),
+            EventPayload::StateUpdated(_) | EventPayload::ConfigUpdated(_) => {}
             EventPayload::ContextPlaced(payload) => {
-                if let Some(node) = crate::tree::Node::of_event(event) {
-                    self.grow(node, ctx.sequence);
-                }
                 if let Some(call) = self
                     .effect_mut(EffectKind::LlmCall, &payload.call)
                     .and_then(|e| e.llm_mut())
@@ -737,11 +723,6 @@ impl SessionState {
                     sync.auth = Some(p.auth);
                 }
             }
-            EventPayload::StateUpdated(_) | EventPayload::ConfigUpdated(_) => {
-                if let Some(node) = crate::tree::Node::of_event(event) {
-                    self.grow(node, ctx.sequence);
-                }
-            }
             EventPayload::SessionCancelled => {
                 self.limited = None;
             }
@@ -871,6 +852,11 @@ impl SessionState {
                 d.parked = None;
             }
         }
+        let indexed = crate::tree::index(ctx.sequence, event);
+        if let Some(node) = &indexed.node {
+            self.grow(&node.entry);
+        }
+        self.tree.push(&indexed);
     }
 
     fn track_usage(&mut self, usage: &Option<Usage>) {

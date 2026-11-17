@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 use crate::decision::BranchConfig;
-use crate::events::BranchEnd;
+use crate::events::{BranchClosed, BranchEnd, BranchStarted, EventPayload};
 use crate::protocol::{AgentConfig, DraftMessage, Message, NewMessage, WorkerState};
 use crate::state::{BranchState, Logged};
 use crate::store::StoreError;
@@ -175,15 +175,26 @@ impl Tree {
         self.get(id).is_some()
     }
 
-    pub fn push(&mut self, node: Logged<Node>) {
+    pub fn push(&mut self, indexed: &Indexed) {
+        if let Some(node) = &indexed.node {
+            self.unwritten
+                .entry(node.id().to_string())
+                .or_insert_with(|| node.clone());
+        }
+        if let Some(change) = &indexed.change {
+            let id = change.id();
+            let known = self.branch(id);
+            if let Some(record) = change.record(indexed.seq, known) {
+                self.branches.insert(id.to_string(), record);
+            }
+        }
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub fn seed(&mut self, node: Logged<Node>) {
         self.unwritten
             .entry(node.id().to_string())
             .or_insert_with(|| Arc::new(node));
-    }
-
-    pub fn record(&mut self, id: &str, state: BranchState, closed: Option<BranchEnd>) {
-        self.branches
-            .insert(id.to_string(), BranchRecord { state, closed });
     }
 
     pub fn branch(&self, id: &str) -> Option<BranchRecord> {
@@ -379,9 +390,73 @@ impl Iterator for Ancestors<'_> {
     }
 }
 
+pub enum BranchChange<'a> {
+    Started(&'a BranchStarted),
+    Closed(&'a BranchClosed),
+}
+
+impl BranchChange<'_> {
+    pub fn id(&self) -> &str {
+        match self {
+            BranchChange::Started(p) => &p.id,
+            BranchChange::Closed(p) => &p.id,
+        }
+    }
+
+    pub fn record(&self, seq: u64, known: Option<BranchRecord>) -> Option<BranchRecord> {
+        match self {
+            BranchChange::Started(p) => Some(BranchRecord {
+                state: BranchState::started(p, seq),
+                closed: None,
+            }),
+            BranchChange::Closed(p) => known.map(|mut record| {
+                if let Some(leaf) = &p.leaf {
+                    record.state.leaf = Some(leaf.clone());
+                }
+                record.closed = Some(p.reason);
+                record
+            }),
+        }
+    }
+}
+
+pub struct Indexed<'a> {
+    pub seq: u64,
+    pub node: Option<NodeRef>,
+    pub change: Option<BranchChange<'a>>,
+    pub branch: Option<&'a str>,
+}
+
+impl Indexed<'_> {
+    pub fn answers(&self) -> Option<&str> {
+        let message = self.node.as_ref()?.message()?;
+        (message.role == crate::protocol::Role::Tool)
+            .then_some(message.tool_call_id.as_deref())
+            .flatten()
+    }
+}
+
+pub fn index(seq: u64, event: &EventPayload) -> Indexed<'_> {
+    let (change, branch) = match event {
+        EventPayload::BranchStarted(p) => (Some(BranchChange::Started(p)), Some(p.id.as_str())),
+        EventPayload::BranchClosed(p) => (Some(BranchChange::Closed(p)), Some(p.id.as_str())),
+        EventPayload::BranchMoved(p) => (None, p.branch.as_deref()),
+        EventPayload::NewMessage(m) => (None, m.branch.as_deref()),
+        EventPayload::StateUpdated(v) => (None, v.node.branch.as_deref()),
+        EventPayload::ConfigUpdated(v) => (None, v.node.branch.as_deref()),
+        EventPayload::ContextPlaced(c) => (None, c.node.branch.as_deref()),
+        _ => (None, None),
+    };
+    Indexed {
+        seq,
+        node: Node::of_event(event).map(|entry| Arc::new(Logged { seq, entry })),
+        change,
+        branch,
+    }
+}
+
 impl Node {
-    pub fn of_event(payload: &crate::events::EventPayload) -> Option<Node> {
-        use crate::events::EventPayload;
+    fn of_event(payload: &EventPayload) -> Option<Node> {
         Some(match payload {
             EventPayload::NewMessage(m) => Node::of_message(m),
             EventPayload::StateUpdated(v) => Node {

@@ -176,7 +176,7 @@ pub struct BranchState {
 }
 
 impl BranchState {
-    pub fn started(p: &BranchStarted, seq: u64, depth: usize, detached: bool) -> Self {
+    pub fn started(p: &BranchStarted, seq: u64) -> Self {
         BranchState {
             node: p.node.clone(),
             from: p.from.clone(),
@@ -188,8 +188,8 @@ impl BranchState {
             leaf: p.leaf.clone(),
             turn_id: p.turn_id.clone(),
             subagent: p.subagent.clone(),
-            depth,
-            detached,
+            depth: p.depth,
+            detached: p.detached,
         }
     }
 

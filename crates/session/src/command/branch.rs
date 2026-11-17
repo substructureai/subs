@@ -251,6 +251,8 @@ impl Working {
             self.then(|s| effects::connector::sync(s, config));
         }
         let node = self.ids.next();
+        let depth = self.branch_depth(parent.as_deref()) + 1;
+        let detached = start.mode == BranchMode::Detached || self.detached(parent.as_deref());
         self.emit(EventPayload::BranchStarted(Box::new(BranchStarted {
             id: start.id.clone(),
             node: node.clone(),
@@ -259,6 +261,8 @@ impl Working {
             agent,
             name: start.name.clone(),
             mode: start.mode,
+            depth,
+            detached,
             turn_id,
             subagent: None,
             leaf: None,
@@ -380,6 +384,8 @@ impl Working {
             ),
         };
         let fresh = own.is_none();
+        let depth = self.branch_depth(parent.as_deref()) + 1;
+        let detached = mode == BranchMode::Detached || self.detached(parent.as_deref());
         self.emit(EventPayload::BranchStarted(Box::new(BranchStarted {
             id: branch.clone(),
             node: node.clone(),
@@ -388,6 +394,8 @@ impl Working {
             agent: agent.clone(),
             name: Some(agent_id),
             mode,
+            depth,
+            detached,
             turn_id,
             subagent: Some(call.to_string()),
             leaf: own.clone(),

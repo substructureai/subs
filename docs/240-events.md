@@ -203,7 +203,7 @@ the same attempt.
 
 | Event | Meaning |
 | --- | --- |
-| `branch.started` | `{ id, from?, parent?, agent, name?, mode, turn_id?, subagent?, leaf? }`. A [branch](./125-branches.md) started, or a subagent's went on from `leaf`. |
+| `branch.started` | `{ id, from?, parent?, agent, name?, mode, depth, detached?, turn_id?, subagent?, leaf? }`. A [branch](./125-branches.md) started, or a subagent's went on from `leaf`. `depth` counts the branches it sits in, itself included, and `detached` holds for it and everything below a detached branch. |
 | `branch.closed` | `{ id, reason, data?, error? }`. `reason` is `done`, `failed`, `voided`, `closed`, or `promoted`. |
 
 A `message.new` with `branch` is written on that branch. It does not move the

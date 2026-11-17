@@ -4,10 +4,8 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Utc};
 
 use crate::entry::{CommandId, CommandResult, Entry};
-use crate::events::EventPayload;
 use crate::session::{Session, SessionEvent};
-use crate::state::Logged;
-use crate::tree::{BranchRecord, Node, NodeRef, Nodes};
+use crate::tree::{index, BranchRecord, NodeRef, Nodes};
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum StoreError {
@@ -86,46 +84,29 @@ impl Store for MemoryStore {
         if entry.version != head + 1 {
             return Err(StoreError::VersionTaken(entry.version));
         }
-        let ids: Vec<String> = entry
+        let indexed: Vec<_> = entry
             .events
             .iter()
-            .filter_map(|e| Node::of_event(&e.payload).map(|n| n.id().to_string()))
+            .map(|e| index(e.seq, &e.payload))
             .collect();
-        let unique: std::collections::HashSet<&String> = ids.iter().collect();
-        if unique.len() < ids.len() || ids.iter().any(|id| space.ids.contains_key(id)) {
+        let ids: Vec<&str> = indexed
+            .iter()
+            .filter_map(|i| i.node.as_ref().map(|n| n.id()))
+            .collect();
+        let unique: std::collections::HashSet<&str> = ids.iter().copied().collect();
+        if unique.len() < ids.len() || ids.iter().any(|id| space.ids.contains_key(*id)) {
             return Err(StoreError::Corrupt("a node id is written twice".into()));
         }
-        for event in &entry.events {
-            let Some(node) = Node::of_event(&event.payload) else {
-                continue;
-            };
-            space.ids.entry(node.id().to_string()).or_insert(event.seq);
-            space.nodes.insert(
-                event.seq,
-                Arc::new(Logged {
-                    seq: event.seq,
-                    entry: node,
-                }),
-            );
-        }
-        for event in &entry.events {
-            match &event.payload {
-                EventPayload::BranchStarted(p) => {
-                    space.branches.insert(
-                        p.id.clone(),
-                        BranchRecord {
-                            state: crate::state::BranchState::started(p, event.seq, 0, false),
-                            closed: None,
-                        },
-                    );
+        for indexed in &indexed {
+            if let Some(node) = &indexed.node {
+                space.ids.insert(node.id().to_string(), indexed.seq);
+                space.nodes.insert(indexed.seq, node.clone());
+            }
+            if let Some(change) = &indexed.change {
+                let known = space.branches.remove(change.id());
+                if let Some(record) = change.record(indexed.seq, known) {
+                    space.branches.insert(change.id().to_string(), record);
                 }
-                EventPayload::BranchClosed(p) => {
-                    if let Some(record) = space.branches.get_mut(&p.id) {
-                        record.state.leaf = p.leaf.clone().or(record.state.leaf.take());
-                        record.closed = Some(p.reason);
-                    }
-                }
-                _ => {}
             }
         }
         for handled in &entry.commands {

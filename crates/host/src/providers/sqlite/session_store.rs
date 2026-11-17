@@ -8,9 +8,7 @@ use quick_cache::{Equivalent, Weighter};
 use rusqlite::{params, OptionalExtension, Row, Transaction, TransactionBehavior};
 use substructure_session::delivery::Start;
 use substructure_session::events::{BranchClosed, BranchStarted, EventPayload};
-use substructure_session::protocol::Role;
-use substructure_session::state::{BranchState, Logged};
-use substructure_session::tree::{BranchRecord, Fact, Node, NodeRef, Nodes};
+use substructure_session::tree::{index, BranchChange, BranchRecord, Fact, Node, NodeRef, Nodes};
 use substructure_session::{
     CommandId, CommandResult, Entry, Handled, Session, SessionEvent, Store, StoreError,
 };
@@ -168,14 +166,10 @@ impl SqliteSessionStore {
     }
 
     fn node_of(&self, seq: i64, payload: &[u8]) -> Result<Option<NodeRef>, StoreError> {
-        if let Some(node) = Node::of_event(&parse(payload)?) {
-            let logged = Arc::new(Logged {
-                seq: seq as u64,
-                entry: node,
-            });
-            return Ok(Some(self.keep(logged, payload.len() as u64)));
-        }
-        Ok(None)
+        let event = parse(payload)?;
+        Ok(index(seq as u64, &event)
+            .node
+            .map(|node| self.keep(node, payload.len() as u64)))
     }
 
     fn select_nodes(
@@ -241,8 +235,9 @@ impl SqliteSessionStore {
             .map_err(unavailable)?;
         for event in &entry.events {
             let (envelope, payload) = split(event)?;
-            let node = Node::of_event(&event.payload);
-            let prev: Option<String> = match node.as_ref().and_then(Node::parent) {
+            let indexed = index(event.seq, &event.payload);
+            let node = indexed.node.as_deref().map(|n| &n.entry);
+            let prev: Option<String> = match node.and_then(Node::parent) {
                 Some(parent) => above
                     .query_row(params![self.tenant_id, self.session_id, parent], |row| {
                         row.get(0)
@@ -252,25 +247,18 @@ impl SqliteSessionStore {
                     .flatten(),
                 None => None,
             };
-            let answers = node.as_ref().and_then(|n| {
-                n.message()
-                    .filter(|m| m.role == Role::Tool)
-                    .and_then(|m| m.tool_call_id.clone())
-            });
             insert
                 .execute(params![
                     self.tenant_id,
                     self.session_id,
                     event.seq as i64,
                     entry.version as i64,
-                    node.as_ref().map(Node::id),
-                    node.as_ref().and_then(Node::parent),
-                    node.as_ref().map(kind),
-                    node.as_ref()
-                        .and_then(Node::branch)
-                        .or_else(|| branch_of(&event.payload)),
+                    node.map(Node::id),
+                    node.and_then(Node::parent),
+                    node.map(kind),
+                    indexed.branch,
                     prev,
-                    answers,
+                    indexed.answers(),
                     envelope,
                     payload,
                 ])
@@ -280,10 +268,10 @@ impl SqliteSessionStore {
     }
 
     fn write_branches(&self, tx: &Transaction, entry: &Entry) -> Result<(), StoreError> {
+        let corrupt = |e: serde_json::Error| StoreError::Corrupt(e.to_string());
         for event in &entry.events {
-            let corrupt = |e: serde_json::Error| StoreError::Corrupt(e.to_string());
-            match &event.payload {
-                EventPayload::BranchStarted(p) => {
+            match index(event.seq, &event.payload).change {
+                Some(BranchChange::Started(p)) => {
                     tx.execute(
                         "INSERT OR REPLACE INTO session_branches
                             (tenant_id, session_id, branch_id, seq, started, closed)
@@ -298,7 +286,7 @@ impl SqliteSessionStore {
                     )
                     .map_err(unavailable)?;
                 }
-                EventPayload::BranchClosed(p) => {
+                Some(BranchChange::Closed(p)) => {
                     tx.execute(
                         "UPDATE session_branches SET closed = ?4
                           WHERE tenant_id = ?1 AND session_id = ?2 AND branch_id = ?3",
@@ -311,7 +299,7 @@ impl SqliteSessionStore {
                     )
                     .map_err(unavailable)?;
                 }
-                _ => {}
+                None => {}
             }
         }
         Ok(())
@@ -324,15 +312,6 @@ fn kind(node: &Node) -> i64 {
         Fact::State { .. } => 1,
         Fact::Config { .. } => 2,
         Fact::Context { .. } => 3,
-    }
-}
-
-fn branch_of(payload: &EventPayload) -> Option<&str> {
-    match payload {
-        EventPayload::BranchStarted(p) => Some(&p.id),
-        EventPayload::BranchClosed(p) => Some(&p.id),
-        EventPayload::BranchMoved(p) => p.branch.as_deref(),
-        _ => None,
     }
 }
 
@@ -731,14 +710,12 @@ impl Nodes for SqliteSessionStore {
             .map(|c| serde_json::from_slice(&c))
             .transpose()
             .map_err(corrupt)?;
-        let mut state = BranchState::started(&started, seq as u64, 0, false);
-        if let Some(leaf) = closed.as_ref().and_then(|c| c.leaf.clone()) {
-            state.leaf = Some(leaf);
-        }
-        Ok(Some(BranchRecord {
-            state,
-            closed: closed.map(|c| c.reason),
-        }))
+        let seq = seq as u64;
+        let record = BranchChange::Started(&started).record(seq, None);
+        Ok(match &closed {
+            Some(closed) => BranchChange::Closed(closed).record(seq, record),
+            None => record,
+        })
     }
 
     fn versions(
