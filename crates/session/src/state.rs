@@ -697,14 +697,29 @@ pub struct BranchState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub closed: Option<BranchEnd>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent: Option<String>,
+    #[serde(default)]
+    pub depth: usize,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub detached: bool,
 }
 
 impl BranchState {
-    pub fn is_open(&self) -> bool {
-        self.closed.is_none()
+    pub fn started(p: &BranchStarted, seq: u64, depth: usize, detached: bool) -> Self {
+        BranchState {
+            node: p.node.clone(),
+            from: p.from.clone(),
+            parent: p.parent.clone(),
+            agent: p.agent.clone(),
+            name: p.name.clone(),
+            mode: p.mode,
+            seq,
+            leaf: p.leaf.clone(),
+            turn_id: p.turn_id.clone(),
+            subagent: p.subagent.clone(),
+            depth,
+            detached,
+        }
     }
 
     pub fn at(&self) -> Option<&str> {
@@ -1057,7 +1072,7 @@ impl SessionState {
     }
 
     pub fn open_branch(&self, id: &str) -> Option<&BranchState> {
-        self.branches.get(id).filter(|b| b.is_open())
+        self.branches.get(id)
     }
 
     pub fn parallel_branches(&self) -> bool {
@@ -1074,25 +1089,15 @@ impl SessionState {
     }
 
     pub fn detached(&self, branch: Option<&str>) -> bool {
-        let mut cursor = branch;
-        let mut seen = 0;
-        while let Some(b) = cursor.and_then(|id| self.branches.get(id)) {
-            if b.mode == BranchMode::Detached {
-                return true;
-            }
-            cursor = b.parent.as_deref();
-            seen += 1;
-            if seen > self.branches.len() {
-                break;
-            }
-        }
-        false
+        branch
+            .and_then(|b| self.branches.get(b))
+            .is_some_and(|b| b.detached)
     }
 
     pub fn held_by_branches(&self, parent: Option<&str>) -> usize {
         self.branches
             .values()
-            .filter(|b| b.is_open() && b.mode == BranchMode::Blocking)
+            .filter(|b| b.mode == BranchMode::Blocking)
             .filter(|b| b.parent.as_deref() == parent)
             .count()
     }
@@ -1758,43 +1763,22 @@ impl SessionState {
                         l.summary = Some(p.id.clone());
                     }
                 }
-                match self.branches.get_mut(&p.id) {
-                    Some(b) if !b.is_open() => {
-                        b.closed = None;
-                        b.mode = p.mode;
-                        b.turn_id = p.turn_id.clone();
-                        b.subagent = p.subagent.clone();
-                    }
-                    Some(_) => {}
-                    None => {
-                        self.branches.insert(
-                            p.id.clone(),
-                            BranchState {
-                                node: p.node.clone(),
-                                from: p.from.clone(),
-                                parent: p.parent.clone(),
-                                agent: p.agent.clone(),
-                                name: p.name.clone(),
-                                mode: p.mode,
-                                seq: ctx.sequence,
-                                leaf: None,
-                                turn_id: p.turn_id.clone(),
-                                closed: None,
-                                subagent: p.subagent.clone(),
-                            },
-                        );
-                        if let Some(node) = crate::tree::Node::of_event(event) {
-                            self.grow(node, ctx.sequence);
-                        }
+                if !self.branches.contains_key(&p.id) {
+                    let parent = p.parent.as_deref().and_then(|b| self.branches.get(b));
+                    let depth = parent.map_or(0, |b| b.depth) + 1;
+                    let detached =
+                        p.mode == BranchMode::Detached || parent.is_some_and(|b| b.detached);
+                    let branch = BranchState::started(p, ctx.sequence, depth, detached);
+                    self.tree.record(&p.id, branch.clone(), None);
+                    self.branches.insert(p.id.clone(), branch);
+                    if let Some(node) = crate::tree::Node::of_event(event) {
+                        self.grow(node, ctx.sequence);
                     }
                 }
             }
             EventPayload::BranchClosed(p) => {
-                if let Some(b) = self.branches.get_mut(&p.id) {
-                    b.closed = match (b.closed, p.reason) {
-                        (_, BranchEnd::Promoted) | (None, _) => Some(p.reason),
-                        (closed, _) => closed,
-                    };
+                if let Some(branch) = self.branches.remove(&p.id) {
+                    self.tree.record(&p.id, branch, Some(p.reason));
                 }
             }
             EventPayload::HeadMoved(payload) => {

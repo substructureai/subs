@@ -73,7 +73,7 @@ pub fn plan(state: &SessionState, now: DateTime<Utc>) -> Vec<ScheduleStep> {
 
 fn owed_fetches(state: &SessionState) -> Vec<ScheduleStep> {
     let mut owed = state.at_head().unsynced_connectors();
-    for (id, _) in state.branches.iter().filter(|(_, b)| b.is_open()) {
+    for id in state.branches.keys() {
         for path in state.at_scope(Some(id)).unsynced_connectors() {
             if !owed.contains(&path) {
                 owed.push(path);

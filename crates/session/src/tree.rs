@@ -4,8 +4,9 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 use crate::decision::BranchConfig;
+use crate::events::BranchEnd;
 use crate::protocol::{AgentConfig, DraftMessage, Message, NewMessage, WorkerState};
-use crate::state::Logged;
+use crate::state::{BranchState, Logged};
 use crate::store::StoreError;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -86,11 +87,54 @@ impl Node {
 
 pub type Shared = Arc<Logged<Node>>;
 
+#[derive(Debug, Clone)]
+pub struct BranchRecord {
+    pub state: BranchState,
+    pub closed: Option<BranchEnd>,
+}
+
+pub fn branch_record<'a>(
+    events: impl IntoIterator<Item = (u64, &'a crate::events::EventPayload)>,
+) -> Option<BranchRecord> {
+    use crate::events::EventPayload;
+    let mut record: Option<BranchRecord> = None;
+    for (seq, event) in events {
+        match event {
+            EventPayload::BranchStarted(p) => match record.as_mut() {
+                Some(r) => r.closed = None,
+                None => {
+                    record = Some(BranchRecord {
+                        state: BranchState::started(p, seq, 0, false),
+                        closed: None,
+                    })
+                }
+            },
+            EventPayload::BranchClosed(p) => {
+                if let Some(r) = record.as_mut() {
+                    r.closed = Some(p.reason);
+                }
+            }
+            EventPayload::HeadMoved(p) => {
+                if let Some(r) = record.as_mut() {
+                    r.state.leaf = Some(p.head_id.clone());
+                }
+            }
+            other => {
+                if let (Some(r), Some(node)) = (record.as_mut(), Node::of_event(other)) {
+                    r.state.leaf = Some(node.id().to_string());
+                }
+            }
+        }
+    }
+    record
+}
+
 pub trait Nodes: Send + Sync {
     fn node(&self, id: &str) -> Result<Option<Shared>, StoreError>;
     fn ancestors(&self, id: &str) -> Result<Vec<Shared>, StoreError>;
     fn children(&self, parent: &str, branch: Option<&str>) -> Result<Vec<Shared>, StoreError>;
     fn answers(&self, tool_call_id: &str) -> Result<Vec<Shared>, StoreError>;
+    fn branch(&self, id: &str) -> Result<Option<BranchRecord>, StoreError>;
     fn remember(&self, _nodes: Vec<Shared>) {}
 }
 
@@ -98,6 +142,7 @@ pub trait Nodes: Send + Sync {
 pub struct Tree {
     source: Option<Arc<dyn Nodes>>,
     fresh: HashMap<String, Shared>,
+    branches: HashMap<String, BranchRecord>,
     failed: Mutex<Option<StoreError>>,
 }
 
@@ -106,6 +151,7 @@ impl Clone for Tree {
         Tree {
             source: self.source.clone(),
             fresh: self.fresh.clone(),
+            branches: self.branches.clone(),
             failed: Mutex::default(),
         }
     }
@@ -161,11 +207,24 @@ impl Tree {
             .or_insert_with(|| Arc::new(node));
     }
 
-    pub fn flush(&mut self) {
-        let fresh: Vec<Shared> = self.fresh.drain().map(|(_, node)| node).collect();
-        if let Some(source) = &self.source {
-            source.remember(fresh);
+    pub fn record(&mut self, id: &str, state: BranchState, closed: Option<BranchEnd>) {
+        self.branches
+            .insert(id.to_string(), BranchRecord { state, closed });
+    }
+
+    pub fn branch(&self, id: &str) -> Option<BranchRecord> {
+        match self.branches.get(id) {
+            Some(record) => Some(record.clone()),
+            None => self.read(|s| s.branch(id)),
         }
+    }
+
+    pub fn flush(&mut self) {
+        let Some(source) = &self.source else {
+            return;
+        };
+        self.branches.clear();
+        source.remember(self.fresh.drain().map(|(_, node)| node).collect());
     }
 
     pub fn fresh(&self) -> impl Iterator<Item = &Shared> {
@@ -337,7 +396,7 @@ impl Node {
                     placed: c.placed.clone(),
                 },
             },
-            EventPayload::BranchStarted(b) => Node {
+            EventPayload::BranchStarted(b) if b.leaf.is_none() => Node {
                 place: Place {
                     id: b.node.clone(),
                     parent_id: b.from.clone(),

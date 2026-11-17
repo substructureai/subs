@@ -228,6 +228,10 @@ fn a_finished_draft_is_promoted_from_the_log_and_a_reload_agrees() {
         }],
     );
     assert!(matches!(run.live_trigger(), Trigger::BranchFinished { .. }));
+    assert!(
+        !run.session.state().branches.contains_key("draft-b"),
+        "a finished branch leaves the state"
+    );
     let d = run.live();
     run.decide(d, run.path(None), vec![]);
 
@@ -443,7 +447,12 @@ fn a_diverging_reply_on_a_branch_moves_its_leaf_and_stays_off_the_chat() {
     assert_eq!(written[0].branch.as_deref(), Some("draft"));
     assert_eq!(run.session.state().head_id, head, "the chat does not move");
     assert_eq!(
-        run.session.state().branches["draft"].leaf.as_deref(),
+        run.session
+            .state()
+            .tree
+            .branch("draft")
+            .and_then(|b| b.state.leaf)
+            .as_deref(),
         Some("x1")
     );
 }
@@ -498,7 +507,12 @@ fn a_branch_reply_that_only_drops_messages_moves_its_leaf_back() {
         "got {events:?}"
     );
     assert_eq!(
-        run.session.state().branches["draft"].leaf.as_deref(),
+        run.session
+            .state()
+            .tree
+            .branch("draft")
+            .and_then(|b| b.state.leaf)
+            .as_deref(),
         Some(start.as_str())
     );
 }

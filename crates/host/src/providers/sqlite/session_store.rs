@@ -10,7 +10,7 @@ use substructure_session::delivery::Start;
 use substructure_session::events::EventPayload;
 use substructure_session::protocol::{NewMessage, Role};
 use substructure_session::state::Logged;
-use substructure_session::tree::{Fact, Node, Nodes, Shared};
+use substructure_session::tree::{BranchRecord, Fact, Node, Nodes, Shared};
 use substructure_session::{
     CommandId, CommandResult, Entry, Handled, Session, SessionEvent, Store, StoreError,
 };
@@ -250,7 +250,9 @@ impl SqliteSessionStore {
                     node.as_ref().map(Node::id),
                     node.as_ref().and_then(Node::parent),
                     node.as_ref().map(kind),
-                    node.as_ref().and_then(Node::branch),
+                    node.as_ref()
+                        .and_then(Node::branch)
+                        .or_else(|| branch_of(&event.payload)),
                     answers,
                     envelope,
                     payload,
@@ -267,6 +269,15 @@ fn kind(node: &Node) -> i64 {
         Fact::State { .. } => 1,
         Fact::Config { .. } => 2,
         Fact::Context { .. } => 3,
+    }
+}
+
+fn branch_of(payload: &EventPayload) -> Option<&str> {
+    match payload {
+        EventPayload::BranchStarted(p) => Some(&p.id),
+        EventPayload::BranchClosed(p) => Some(&p.id),
+        EventPayload::HeadMoved(p) => p.branch.as_deref(),
+        _ => None,
     }
 }
 
@@ -657,6 +668,35 @@ impl Nodes for SqliteSessionStore {
               ORDER BY seq",
             params![self.tenant_id, self.session_id, tool_call_id],
         )
+    }
+
+    fn branch(&self, id: &str) -> Result<Option<BranchRecord>, StoreError> {
+        let conn = self.reader()?;
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT seq, payload FROM session_events
+                  WHERE tenant_id = ?1 AND session_id = ?2 AND branch = ?3 AND node_id IS NULL
+                 UNION ALL
+                 SELECT * FROM (SELECT seq, payload FROM session_events
+                  WHERE tenant_id = ?1 AND session_id = ?2 AND branch = ?3
+                    AND node_id IS NOT NULL
+                  ORDER BY seq DESC LIMIT 1)
+                 ORDER BY seq",
+            )
+            .map_err(unavailable)?;
+        let rows = stmt
+            .query_map(params![self.tenant_id, self.session_id, id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(unavailable)?;
+        let mut events = Vec::new();
+        for row in rows {
+            let (seq, payload) = row.map_err(unavailable)?;
+            events.push((seq as u64, parse(&payload)?));
+        }
+        Ok(substructure_session::tree::branch_record(
+            events.iter().map(|(seq, event)| (*seq, event)),
+        ))
     }
 
     fn remember(&self, nodes: Vec<Shared>) {

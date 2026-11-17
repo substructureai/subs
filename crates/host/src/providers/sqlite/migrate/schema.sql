@@ -9,6 +9,9 @@ CREATE INDEX idx_engine_queue_topic ON engine_queue (topic, visible_at, enqueued
 CREATE INDEX idx_session_events_answers
             ON session_events (tenant_id, session_id, answers) WHERE answers IS NOT NULL;
 
+CREATE INDEX idx_session_events_branch
+            ON session_events (tenant_id, session_id, branch, seq) WHERE branch IS NOT NULL;
+
 CREATE INDEX idx_session_events_children
             ON session_events (tenant_id, session_id, parent_id, branch, seq)
             WHERE node_id IS NOT NULL;

@@ -20,7 +20,7 @@ impl SessionState {
             found.extend(
                 self.branches
                     .iter()
-                    .filter(|(_, b)| b.is_open() && b.parent.as_deref() == Some(parent.as_str()))
+                    .filter(|(_, b)| b.parent.as_deref() == Some(parent.as_str()))
                     .map(|(child, _)| child.clone()),
             );
             at += 1;
@@ -50,16 +50,9 @@ impl SessionState {
     }
 
     pub fn branch_depth(&self, branch: Option<&str>) -> usize {
-        let mut depth = 0;
-        let mut cursor = branch;
-        while let Some(b) = cursor.and_then(|id| self.branches.get(id)) {
-            depth += 1;
-            if depth > self.branches.len() {
-                break;
-            }
-            cursor = b.parent.as_deref();
-        }
-        depth
+        branch
+            .and_then(|b| self.branches.get(b))
+            .map_or(0, |b| b.depth)
     }
 
     pub fn close_branch(
@@ -148,7 +141,7 @@ impl SessionState {
     pub fn void_turn_branches(&self) -> Vec<EventPayload> {
         self.branches
             .iter()
-            .filter(|(_, b)| b.is_open() && b.mode == BranchMode::Blocking)
+            .filter(|(_, b)| b.mode == BranchMode::Blocking)
             .filter(|(_, b)| !self.detached(b.parent.as_deref()))
             .filter(|(_, b)| b.parent.is_none())
             .flat_map(|(id, _)| {
@@ -162,7 +155,7 @@ impl SessionState {
         let at = self.at(node.as_deref());
         self.branches
             .iter()
-            .filter(|(_, b)| b.is_open() && b.parent.as_deref() == scope)
+            .filter(|(_, b)| b.parent.as_deref() == scope)
             .filter(|(_, b)| b.mode == BranchMode::Blocking)
             .filter(|(_, b)| b.from.is_some() && !at.anchor_on_path(b.from.as_deref()))
             .flat_map(|(id, _)| {
@@ -183,9 +176,10 @@ impl SessionState {
                 }
         });
         let waits = self.held_by_branches(Some(id)) > 0
-            || self.branches.values().any(|b| {
-                b.is_open() && b.parent.as_deref() == Some(id) && b.mode == BranchMode::Detached
-            });
+            || self
+                .branches
+                .values()
+                .any(|b| b.parent.as_deref() == Some(id) && b.mode == BranchMode::Detached);
         let parked = self.at_scope(Some(id)).active_interrupt_for().is_some();
         if busy || waits || parked {
             return Vec::new();
@@ -201,7 +195,7 @@ impl Working {
         messages: Vec<DraftMessage>,
     ) -> Option<String> {
         let parent = self.scope.clone();
-        if self.branches.contains_key(&start.id) {
+        if self.branches.contains_key(&start.id) || self.tree.branch(&start.id).is_some() {
             tracing::debug!(branch = %start.id, "branch already started; nothing to do");
             return None;
         }
@@ -261,6 +255,7 @@ impl Working {
             mode: start.mode,
             turn_id,
             subagent: None,
+            leaf: None,
         })));
         let mut parent_id = self.scope_node(Some(&start.id));
         for draft in messages {
@@ -285,8 +280,11 @@ impl Working {
         call_id: &str,
         messages: Vec<DraftMessage>,
     ) -> Option<String> {
-        if let Some(b) = self.branches.get(call_id) {
-            return b.is_open().then(|| call_id.to_string());
+        if self.branches.contains_key(call_id) {
+            return Some(call_id.to_string());
+        }
+        if self.tree.branch(call_id).is_some() {
+            return None;
         }
         let (from, shared) = self.recorded_prefix(&messages);
         let start = BranchStart {
@@ -339,7 +337,12 @@ impl Working {
             name: None,
             reasoning: None,
         });
-        let (from, agent, mut own, node) = match self.branches.get(&branch) {
+        let known = self
+            .branches
+            .get(&branch)
+            .cloned()
+            .or_else(|| self.tree.branch(&branch).map(|r| r.state));
+        let (from, agent, mut own, node) = match known {
             Some(b) => {
                 let leaf = b.at().map(str::to_string);
                 if leaf.as_deref().is_some_and(|l| !self.has_node(l)) {
@@ -377,6 +380,7 @@ impl Working {
             mode,
             turn_id,
             subagent: Some(call.to_string()),
+            leaf: own.clone(),
         })));
         if let BranchConfig::Config(config) = &agent {
             self.then(|s| effects::connector::sync(s, config));
@@ -440,11 +444,15 @@ impl Working {
     }
 
     pub(super) fn promote_branch(&mut self, id: &str) {
-        let Some(branch) = self.branches.get(id) else {
+        let record = match self.branches.get(id) {
+            Some(open) => Some((open.clone(), None)),
+            None => self.tree.branch(id).map(|r| (r.state, r.closed)),
+        };
+        let Some((branch, closed)) = record else {
             tracing::warn!(branch = id, "branch.promote names no branch");
             return;
         };
-        let promotable = matches!(branch.closed, None | Some(BranchEnd::Done))
+        let promotable = matches!(closed, None | Some(BranchEnd::Done))
             && branch.parent.is_none()
             && self.branch_and_below(id).len() == 1;
         let Some(leaf) = branch.leaf.clone().filter(|_| promotable) else {

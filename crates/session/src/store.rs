@@ -7,7 +7,7 @@ use crate::entry::{CommandId, CommandResult, Entry};
 use crate::protocol::NewMessage;
 use crate::session::{Session, SessionEvent};
 use crate::state::Logged;
-use crate::tree::{Node, Nodes, Shared};
+use crate::tree::{BranchRecord, Node, Nodes, Shared};
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum StoreError {
@@ -229,6 +229,16 @@ impl Nodes for MemoryStore {
             .collect())
     }
 
+    fn branch(&self, id: &str) -> Result<Option<BranchRecord>, StoreError> {
+        let space = self.space();
+        let events = space.log.values().flat_map(|entry| entry.events.iter());
+        Ok(crate::tree::branch_record(
+            events
+                .filter(|e| touches(&e.payload, id))
+                .map(|e| (e.seq, &e.payload)),
+        ))
+    }
+
     fn answers(&self, tool_call_id: &str) -> Result<Vec<Shared>, StoreError> {
         Ok(self
             .space()
@@ -240,5 +250,15 @@ impl Nodes for MemoryStore {
             })
             .cloned()
             .collect())
+    }
+}
+
+pub fn touches(payload: &crate::events::EventPayload, branch: &str) -> bool {
+    use crate::events::EventPayload;
+    match payload {
+        EventPayload::BranchStarted(p) => p.id == branch,
+        EventPayload::BranchClosed(p) => p.id == branch,
+        EventPayload::HeadMoved(p) => p.branch.as_deref() == Some(branch),
+        other => Node::of_event(other).is_some_and(|n| n.branch() == Some(branch)),
     }
 }
