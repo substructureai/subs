@@ -70,7 +70,7 @@ pub struct SqliteSessionStore {
 }
 
 impl SqliteSessionStore {
-    fn reader(&self) -> Result<rusqlite::Connection, StoreError> {
+    fn reader(&self) -> Result<super::Reader, StoreError> {
         self.db
             .reader
             .open()

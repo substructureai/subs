@@ -25,14 +25,54 @@ pub use session_index::SqliteSessionIndexStore;
 pub use session_store::{SqliteSessionStore, SqliteSessionStores};
 pub use wake::SqliteAlarms;
 
+const IDLE_READERS: usize = 16;
+
 #[derive(Clone)]
 pub struct ReaderConfig {
     path: String,
     busy_timeout: Duration,
+    idle: Arc<Mutex<Vec<Connection>>>,
+}
+
+pub struct Reader {
+    conn: Option<Connection>,
+    idle: Arc<Mutex<Vec<Connection>>>,
+}
+
+impl std::ops::Deref for Reader {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.conn
+            .as_ref()
+            .expect("a reader holds its connection until dropped")
+    }
+}
+
+impl Drop for Reader {
+    fn drop(&mut self) {
+        let Some(conn) = self.conn.take() else { return };
+        if let Ok(mut idle) = self.idle.lock() {
+            if idle.len() < IDLE_READERS {
+                idle.push(conn);
+            }
+        }
+    }
 }
 
 impl ReaderConfig {
-    pub fn open(&self) -> Result<Connection, StoreError> {
+    pub fn open(&self) -> Result<Reader, StoreError> {
+        let kept = self.idle.lock().ok().and_then(|mut idle| idle.pop());
+        let conn = match kept {
+            Some(conn) => conn,
+            None => self.connect()?,
+        };
+        Ok(Reader {
+            conn: Some(conn),
+            idle: self.idle.clone(),
+        })
+    }
+
+    fn connect(&self) -> Result<Connection, StoreError> {
         let conn = Connection::open_with_flags(
             &self.path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
@@ -80,6 +120,7 @@ impl SqliteDb {
         let reader = ReaderConfig {
             path: path_str,
             busy_timeout,
+            idle: Arc::default(),
         };
 
         let db = Self {
