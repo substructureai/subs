@@ -9,7 +9,7 @@ use crate::connectors::ConnectionPath;
 use crate::connectors::{AuthNeed, RemoteTool};
 pub use crate::protocol::EffectKind;
 use crate::protocol::{
-    AgentConfig, BranchMode, ClientContext, ConnectorToolKind, ContextReason, ContextStrategyKind,
+    AgentConfig, BranchMode, ConnectorToolKind, ContextReason, ContextStrategyKind,
     DeferToolsStrategy, DraftMessage, ErrorInfo, HeldCall, InterruptOrigin, LlmFormat, LlmResponse,
     Message, MessageTree, NewMessage, RetryPolicy, SessionOwner, SpawnMode, StoredResult, Usage,
     WorkerRef, WorkerState,
@@ -89,8 +89,6 @@ pub enum EventPayload {
     DecisionQueued(DecisionQueued),
     #[serde(rename = "decision.dropped")]
     DecisionDropped(DecisionDropped),
-    #[serde(rename = "decision.amended")]
-    DecisionAmended(DecisionAmended),
     #[serde(rename = "call.voided")]
     CallVoided(CallVoided),
     #[serde(rename = "session.cancelled")]
@@ -719,15 +717,6 @@ pub struct DecisionDropped {
     /// The ids of the client messages the decision held.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub messages: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DecisionAmended {
-    pub id: String,
-    pub messages: Vec<DraftMessage>,
-    pub client: ClientContext,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub metadata: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

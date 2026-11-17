@@ -342,6 +342,13 @@ impl SessionState {
     }
 
     fn apply_decision_queued(&mut self, p: &DecisionQueued, ctx: &ApplyContext) {
+        if let Some(queued) = self
+            .effect_mut(EffectKind::Decision, &p.id)
+            .and_then(|e| e.decision_mut())
+        {
+            queued.trigger = p.trigger.clone();
+            return;
+        }
         match &p.trigger {
             Trigger::SessionStart => self.session_start_failed = false,
             Trigger::TurnFinished { .. } => self.quiet_end = None,
@@ -678,22 +685,6 @@ impl SessionState {
             EventPayload::DecisionErrored(p) => self.apply_decision_errored(p, now),
             EventPayload::SessionMessageRequested(_) => {}
             EventPayload::DecisionQueued(p) => self.apply_decision_queued(p, ctx),
-            EventPayload::DecisionAmended(p) => {
-                if let Some(Trigger::ClientMessage {
-                    messages,
-                    client,
-                    metadata,
-                    ..
-                }) = self
-                    .effect_mut(EffectKind::Decision, &p.id)
-                    .and_then(|e| e.decision_mut())
-                    .map(|d| &mut d.trigger)
-                {
-                    messages.extend(p.messages.iter().cloned());
-                    *client = std::mem::take(client).followed_by(p.client.clone());
-                    metadata.extend(p.metadata.clone());
-                }
-            }
             EventPayload::DecisionDropped(p) => {
                 self.remove_effect(EffectKind::Decision, &p.id);
                 self.dequeue(EffectKind::Decision, &p.id);

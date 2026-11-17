@@ -1295,7 +1295,7 @@ fn trace_merged_turn() {
         "decision.queued",
         "decision.dispatched",
         "decision.queued",
-        "decision.amended",
+        "decision.queued",
         "decision.completed",
         "message.new",
         "decision.queued",

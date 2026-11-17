@@ -392,11 +392,25 @@ impl SessionState {
             .into_iter()
             .filter(|m| m.id.as_deref().is_none_or(|id| !held.contains(id)))
             .collect();
-        let queued = vec![EventPayload::DecisionAmended(DecisionAmended {
+        let Some(decision) = self.worker_decision(waiting.decision_id) else {
+            return (Vec::new(), None);
+        };
+        let mut trigger = decision.trigger.clone();
+        if let Trigger::ClientMessage {
+            messages,
+            client: held,
+            metadata: kept,
+            ..
+        } = &mut trigger
+        {
+            messages.extend(fresh);
+            *held = std::mem::take(held).followed_by(client);
+            kept.extend(metadata);
+        }
+        let queued = vec![EventPayload::DecisionQueued(DecisionQueued {
             id: waiting.decision_id.to_string(),
-            messages: fresh,
-            client,
-            metadata,
+            trigger,
+            branch: decision.branch.clone(),
         })];
         (queued, Some(waiting.turn_id.to_string()))
     }
