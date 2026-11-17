@@ -352,12 +352,6 @@ impl SessionState {
         match &p.trigger {
             Trigger::SessionStart => self.session_start_failed = false,
             Trigger::TurnFinished { .. } => self.quiet_end = None,
-            Trigger::ClientMessage { messages, .. } if self.title.is_none() => {
-                self.title = messages
-                    .iter()
-                    .filter(|m| m.role == Role::User)
-                    .find_map(|m| m.content.as_ref().and_then(|c| title(&c.text_owned())));
-            }
             _ => {}
         }
         let retry_policy = self.worker_retry.clone().unwrap_or(RetryPolicy::no_retry());
@@ -920,7 +914,7 @@ fn remember(turns: &mut Vec<String>, turn_id: &str) {
 }
 
 #[cfg(test)]
-mod summary_fold_tests {
+mod turn_fold_tests {
     use serde_json::json;
 
     use super::*;
@@ -934,31 +928,6 @@ mod summary_fold_tests {
                 sequence: 1,
             },
         );
-    }
-
-    fn client_message(id: &str, text: &str) -> serde_json::Value {
-        json!({
-            "type": "decision.queued",
-            "id": id,
-            "trigger": {"type": "client.message", "messages": [{"role": "user", "content": text}]},
-        })
-    }
-
-    #[test]
-    fn the_title_is_the_first_client_message_on_one_line() {
-        let mut s = SessionState::new("sess-1".to_string());
-        apply(&mut s, client_message("d1", "  Where is\n my   order? "));
-        apply(&mut s, client_message("d2", "Any update?"));
-        assert_eq!(s.title.as_deref(), Some("Where is my order?"));
-    }
-
-    #[test]
-    fn a_title_is_clipped() {
-        assert_eq!(
-            title(&"x".repeat(500)).unwrap().chars().count(),
-            TITLE_CHARS
-        );
-        assert_eq!(title("   "), None);
     }
 
     #[test]

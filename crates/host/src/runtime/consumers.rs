@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use substructure_session::delivery::{AtLimit, Restart, Start, Subscription, Unsent, WorkReader};
+use substructure_session::events::EventPayload;
 use substructure_session::{Session, ToolTarget, Work, WorkId};
 
 use crate::plugins::PluginResolver;
@@ -268,9 +269,13 @@ impl Reader for IndexReader {
         &self,
         _sessions: &Sessions,
         session: &Session,
-        _events: &[SessionEvent],
+        events: &[SessionEvent],
     ) -> Result<(), DeliveryError> {
         let summary = session.summary();
+        let title = events.iter().find_map(|e| match &e.payload {
+            EventPayload::DecisionQueued(q) => q.trigger.title(),
+            _ => None,
+        });
         self.0
             .upsert_session_index(SessionIndexRecord {
                 tenant_id: summary.tenant_id,
@@ -290,7 +295,7 @@ impl Reader for IndexReader {
                 ),
                 status: summary.status,
                 turn_id: summary.turn_id,
-                title: summary.title,
+                title,
                 user_id: summary.user_id,
                 turns: summary.turns,
                 input_tokens: summary.usage.input,

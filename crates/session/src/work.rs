@@ -138,7 +138,6 @@ pub struct Summary {
     pub last_event_at: Option<DateTime<Utc>>,
     pub wake_at: Option<DateTime<Utc>>,
     /// The first thing the user said, as a one-line title.
-    pub title: Option<String>,
     /// The owner's subject id: who the session is with.
     pub user_id: Option<String>,
     pub turns: u64,
@@ -192,7 +191,6 @@ impl Session {
         let state = &self.state;
         let meta = state.event_meta(self.last_event_at.unwrap_or_default());
         let running = state.phase.turn_id().is_some();
-        let title = state.title.clone();
         Summary {
             session_id: self.id.clone(),
             tenant_id: self.tenant_id.clone(),
@@ -206,7 +204,6 @@ impl Session {
             first_event_at: self.first_event_at,
             last_event_at: self.last_event_at,
             wake_at: self.wake_at,
-            title,
             user_id: state
                 .owner
                 .as_ref()

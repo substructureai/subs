@@ -7,11 +7,11 @@ use crate::attachments;
 use crate::decision::Trigger;
 use crate::ids::Ids;
 use crate::propose::{propose, Proposing};
-use crate::protocol::QueueMode;
 use crate::protocol::{
     AgentConfig, BranchView, ClientContext, DecisionRequest, DecisionResponse, DecisionTrigger,
     DecisionTurn, DeferToolsStrategy, DraftMessage, Effect, InterruptResumption, LlmFormat,
-    LlmRequest, Message, MessageTree, SessionOwner, WorkerIdentity, WorkerRef, WorkerState,
+    LlmRequest, Message, MessageTree, QueueMode, SessionOwner, WorkerIdentity, WorkerRef,
+    WorkerState,
 };
 use crate::session::Session;
 use crate::span::SpanContext;

@@ -26,7 +26,7 @@ use crate::connectors::{filter, AuthNeed, RemoteTool};
 
 use crate::protocol::{
     AgentTool, BoundServer, ConnectorTool, ConnectorToolKind, DeferToolsStrategy, Handler,
-    McpServer, StoredResult, SubagentToolsStrategy, CALL_TOOL, RUN_CODE, SKILL,
+    McpServer, QueueMode, StoredResult, SubagentToolsStrategy, CALL_TOOL, RUN_CODE, SKILL,
 };
 
 use crate::system1::System1Request;
@@ -42,7 +42,6 @@ use crate::protocol::{
     SpawnMode, SubagentTools, Usage, WorkerRef, WorkerState,
 };
 
-use crate::protocol::QueueMode;
 use crate::retry::RetryState;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -438,10 +437,6 @@ pub struct SessionState {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub last_turn_failed: bool,
 
-    /// The first thing a client said, kept even when no turn ever answered it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub detached_turns: Vec<String>,
 
@@ -499,7 +494,6 @@ impl SessionState {
             turns: 0,
             recent_turns: Vec::new(),
             last_turn_failed: false,
-            title: None,
             detached_turns: Vec::new(),
             head_id: None,
             tree: crate::tree::Tree::default(),
@@ -1056,12 +1050,4 @@ pub fn waiting_on_client(calls: &[Effect]) -> bool {
         .filter(|c| c.name.as_deref() != Some(RUN_CODE))
         .peekable();
     open.peek().is_some() && open.all(|c| c.handler == Some(Handler::Client))
-}
-
-const TITLE_CHARS: usize = 200;
-
-/// A message as a one-line title: whitespace collapsed, clipped.
-pub fn title(text: &str) -> Option<String> {
-    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    (!line.is_empty()).then(|| line.chars().take(TITLE_CHARS).collect())
 }

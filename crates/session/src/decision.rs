@@ -4,11 +4,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::connectors::ConnectionPath;
-use crate::protocol::QueueMode;
 use crate::protocol::{
     AgentConfig, BranchMode, ClientContext, ContextReason, ContextStrategyKind, DeferToolsStrategy,
-    DraftMessage, ErrorInfo, Handler, HeldCall, LlmFormat, LlmRequest, LlmResponse, RetryOverride,
-    RetryPolicy, SpawnMode, StoredResult, ToolResult, Usage,
+    DraftMessage, ErrorInfo, Handler, HeldCall, LlmFormat, LlmRequest, LlmResponse, QueueMode,
+    RetryOverride, RetryPolicy, Role, SpawnMode, StoredResult, ToolResult, Usage,
 };
 use crate::retry::RetryTarget;
 use crate::state::TurnPhase;
@@ -372,6 +371,17 @@ impl Trigger {
         }
     }
 
+    /// The first line a person wrote, clipped, for naming the session.
+    pub fn title(&self) -> Option<String> {
+        let Trigger::ClientMessage { messages, .. } = self else {
+            return None;
+        };
+        messages
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .find_map(|m| title(&m.content.as_ref()?.text_owned()))
+    }
+
     pub fn deferred_turn_id(&self) -> Option<&str> {
         match self {
             Trigger::ClientMessage { turn_id, queue, .. } if *queue != QueueMode::Join => {
@@ -585,4 +595,42 @@ pub enum Action {
         #[serde(default)]
         messages: Vec<DraftMessage>,
     },
+}
+
+const TITLE_CHARS: usize = 200;
+
+fn title(text: &str) -> Option<String> {
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!line.is_empty()).then(|| line.chars().take(TITLE_CHARS).collect())
+}
+
+#[cfg(test)]
+mod title_tests {
+    use super::*;
+
+    fn asked(text: &str) -> Trigger {
+        serde_json::from_value(serde_json::json!({
+            "type": "client.message",
+            "messages": [{"role": "user", "content": text}],
+            "queue": false,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_title_is_the_first_line_a_person_wrote() {
+        assert_eq!(
+            asked("  Where is\n my   order? ").title().as_deref(),
+            Some("Where is my order?")
+        );
+        assert_eq!(asked("   ").title(), None);
+    }
+
+    #[test]
+    fn a_title_is_clipped() {
+        assert_eq!(
+            asked(&"x".repeat(500)).title().unwrap().chars().count(),
+            TITLE_CHARS
+        );
+    }
 }

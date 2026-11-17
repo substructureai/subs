@@ -498,7 +498,7 @@ fn do_upsert_session_index(
             status_json = excluded.status_json,
             turn_id = excluded.turn_id,
             updated_at = excluded.updated_at,
-            title = excluded.title,
+            title = COALESCE(session_index.title, excluded.title),
             user_id = excluded.user_id,
             turns = excluded.turns,
             activity = excluded.activity,
@@ -599,6 +599,36 @@ mod tests {
     async fn ids(store: &SqliteSessionIndexStore, filter: SessionFilter) -> Vec<String> {
         let page = store.list_sessions(&filter).await.unwrap();
         page.items.into_iter().map(|i| i.session_id).collect()
+    }
+
+    #[tokio::test]
+    async fn a_session_keeps_the_first_title_it_was_given() {
+        let store = store();
+        store
+            .upsert_session_index(record(
+                "a",
+                1,
+                "Where is my order?",
+                "u1",
+                SessionActivity::Idle,
+            ))
+            .await
+            .unwrap();
+        for (seq, title) in [(2, None), (3, Some("Any update?".to_string()))] {
+            let later = SessionIndexRecord {
+                seq,
+                title,
+                ..record("a", 1, "", "u1", SessionActivity::Idle)
+            };
+            store.upsert_session_index(later).await.unwrap();
+        }
+        let item = store
+            .list_sessions(&filter())
+            .await
+            .unwrap()
+            .items
+            .remove(0);
+        assert_eq!(item.title.as_deref(), Some("Where is my order?"));
     }
 
     #[tokio::test]
