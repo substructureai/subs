@@ -454,6 +454,8 @@ pub struct EffectState {
     pub asked_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<String>,
     pub payload: EffectPayload,
 }
 
@@ -522,6 +524,7 @@ impl EffectState {
             tracking,
             asked_at: None,
             branch: None,
+            turn: None,
             payload,
         }
     }

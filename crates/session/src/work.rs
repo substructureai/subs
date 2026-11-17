@@ -420,7 +420,7 @@ impl Session {
                 owner: state.owner.clone()?,
                 agent_id: state.agent_id.clone()?,
                 ancestry: state.ancestry.clone(),
-                turn_id: state.turn_id().map(str::to_string),
+                turn_id: effect.turn.clone(),
                 retry: effect.tracking.retry_policy.clone(),
             }),
         })

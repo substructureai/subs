@@ -1114,18 +1114,16 @@ proptest! {
                 prop_assert!(false, "{call} sent other bytes than it fingerprinted\ncommands:\n{commands}");
             }
             for item in world.agg.open_work() {
-                let request = match &item {
-                    crate::Work::CallLlm { call, .. } => serde_json::to_value(&call.request),
-                    crate::Work::CallSystem1 { call, .. } => serde_json::to_value(&call.request),
-                    _ => continue,
+                if !matches!(item, crate::Work::CallLlm { .. } | crate::Work::CallSystem1 { .. }) {
+                    continue;
                 }
-                .unwrap();
+                let now = serde_json::to_value(&item).unwrap();
                 let first = sent
                     .entry(serde_json::to_string(item.id()).unwrap())
-                    .or_insert_with(|| request.clone());
+                    .or_insert_with(|| now.clone());
                 prop_assert_eq!(
-                    &*first, &request,
-                    "an open call's request changed after it was sent\ncommands:\n{}", commands
+                    &*first, &now,
+                    "an open call's work changed after it was sent\ncommands:\n{}", commands
                 );
             }
             store.reads.store(0, std::sync::atomic::Ordering::Relaxed);

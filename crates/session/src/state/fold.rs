@@ -60,6 +60,10 @@ impl SessionState {
             EffectPayload::ConnectorSync(_) => None,
             _ => self.scope_node(branch),
         };
+        let turn = match self.detached(branch) {
+            true => None,
+            false => self.phase.turn_id().map(str::to_string),
+        };
         self.effects.insert(
             (payload.kind(), id.to_string()),
             EffectState {
@@ -67,6 +71,7 @@ impl SessionState {
                 tracking,
                 asked_at: anchor,
                 branch: branch.map(str::to_string),
+                turn,
                 payload,
             },
         );
