@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use quick_cache::sync::Cache;
 use quick_cache::{Equivalent, Weighter};
 use rusqlite::{params, OptionalExtension, Row, Transaction, TransactionBehavior};
@@ -10,7 +11,9 @@ use substructure_session::events::EventPayload;
 use substructure_session::protocol::{NewMessage, Role};
 use substructure_session::state::Logged;
 use substructure_session::tree::{Fact, Node, Nodes, Shared};
-use substructure_session::{Entry, Handled, Session, SessionEvent, Store, StoreError};
+use substructure_session::{
+    CommandId, CommandResult, Entry, Handled, Session, SessionEvent, Store, StoreError,
+};
 
 use super::SqliteDb;
 use crate::runtime::sessions::{SessionKey, SessionStores, SharedStore};
@@ -346,6 +349,23 @@ impl Store for SqliteSessionStore {
         )
         .map_err(unavailable)?;
         self.write_events(&tx, entry)?;
+        for handled in &entry.commands {
+            let result = serde_json::to_vec(&handled.result)
+                .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+            tx.execute(
+                "INSERT OR REPLACE INTO session_commands
+                    (tenant_id, session_id, command_id, at, result)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    self.tenant_id,
+                    self.session_id,
+                    handled.id.0,
+                    entry.at.to_rfc3339(),
+                    result
+                ],
+            )
+            .map_err(unavailable)?;
+        }
         tx.execute(
             "INSERT INTO session_heads (tenant_id, session_id, version, seq)
              VALUES (?1, ?2, ?3, ?4)
@@ -522,6 +542,30 @@ impl Store for SqliteSessionStore {
 
     fn nodes(&self) -> Arc<dyn Nodes> {
         Arc::new(self.clone())
+    }
+
+    fn handled(
+        &self,
+        id: &CommandId,
+    ) -> Result<Option<(CommandResult, DateTime<Utc>)>, StoreError> {
+        let row: Option<(String, Vec<u8>)> = self
+            .reader()?
+            .query_row(
+                "SELECT at, result FROM session_commands
+                  WHERE tenant_id = ?1 AND session_id = ?2 AND command_id = ?3",
+                params![self.tenant_id, self.session_id, id.0],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(unavailable)?;
+        let Some((at, result)) = row else {
+            return Ok(None);
+        };
+        let at = super::parse_dt(&at)
+            .ok_or_else(|| StoreError::Corrupt(format!("command time {at}")))?;
+        let result =
+            serde_json::from_slice(&result).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+        Ok(Some((result, at)))
     }
 
     fn messages(&self) -> Result<Vec<NewMessage>, StoreError> {

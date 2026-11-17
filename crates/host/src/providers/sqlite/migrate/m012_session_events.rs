@@ -60,6 +60,14 @@ pub fn up(conn: &Connection) -> rusqlite::Result<()> {
             seq        INTEGER NOT NULL,
             PRIMARY KEY (tenant_id, session_id)
          ) WITHOUT ROWID;
+         CREATE TABLE session_commands (
+            tenant_id  TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            command_id TEXT NOT NULL,
+            at         TEXT NOT NULL,
+            result     BLOB NOT NULL,
+            PRIMARY KEY (tenant_id, session_id, command_id)
+         ) WITHOUT ROWID;
          CREATE TABLE session_snapshots (
             tenant_id  TEXT NOT NULL,
             session_id TEXT NOT NULL,

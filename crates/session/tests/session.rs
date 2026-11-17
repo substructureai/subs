@@ -134,7 +134,10 @@ fn a_kept_session_catches_up_when_another_writer_got_there_first() {
     let ran = kept.run(&store, Utc::now(), interrupt("c3", 2)).unwrap();
     assert_eq!(ran.written.unwrap().version, 3);
     assert_eq!(kept.version(), 3);
-    assert!(kept.seen(&"c2".into()).is_some());
+    assert!(kept
+        .handled(&store, &"c2".into(), Utc::now())
+        .unwrap()
+        .is_some());
 }
 
 #[test]
@@ -168,7 +171,10 @@ fn writers_racing_on_one_store_each_land_exactly_once() {
     assert_eq!(session.version(), 41);
     for t in 0..4 {
         for n in 0..10 {
-            assert!(session.seen(&format!("t{t}-{n}").into()).is_some());
+            assert!(session
+                .handled(&store, &format!("t{t}-{n}").into(), Utc::now())
+                .unwrap()
+                .is_some());
         }
     }
 }

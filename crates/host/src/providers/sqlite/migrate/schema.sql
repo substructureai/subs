@@ -99,6 +99,15 @@ CREATE TABLE secrets (
             PRIMARY KEY (tenant_id, id)
         );
 
+CREATE TABLE session_commands (
+            tenant_id  TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            command_id TEXT NOT NULL,
+            at         TEXT NOT NULL,
+            result     BLOB NOT NULL,
+            PRIMARY KEY (tenant_id, session_id, command_id)
+         ) WITHOUT ROWID;
+
 CREATE TABLE session_cursors (
             tenant_id  TEXT NOT NULL,
             session_id TEXT NOT NULL,

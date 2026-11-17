@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -78,12 +76,6 @@ pub enum Error {
     Busy(u32),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Seen {
-    pub result: CommandResult,
-    pub at: DateTime<Utc>,
-}
-
 #[derive(Debug)]
 pub struct Ran {
     pub result: CommandResult,
@@ -107,8 +99,6 @@ pub struct Session {
     pub(crate) wake_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub(crate) version: u64,
-    #[serde(default)]
-    pub(crate) seen: BTreeMap<CommandId, Seen>,
     #[serde(skip)]
     settings: Settings,
 }
@@ -125,7 +115,6 @@ impl Session {
             last_event_at: None,
             wake_at: None,
             version: 0,
-            seen: BTreeMap::new(),
             settings,
         }
     }
@@ -200,8 +189,17 @@ impl Session {
         self.seq > 0
     }
 
-    pub fn seen(&self, id: &CommandId) -> Option<&CommandResult> {
-        self.seen.get(id).map(|s| &s.result)
+    pub fn handled(
+        &self,
+        store: &dyn Store,
+        id: &CommandId,
+        now: DateTime<Utc>,
+    ) -> Result<Option<CommandResult>, Error> {
+        let horizon = now - self.settings.retention;
+        Ok(store
+            .handled(id)?
+            .filter(|(_, at)| *at >= horizon)
+            .map(|(result, _)| result))
     }
 
     pub fn run(
@@ -210,7 +208,12 @@ impl Session {
         now: DateTime<Utc>,
         command: Command,
     ) -> Result<Ran, Error> {
-        self.write(store, |session| session.propose(now, &command))
+        self.write(store, |session| {
+            if let Some(result) = session.handled(store, &command.id, now)? {
+                return Ok((None, result));
+            }
+            session.propose(now, &command)
+        })
     }
 
     pub fn wake(&mut self, store: &dyn Store, now: DateTime<Utc>) -> Result<Option<Entry>, Error> {
@@ -289,9 +292,6 @@ impl Session {
         now: DateTime<Utc>,
         command: &Command,
     ) -> Result<(Option<Draft>, CommandResult), Error> {
-        if let Some(result) = self.seen(&command.id) {
-            return Ok((None, result.clone()));
-        }
         let mut working = Working::new(self.state.clone(), self.seq, now);
         let ran = working.run(command.payload.clone(), &command.caller);
         if let Some(error) = working.tree_failed() {
@@ -405,17 +405,6 @@ impl Session {
             self.last_event_at = Some(event.occurred_at);
             self.wake_at = event.meta.wake_at;
         }
-        for handled in &entry.commands {
-            self.seen.insert(
-                handled.id.clone(),
-                Seen {
-                    result: handled.result.clone(),
-                    at: entry.at,
-                },
-            );
-        }
-        let horizon = entry.at - self.settings.retention;
-        self.seen.retain(|_, seen| seen.at >= horizon);
         self.version = entry.version;
     }
 

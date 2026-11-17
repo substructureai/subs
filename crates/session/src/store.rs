@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use crate::entry::Entry;
+use chrono::{DateTime, Utc};
+
+use crate::entry::{CommandId, CommandResult, Entry};
 use crate::protocol::NewMessage;
 use crate::session::{Session, SessionEvent};
 use crate::state::Logged;
@@ -30,6 +32,8 @@ pub trait Store {
     fn set_cursor(&self, consumer: &str, seq: u64) -> Result<(), StoreError>;
     fn nodes(&self) -> Arc<dyn Nodes>;
     fn messages(&self) -> Result<Vec<NewMessage>, StoreError>;
+    fn handled(&self, id: &CommandId)
+        -> Result<Option<(CommandResult, DateTime<Utc>)>, StoreError>;
 }
 
 impl Entry {
@@ -59,6 +63,7 @@ struct Space {
     cursors: BTreeMap<String, u64>,
     nodes: BTreeMap<u64, Shared>,
     ids: BTreeMap<String, u64>,
+    handled: BTreeMap<CommandId, (CommandResult, DateTime<Utc>)>,
 }
 
 #[derive(Clone, Default)]
@@ -93,6 +98,11 @@ impl Store for MemoryStore {
                     entry: node,
                 }),
             );
+        }
+        for handled in &entry.commands {
+            space
+                .handled
+                .insert(handled.id.clone(), (handled.result.clone(), entry.at));
         }
         space.log.insert(entry.version, entry.clone());
         Ok(())
@@ -141,6 +151,13 @@ impl Store for MemoryStore {
 
     fn nodes(&self) -> Arc<dyn Nodes> {
         Arc::new(self.clone())
+    }
+
+    fn handled(
+        &self,
+        id: &CommandId,
+    ) -> Result<Option<(CommandResult, DateTime<Utc>)>, StoreError> {
+        Ok(self.space().handled.get(id).cloned())
     }
 
     fn events_at(&self, seqs: &[u64]) -> Result<Vec<SessionEvent>, StoreError> {

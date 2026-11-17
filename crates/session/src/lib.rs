@@ -39,7 +39,7 @@ mod worker_state;
 pub use caller::Caller;
 pub use entry::{Accepted, Command, CommandId, CommandResult, Entry, Handled, Rejected};
 pub use ids::Ids;
-pub use session::{CommitContext, Error, Ran, Seen, Session, SessionEvent, Settings};
+pub use session::{CommitContext, Error, Ran, Session, SessionEvent, Settings};
 pub use store::{MemoryStore, Store, StoreError};
 pub use work::{
     settle, LlmCall, Mail, Script, ScriptRecord, Subagent, Summary, System1Call, ToolCall,
