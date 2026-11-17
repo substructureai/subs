@@ -9,18 +9,12 @@ CREATE INDEX idx_engine_queue_topic ON engine_queue (topic, visible_at, enqueued
 CREATE INDEX idx_session_events_answers
             ON session_events (tenant_id, session_id, answers, seq) WHERE answers IS NOT NULL;
 
-CREATE INDEX idx_session_events_branch
-            ON session_events (tenant_id, session_id, branch, seq) WHERE branch IS NOT NULL;
-
 CREATE INDEX idx_session_events_children
             ON session_events (tenant_id, session_id, parent_id, branch, seq)
             WHERE parent_id IS NOT NULL;
 
 CREATE UNIQUE INDEX idx_session_events_node
             ON session_events (tenant_id, session_id, node_id) WHERE node_id IS NOT NULL;
-
-CREATE INDEX idx_session_events_version
-            ON session_events (tenant_id, session_id, version);
 
 CREATE INDEX idx_session_events_versions
             ON session_events (tenant_id, session_id, prev, branch, seq) WHERE kind = 0;
@@ -119,7 +113,10 @@ CREATE TABLE session_commands (
             tenant_id  TEXT NOT NULL,
             session_id TEXT NOT NULL,
             command_id TEXT NOT NULL,
+            version    INTEGER NOT NULL,
             at         TEXT NOT NULL,
+            kind       TEXT NOT NULL,
+            caller     TEXT NOT NULL,
             result     BLOB NOT NULL,
             PRIMARY KEY (tenant_id, session_id, command_id)
          ) WITHOUT ROWID;
@@ -131,15 +128,6 @@ CREATE TABLE session_cursors (
             seq        INTEGER NOT NULL,
             PRIMARY KEY (tenant_id, session_id, consumer)
         ) WITHOUT ROWID;
-
-CREATE TABLE session_entries (
-            tenant_id  TEXT NOT NULL,
-            session_id TEXT NOT NULL,
-            version    INTEGER NOT NULL,
-            at         TEXT NOT NULL,
-            commands   BLOB NOT NULL,
-            PRIMARY KEY (tenant_id, session_id, version)
-         ) WITHOUT ROWID;
 
 CREATE TABLE session_events (
             tenant_id  TEXT NOT NULL,

@@ -142,9 +142,11 @@ impl Session {
             .unwrap_or_else(|| Self::new(id, tenant_id, Settings::default()));
         session.settings = settings;
         session.state.tree = crate::tree::Tree::over(store.nodes());
-        for entry in store.read(session.version)? {
-            session.apply(&entry);
+        let tail = store.read(session.seq)?;
+        for event in &tail.events {
+            session.apply_event(event);
         }
+        session.version = tail.version;
         session.state.tree.written();
         session.checked()
     }
@@ -273,7 +275,10 @@ impl Session {
                     self.state = state;
                     self.record(&entry);
                 }
-                None => self.apply(&entry),
+                None => {
+                    entry.events.iter().for_each(|e| self.apply_event(e));
+                    self.version = entry.version;
+                }
             }
             self.state.tree.written();
             if entry.version % self.settings.snapshot_every.max(1) == 0 {
@@ -388,27 +393,27 @@ impl Session {
             .collect()
     }
 
-    fn apply(&mut self, entry: &Entry) {
-        for event in &entry.events {
-            self.state.apply(
-                &event.payload,
-                &ApplyContext {
-                    occurred_at: event.occurred_at,
-                    sequence: event.seq,
-                },
-            );
-        }
-        self.record(entry);
+    fn apply_event(&mut self, event: &SessionEvent) {
+        self.state.apply(
+            &event.payload,
+            &ApplyContext {
+                occurred_at: event.occurred_at,
+                sequence: event.seq,
+            },
+        );
+        self.record_event(event);
     }
 
     fn record(&mut self, entry: &Entry) {
-        for event in &entry.events {
-            self.seq = event.seq;
-            self.first_event_at.get_or_insert(event.occurred_at);
-            self.last_event_at = Some(event.occurred_at);
-            self.wake_at = event.meta.wake_at;
-        }
+        entry.events.iter().for_each(|e| self.record_event(e));
         self.version = entry.version;
+    }
+
+    fn record_event(&mut self, event: &SessionEvent) {
+        self.seq = event.seq;
+        self.first_event_at.get_or_insert(event.occurred_at);
+        self.last_event_at = Some(event.occurred_at);
+        self.wake_at = event.meta.wake_at;
     }
 
     #[cfg(any(test, feature = "testing"))]

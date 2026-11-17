@@ -66,7 +66,7 @@ fn a_command_is_written_and_its_work_follows_from_the_events() {
     assert_eq!(ran.result.unwrap().seq, session.seq());
     let written = ran.written.unwrap();
     assert_eq!(written.version, 1);
-    assert_eq!(store.read(0).unwrap().len(), 1);
+    assert_eq!(store.read(0).unwrap().version, 1);
     assert!(matches!(
         session.work(&written.events).as_slice(),
         [Work::AskWorker { work, .. }] if work.kind == EffectKind::Decision
@@ -82,7 +82,7 @@ fn a_resent_command_gets_its_first_answer_and_writes_nothing() {
 
     assert_eq!(first.result, again.result);
     assert!(again.written.is_none());
-    assert_eq!(store.read(0).unwrap().len(), 1);
+    assert_eq!(store.read(0).unwrap().version, 1);
 }
 
 #[test]
@@ -96,7 +96,7 @@ fn a_rejected_command_is_written_with_its_error() {
         ran.result.unwrap_err().error,
         SessionError::SessionAlreadyCreated
     );
-    assert_eq!(store.read(0).unwrap().len(), 2);
+    assert_eq!(store.read(0).unwrap().version, 2);
 }
 
 #[test]
@@ -120,7 +120,7 @@ fn a_command_refused_by_a_session_never_created_writes_nothing() {
         SessionError::SessionNotCreated
     );
     assert!(ran.written.is_none());
-    assert!(store.read(0).unwrap().is_empty());
+    assert_eq!(store.read(0).unwrap().version, 0);
 }
 
 #[test]
@@ -205,12 +205,13 @@ fn a_snapshot_gives_the_same_session_as_the_log() {
 #[test]
 fn an_entry_records_each_command_without_its_payload() {
     let store = MemoryStore::new();
-    load(&store, Settings::default())
+    let written = load(&store, Settings::default())
         .run(&store, Utc::now(), create("c1"))
+        .unwrap()
+        .written
         .unwrap();
 
-    let entry: serde_json::Value =
-        serde_json::from_slice(&store.read(0).unwrap()[0].to_json().unwrap()).unwrap();
+    let entry: serde_json::Value = serde_json::from_slice(&written.to_json().unwrap()).unwrap();
     let command = &entry["commands"][0];
     assert_eq!(command["id"], "c1");
     assert_eq!(command["kind"], "create_session");

@@ -87,6 +87,12 @@ pub struct Entry {
     pub events: Vec<SessionEvent>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct Tail {
+    pub version: u64,
+    pub events: Vec<SessionEvent>,
+}
+
 impl Entry {
     pub fn first_seq(&self) -> Option<u64> {
         self.events.first().map(|e| e.seq)

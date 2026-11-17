@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 
-use crate::entry::{CommandId, CommandResult, Entry};
+use crate::entry::{CommandId, CommandResult, Entry, Tail};
 use crate::session::{Session, SessionEvent};
 use crate::tree::{index, BranchRecord, NodeRef, Nodes};
 
@@ -21,7 +21,7 @@ pub enum StoreError {
 
 pub trait Store {
     fn append(&self, entry: &Entry) -> Result<(), StoreError>;
-    fn read(&self, after_version: u64) -> Result<Vec<Entry>, StoreError>;
+    fn read(&self, after_seq: u64) -> Result<Tail, StoreError>;
     fn events(&self, after_seq: u64, max: usize) -> Result<Vec<SessionEvent>, StoreError>;
     fn events_at(&self, seqs: &[u64]) -> Result<Vec<SessionEvent>, StoreError>;
     fn snapshot(&self, session: &Session) -> Result<(), StoreError>;
@@ -118,13 +118,18 @@ impl Store for MemoryStore {
         Ok(())
     }
 
-    fn read(&self, after_version: u64) -> Result<Vec<Entry>, StoreError> {
-        Ok(self
-            .space()
-            .log
-            .range(after_version + 1..)
-            .map(|(_, entry)| entry.clone())
-            .collect())
+    fn read(&self, after_seq: u64) -> Result<Tail, StoreError> {
+        let space = self.space();
+        Ok(Tail {
+            version: space.log.keys().next_back().copied().unwrap_or(0),
+            events: space
+                .log
+                .values()
+                .flat_map(|entry| entry.events.iter())
+                .filter(|e| e.seq > after_seq)
+                .cloned()
+                .collect(),
+        })
     }
 
     fn events(&self, after_seq: u64, max: usize) -> Result<Vec<SessionEvent>, StoreError> {

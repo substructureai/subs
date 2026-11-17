@@ -39,7 +39,7 @@ pub mod work;
 mod worker_state;
 
 pub use caller::Caller;
-pub use entry::{Accepted, Command, CommandId, CommandResult, Entry, Handled, Rejected};
+pub use entry::{Accepted, Command, CommandId, CommandResult, Entry, Handled, Rejected, Tail};
 pub use ids::Ids;
 pub use session::{CommitContext, Error, Ran, Session, SessionEvent, Settings};
 pub use store::{MemoryStore, Store, StoreError};

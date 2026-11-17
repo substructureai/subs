@@ -1059,7 +1059,7 @@ impl crate::Store for Counted {
     fn append(&self, entry: &crate::Entry) -> Result<(), crate::StoreError> {
         self.store.append(entry)
     }
-    fn read(&self, after: u64) -> Result<Vec<crate::Entry>, crate::StoreError> {
+    fn read(&self, after: u64) -> Result<crate::Tail, crate::StoreError> {
         self.store.read(after)
     }
     fn events(

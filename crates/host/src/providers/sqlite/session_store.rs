@@ -10,7 +10,7 @@ use substructure_session::delivery::Start;
 use substructure_session::events::{BranchClosed, BranchStarted, EventPayload};
 use substructure_session::tree::{index, BranchChange, BranchRecord, Fact, Node, NodeRef, Nodes};
 use substructure_session::{
-    CommandId, CommandResult, Entry, Handled, Session, SessionEvent, Store, StoreError,
+    CommandId, CommandResult, Entry, Session, SessionEvent, Store, StoreError, Tail,
 };
 
 use super::SqliteDb;
@@ -359,8 +359,6 @@ fn joined(
 
 impl Store for SqliteSessionStore {
     fn append(&self, entry: &Entry) -> Result<(), StoreError> {
-        let commands =
-            serde_json::to_vec(&entry.commands).map_err(|e| StoreError::Corrupt(e.to_string()))?;
         let mut conn = self
             .db
             .writer
@@ -381,32 +379,25 @@ impl Store for SqliteSessionStore {
         if entry.version != head as u64 + 1 {
             return Err(StoreError::VersionTaken(entry.version));
         }
-        tx.execute(
-            "INSERT INTO session_entries (tenant_id, session_id, version, at, commands)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                self.tenant_id,
-                self.session_id,
-                entry.version as i64,
-                entry.at.to_rfc3339(),
-                commands
-            ],
-        )
-        .map_err(unavailable)?;
         self.write_events(&tx, entry)?;
         self.write_branches(&tx, entry)?;
         for handled in &entry.commands {
             let result = serde_json::to_vec(&handled.result)
                 .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+            let caller = serde_json::to_value(handled.caller)
+                .map_err(|e| StoreError::Corrupt(e.to_string()))?;
             tx.execute(
                 "INSERT OR REPLACE INTO session_commands
-                    (tenant_id, session_id, command_id, at, result)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                    (tenant_id, session_id, command_id, version, at, kind, caller, result)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     self.tenant_id,
                     self.session_id,
                     handled.id.0,
+                    entry.version as i64,
                     entry.at.to_rfc3339(),
+                    handled.kind,
+                    caller.as_str().unwrap_or_default(),
                     result
                 ],
             )
@@ -429,72 +420,39 @@ impl Store for SqliteSessionStore {
         tx.commit().map_err(unavailable)
     }
 
-    fn read(&self, after_version: u64) -> Result<Vec<Entry>, StoreError> {
+    fn read(&self, after_seq: u64) -> Result<Tail, StoreError> {
         let conn = self.reader()?;
         let tx = conn.unchecked_transaction().map_err(unavailable)?;
+        let version: i64 = tx
+            .query_row(
+                "SELECT version FROM session_heads WHERE tenant_id = ?1 AND session_id = ?2",
+                params![self.tenant_id, self.session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(unavailable)?
+            .unwrap_or(0);
         let mut stmt = tx
             .prepare_cached(
-                "SELECT version, at, commands FROM session_entries
-                  WHERE tenant_id = ?1 AND session_id = ?2 AND version > ?3
-                  ORDER BY version",
-            )
-            .map_err(unavailable)?;
-        let rows = stmt
-            .query_map(
-                params![self.tenant_id, self.session_id, after_version as i64],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Vec<u8>>(2)?,
-                    ))
-                },
-            )
-            .map_err(unavailable)?;
-        let mut entries: Vec<Entry> = Vec::new();
-        for row in rows {
-            let (version, at, commands) = row.map_err(unavailable)?;
-            let commands: Vec<Handled> = serde_json::from_slice(&commands)
-                .map_err(|e| StoreError::Corrupt(e.to_string()))?;
-            entries.push(Entry {
-                version: version as u64,
-                at: super::parse_dt(&at)
-                    .ok_or_else(|| StoreError::Corrupt(format!("entry time {at}")))?,
-                commands,
-                events: Vec::new(),
-            });
-        }
-        drop(stmt);
-        let mut stmt = tx
-            .prepare_cached(
-                "SELECT seq, envelope, payload, version FROM session_events
-                  WHERE tenant_id = ?1 AND session_id = ?2 AND version > ?3
+                "SELECT seq, envelope, payload FROM session_events
+                  WHERE tenant_id = ?1 AND session_id = ?2 AND seq > ?3
                   ORDER BY seq",
             )
             .map_err(unavailable)?;
-        let rows = stmt
+        let events = stmt
             .query_map(
-                params![self.tenant_id, self.session_id, after_version as i64],
-                |row| Ok((self.event(row)?, row.get::<_, i64>(3)? as u64)),
+                params![self.tenant_id, self.session_id, after_seq as i64],
+                |row| self.event(row),
             )
-            .map_err(unavailable)?;
-        let mut at = 0;
-        for row in rows {
-            let (event, version) = row.map_err(unavailable)?;
-            while entries.get(at).is_some_and(|e| e.version < version) {
-                at += 1;
-            }
-            let entry = entries
-                .get_mut(at)
-                .filter(|e| e.version == version)
-                .ok_or_else(|| {
-                    StoreError::Corrupt(format!("an event of missing entry {version}"))
-                })?;
-            entry.events.push(event?);
-        }
+            .map_err(unavailable)?
+            .map(|row| row.map_err(unavailable)?)
+            .collect::<Result<Vec<_>, _>>()?;
         drop(stmt);
         tx.commit().map_err(unavailable)?;
-        Ok(entries)
+        Ok(Tail {
+            version: version as u64,
+            events,
+        })
     }
 
     fn events(&self, after_seq: u64, max: usize) -> Result<Vec<SessionEvent>, StoreError> {
@@ -780,9 +738,7 @@ mod tests {
         assert_eq!(s.append(&entry(1)), Err(StoreError::VersionTaken(1)));
         assert_eq!(s.append(&entry(3)), Err(StoreError::VersionTaken(3)));
         s.append(&entry(2)).unwrap();
-        let versions: Vec<u64> = s.read(0).unwrap().iter().map(|e| e.version).collect();
-        assert_eq!(versions, vec![1, 2]);
-        assert_eq!(s.read(1).unwrap()[0].version, 2);
+        assert_eq!(s.read(0).unwrap().version, 2);
     }
 
     #[test]
@@ -791,8 +747,8 @@ mod tests {
         let stores = SqliteSessionStores::new(db);
         stores.open("t", "a").append(&entry(1)).unwrap();
         stores.open("t", "b").append(&entry(1)).unwrap();
-        assert_eq!(stores.open("t", "a").read(0).unwrap().len(), 1);
-        assert!(stores.open("u", "a").read(0).unwrap().is_empty());
+        assert_eq!(stores.open("t", "a").read(0).unwrap().version, 1);
+        assert_eq!(stores.open("u", "a").read(0).unwrap().version, 0);
     }
 
     #[test]
@@ -1009,6 +965,28 @@ mod cold {
         }
     }
 
+    fn created() -> CommandPayload {
+        let config: AgentConfig =
+            serde_json::from_value(serde_json::json!({ "llm": "claude", "model": "m1" })).unwrap();
+        CommandPayload::CreateSession {
+            agent_id: "agent".into(),
+            owner: SessionOwner {
+                tenant_id: "t".into(),
+                requester: Requester::new(
+                    Subject::new(Issuer::app(), "u".to_string()),
+                    Default::default(),
+                ),
+                metadata: Default::default(),
+            },
+            ancestry: vec![],
+            worker_retry: RetryPolicy::no_retry(),
+            agent: Some(Box::new(config)),
+            worker: None,
+            events: None,
+            state: None,
+        }
+    }
+
     impl Cold {
         fn new() -> Self {
             let dir = tempfile::tempdir().unwrap();
@@ -1022,26 +1000,7 @@ mod cold {
                 session,
                 n: 0,
             };
-            let config: AgentConfig =
-                serde_json::from_value(serde_json::json!({ "llm": "claude", "model": "m1" }))
-                    .unwrap();
-            cold.send(CommandPayload::CreateSession {
-                agent_id: "agent".into(),
-                owner: SessionOwner {
-                    tenant_id: "t".into(),
-                    requester: Requester::new(
-                        Subject::new(Issuer::app(), "u".to_string()),
-                        Default::default(),
-                    ),
-                    metadata: Default::default(),
-                },
-                ancestry: vec![],
-                worker_retry: RetryPolicy::no_retry(),
-                agent: Some(Box::new(config)),
-                worker: None,
-                events: None,
-                state: None,
-            });
+            cold.send(created());
             cold.drain();
             cold
         }
@@ -1156,6 +1115,30 @@ mod cold {
             );
             loaded
         }
+    }
+
+    #[test]
+    fn a_command_written_without_events_reloads() {
+        let mut cold = Cold::new();
+        let before = cold.session.version();
+        let ran = cold
+            .session
+            .run(
+                cold.store.as_ref(),
+                Utc::now(),
+                Command::system("again", "t", created()),
+            )
+            .unwrap();
+        assert!(ran.result.is_err());
+        assert!(ran.written.is_some_and(|e| e.events.is_empty()));
+        assert_eq!(cold.session.version(), before + 1);
+        let loaded = Session::load(cold.store.as_ref(), "s1", "t", Settings::default()).unwrap();
+        assert_eq!(loaded.version(), cold.session.version());
+        assert_eq!(
+            serde_json::to_value(loaded.state()).unwrap(),
+            serde_json::to_value(cold.session.state()).unwrap()
+        );
+        assert!(cold.store.handled(&"again".into()).unwrap().is_some());
     }
 
     #[test]
