@@ -436,7 +436,7 @@ mod tests {
     use crate::connectors::ConnectionPath;
     use crate::connectors::{AuthNeed, RemoteTool};
     use crate::events::{
-        AgentConfigUpdated, ConnectorSyncCompleted, ConnectorSyncErrored, ConnectorSyncRequested,
+        ConfigUpdated, ConnectorSyncCompleted, ConnectorSyncErrored, ConnectorSyncRequested,
         EventPayload,
     };
     use crate::protocol::{
@@ -460,7 +460,7 @@ mod tests {
         apply(
             &mut s,
             1,
-            EventPayload::AgentConfigUpdated(AgentConfigUpdated {
+            EventPayload::ConfigUpdated(ConfigUpdated {
                 config: AgentConfig {
                     model: "m1".to_string(),
                     plugins: vec![AgentPlugin {
@@ -545,7 +545,7 @@ mod tests {
         apply(
             &mut s,
             1,
-            EventPayload::AgentConfigUpdated(AgentConfigUpdated {
+            EventPayload::ConfigUpdated(ConfigUpdated {
                 config: AgentConfig {
                     model: "m1".to_string(),
                     mcp: vec![McpServer {
@@ -638,7 +638,7 @@ mod tests {
         apply(
             &mut s,
             4,
-            EventPayload::AgentConfigUpdated(AgentConfigUpdated {
+            EventPayload::ConfigUpdated(ConfigUpdated {
                 config,
                 node: crate::tree::Place {
                     id: uuid::Uuid::now_v7().to_string(),
@@ -703,7 +703,7 @@ mod tests {
         apply(
             &mut s,
             4,
-            EventPayload::AgentConfigUpdated(AgentConfigUpdated {
+            EventPayload::ConfigUpdated(ConfigUpdated {
                 config: AgentConfig {
                     model: "m1".to_string(),
                     ..Default::default()
@@ -1226,7 +1226,7 @@ mod tests {
         apply(
             &mut s,
             1,
-            EventPayload::AgentConfigUpdated(AgentConfigUpdated {
+            EventPayload::ConfigUpdated(ConfigUpdated {
                 config,
                 node: crate::tree::Place {
                     id: uuid::Uuid::now_v7().to_string(),

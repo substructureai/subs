@@ -385,13 +385,13 @@ impl Node {
         use crate::events::EventPayload;
         Some(match payload {
             EventPayload::NewMessage(m) => Node::of_message(m),
-            EventPayload::WorkerStateUpdated(v) => Node {
+            EventPayload::StateUpdated(v) => Node {
                 place: v.node.clone(),
                 fact: Fact::State {
                     state: v.state.clone(),
                 },
             },
-            EventPayload::AgentConfigUpdated(v) => Node {
+            EventPayload::ConfigUpdated(v) => Node {
                 place: v.node.clone(),
                 fact: Fact::Config {
                     config: Some(v.config.clone()),

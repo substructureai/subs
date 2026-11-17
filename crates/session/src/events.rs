@@ -23,8 +23,8 @@ pub enum EventPayload {
     SessionCreated(Box<SessionCreated>),
     #[serde(rename = "message.new")]
     NewMessage(NewMessage),
-    #[serde(rename = "head.moved")]
-    HeadMoved(HeadMoved),
+    #[serde(rename = "branch.moved")]
+    BranchMoved(BranchMoved),
     #[serde(rename = "llm.call.requested")]
     LlmCallRequested(LlmCallRequested),
     #[serde(rename = "llm.call.dispatched")]
@@ -79,10 +79,10 @@ pub enum EventPayload {
     DecisionErrored(DecisionErrored),
     #[serde(rename = "session.message_requested")]
     SessionMessageRequested(SessionMessageRequested),
-    #[serde(rename = "worker.state.updated")]
-    WorkerStateUpdated(WorkerStateUpdated),
-    #[serde(rename = "agent.updated")]
-    AgentConfigUpdated(AgentConfigUpdated),
+    #[serde(rename = "state.updated")]
+    StateUpdated(StateUpdated),
+    #[serde(rename = "config.updated")]
+    ConfigUpdated(ConfigUpdated),
     #[serde(rename = "subagent.turn_completed")]
     SubagentTurnCompleted(SubagentTurnCompleted),
     #[serde(rename = "decision.queued")]
@@ -268,8 +268,8 @@ pub struct SessionCreated {
 pub struct SessionDone {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HeadMoved {
-    pub head_id: String,
+pub struct BranchMoved {
+    pub leaf: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
 }
@@ -653,14 +653,14 @@ pub struct SessionMessageRequested {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkerStateUpdated {
+pub struct StateUpdated {
     pub state: WorkerState,
     #[serde(flatten)]
     pub node: crate::tree::Place,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentConfigUpdated {
+pub struct ConfigUpdated {
     pub config: AgentConfig,
     #[serde(flatten)]
     pub node: crate::tree::Place,

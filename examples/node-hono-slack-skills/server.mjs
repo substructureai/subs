@@ -95,7 +95,7 @@ async function decide({ trigger, proposed, state, messages }) {
 
 // --- events URL -----------------------------------------------------------
 
-// The skills each thread has on, from the `worker.state.updated` events.
+// The skills each thread has on, from the `state.updated` events.
 const activeBySession = new Map();
 
 function signed(body, header) {
@@ -106,7 +106,7 @@ function signed(body, header) {
 
 async function heard({ session_id, metadata, events = [] }) {
     for (const { payload } of events) {
-        if (payload.type === "worker.state.updated") {
+        if (payload.type === "state.updated") {
             activeBySession.set(session_id, payload.state?.active ?? []);
         }
         // The row goes into the thread once the turn ends.

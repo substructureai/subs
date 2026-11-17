@@ -5605,7 +5605,7 @@ fn a_session_opens_with_the_config_its_creation_carries() {
     assert!(
         events
             .iter()
-            .any(|e| matches!(e, EventPayload::AgentConfigUpdated(_))),
+            .any(|e| matches!(e, EventPayload::ConfigUpdated(_))),
         "creation seeds the config: {events:#?}"
     );
     assert_eq!(
@@ -7172,11 +7172,11 @@ fn submit_state(
     )
 }
 
-fn state_updates(events: &[EventPayload]) -> Vec<&WorkerStateUpdated> {
+fn state_updates(events: &[EventPayload]) -> Vec<&StateUpdated> {
     events
         .iter()
         .filter_map(|e| match e {
-            EventPayload::WorkerStateUpdated(p) => Some(p),
+            EventPayload::StateUpdated(p) => Some(p),
             _ => None,
         })
         .collect()
@@ -7288,11 +7288,11 @@ fn omitted_state_keeps_the_current_version() {
     assert_eq!(agg.state.at_head().worker_state().0, json!({"v": 1}));
 }
 
-fn agent_updates(events: &[EventPayload]) -> Vec<&AgentConfigUpdated> {
+fn agent_updates(events: &[EventPayload]) -> Vec<&ConfigUpdated> {
     events
         .iter()
         .filter_map(|e| match e {
-            EventPayload::AgentConfigUpdated(p) => Some(p),
+            EventPayload::ConfigUpdated(p) => Some(p),
             _ => None,
         })
         .collect()
@@ -8104,7 +8104,7 @@ fn a_search_answers_at_the_anchor_of_the_call() {
         &ctx,
     );
     agg.commit(
-        vec![EventPayload::AgentConfigUpdated(AgentConfigUpdated {
+        vec![EventPayload::ConfigUpdated(ConfigUpdated {
             config: AgentConfig {
                 mcp: vec![],
                 ..searching_connector_config(&["sentry"])
@@ -9801,7 +9801,7 @@ fn create_session_writes_seeded_state_before_session_start() {
             events.as_slice(),
             [
                 EventPayload::SessionCreated(_),
-                EventPayload::WorkerStateUpdated(_),
+                EventPayload::StateUpdated(_),
                 EventPayload::DecisionQueued(q),
                 EventPayload::DecisionDispatched(_),
             ] if matches!(q.trigger, Trigger::SessionStart)
@@ -10516,7 +10516,7 @@ fn head_moves(events: &[EventPayload]) -> Vec<&str> {
     events
         .iter()
         .filter_map(|e| match e {
-            EventPayload::HeadMoved(h) => Some(h.head_id.as_str()),
+            EventPayload::BranchMoved(h) => Some(h.leaf.as_str()),
             _ => None,
         })
         .collect()

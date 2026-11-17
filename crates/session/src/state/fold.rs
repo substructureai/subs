@@ -463,13 +463,13 @@ impl SessionState {
                     self.tree.record(&p.id, branch, Some(p.reason));
                 }
             }
-            EventPayload::HeadMoved(payload) => match payload.branch.as_deref() {
+            EventPayload::BranchMoved(payload) => match payload.branch.as_deref() {
                 Some(b) => {
                     if let Some(branch) = self.branches.get_mut(b) {
-                        branch.leaf = Some(payload.head_id.clone());
+                        branch.leaf = Some(payload.leaf.clone());
                     }
                 }
-                None => self.head_id = Some(payload.head_id.clone()),
+                None => self.head_id = Some(payload.leaf.clone()),
             },
             EventPayload::LlmCallRequested(payload) => self.apply_llm_requested(payload, ctx),
             EventPayload::LlmCallDispatched(payload) => self.apply_llm_dispatched(payload, ctx),
@@ -765,7 +765,7 @@ impl SessionState {
                     sync.auth = Some(p.auth);
                 }
             }
-            EventPayload::WorkerStateUpdated(_) | EventPayload::AgentConfigUpdated(_) => {
+            EventPayload::StateUpdated(_) | EventPayload::ConfigUpdated(_) => {
                 if let Some(node) = crate::tree::Node::of_event(event) {
                     self.grow(node, ctx.sequence);
                 }

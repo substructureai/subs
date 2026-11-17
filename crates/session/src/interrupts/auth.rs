@@ -86,9 +86,7 @@ fn ask(connection: &ConnectionPath, need: AuthNeed) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{
-        AgentConfigUpdated, ConnectorAuthFailed, ConnectorSyncRequested, EventPayload,
-    };
+    use crate::events::{ConfigUpdated, ConnectorAuthFailed, ConnectorSyncRequested, EventPayload};
     use crate::protocol::InterruptOrigin;
     use crate::protocol::{
         AgentConfig, DecisionAction, Issuer, McpAuthFailure, McpServer, RetryPolicy, SessionOwner,
@@ -128,7 +126,7 @@ mod tests {
             metadata: Default::default(),
         });
         s.apply(
-            &EventPayload::AgentConfigUpdated(AgentConfigUpdated {
+            &EventPayload::ConfigUpdated(ConfigUpdated {
                 config: config(policy),
                 node: crate::tree::Place {
                     id: uuid::Uuid::now_v7().to_string(),

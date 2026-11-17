@@ -57,7 +57,7 @@ Render a chat from these.
 | --- | --- |
 | `session.created` | The session exists. |
 | `message.new` | A message joined the tree: `{ message, parent_id?, copied_from? }`. `copied_from` names the original of a copy. |
-| `head.moved` | The active leaf changed: `{ head_id, branch? }`. A client switched versions, or a reply dropped messages. With `branch`, that branch's leaf moved. |
+| `branch.moved` | The active leaf changed: `{ leaf, branch? }`. A client switched versions, or a reply dropped messages. With `branch`, that branch's leaf moved. |
 | `context.placed` | `{ id, parent_id?, branch?, call, placed? }`. What a model call put into its prompt, as a node on the path, so later calls send the same prefix. |
 | `turn.started` | A turn began: `{ turn_id, metadata? }`. `metadata` is the `metadata` the turn was submitted with. For a merged turn, a later submit's key wins. |
 | `turn.joined` | Messages sent with `queue: "join"` run in the running turn: `{ turn_id, next_turn_id?, metadata? }`. `next_turn_id` is the `next_turn_id` their submit got. `metadata` is the keys they add to the turn. |
@@ -151,8 +151,8 @@ stream with that to watch the child.
 
 | Event | Meaning |
 | --- | --- |
-| `worker.state.updated` | A decision wrote new state. |
-| `agent.updated` | A decision wrote a new config. |
+| `state.updated` | A decision wrote new state. |
+| `config.updated` | A decision wrote a new config. |
 
 ## Context
 

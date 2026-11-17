@@ -483,8 +483,8 @@ impl Working {
             error: None,
             leaf: Some(leaf.clone()),
         }));
-        self.emit(EventPayload::HeadMoved(HeadMoved {
-            head_id: leaf,
+        self.emit(EventPayload::BranchMoved(BranchMoved {
+            leaf,
             branch: None,
         }));
         self.then(|s| s.void_stranded_work(None));

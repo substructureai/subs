@@ -1731,7 +1731,7 @@ mod branches {
             None,
         );
 
-        assert!(events.iter().any(|e| matches!(e, Logged::HeadMoved(_))));
+        assert!(events.iter().any(|e| matches!(e, Logged::BranchMoved(_))));
         assert_eq!(
             session.state().message_tree().head_id.as_deref(),
             Some("a1")

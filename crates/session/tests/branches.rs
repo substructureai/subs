@@ -502,7 +502,7 @@ fn a_branch_reply_that_only_drops_messages_moves_its_leaf_back() {
     assert!(
         events.iter().any(|e| matches!(
             e,
-            EventPayload::HeadMoved(h) if h.branch.as_deref() == Some("draft") && h.head_id == start
+            EventPayload::BranchMoved(h) if h.branch.as_deref() == Some("draft") && h.leaf == start
         )),
         "got {events:?}"
     );

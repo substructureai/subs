@@ -331,7 +331,7 @@ fn branch_of(payload: &EventPayload) -> Option<&str> {
     match payload {
         EventPayload::BranchStarted(p) => Some(&p.id),
         EventPayload::BranchClosed(p) => Some(&p.id),
-        EventPayload::HeadMoved(p) => p.branch.as_deref(),
+        EventPayload::BranchMoved(p) => p.branch.as_deref(),
         _ => None,
     }
 }

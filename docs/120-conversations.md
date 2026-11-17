@@ -61,7 +61,7 @@ matches on ID, not on content.
 To switch back to an earlier version, send its view. The head moves to it,
 and the version keeps its own state. A view that stops partway along a path
 moves the head there, and the next reply branches. Either way the engine emits
-`head.moved` and cancels work in flight that is not on the new path.
+`branch.moved` and cancels work in flight that is not on the new path.
 
 ## Example: edit an earlier message
 

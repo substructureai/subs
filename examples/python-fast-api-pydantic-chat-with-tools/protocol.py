@@ -1348,10 +1348,10 @@ class Effect(BaseModel):
         extra='forbid',
     )
     agent_id: str | None = None
-    anchor: str | None = Field(
+    arguments: str | None = None
+    asked_at: str | None = Field(
         None, description='The tree node the effect was requested at.'
     )
-    arguments: str | None = None
     attempt: conint(ge=0)
     branch: str | None = Field(
         None, description='The branch the effect runs on. Absent on the conversation.'

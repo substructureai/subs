@@ -738,11 +738,11 @@ export type BranchMode = "blocking" | "detached";
  */
 export interface Effect {
     agent_id?: null | string;
+    arguments?: null | string;
     /**
      * The tree node the effect was requested at.
      */
-    anchor?: null | string;
-    arguments?: null | string;
+    asked_at?: null | string;
     attempt: number;
     /**
      * The branch the effect runs on. Absent on the conversation.

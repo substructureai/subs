@@ -66,7 +66,7 @@ unit-conversion**. Every later turn in that thread keeps the skill.
 | `/` | `session.start` | Sets the agent, with the tools the thread's skills unlock. |
 | `/` | `client.action` | A click. Appends the skill, moves the check mark, and opens a turn with `llm.call`. |
 | `/` | `tool.execute` | Runs a tool an active skill unlocked. |
-| `/events` | `worker.state.updated` | Notes which skills the thread has on. |
+| `/events` | `state.updated` | Notes which skills the thread has on. |
 | `/events` | `turn.completed` | Posts the row of buttons into the thread. |
 
 A click is a `client.action` named after the button's `action_id`, so

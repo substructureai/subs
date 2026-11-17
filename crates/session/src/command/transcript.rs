@@ -92,21 +92,24 @@ impl SessionState {
             .or_else(|| landed.forks.then(|| read.config()).flatten())
             .filter(|c| Some(c) != base.config().as_ref());
         if let Some(state) = state {
-            events.push(EventPayload::WorkerStateUpdated(WorkerStateUpdated {
+            events.push(EventPayload::StateUpdated(StateUpdated {
                 state,
                 node: place(&mut cursor),
             }));
         }
         if let Some(config) = config {
             events.extend(crate::effects::connector::sync(self, &config));
-            events.push(EventPayload::AgentConfigUpdated(AgentConfigUpdated {
+            events.push(EventPayload::ConfigUpdated(ConfigUpdated {
                 config,
                 node: place(&mut cursor),
             }));
         }
         if events.is_empty() && moved {
             if let Some(head_id) = landed.at {
-                events.push(EventPayload::HeadMoved(HeadMoved { head_id, branch }));
+                events.push(EventPayload::BranchMoved(BranchMoved {
+                    leaf: head_id,
+                    branch,
+                }));
             }
         }
         events

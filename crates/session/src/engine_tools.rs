@@ -205,7 +205,7 @@ fn skill_files(skill: &Skill) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{AgentConfigUpdated, EventPayload};
+    use crate::events::{ConfigUpdated, EventPayload};
     use crate::plugins::{PluginSet, Skill};
     use crate::protocol::{AgentConfig, AgentPlugin, SkillMeta};
     use crate::state::{ApplyContext, SessionState};
@@ -213,7 +213,7 @@ mod tests {
     fn state_with_plugin() -> SessionState {
         let mut s = SessionState::new("sess-1".to_string());
         s.apply(
-            &EventPayload::AgentConfigUpdated(AgentConfigUpdated {
+            &EventPayload::ConfigUpdated(ConfigUpdated {
                 config: AgentConfig {
                     model: "m1".to_string(),
                     plugins: vec![AgentPlugin {
