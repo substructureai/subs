@@ -308,6 +308,53 @@ impl World {
         None
     }
 
+    fn unprefixed(&self) -> Option<(String, String)> {
+        let bare = |prompt: &[crate::protocol::Message]| -> Vec<serde_json::Value> {
+            prompt
+                .iter()
+                .map(|m| {
+                    let mut m = DraftMessage::from(m.clone());
+                    m.id = None;
+                    serde_json::to_value(m).unwrap()
+                })
+                .collect()
+        };
+        let mut state = SessionState::new("sess-1".to_string());
+        let mut sent: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+        for (seq, occurred_at, payload) in &self.log {
+            if let EventPayload::LlmCallDispatched(d) = payload {
+                let tree_call = state.llm_call(&d.id).is_some_and(|c| {
+                    matches!(c.source, crate::decision::PromptSource::Tree { .. })
+                });
+                if let Some(out) = state.outgoing(&d.id).filter(|_| tree_call) {
+                    let prompt = bare(&out.prompt);
+                    for node in state.tree.up(out.node.as_deref()) {
+                        match &node.fact {
+                            crate::tree::Fact::Config { .. } => break,
+                            crate::tree::Fact::Context { call, .. }
+                                if sent
+                                    .get(call)
+                                    .is_some_and(|before| !prompt.starts_with(before)) =>
+                            {
+                                return Some((call.clone(), d.id.clone()));
+                            }
+                            _ => {}
+                        }
+                    }
+                    sent.insert(d.id.clone(), prompt);
+                }
+            }
+            state.apply(
+                payload,
+                &ApplyContext {
+                    occurred_at: *occurred_at,
+                    sequence: *seq,
+                },
+            );
+        }
+        None
+    }
+
     fn replayed(&self) -> SessionState {
         let mut state = SessionState::new("sess-1".to_string());
         for (seq, occurred_at, payload) in &self.log {
@@ -537,6 +584,7 @@ impl World {
         let model = self.mint();
         AgentConfig {
             llm: Some("claude".to_string()),
+            system: Some(format!("system {model}")),
             model,
             mcp: vec![McpServer {
                 id: "conn-1".into(),
@@ -1063,6 +1111,9 @@ proptest! {
             world.step(op);
             let commands = world.trace.join("\n");
             let store = world.store.clone().expect("a stored world");
+            if let Some((before, after)) = world.unprefixed() {
+                prop_assert!(false, "{before}'s prompt is not a prefix of {after}'s, though {after} reads through it\ncommands:\n{commands}");
+            }
             if let Some(call) = world.unfingerprinted() {
                 prop_assert!(false, "{call} sent other bytes than it fingerprinted\ncommands:\n{commands}");
             }

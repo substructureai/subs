@@ -354,7 +354,10 @@ fn place(
             (last.id.clone(), None)
         }
         Placement::Own => {
-            let after = prompt.last().map(|m| m.id.clone());
+            let after = prompt
+                .last()
+                .filter(|_| leading_system(prompt) < prompt.len())
+                .map(|m| m.id.clone());
             prompt.push(message(&id, Role::User, &content));
             (id, after)
         }
@@ -371,7 +374,7 @@ fn place(
 
 fn start(prompt: &[Message], p: &Placed) -> Option<usize> {
     match &p.after {
-        None => Some(0),
+        None => Some(leading_system(prompt)),
         Some(after) => prompt.iter().position(|m| &m.id == after).map(|i| i + 1),
     }
 }
@@ -971,6 +974,52 @@ mod tests {
             2,
             "then the turn's own messages"
         );
+    }
+
+    fn notice() -> Vec<PromptContext> {
+        vec![PromptContext {
+            id: "notice".into(),
+            placement: Placement::System,
+            content: "a server is down".into(),
+        }]
+    }
+
+    #[test]
+    fn context_placed_after_only_a_system_prompt_is_rebuilt_for_the_next_call() {
+        let mut sent = vec![text("c1:0", Role::System, "be brief")];
+        let mut placed = Vec::new();
+        merge(
+            &mut sent,
+            &mut Vec::new(),
+            &mut placed,
+            "c1",
+            false,
+            notice(),
+        );
+        let mut next = vec![text("c2:0", Role::System, "be brief")];
+        restore(&mut next, &placed);
+        assert_eq!(fingerprint(&next), fingerprint(&sent));
+    }
+
+    #[test]
+    fn context_placed_into_an_empty_prompt_is_rebuilt_after_a_system_prompt() {
+        let mut sent = Vec::new();
+        let mut placed = Vec::new();
+        merge(
+            &mut sent,
+            &mut Vec::new(),
+            &mut placed,
+            "c1",
+            false,
+            notice(),
+        );
+        let mut next = vec![
+            text("c2:0", Role::System, "be brief"),
+            text("u1", Role::User, "hi"),
+        ];
+        restore(&mut next, &placed);
+        let ids: Vec<&str> = next.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["c2:0", placed[0].message.as_str(), "u1"]);
     }
 
     #[test]
