@@ -1287,11 +1287,13 @@ mod cold {
             serde_json::to_value(c.session.state()).unwrap(),
             "a load from the log is the live state"
         );
-        let contexts = loaded.state().at_head().placed_on_path().len();
-        assert!(
-            contexts <= 2,
-            "each request places at most once: {contexts}"
-        );
+        let contexts = loaded
+            .state()
+            .tree
+            .up(loaded.state().head_id.as_deref())
+            .filter(|n| matches!(n.fact, Fact::Context { .. }))
+            .count();
+        assert_eq!(contexts, 2, "one node per request, none for the retry");
     }
 
     #[test]
