@@ -86,6 +86,15 @@ impl Store for MemoryStore {
         if entry.version != head + 1 {
             return Err(StoreError::VersionTaken(entry.version));
         }
+        let ids: Vec<String> = entry
+            .events
+            .iter()
+            .filter_map(|e| Node::of_event(&e.payload).map(|n| n.id().to_string()))
+            .collect();
+        let unique: std::collections::HashSet<&String> = ids.iter().collect();
+        if unique.len() < ids.len() || ids.iter().any(|id| space.ids.contains_key(id)) {
+            return Err(StoreError::Corrupt("a node id is written twice".into()));
+        }
         for event in &entry.events {
             let Some(node) = Node::of_event(&event.payload) else {
                 continue;

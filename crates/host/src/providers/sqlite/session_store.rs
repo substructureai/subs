@@ -764,7 +764,10 @@ impl Nodes for SqliteSessionStore {
 }
 
 fn unavailable(error: rusqlite::Error) -> StoreError {
-    StoreError::Unavailable(error.to_string())
+    match error.sqlite_error_code() {
+        Some(rusqlite::ErrorCode::ConstraintViolation) => StoreError::Corrupt(error.to_string()),
+        _ => StoreError::Unavailable(error.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -1222,8 +1225,77 @@ mod cold {
         assert_eq!(loaded.state().tree.versions("u2"), ["u2", "e2"]);
     }
 
+    fn call(id: &str, retry: RetryPolicy) -> Action {
+        Action::CallLlm {
+            id: id.into(),
+            llm: "claude".into(),
+            request: LlmRequest {
+                model: "m1".into(),
+                messages: vec![],
+                tools: None,
+                temperature: None,
+                max_completion_tokens: None,
+                reasoning: None,
+            },
+            source: Default::default(),
+            stream: false,
+            retry,
+            handler: Default::default(),
+            format: None,
+            branch: None,
+        }
+    }
+
+    fn fail(c: &mut Cold, id: &str, attempt: u32, retryable: bool) {
+        c.send(CommandPayload::settle(
+            EffectKind::LlmCall,
+            id,
+            Some(attempt),
+            substructure_session::effects::Outcome::Error(
+                substructure_session::command::SettleError::new(
+                    substructure_session::protocol::ErrorInfo::new(
+                        substructure_session::protocol::ErrorCode::Internal,
+                        "down",
+                    ),
+                    retryable,
+                ),
+            ),
+        ));
+    }
+
     #[test]
-    fn a_retried_call_and_a_closed_branch_read_the_log_with_nothing_cached() {
+    fn a_call_retried_and_asked_again_keeps_one_context_node_each() {
+        let mut c = Cold::new();
+        c.say("hi");
+        let retry = RetryPolicy {
+            max_attempts: 2,
+            backoff_base_secs: 0,
+            backoff_max_secs: 0,
+            ..RetryPolicy::no_retry()
+        };
+        c.reply_with(c.path(), None, vec![call("c1", retry)]);
+        fail(&mut c, "c1", 0, true);
+        c.send(CommandPayload::Wake { now: Utc::now() });
+        fail(&mut c, "c1", 1, true);
+        c.reply_with(c.path(), None, vec![call("c1", RetryPolicy::no_retry())]);
+        fail(&mut c, "c1", 0, false);
+        c.drain();
+
+        let loaded = c.reloaded();
+        assert_eq!(
+            serde_json::to_value(loaded.state()).unwrap(),
+            serde_json::to_value(c.session.state()).unwrap(),
+            "a load from the log is the live state"
+        );
+        let contexts = loaded.state().at_head().placed_on_path().len();
+        assert!(
+            contexts <= 2,
+            "each request places at most once: {contexts}"
+        );
+    }
+
+    #[test]
+    fn a_closed_branch_with_its_own_config_reads_the_log_with_nothing_cached() {
         let mut c = Cold::new();
         c.say("hi");
         let view = c.path();

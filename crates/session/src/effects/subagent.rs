@@ -82,7 +82,7 @@ impl KindSpec for SubagentSpec {
         )]
     }
 
-    fn dispatch(&self, state: &SessionState, id: &str) -> Vec<EventPayload> {
+    fn dispatch(&self, state: &Cx<'_>, id: &str) -> Vec<EventPayload> {
         if state.has_effect(EffectKind::Subagent, id) {
             vec![EventPayload::SubagentDispatched(SubagentDispatched {
                 id: id.to_string(),

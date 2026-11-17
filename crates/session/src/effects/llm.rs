@@ -74,7 +74,7 @@ impl KindSpec for LlmSpec {
         )
     }
 
-    fn dispatch(&self, state: &SessionState, id: &str) -> Vec<EventPayload> {
+    fn dispatch(&self, state: &Cx<'_>, id: &str) -> Vec<EventPayload> {
         let Some(effect) = state.effect(EffectKind::LlmCall, id) else {
             return void_events(EffectKind::LlmCall, id.to_string());
         };
@@ -88,7 +88,7 @@ impl KindSpec for LlmSpec {
         {
             events.push(EventPayload::ContextPlaced(ContextPlaced {
                 node: crate::tree::Place {
-                    id: format!("{id}:ctx"),
+                    id: state.ids().next(),
                     parent_id: out.node.clone(),
                     branch: effect.branch.clone(),
                 },

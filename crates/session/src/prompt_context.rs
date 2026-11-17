@@ -903,8 +903,12 @@ mod tests {
                 branch: None,
             }),
         );
-        let dispatched =
-            crate::effects::KindSpec::dispatch(&crate::effects::llm::LlmSpec, state, id);
+        let ids = crate::ids::Ids::new("s", seq, chrono::Utc::now());
+        let dispatched = crate::effects::KindSpec::dispatch(
+            &crate::effects::llm::LlmSpec,
+            &crate::cx::Cx::new(state, &ids),
+            id,
+        );
         for (i, event) in dispatched.into_iter().enumerate() {
             apply(state, seq + 1 + i as u64, event);
         }

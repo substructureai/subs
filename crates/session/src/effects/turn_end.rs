@@ -41,7 +41,7 @@ impl KindSpec for TurnEndSpec {
         })
     }
 
-    fn dispatch(&self, state: &SessionState, _id: &str) -> Vec<EventPayload> {
+    fn dispatch(&self, state: &Cx<'_>, _id: &str) -> Vec<EventPayload> {
         state.finalize_run(None)
     }
 }

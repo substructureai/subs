@@ -86,7 +86,7 @@ async fn run(
     }
 
     let open: Vec<String> = match ctx.get_session(caller.tenant_id(), &session_id).await {
-        Ok(session) => crate::runtime::sessions::read(&session, |state| {
+        Ok(session) => crate::runtime::sessions::read(std::sync::Arc::new(session), |state| {
             state
                 .at_head()
                 .interrupts_for()
@@ -229,7 +229,7 @@ async fn connect(
     let frames = match session {
         Some(session) => {
             let thread_id = input.thread_id;
-            match crate::runtime::sessions::read(&session, move |state| {
+            match crate::runtime::sessions::read(std::sync::Arc::new(session), move |state| {
                 snapshot_events(thread_id, run_id, Some(state))
             })
             .await

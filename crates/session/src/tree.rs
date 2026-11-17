@@ -144,6 +144,10 @@ impl Tree {
         self.failed.lock().ok()?.take()
     }
 
+    pub fn failing(&self) -> bool {
+        self.failed.lock().is_ok_and(|failed| failed.is_some())
+    }
+
     fn read<T: Default>(&self, read: impl FnOnce(&dyn Nodes) -> Result<T, StoreError>) -> T {
         let Some(source) = &self.source else {
             return T::default();

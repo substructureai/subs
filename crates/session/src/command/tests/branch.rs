@@ -246,7 +246,11 @@ fn a_fork_reads_the_conversation_and_then_its_own_messages() {
         Some("u1"),
         "the head stays"
     );
-    let own = branch.leaf.clone().expect("its message is its own node");
+    let own = agg
+        .state
+        .tree
+        .message_at(branch.leaf.as_deref())
+        .expect("its message is its own node");
     assert_eq!(agg.state.node_branch(&own).as_deref(), Some("title"));
 
     let call = agg.state.effect(EffectKind::LlmCall, "t1").unwrap();
@@ -428,10 +432,9 @@ fn a_branch_runs_its_tools_on_itself() {
         .leaf
         .clone()
         .unwrap();
-    let placed = agg.state.tree.get(&leaf).expect("its context is the leaf");
     assert_eq!(
-        next.anchor.as_deref(),
-        placed.parent(),
+        next.anchor,
+        agg.state.tree.message_at(Some(&leaf)),
         "it reads the branch, tool result included"
     );
     assert_eq!(agg.state.head_id.as_deref(), Some("c1"));

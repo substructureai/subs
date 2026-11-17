@@ -3212,17 +3212,19 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
     }
 
     pub fn system_prefix_open(&self, exclude: &str) -> bool {
+        let mut path = std::collections::HashSet::new();
         for node in self.up() {
             match &node.fact {
                 crate::tree::Fact::Context { call, .. } if call != exclude => return false,
                 crate::tree::Fact::Config { root: true, .. } => break,
                 _ => {}
             }
+            path.insert(node.id().to_string());
         }
-        let path = self.path_set();
         !self.state.effects.values().any(|e| {
             e.id != exclude
-                && e.llm().is_some_and(|c| c.source != PromptSource::Explicit)
+                && e.llm()
+                    .is_some_and(|c| c.source != PromptSource::Explicit && c.context.is_none())
                 && SessionState::anchored_on(&path, e.anchor.as_deref())
                 && e.tracking.status() != EffectStatus::Queued
         })

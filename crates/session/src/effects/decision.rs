@@ -75,7 +75,7 @@ impl KindSpec for DecisionSpec {
         false
     }
 
-    fn resend(&self, state: &SessionState, id: &str) -> Vec<EventPayload> {
+    fn resend(&self, state: &Cx<'_>, id: &str) -> Vec<EventPayload> {
         own_turn_started(state, id)
             .into_iter()
             .chain([EventPayload::DecisionDispatched(DecisionDispatched {
@@ -134,7 +134,7 @@ impl KindSpec for DecisionSpec {
         deps
     }
 
-    fn dispatch(&self, state: &SessionState, id: &str) -> Vec<EventPayload> {
+    fn dispatch(&self, state: &Cx<'_>, id: &str) -> Vec<EventPayload> {
         let Some(decision) = state.worker_decision(id) else {
             return vec![state.decision_dropped(id)];
         };

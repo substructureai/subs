@@ -849,10 +849,9 @@ async fn step<T: Send + 'static>(
 }
 
 pub async fn read<T: Send + 'static>(
-    session: &Session,
+    session: Arc<Session>,
     f: impl FnOnce(&SessionState) -> T + Send + 'static,
 ) -> Result<T, StoreError> {
-    let session = session.clone();
     tokio::task::spawn_blocking(move || {
         let read = f(session.state());
         match session.state().tree.failed() {

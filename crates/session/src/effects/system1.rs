@@ -39,7 +39,7 @@ impl KindSpec for System1Spec {
         )]
     }
 
-    fn dispatch(&self, state: &SessionState, id: &str) -> Vec<EventPayload> {
+    fn dispatch(&self, state: &Cx<'_>, id: &str) -> Vec<EventPayload> {
         let Some(effect) = state.effect(EffectKind::System1Call, id) else {
             return void_events(EffectKind::System1Call, id.to_string());
         };

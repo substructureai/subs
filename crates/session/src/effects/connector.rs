@@ -66,11 +66,11 @@ impl KindSpec for ConnectorSpec {
         true
     }
 
-    fn dispatch(&self, _state: &SessionState, id: &str) -> Vec<EventPayload> {
+    fn dispatch(&self, _state: &Cx<'_>, id: &str) -> Vec<EventPayload> {
         void_events(EffectKind::ConnectorSync, id.to_string())
     }
 
-    fn resend(&self, state: &SessionState, id: &str) -> Vec<EventPayload> {
+    fn resend(&self, state: &Cx<'_>, id: &str) -> Vec<EventPayload> {
         self.retry(state, id)
     }
 

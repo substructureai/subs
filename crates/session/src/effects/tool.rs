@@ -115,7 +115,7 @@ impl KindSpec for ToolSpec {
         events
     }
 
-    fn dispatch(&self, state: &SessionState, id: &str) -> Vec<EventPayload> {
+    fn dispatch(&self, state: &Cx<'_>, id: &str) -> Vec<EventPayload> {
         let Some(effect) = state.effect(EffectKind::ToolCall, id) else {
             return void_events(EffectKind::ToolCall, id.to_string());
         };

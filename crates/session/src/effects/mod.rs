@@ -118,7 +118,7 @@ pub trait KindSpec: Sync {
         )
     }
 
-    fn dispatch(&self, state: &SessionState, id: &str) -> Vec<EventPayload>;
+    fn dispatch(&self, state: &Cx<'_>, id: &str) -> Vec<EventPayload>;
 
     fn execute_trigger(&self, _state: &SessionState, _id: &str) -> Option<Trigger> {
         None
@@ -132,7 +132,7 @@ pub trait KindSpec: Sync {
         true
     }
 
-    fn resend(&self, state: &SessionState, id: &str) -> Vec<EventPayload> {
+    fn resend(&self, state: &Cx<'_>, id: &str) -> Vec<EventPayload> {
         self.dispatch(state, id)
     }
 

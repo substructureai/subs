@@ -340,6 +340,9 @@ impl Session {
         let head = self.seq;
         if restarted && reader.restart == Restart::ResendOpen {
             let items = self.resend(store)?;
+            if let Some(error) = self.state.tree.failed() {
+                return Err(error.into());
+            }
             if !items.is_empty() {
                 return Ok(Next {
                     batch: Some(Batch {
@@ -365,6 +368,9 @@ impl Session {
                 return Ok(Next::idle(Vec::new()));
             };
             let items = self.work(&read);
+            if let Some(error) = self.state.tree.failed() {
+                return Err(error.into());
+            }
             if items.is_empty() {
                 store.set_cursor(&reader.name, through)?;
                 continue;

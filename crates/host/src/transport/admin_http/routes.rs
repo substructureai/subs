@@ -263,7 +263,7 @@ pub async fn connect_session_ag_ui(
     let frames = match session {
         Some(session) => {
             let run_id = input.run_id;
-            match crate::runtime::sessions::read(&session, move |state| {
+            match crate::runtime::sessions::read(std::sync::Arc::new(session), move |state| {
                 snapshot_events(session_id, run_id, Some(state))
             })
             .await

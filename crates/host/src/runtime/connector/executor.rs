@@ -140,8 +140,9 @@ pub async fn answer_locally(
     plugins: &dyn PluginResolver,
 ) -> Result<Option<StoredResult>, String> {
     use crate::runtime::sessions::read;
+    let session = std::sync::Arc::new(session.clone());
     let id = tool_call_id.to_string();
-    let (attachment, skill) = read(session, move |state| {
+    let (attachment, skill) = read(session.clone(), move |state| {
         (state.attachment_call(&id), state.skill_call(&id))
     })
     .await
@@ -157,7 +158,7 @@ pub async fn answer_locally(
         false => plugins.resolve(session.tenant_id(), &call.plugin_id).await,
     };
     let (asked, held) = (call.clone(), bundle.clone());
-    let file = read(session, move |state| {
+    let file = read(session.clone(), move |state| {
         engine_tools::stored_file(
             state.at(asked.node.as_deref()),
             held.as_ref(),
