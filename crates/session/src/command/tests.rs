@@ -14727,8 +14727,8 @@ fn a_tree_call_survives_a_snapshot_and_an_older_one_loads_as_legacy() {
     assert!(placed_by(&agg, "call-2").is_empty());
 
     let mut old = snapshot.to_string();
-    old = old.replace(r#""source":{"at":"call-1:ctx","kind":"tree"},"#, "");
-    old = old.replace(r#""source":{"kind":"tree","at":"call-1:ctx"},"#, "");
+    old = old.replace(r#""source":{"at":"u1","kind":"tree"},"#, "");
+    old = old.replace(r#""source":{"kind":"tree","at":"u1"},"#, "");
     assert!(!old.contains("\"kind\":\"tree\""), "the source is cut out");
     let old: SessionState = serde_json::from_str(&old).unwrap();
     assert_eq!(

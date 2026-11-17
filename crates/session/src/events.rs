@@ -171,6 +171,8 @@ pub struct BranchClosed {
     pub data: serde_json::Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<ErrorInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leaf: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

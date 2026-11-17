@@ -47,17 +47,26 @@ pub fn up(conn: &Connection) -> rusqlite::Result<()> {
          );
          CREATE INDEX idx_session_events_version
             ON session_events (tenant_id, session_id, version);
-         CREATE INDEX idx_session_events_node
+         CREATE UNIQUE INDEX idx_session_events_node
             ON session_events (tenant_id, session_id, node_id) WHERE node_id IS NOT NULL;
          CREATE INDEX idx_session_events_children
             ON session_events (tenant_id, session_id, parent_id, branch, seq)
-            WHERE node_id IS NOT NULL;
+            WHERE parent_id IS NOT NULL;
          CREATE INDEX idx_session_events_branch
             ON session_events (tenant_id, session_id, branch, seq) WHERE branch IS NOT NULL;
          CREATE INDEX idx_session_events_versions
             ON session_events (tenant_id, session_id, prev, branch, seq) WHERE kind = 0;
          CREATE INDEX idx_session_events_answers
-            ON session_events (tenant_id, session_id, answers) WHERE answers IS NOT NULL;
+            ON session_events (tenant_id, session_id, answers, seq) WHERE answers IS NOT NULL;
+         CREATE TABLE session_branches (
+            tenant_id  TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            branch_id  TEXT NOT NULL,
+            seq        INTEGER NOT NULL,
+            started    BLOB NOT NULL,
+            closed     BLOB,
+            PRIMARY KEY (tenant_id, session_id, branch_id)
+         ) WITHOUT ROWID;
          CREATE TABLE session_heads (
             tenant_id  TEXT NOT NULL,
             session_id TEXT NOT NULL,

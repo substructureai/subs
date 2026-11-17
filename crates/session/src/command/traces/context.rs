@@ -564,10 +564,16 @@ fn a_held_tree_call_runs_on_the_new_branch_and_is_told_its_context_once() {
     assert_eq!(read[0], "be brief");
     assert_eq!(listings(&t, "call-3"), 1, "{read:?}");
     assert_eq!(read[2..], path(&t), "then the new branch");
-    let head = t.agg.state.head_id.clone();
+    let head = t.agg.state.head_id.clone().unwrap();
+    let read_at = t
+        .agg
+        .state
+        .tree
+        .get(&head)
+        .and_then(|n| n.parent().map(str::to_string));
     assert_eq!(
         t.agg.state.llm_call("call-3").unwrap().source,
-        PromptSource::Tree { at: head }
+        PromptSource::Tree { at: read_at }
     );
 
     answered(&mut t, "call-3", "a3", 100);

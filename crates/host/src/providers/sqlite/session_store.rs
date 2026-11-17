@@ -7,9 +7,9 @@ use quick_cache::sync::Cache;
 use quick_cache::{Equivalent, Weighter};
 use rusqlite::{params, OptionalExtension, Row, Transaction, TransactionBehavior};
 use substructure_session::delivery::Start;
-use substructure_session::events::EventPayload;
+use substructure_session::events::{BranchClosed, BranchStarted, EventPayload};
 use substructure_session::protocol::Role;
-use substructure_session::state::Logged;
+use substructure_session::state::{BranchState, Logged};
 use substructure_session::tree::{BranchRecord, Fact, Node, Nodes, Shared};
 use substructure_session::{
     CommandId, CommandResult, Entry, Handled, Session, SessionEvent, Store, StoreError,
@@ -236,8 +236,7 @@ impl SqliteSessionStore {
         let mut above = tx
             .prepare_cached(
                 "SELECT CASE WHEN kind = 0 THEN node_id ELSE prev END FROM session_events
-                  WHERE tenant_id = ?1 AND session_id = ?2 AND node_id = ?3
-                  ORDER BY seq LIMIT 1",
+                  WHERE tenant_id = ?1 AND session_id = ?2 AND node_id = ?3",
             )
             .map_err(unavailable)?;
         for event in &entry.events {
@@ -276,6 +275,44 @@ impl SqliteSessionStore {
                     payload,
                 ])
                 .map_err(unavailable)?;
+        }
+        Ok(())
+    }
+
+    fn write_branches(&self, tx: &Transaction, entry: &Entry) -> Result<(), StoreError> {
+        for event in &entry.events {
+            let corrupt = |e: serde_json::Error| StoreError::Corrupt(e.to_string());
+            match &event.payload {
+                EventPayload::BranchStarted(p) => {
+                    tx.execute(
+                        "INSERT OR REPLACE INTO session_branches
+                            (tenant_id, session_id, branch_id, seq, started, closed)
+                         VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+                        params![
+                            self.tenant_id,
+                            self.session_id,
+                            p.id,
+                            event.seq as i64,
+                            serde_json::to_vec(p).map_err(corrupt)?
+                        ],
+                    )
+                    .map_err(unavailable)?;
+                }
+                EventPayload::BranchClosed(p) => {
+                    tx.execute(
+                        "UPDATE session_branches SET closed = ?4
+                          WHERE tenant_id = ?1 AND session_id = ?2 AND branch_id = ?3",
+                        params![
+                            self.tenant_id,
+                            self.session_id,
+                            p.id,
+                            serde_json::to_vec(p).map_err(corrupt)?
+                        ],
+                    )
+                    .map_err(unavailable)?;
+                }
+                _ => {}
+            }
         }
         Ok(())
     }
@@ -378,6 +415,7 @@ impl Store for SqliteSessionStore {
         )
         .map_err(unavailable)?;
         self.write_events(&tx, entry)?;
+        self.write_branches(&tx, entry)?;
         for handled in &entry.commands {
             let result = serde_json::to_vec(&handled.result)
                 .map_err(|e| StoreError::Corrupt(e.to_string()))?;
@@ -414,7 +452,8 @@ impl Store for SqliteSessionStore {
 
     fn read(&self, after_version: u64) -> Result<Vec<Entry>, StoreError> {
         let conn = self.reader()?;
-        let mut stmt = conn
+        let tx = conn.unchecked_transaction().map_err(unavailable)?;
+        let mut stmt = tx
             .prepare_cached(
                 "SELECT version, at, commands FROM session_entries
                   WHERE tenant_id = ?1 AND session_id = ?2 AND version > ?3
@@ -446,7 +485,8 @@ impl Store for SqliteSessionStore {
                 events: Vec::new(),
             });
         }
-        let mut stmt = conn
+        drop(stmt);
+        let mut stmt = tx
             .prepare_cached(
                 "SELECT seq, envelope, payload, version FROM session_events
                   WHERE tenant_id = ?1 AND session_id = ?2 AND version > ?3
@@ -473,6 +513,8 @@ impl Store for SqliteSessionStore {
                 })?;
             entry.events.push(event?);
         }
+        drop(stmt);
+        tx.commit().map_err(unavailable)?;
         Ok(entries)
     }
 
@@ -606,43 +648,47 @@ impl Nodes for SqliteSessionStore {
         Ok(self
             .select_nodes(
                 "SELECT seq, payload FROM session_events
-                  WHERE tenant_id = ?1 AND session_id = ?2 AND node_id = ?3
-                  ORDER BY seq LIMIT 1",
+                  WHERE tenant_id = ?1 AND session_id = ?2 AND node_id = ?3",
                 params![self.tenant_id, self.session_id, id],
             )?
             .into_iter()
             .next())
     }
 
-    fn ancestors(&self, id: &str) -> Result<Vec<Shared>, StoreError> {
+    fn ancestors(&self, id: &str, limit: usize) -> Result<Vec<Shared>, StoreError> {
         let mut found = Vec::new();
         let mut cursor = Some(id.to_string());
-        while let Some(node) = cursor.as_deref().and_then(|id| self.cached(id)) {
+        while let Some(node) = cursor
+            .as_deref()
+            .filter(|_| found.len() < limit)
+            .and_then(|id| self.cached(id))
+        {
             cursor = node.parent().map(str::to_string);
             found.push(node);
         }
-        let Some(missing) = cursor else {
+        let Some(missing) = cursor.filter(|_| found.len() < limit) else {
             return Ok(found);
         };
         found.extend(self.select_nodes(
             "WITH RECURSIVE up(seq, parent_id, depth) AS (
                 SELECT seq, parent_id, 0 FROM session_events
                  WHERE tenant_id = ?1 AND session_id = ?2 AND node_id = ?3
-                 ORDER BY seq LIMIT 1
                 UNION ALL
                 SELECT e.seq, e.parent_id, up.depth + 1 FROM up
                   JOIN session_events e
-                    ON e.tenant_id = ?1 AND e.session_id = ?2
-                   AND e.seq = (SELECT MIN(seq) FROM session_events
-                                 WHERE tenant_id = ?1 AND session_id = ?2
-                                   AND node_id = up.parent_id)
-                 WHERE up.depth < 1000000
+                    ON e.tenant_id = ?1 AND e.session_id = ?2 AND e.node_id = up.parent_id
+                 WHERE up.depth + 1 < ?4
              )
              SELECT e.seq, e.payload FROM up
                JOIN session_events e
                  ON e.tenant_id = ?1 AND e.session_id = ?2 AND e.seq = up.seq
               ORDER BY up.depth",
-            params![self.tenant_id, self.session_id, missing],
+            params![
+                self.tenant_id,
+                self.session_id,
+                missing,
+                (limit - found.len()) as i64
+            ],
         )?);
         Ok(found)
     }
@@ -666,32 +712,33 @@ impl Nodes for SqliteSessionStore {
     }
 
     fn branch(&self, id: &str) -> Result<Option<BranchRecord>, StoreError> {
-        let conn = self.reader()?;
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT seq, payload FROM session_events
-                  WHERE tenant_id = ?1 AND session_id = ?2 AND branch = ?3 AND node_id IS NULL
-                 UNION ALL
-                 SELECT * FROM (SELECT seq, payload FROM session_events
-                  WHERE tenant_id = ?1 AND session_id = ?2 AND branch = ?3
-                    AND node_id IS NOT NULL
-                  ORDER BY seq DESC LIMIT 1)
-                 ORDER BY seq",
+        let row: Option<(i64, Vec<u8>, Option<Vec<u8>>)> = self
+            .reader()?
+            .query_row(
+                "SELECT seq, started, closed FROM session_branches
+                  WHERE tenant_id = ?1 AND session_id = ?2 AND branch_id = ?3",
+                params![self.tenant_id, self.session_id, id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
+            .optional()
             .map_err(unavailable)?;
-        let rows = stmt
-            .query_map(params![self.tenant_id, self.session_id, id], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
-            })
-            .map_err(unavailable)?;
-        let mut events = Vec::new();
-        for row in rows {
-            let (seq, payload) = row.map_err(unavailable)?;
-            events.push((seq as u64, parse(&payload)?));
+        let Some((seq, started, closed)) = row else {
+            return Ok(None);
+        };
+        let corrupt = |e: serde_json::Error| StoreError::Corrupt(e.to_string());
+        let started: BranchStarted = serde_json::from_slice(&started).map_err(corrupt)?;
+        let closed: Option<BranchClosed> = closed
+            .map(|c| serde_json::from_slice(&c))
+            .transpose()
+            .map_err(corrupt)?;
+        let mut state = BranchState::started(&started, seq as u64, 0, false);
+        if let Some(leaf) = closed.as_ref().and_then(|c| c.leaf.clone()) {
+            state.leaf = Some(leaf);
         }
-        Ok(substructure_session::tree::branch_record(
-            events.iter().map(|(seq, event)| (*seq, event)),
-        ))
+        Ok(Some(BranchRecord {
+            state,
+            closed: closed.map(|c| c.reason),
+        }))
     }
 
     fn versions(
@@ -845,7 +892,7 @@ mod tests {
         assert!(nodes.node("nobody").unwrap().is_none());
         let parent = u1.parent().expect("it hangs below the setup").to_string();
         let path: Vec<String> = nodes
-            .ancestors("u1")
+            .ancestors("u1", 256)
             .unwrap()
             .iter()
             .map(|n| n.id().to_string())
@@ -943,5 +990,311 @@ mod tests {
         assert!(stores.behind(&consumers).unwrap().is_empty());
         store.set_cursor("slack", head - 1).unwrap();
         assert_eq!(stores.behind(&consumers).unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod cold {
+    use std::time::Duration;
+
+    use chrono::Utc;
+    use substructure_session::command::{CommandPayload, TurnTarget};
+    use substructure_session::decision::{Action, BranchConfig, BranchFrom, BranchStart};
+    use substructure_session::protocol::EffectKind;
+    use substructure_session::protocol::{
+        AgentConfig, BranchMode, ClientMessages, ClientPayload, Content, DraftMessage, Issuer,
+        LlmRequest, QueueMode, Requester, RetryPolicy, Role, SessionOwner, Subject, WorkerState,
+    };
+    use substructure_session::request::WorkerDecisionRequest;
+    use substructure_session::{Command, Settings, Work};
+
+    use super::*;
+
+    struct Cold {
+        _dir: tempfile::TempDir,
+        store: SharedStore,
+        session: Session,
+        n: usize,
+    }
+
+    fn draft(id: &str, role: Role, text: &str) -> DraftMessage {
+        DraftMessage {
+            id: Some(id.into()),
+            role,
+            content: Some(Content::Text(text.into())),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            reasoning: None,
+        }
+    }
+
+    impl Cold {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("subs.db");
+            let db = SqliteDb::open(path.to_str().unwrap(), Duration::from_secs(5)).unwrap();
+            let store = SqliteSessionStores::with_node_cache(db, 0).open("t", "s1");
+            let session = Session::load(store.as_ref(), "s1", "t", Settings::default()).unwrap();
+            let mut cold = Cold {
+                _dir: dir,
+                store,
+                session,
+                n: 0,
+            };
+            let config: AgentConfig =
+                serde_json::from_value(serde_json::json!({ "llm": "claude", "model": "m1" }))
+                    .unwrap();
+            cold.send(CommandPayload::CreateSession {
+                agent_id: "agent".into(),
+                owner: SessionOwner {
+                    tenant_id: "t".into(),
+                    requester: Requester::new(
+                        Subject::new(Issuer::app(), "u".to_string()),
+                        Default::default(),
+                    ),
+                    metadata: Default::default(),
+                },
+                ancestry: vec![],
+                worker_retry: RetryPolicy::no_retry(),
+                agent: Some(Box::new(config)),
+                worker: None,
+                events: None,
+                state: None,
+            });
+            cold.drain();
+            cold
+        }
+
+        fn send(&mut self, payload: CommandPayload) {
+            self.n += 1;
+            let ran = self
+                .session
+                .run(
+                    self.store.as_ref(),
+                    Utc::now(),
+                    Command::system(format!("c{}", self.n), "t", payload),
+                )
+                .unwrap();
+            ran.result.expect("accepted");
+        }
+
+        fn asked(&self) -> Option<WorkerDecisionRequest> {
+            self.session.open_work().into_iter().find_map(|w| match w {
+                Work::AskWorker { request, .. } => Some(*request),
+                _ => None,
+            })
+        }
+
+        fn reply(&mut self, view: Vec<DraftMessage>, state: Option<serde_json::Value>) {
+            self.reply_with(
+                view,
+                state,
+                vec![Action::Done {
+                    data: serde_json::Value::Null,
+                }],
+            );
+        }
+
+        fn reply_with(
+            &mut self,
+            view: Vec<DraftMessage>,
+            state: Option<serde_json::Value>,
+            actions: Vec<Action>,
+        ) {
+            let decision_id = self.asked().expect("a decision is open").decision_id;
+            self.send(CommandPayload::SubmitWorkerDecision {
+                decision_id,
+                transcript: view,
+                actions,
+                state: state.map(WorkerState::from),
+                agent: None,
+            });
+            self.drain();
+        }
+
+        fn drain(&mut self) {
+            for _ in 0..10 {
+                let Some(request) = self.asked() else { return };
+                self.send(CommandPayload::SubmitWorkerDecision {
+                    decision_id: request.decision_id,
+                    transcript: vec![],
+                    actions: vec![],
+                    state: None,
+                    agent: None,
+                });
+            }
+        }
+
+        fn view(&mut self, messages: Vec<DraftMessage>) {
+            self.send(CommandPayload::SubmitClientPayload {
+                payload: ClientPayload::Messages(ClientMessages {
+                    messages,
+                    stream: false,
+                    client: Default::default(),
+                }),
+                turn: TurnTarget::Open(format!("v{}", self.n)),
+                queue: QueueMode::Refuse,
+                metadata: Default::default(),
+            });
+        }
+
+        fn say(&mut self, text: &str) {
+            self.view(
+                [
+                    self.path(),
+                    vec![DraftMessage {
+                        id: None,
+                        ..draft("", Role::User, text)
+                    }],
+                ]
+                .concat(),
+            );
+        }
+
+        fn path(&self) -> Vec<DraftMessage> {
+            self.session
+                .state()
+                .at_head()
+                .transcript()
+                .into_iter()
+                .map(DraftMessage::from)
+                .collect()
+        }
+
+        fn ids(&self) -> Vec<String> {
+            self.path().into_iter().filter_map(|m| m.id).collect()
+        }
+
+        fn reloaded(&self) -> Session {
+            Session::load(self.store.as_ref(), "s1", "t", Settings::default()).unwrap()
+        }
+    }
+
+    #[test]
+    fn an_edit_and_a_switch_read_the_log_with_nothing_cached() {
+        let mut c = Cold::new();
+        let (u1, a1) = (
+            draft("u1", Role::User, "hi"),
+            draft("a1", Role::Assistant, "hello"),
+        );
+        let (u2, a2) = (
+            draft("u2", Role::User, "more"),
+            draft("a2", Role::Assistant, "ok"),
+        );
+        c.view(vec![u1.clone()]);
+        c.reply(
+            vec![u1.clone(), a1.clone()],
+            Some(serde_json::json!({ "turns": 1 })),
+        );
+        c.view(vec![u1.clone(), a1.clone(), u2.clone()]);
+        c.reply(
+            vec![u1.clone(), a1.clone(), u2.clone(), a2.clone()],
+            Some(serde_json::json!({ "turns": 2 })),
+        );
+        assert_eq!(c.ids(), ["u1", "a1", "u2", "a2"]);
+
+        let edit = vec![u1.clone(), a1.clone(), draft("e2", Role::User, "edited")];
+        c.view(edit.clone());
+        let asked = c.asked().expect("the edit asks the worker");
+        assert_eq!(asked.state.0, serde_json::json!({ "turns": 1 }));
+        c.reply(
+            [edit, vec![draft("b2", Role::Assistant, "sure")]].concat(),
+            Some(serde_json::json!({ "turns": 2, "edited": true })),
+        );
+        assert_eq!(c.ids(), ["u1", "a1", "e2", "b2"]);
+
+        let back = vec![u1, a1, u2, a2];
+        c.view(back.clone());
+        assert_eq!(
+            c.asked().unwrap().state.0,
+            serde_json::json!({ "turns": 2 })
+        );
+        c.reply(back, None);
+        assert_eq!(c.ids(), ["u1", "a1", "u2", "a2"]);
+
+        let loaded = c.reloaded();
+        assert_eq!(
+            serde_json::to_value(loaded.state()).unwrap(),
+            serde_json::to_value(c.session.state()).unwrap(),
+            "a load from the log is the live state"
+        );
+        assert_eq!(loaded.state().tree.versions("u2"), ["u2", "e2"]);
+    }
+
+    #[test]
+    fn a_retried_call_and_a_closed_branch_read_the_log_with_nothing_cached() {
+        let mut c = Cold::new();
+        c.say("hi");
+        let view = c.path();
+        let config: AgentConfig =
+            serde_json::from_value(serde_json::json!({ "llm": "claude", "model": "m2" })).unwrap();
+        c.reply_with(
+            view,
+            None,
+            vec![Action::CallLlm {
+                id: "c1".into(),
+                llm: "claude".into(),
+                request: LlmRequest {
+                    model: "m1".into(),
+                    messages: vec![],
+                    tools: None,
+                    temperature: None,
+                    max_completion_tokens: None,
+                    reasoning: None,
+                },
+                source: Default::default(),
+                stream: false,
+                retry: RetryPolicy::no_retry(),
+                handler: Default::default(),
+                format: None,
+                branch: Some(BranchStart {
+                    id: "side".into(),
+                    from: BranchFrom::Head,
+                    agent: BranchConfig::Config(Box::new(config)),
+                    name: None,
+                    mode: BranchMode::Detached,
+                }),
+            }],
+        );
+        c.send(CommandPayload::settle(
+            EffectKind::LlmCall,
+            "c1",
+            Some(0),
+            substructure_session::effects::Outcome::Llm(Box::new(
+                serde_json::from_value(serde_json::json!({
+                    "model": "m2",
+                    "content": "done",
+                    "finish_reason": "stop",
+                }))
+                .unwrap(),
+            )),
+        ));
+        c.drain();
+        assert!(
+            !c.session.state().branches.contains_key("side"),
+            "it closed"
+        );
+
+        let record = c
+            .store
+            .nodes()
+            .branch("side")
+            .unwrap()
+            .expect("the log keeps it");
+        assert!(record.closed.is_some());
+        let at = record.state.at().map(str::to_string);
+        let read = c.session.state().at(at.as_deref());
+        assert_eq!(read.resolve_agent_for().map(|a| a.model), Some("m2".into()));
+        let ancestors = c
+            .store
+            .nodes()
+            .ancestors(at.as_deref().unwrap(), 256)
+            .unwrap();
+        assert_eq!(
+            ancestors.last().and_then(|n| n.parent()),
+            None,
+            "it reaches the root"
+        );
     }
 }

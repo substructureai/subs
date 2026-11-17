@@ -413,8 +413,8 @@ pub struct LlmCallState {
     pub format: Option<LlmFormat>,
     #[serde(default)]
     pub defer_tools_strategy: DeferToolsStrategy,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub context_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
     /// The tools the model gets, set at dispatch from `spec.tools`, which
     /// keeps the tools the call asked for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -568,7 +568,6 @@ pub struct Outgoing {
     pub prompt: Vec<Message>,
     pub placed: Vec<prompt_context::Placed>,
     pub places: bool,
-    context_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1159,8 +1158,12 @@ impl SessionState {
         if !forks && parent != self.scope_node(branch.as_deref()) {
             return;
         }
-        match branch.and_then(|b| self.branches.get_mut(&b)) {
-            Some(branch) => branch.leaf = Some(id),
+        match branch {
+            Some(b) => {
+                if let Some(branch) = self.branches.get_mut(&b) {
+                    branch.leaf = Some(id);
+                }
+            }
             None => {
                 if user {
                     self.status = SessionStatus::Idle;
@@ -1465,7 +1468,7 @@ impl SessionState {
                     stream: payload.stream,
                     handler: payload.handler,
                     format: payload.format,
-                    context_ids: Vec::new(),
+                    context: None,
                     dispatched_seq: None,
                     sent_tools: None,
                     unanswered: Vec::new(),
@@ -1493,13 +1496,13 @@ impl SessionState {
     pub fn outgoing(&self, id: &str) -> Option<Outgoing> {
         let effect = self.effect(EffectKind::LlmCall, id)?;
         let call = effect.llm()?;
-        let node = match &call.source {
+        let node = call.context.clone().or_else(|| match &call.source {
             PromptSource::Tree { at } => at.clone(),
             _ => effect.anchor.clone().or_else(|| self.head_id.clone()),
-        };
+        });
         Some(
             self.at(node.as_deref())
-                .outgoing(id, &call.source, &call.prompt, &call.context_ids),
+                .outgoing(id, &call.source, &call.prompt),
         )
     }
 
@@ -1540,7 +1543,6 @@ impl SessionState {
                     None => sent_tools(call.spec.tools.clone(), &connector_tools, &locked),
                 };
                 call.prompt = out.prompt;
-                call.context_ids = out.context_ids;
                 call.dispatched_seq = Some(ctx.sequence);
             }
         }
@@ -1755,6 +1757,15 @@ impl SessionState {
         if kind == EffectKind::LlmCall {
             self.settle_prompt(&p.id);
         }
+        if kind == EffectKind::ToolCall {
+            for e in self.effects.values_mut() {
+                match &mut e.payload {
+                    EffectPayload::LlmCall(call) => call.unanswered.retain(|id| *id != p.id),
+                    EffectPayload::ToolCall(tool) if e.id == p.id => tool.recorded = true,
+                    _ => {}
+                }
+            }
+        }
         self.dequeue(kind, &p.id);
     }
 
@@ -1798,30 +1809,25 @@ impl SessionState {
                     self.tree.record(&p.id, branch, Some(p.reason));
                 }
             }
-            EventPayload::HeadMoved(payload) => {
-                match payload
-                    .branch
-                    .as_deref()
-                    .and_then(|b| self.branches.get_mut(b))
-                {
-                    Some(branch) => branch.leaf = Some(payload.head_id.clone()),
-                    None => self.head_id = Some(payload.head_id.clone()),
+            EventPayload::HeadMoved(payload) => match payload.branch.as_deref() {
+                Some(b) => {
+                    if let Some(branch) = self.branches.get_mut(b) {
+                        branch.leaf = Some(payload.head_id.clone());
+                    }
                 }
-            }
+                None => self.head_id = Some(payload.head_id.clone()),
+            },
             EventPayload::LlmCallRequested(payload) => self.apply_llm_requested(payload, ctx),
             EventPayload::LlmCallDispatched(payload) => self.apply_llm_dispatched(payload, ctx),
             EventPayload::ContextPlaced(payload) => {
                 if let Some(node) = crate::tree::Node::of_event(event) {
                     self.grow(node, ctx.sequence);
                 }
-                let at = Some(payload.node.id.clone());
-                if let Some(effect) = self.effect_mut(EffectKind::LlmCall, &payload.call) {
-                    effect.anchor = at.clone();
-                    if let Some(call) = effect.llm_mut() {
-                        if let PromptSource::Tree { at: source } = &mut call.source {
-                            *source = at;
-                        }
-                    }
+                if let Some(call) = self
+                    .effect_mut(EffectKind::LlmCall, &payload.call)
+                    .and_then(|e| e.llm_mut())
+                {
+                    call.context = Some(payload.node.id.clone());
                 }
             }
             EventPayload::LlmCallCompleted(payload) => {
@@ -3129,7 +3135,7 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
             .collect()
     }
 
-    fn contexts(&self) -> Vec<prompt_context::Placed> {
+    pub fn placed_on_path(&self) -> Vec<prompt_context::Placed> {
         let mut placed: Vec<Vec<prompt_context::Placed>> = Vec::new();
         for node in self.up() {
             match &node.fact {
@@ -3142,23 +3148,19 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
     }
 
     pub fn said(&self) -> std::collections::HashSet<String> {
-        self.contexts().into_iter().flat_map(|p| p.ids).collect()
+        self.placed_on_path()
+            .into_iter()
+            .flat_map(|p| p.ids)
+            .collect()
     }
 
-    pub fn outgoing(
-        &self,
-        id: &str,
-        source: &PromptSource,
-        given: &[Message],
-        applied: &[String],
-    ) -> Outgoing {
+    pub fn outgoing(&self, id: &str, source: &PromptSource, given: &[Message]) -> Outgoing {
         let node = self.node.map(str::to_string);
         let mut out = Outgoing {
             node,
             prompt: given.to_vec(),
             placed: Vec::new(),
             places: false,
-            context_ids: applied.to_vec(),
         };
         match source {
             PromptSource::Explicit => return out,
@@ -3196,7 +3198,7 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
                 let open = self.system_prefix_open(id);
                 prompt_context::merge(
                     &mut out.prompt,
-                    &mut out.context_ids,
+                    &mut Vec::new(),
                     &mut out.placed,
                     id,
                     open,
@@ -3208,22 +3210,21 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
         out
     }
 
-    pub fn placed_on_path(&self) -> Vec<prompt_context::Placed> {
-        self.contexts()
-    }
-
     pub fn system_prefix_open(&self, exclude: &str) -> bool {
-        let placed = self
-            .up()
-            .any(|n| matches!(&n.fact, crate::tree::Fact::Context { call, .. } if call != exclude));
+        for node in self.up() {
+            match &node.fact {
+                crate::tree::Fact::Context { call, .. } if call != exclude => return false,
+                crate::tree::Fact::Config { root: true, .. } => break,
+                _ => {}
+            }
+        }
         let path = self.path_set();
-        !placed
-            && !self.state.effects.values().any(|e| {
-                e.id != exclude
-                    && e.llm().is_some_and(|c| c.source != PromptSource::Explicit)
-                    && SessionState::anchored_on(&path, e.anchor.as_deref())
-                    && e.tracking.status() != EffectStatus::Queued
-            })
+        !self.state.effects.values().any(|e| {
+            e.id != exclude
+                && e.llm().is_some_and(|c| c.source != PromptSource::Explicit)
+                && SessionState::anchored_on(&path, e.anchor.as_deref())
+                && e.tracking.status() != EffectStatus::Queued
+        })
     }
 
     pub fn call_tool_target(&self, named: &str) -> Option<CallTarget> {
@@ -3406,7 +3407,7 @@ mod open_llm_calls_tests {
             EffectPayload::LlmCall(LlmCallState {
                 source: Default::default(),
                 defer_tools_strategy: Default::default(),
-                context_ids: Vec::new(),
+                context: None,
                 sent_tools: None,
                 unanswered: Vec::new(),
                 format: None,

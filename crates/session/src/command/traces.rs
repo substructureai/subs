@@ -1439,7 +1439,6 @@ fn trace_timeout_retry_then_exhaustion() {
         "llm.call.dispatched",
         "llm.call.errored",
         "llm.call.requested",
-        "context.placed",
         "llm.call.dispatched",
         "llm.call.errored",
         "decision.queued",

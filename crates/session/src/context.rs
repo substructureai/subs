@@ -110,7 +110,7 @@ fn held(state: &SessionState, call: &HeldCall, source: &PromptSource) -> HeldCal
     if !source.is_tree() {
         return call.clone();
     }
-    let out = state.at_head().outgoing(&call.id, source, &[], &[]);
+    let out = state.at_head().outgoing(&call.id, source, &[]);
     HeldCall {
         request: LlmRequest {
             messages: out.prompt.into_iter().map(DraftMessage::from).collect(),

@@ -93,45 +93,9 @@ pub struct BranchRecord {
     pub closed: Option<BranchEnd>,
 }
 
-pub fn branch_record<'a>(
-    events: impl IntoIterator<Item = (u64, &'a crate::events::EventPayload)>,
-) -> Option<BranchRecord> {
-    use crate::events::EventPayload;
-    let mut record: Option<BranchRecord> = None;
-    for (seq, event) in events {
-        match event {
-            EventPayload::BranchStarted(p) => match record.as_mut() {
-                Some(r) => r.closed = None,
-                None => {
-                    record = Some(BranchRecord {
-                        state: BranchState::started(p, seq, 0, false),
-                        closed: None,
-                    })
-                }
-            },
-            EventPayload::BranchClosed(p) => {
-                if let Some(r) = record.as_mut() {
-                    r.closed = Some(p.reason);
-                }
-            }
-            EventPayload::HeadMoved(p) => {
-                if let Some(r) = record.as_mut() {
-                    r.state.leaf = Some(p.head_id.clone());
-                }
-            }
-            other => {
-                if let (Some(r), Some(node)) = (record.as_mut(), Node::of_event(other)) {
-                    r.state.leaf = Some(node.id().to_string());
-                }
-            }
-        }
-    }
-    record
-}
-
 pub trait Nodes: Send + Sync {
     fn node(&self, id: &str) -> Result<Option<Shared>, StoreError>;
-    fn ancestors(&self, id: &str) -> Result<Vec<Shared>, StoreError>;
+    fn ancestors(&self, id: &str, limit: usize) -> Result<Vec<Shared>, StoreError>;
     fn children(&self, parent: &str, branch: Option<&str>) -> Result<Vec<Shared>, StoreError>;
     fn answers(&self, tool_call_id: &str) -> Result<Vec<Shared>, StoreError>;
     fn branch(&self, id: &str) -> Result<Option<BranchRecord>, StoreError>;
@@ -370,6 +334,8 @@ impl Tree {
     }
 }
 
+const ANCESTORS: usize = 256;
+
 pub struct Up<'a> {
     tree: &'a Tree,
     cursor: Option<String>,
@@ -394,7 +360,11 @@ impl Iterator for Up<'_> {
                 Some(node.clone())
             }
             None => {
-                self.stored = self.tree.read(|s| s.ancestors(&id)).into_iter();
+                let mut chunk = self.tree.read(|s| s.ancestors(&id, ANCESTORS));
+                if chunk.len() == ANCESTORS {
+                    self.cursor = chunk.pop().map(|n| n.id().to_string());
+                }
+                self.stored = chunk.into_iter();
                 self.stored.next()
             }
         }

@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Utc};
 
 use crate::entry::{CommandId, CommandResult, Entry};
+use crate::events::EventPayload;
 use crate::session::{Session, SessionEvent};
 use crate::state::Logged;
 use crate::tree::{BranchRecord, Node, Nodes, Shared};
@@ -62,6 +63,7 @@ struct Space {
     nodes: BTreeMap<u64, Shared>,
     ids: BTreeMap<String, u64>,
     handled: BTreeMap<CommandId, (CommandResult, DateTime<Utc>)>,
+    branches: BTreeMap<String, BranchRecord>,
 }
 
 #[derive(Clone, Default)]
@@ -96,6 +98,26 @@ impl Store for MemoryStore {
                     entry: node,
                 }),
             );
+        }
+        for event in &entry.events {
+            match &event.payload {
+                EventPayload::BranchStarted(p) => {
+                    space.branches.insert(
+                        p.id.clone(),
+                        BranchRecord {
+                            state: crate::state::BranchState::started(p, event.seq, 0, false),
+                            closed: None,
+                        },
+                    );
+                }
+                EventPayload::BranchClosed(p) => {
+                    if let Some(record) = space.branches.get_mut(&p.id) {
+                        record.state.leaf = p.leaf.clone().or(record.state.leaf.take());
+                        record.closed = Some(p.reason);
+                    }
+                }
+                _ => {}
+            }
         }
         for handled in &entry.commands {
             space
@@ -188,7 +210,7 @@ impl Nodes for MemoryStore {
             .cloned())
     }
 
-    fn ancestors(&self, id: &str) -> Result<Vec<Shared>, StoreError> {
+    fn ancestors(&self, id: &str, limit: usize) -> Result<Vec<Shared>, StoreError> {
         let space = self.space();
         let mut found = Vec::new();
         let mut cursor = Some(id.to_string());
@@ -196,7 +218,7 @@ impl Nodes for MemoryStore {
             .take()
             .and_then(|id| space.ids.get(&id))
             .and_then(|seq| space.nodes.get(seq))
-            .filter(|_| found.len() < space.nodes.len())
+            .filter(|_| found.len() < limit.min(space.nodes.len()))
         {
             cursor = node.parent().map(str::to_string);
             found.push(node.clone());
@@ -215,13 +237,7 @@ impl Nodes for MemoryStore {
     }
 
     fn branch(&self, id: &str) -> Result<Option<BranchRecord>, StoreError> {
-        let space = self.space();
-        let events = space.log.values().flat_map(|entry| entry.events.iter());
-        Ok(crate::tree::branch_record(
-            events
-                .filter(|e| touches(&e.payload, id))
-                .map(|e| (e.seq, &e.payload)),
-        ))
+        Ok(self.space().branches.get(id).cloned())
     }
 
     fn versions(
@@ -264,15 +280,5 @@ impl Nodes for MemoryStore {
             })
             .cloned()
             .collect())
-    }
-}
-
-pub fn touches(payload: &crate::events::EventPayload, branch: &str) -> bool {
-    use crate::events::EventPayload;
-    match payload {
-        EventPayload::BranchStarted(p) => p.id == branch,
-        EventPayload::BranchClosed(p) => p.id == branch,
-        EventPayload::HeadMoved(p) => p.branch.as_deref() == Some(branch),
-        other => Node::of_event(other).is_some_and(|n| n.branch() == Some(branch)),
     }
 }

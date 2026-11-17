@@ -84,7 +84,9 @@ impl SessionState {
         );
         for b in self.branch_and_below(id).into_iter().rev() {
             let own = b == id;
+            let leaf = self.branches.get(&b).and_then(|b| b.leaf.clone());
             events.push(EventPayload::BranchClosed(BranchClosed {
+                leaf,
                 id: b,
                 reason: if own { reason } else { BranchEnd::Closed },
                 data: if own {
@@ -479,6 +481,7 @@ impl Working {
             reason: BranchEnd::Promoted,
             data: serde_json::Value::Null,
             error: None,
+            leaf: Some(leaf.clone()),
         }));
         self.emit(EventPayload::HeadMoved(HeadMoved {
             head_id: leaf,

@@ -421,9 +421,17 @@ fn a_branch_runs_its_tools_on_itself() {
         .find(|e| e.id != "c1" && e.id != "t1")
         .expect("the branch calls the model again");
     assert_eq!(next.branch.as_deref(), Some("title"));
-    let leaf = agg.state.open_branch("title").unwrap().leaf.clone();
+    let leaf = agg
+        .state
+        .open_branch("title")
+        .unwrap()
+        .leaf
+        .clone()
+        .unwrap();
+    let placed = agg.state.tree.get(&leaf).expect("its context is the leaf");
     assert_eq!(
-        next.anchor, leaf,
+        next.anchor.as_deref(),
+        placed.parent(),
         "it reads the branch, tool result included"
     );
     assert_eq!(agg.state.head_id.as_deref(), Some("c1"));
