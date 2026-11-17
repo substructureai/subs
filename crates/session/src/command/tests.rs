@@ -1269,8 +1269,9 @@ fn append_via_worker(agg: &mut Session, transcript: Vec<DraftMessage>) {
 }
 
 #[test]
-fn request_llm_call_stores_prompt_without_minting_nodes() {
+fn a_call_that_brings_messages_reads_them_on_a_branch_of_its_own() {
     let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    append_via_worker(&mut agg, vec![node_msg("u1", Role::User, "hi")]);
     let events = dispatch(
         &mut agg,
         CommandPayload::RequestLlmCall {
@@ -1278,38 +1279,36 @@ fn request_llm_call_stores_prompt_without_minting_nodes() {
             llm: "claude".to_string(),
             call_id: "llm-1".to_string(),
             request: request_with(vec![
-                node_msg("sys", Role::System, "be helpful"),
                 node_msg("u1", Role::User, "hi"),
+                node_msg("", Role::User, "and more"),
             ]),
             stream: false,
             retry: RetryPolicy::no_retry(),
             handler: LlmHandler::Server,
             format: None,
         },
-        &Caller::System {
-            tenant_id: "tenant-a".to_string(),
-        },
+        &system(),
     );
-
-    assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e, EventPayload::NewMessage(_))),
-        "request mints no tree nodes; got {events:?}"
-    );
-    let call = agg
-        .state
-        .effect(EffectKind::LlmCall, "llm-1")
-        .expect("llm call present");
-    assert_eq!(
-        call.llm()
-            .unwrap()
-            .prompt
-            .iter()
-            .map(|m| m.id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["sys", "u1"]
-    );
+    let started = events
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::BranchStarted(b) => Some(b),
+            _ => None,
+        })
+        .expect("the call starts a branch");
+    assert_eq!(started.id, "llm-1");
+    assert_eq!(started.from.as_deref(), Some("u1"));
+    assert!(matches!(started.agent, crate::decision::BranchConfig::None));
+    let written: Vec<&NewMessage> = events
+        .iter()
+        .filter_map(|e| match e {
+            EventPayload::NewMessage(m) => Some(m),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(written.len(), 1, "only what is not recorded is written");
+    assert_eq!(written[0].branch.as_deref(), Some("llm-1"));
+    assert_eq!(sent_texts(&agg, "llm-1"), ["hi", "and more"]);
 }
 
 #[test]
@@ -2266,7 +2265,7 @@ fn fail_llm_call_emits_errored() {
 }
 
 #[test]
-fn llm_retry_reuses_the_stored_prompt() {
+fn a_retried_call_sends_what_it_sent_before() {
     let mut agg = create_session("sess-1", "tenant-a", "user-1");
     let retry = RetryPolicy {
         queue_timeout_secs: None,
@@ -2289,10 +2288,7 @@ fn llm_retry_reuses_the_stored_prompt() {
             source: Default::default(),
             llm: "claude".to_string(),
             call_id: "llm-1".to_string(),
-            request: request_with(vec![
-                node_msg("sys", Role::System, "sys prompt"),
-                node_msg("u1", Role::User, "hi"),
-            ]),
+            request: test_llm_request(),
             stream: false,
             retry,
             handler: LlmHandler::Server,
@@ -2300,20 +2296,8 @@ fn llm_retry_reuses_the_stored_prompt() {
         },
         &system(),
     );
-
-    let call = agg
-        .state
-        .effect(EffectKind::LlmCall, "llm-1")
-        .expect("call present");
-    assert_eq!(
-        call.llm()
-            .unwrap()
-            .prompt
-            .iter()
-            .map(|m| m.id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["sys", "u1"]
-    );
+    let sent = sent_texts(&agg, "llm-1");
+    assert_eq!(sent, ["sys prompt", "hi"]);
 
     dispatch(
         &mut agg,
@@ -2325,31 +2309,31 @@ fn llm_retry_reuses_the_stored_prompt() {
         ),
         &system(),
     );
+    let later = Utc::now() + chrono::Duration::seconds(120);
+    dispatch(&mut agg, CommandPayload::Wake { now: later }, &system());
     assert_eq!(
         agg.state
             .tracking(EffectKind::LlmCall, "llm-1")
-            .map(|c| c.status()),
-        Some(EffectStatus::RetryScheduled)
+            .map(|t| t.retry.attempts),
+        Some(1)
     );
+    assert_eq!(sent_texts(&agg, "llm-1"), sent);
+}
 
-    let later = Utc::now() + chrono::Duration::seconds(120);
-    let events = dispatch(&mut agg, CommandPayload::Wake { now: later }, &system());
-    let reissued = events
-        .iter()
-        .find_map(|e| match e {
-            EventPayload::LlmCallRequested(p) => Some(p),
+fn sent_texts(agg: &Session, id: &str) -> Vec<String> {
+    agg.open_work()
+        .into_iter()
+        .find_map(|w| match w {
+            crate::Work::CallLlm { call, .. } if call.call_id == id => Some(call.request.messages),
             _ => None,
         })
-        .expect("retry re-issues the llm call");
-
-    assert_eq!(reissued.request.model, "test-model");
-    assert_eq!(reissued.request.messages.len(), 2);
-    assert_eq!(reissued.request.messages[0].id.as_deref(), Some("sys"));
-    assert_eq!(reissued.request.messages[1].id.as_deref(), Some("u1"));
-    assert!(matches!(
-        &reissued.request.messages[1].content,
-        Some(Content::Text(t)) if t == "hi"
-    ));
+        .expect("the call is open")
+        .iter()
+        .map(|m| match &m.content {
+            Some(Content::Text(t)) => t.clone(),
+            _ => String::new(),
+        })
+        .collect()
 }
 
 fn test_llm_request() -> LlmRequest {
@@ -8186,27 +8170,14 @@ fn a_connection_is_announced_once_in_the_system_prefix() {
     );
 }
 
-thread_local! {
-    static SENDS_FROM_TREE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
-}
-
-fn as_legacy(test: fn()) {
-    SENDS_FROM_TREE.set(false);
-    test();
-}
-
-fn send_at_head(agg: &mut Session, id: &str, path: Vec<DraftMessage>) -> Vec<Message> {
-    let (source, path) = match SENDS_FROM_TREE.get() {
-        true => (PromptSource::tree(), Vec::new()),
-        false => (PromptSource::Legacy, path),
-    };
+fn send_at_head(agg: &mut Session, id: &str) -> Vec<Message> {
     dispatch(
         agg,
         CommandPayload::RequestLlmCall {
-            source,
+            source: PromptSource::tree(),
             llm: "claude".to_string(),
             call_id: id.to_string(),
-            request: request_with(path),
+            request: request_with(Vec::new()),
             stream: false,
             retry: RetryPolicy::no_retry(),
             handler: LlmHandler::Server,
@@ -8247,12 +8218,12 @@ fn context_follows_the_branch_a_prompt_is_on() {
 
     let d = open_decision(&mut agg, "hi");
     submit_state(&mut agg, d, vec![u1.clone()], None);
-    let first = send_at_head(&mut agg, "call-1", vec![u1.clone()]);
+    let first = send_at_head(&mut agg, "call-1");
     assert_eq!(context_ids(&first), ["call-1-ctx-mcp.sentry"]);
 
     let d = open_decision(&mut agg, "more");
     submit_state(&mut agg, d, vec![u1.clone(), a1.clone(), u2.clone()], None);
-    let second = send_at_head(&mut agg, "call-2", vec![u1.clone(), a1.clone(), u2.clone()]);
+    let second = send_at_head(&mut agg, "call-2");
     assert!(
         starts_with(&second, &first),
         "the next turn reads the last call's prompt first: {second:?}"
@@ -8261,7 +8232,7 @@ fn context_follows_the_branch_a_prompt_is_on() {
     let d = open_decision(&mut agg, "start over");
     let x1 = node_msg("x1", Role::User, "start over");
     submit_state(&mut agg, d, vec![x1.clone()], None);
-    let other = send_at_head(&mut agg, "call-3", vec![x1]);
+    let other = send_at_head(&mut agg, "call-3");
     assert_eq!(
         context_ids(&other),
         ["call-3-ctx-mcp.sentry"],
@@ -8281,7 +8252,7 @@ fn context_follows_the_branch_a_prompt_is_on() {
         Some("u2"),
         "the view lands on the first branch"
     );
-    let back = send_at_head(&mut agg, "call-4", vec![u1, a1, u2, u3]);
+    let back = send_at_head(&mut agg, "call-4");
     assert_eq!(
         context_ids(&back),
         ["call-1-ctx-mcp.sentry"],
@@ -8298,12 +8269,6 @@ fn context_follows_the_branch_a_prompt_is_on() {
 }
 
 #[test]
-fn a_legacy_prompt_follows_its_branch_as_before() {
-    as_legacy(context_follows_the_branch_a_prompt_is_on);
-    as_legacy(a_fork_after_the_context_was_placed_keeps_it);
-}
-
-#[test]
 fn a_fork_after_the_context_was_placed_keeps_it() {
     let mut agg = session_with_searched_connector("sentry", &["search_issues"]);
     let u1 = node_msg("u1", Role::User, "hi");
@@ -8311,17 +8276,17 @@ fn a_fork_after_the_context_was_placed_keeps_it() {
 
     let d = open_decision(&mut agg, "hi");
     submit_state(&mut agg, d, vec![u1.clone()], None);
-    let first = send_at_head(&mut agg, "call-1", vec![u1.clone()]);
+    let first = send_at_head(&mut agg, "call-1");
 
     let d = open_decision(&mut agg, "more");
     let u2 = node_msg("u2", Role::User, "more");
     submit_state(&mut agg, d, vec![u1.clone(), a1.clone(), u2.clone()], None);
-    send_at_head(&mut agg, "call-2", vec![u1.clone(), a1.clone(), u2]);
+    send_at_head(&mut agg, "call-2");
 
     let d = open_decision(&mut agg, "instead");
     let z2 = node_msg("z2", Role::User, "instead");
     submit_state(&mut agg, d, vec![u1.clone(), a1.clone(), z2.clone()], None);
-    let fork = send_at_head(&mut agg, "call-3", vec![u1, a1, z2]);
+    let fork = send_at_head(&mut agg, "call-3");
     assert!(
         starts_with(&fork, &first),
         "the shared prefix keeps the context it was given: {fork:?}"

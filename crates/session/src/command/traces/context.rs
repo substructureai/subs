@@ -34,19 +34,7 @@ fn started(strategies: Vec<ContextStrategy>) -> Trace {
     t
 }
 
-fn system_message() -> DraftMessage {
-    DraftMessage {
-        role: Role::System,
-        ..user_message("be brief")
-    }
-}
-
-thread_local! {
-    static SOURCE: std::cell::RefCell<PromptSource> = const { std::cell::RefCell::new(PromptSource::Legacy) };
-}
-
-fn skilled(source: PromptSource, strategies: Vec<ContextStrategy>) -> Trace {
-    SOURCE.set(source);
+fn skilled(strategies: Vec<ContextStrategy>) -> Trace {
     let mut t = Trace::create();
     let agent = AgentConfig {
         skills: vec![crate::protocol::AgentSkill {
@@ -68,23 +56,13 @@ fn listings(t: &Trace, id: &str) -> usize {
         .sum()
 }
 
-fn reading(t: &Trace, id: &str, new: Option<DraftMessage>) -> Action {
-    let source = SOURCE.with_borrow(Clone::clone);
-    let mut messages = Vec::new();
-    if !source.is_tree() {
-        messages.push(system_message());
-        messages.extend(t.recorded());
-        messages.extend(new);
-    }
+fn reading(id: &str) -> Action {
     Action::CallLlm {
-        source,
+        source: PromptSource::tree(),
         llm: "claude".to_string(),
         format: None,
         id: id.to_string(),
-        request: LlmRequest {
-            messages,
-            ..llm_request()
-        },
+        request: llm_request(),
         stream: false,
         retry: RetryPolicy::no_retry(),
         handler: LlmHandler::Server,
@@ -126,7 +104,7 @@ fn turn(t: &mut Trace, n: usize, read: u64) {
 fn turn_saying(t: &mut Trace, n: usize, asked: &str, read: u64) {
     let (asked, call) = (asked.to_string(), format!("call-{n}"));
     t.submit(&asked, Some(&format!("turn-{n}")));
-    let action = reading(t, &call, Some(user_message(&asked)));
+    let action = reading(&call);
     t.decide_appending(user_message(&asked), vec![action]);
     answered(t, &call, &format!("a{n}"), read);
     t.decide_appending(reply(&call, &format!("a{n}")), vec![done()]);
@@ -244,7 +222,7 @@ fn summarized(t: &mut Trace) {
 fn ask(t: &mut Trace, n: usize) {
     let (asked, call) = (format!("q{n}"), format!("call-{n}"));
     t.submit(&asked, Some(&format!("turn-{n}")));
-    let action = reading(t, &call, Some(user_message(&asked)));
+    let action = reading(&call);
     t.decide_appending(user_message(&asked), vec![action]);
 }
 
@@ -418,7 +396,7 @@ fn a_kept_history_runs_the_call_and_is_not_asked_again_this_turn() {
     assert_eq!(emitted(&t), ["context.limited", "context.kept"]);
     assert_eq!(requested(&t, "call-2"), ["be brief", "q1", "a1", "q2"]);
     answered(&mut t, "call-2", "a2", 100);
-    let action = reading(&t, "call-3", Some(reply("call-2", "a2")));
+    let action = reading("call-3");
     t.decide_appending(reply("call-2", "a2"), vec![action]);
     assert!(t.agg.state.llm_call("call-3").is_some());
 }
@@ -508,7 +486,7 @@ fn summarizing() -> Vec<ContextStrategy> {
 
 #[test]
 fn a_held_tree_call_shows_the_prompt_it_would_send() {
-    let mut t = skilled(PromptSource::tree(), summarizing());
+    let mut t = skilled(summarizing());
     turn(&mut t, 1, 100);
     turn(&mut t, 2, 2000);
     ask(&mut t, 3);
@@ -527,7 +505,7 @@ fn a_held_tree_call_shows_the_prompt_it_would_send() {
 
 #[test]
 fn a_held_tree_call_runs_on_the_new_branch_and_is_told_its_context_once() {
-    let mut t = skilled(PromptSource::tree(), summarizing());
+    let mut t = skilled(summarizing());
     turn(&mut t, 1, 100);
     turn(&mut t, 2, 2000);
     assert_eq!(listings(&t, "call-2"), 1);
@@ -601,8 +579,8 @@ fn refused_as_too_long(t: &mut Trace, id: &str) {
     );
 }
 
-fn refused_then_summarized(source: PromptSource) -> (usize, usize) {
-    let mut t = skilled(source, vec![]);
+fn refused_then_summarized() -> (usize, usize) {
+    let mut t = skilled(vec![]);
     turn(&mut t, 1, 100);
     ask(&mut t, 2);
     refused_as_too_long(&mut t, "call-2");
@@ -619,31 +597,15 @@ fn refused_then_summarized(source: PromptSource) -> (usize, usize) {
 
 #[test]
 fn a_tree_call_the_provider_refused_moves_to_the_new_branch() {
-    assert_eq!(refused_then_summarized(PromptSource::tree()), (1, 1));
-}
-
-#[test]
-fn a_legacy_call_the_provider_refused_runs_again_as_a_tree_call() {
-    let mut t = skilled(PromptSource::Legacy, vec![]);
-    turn(&mut t, 1, 100);
-    ask(&mut t, 2);
-    refused_as_too_long(&mut t, "call-2");
-    plan(&mut t, "sum-1");
-    answered(&mut t, "sum-1", "they asked once", 50);
-    summarized(&mut t);
-    assert!(t.agg.state.llm_call("call-2").unwrap().source.is_tree());
-    assert_eq!(listings(&t, "call-2"), 1);
+    assert_eq!(refused_then_summarized(), (1, 1));
 }
 
 #[test]
 fn a_held_tree_call_kept_as_it_was_stays_a_tree_call() {
-    let mut t = skilled(
-        PromptSource::tree(),
-        vec![ContextStrategy {
-            over_tokens: Some(90),
-            ..strategy(ContextStrategyKind::Worker)
-        }],
-    );
+    let mut t = skilled(vec![ContextStrategy {
+        over_tokens: Some(90),
+        ..strategy(ContextStrategyKind::Worker)
+    }]);
     turn(&mut t, 1, 100);
     ask(&mut t, 2);
     plan(&mut t, "");
@@ -655,13 +617,10 @@ fn a_held_tree_call_kept_as_it_was_stays_a_tree_call() {
 
 #[test]
 fn a_held_tree_call_starts_over_on_the_turns_own_messages() {
-    let mut t = skilled(
-        PromptSource::tree(),
-        vec![ContextStrategy {
-            idle_secs: Some(3600),
-            ..strategy(ContextStrategyKind::Reset)
-        }],
-    );
+    let mut t = skilled(vec![ContextStrategy {
+        idle_secs: Some(3600),
+        ..strategy(ContextStrategyKind::Reset)
+    }]);
     turn(&mut t, 1, 100);
     t.advance(7200);
     ask(&mut t, 2);

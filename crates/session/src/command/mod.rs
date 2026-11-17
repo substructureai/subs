@@ -842,7 +842,7 @@ impl Working {
                 } => {
                     let messages = request.messages.clone();
                     match self.start_branch(start, messages) {
-                        Some(branch) => self.run_on(
+                        Ok(branch) => self.run_on(
                             Some(branch),
                             CommandPayload::RequestLlmCall {
                                 call_id: id,
@@ -859,7 +859,10 @@ impl Working {
                             },
                             &system,
                         ),
-                        None => Ok(()),
+                        Err(unstarted) => {
+                            self.unstarted(&id, unstarted);
+                            Ok(())
+                        }
                     }
                 }
                 Action::CloseBranch { id } => {
@@ -1126,17 +1129,21 @@ impl Working {
                 call_id,
                 llm,
                 mut request,
-                source,
+                source: _,
                 stream,
                 retry,
                 handler,
                 format,
             } => {
                 SessionState::ensure_internal(caller)?;
-                if source == PromptSource::Explicit && self.scope.is_none() {
+                if !request.messages.is_empty() {
                     let messages = std::mem::take(&mut request.messages);
-                    let Some(branch) = self.explicit_branch(&call_id, messages) else {
-                        return Ok(());
+                    let branch = match self.explicit_branch(&call_id, messages) {
+                        Ok(branch) => branch,
+                        Err(unstarted) => {
+                            self.unstarted(&call_id, unstarted);
+                            return Ok(());
+                        }
                     };
                     return self.run_on(
                         Some(branch),
@@ -1153,7 +1160,7 @@ impl Working {
                         caller,
                     );
                 }
-                let source = self.held_source(&call_id, source);
+                let source = self.held_source(&call_id, PromptSource::tree());
                 let held = HeldCall {
                     id: call_id,
                     llm,

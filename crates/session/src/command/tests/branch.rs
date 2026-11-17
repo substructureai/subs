@@ -1,6 +1,6 @@
 use super::*;
 use crate::decision::{BranchConfig, BranchFrom, BranchStart};
-use crate::protocol::{BranchMode, DecisionAction, ToolCall, ToolCallFunction, Usage};
+use crate::protocol::{BranchMode, DecisionAction, ErrorCode, ToolCall, ToolCallFunction, Usage};
 
 fn configured() -> Session {
     create_session_with_config("sess-b", "tenant-a", "user-1", Some(agent_config("m1")))
@@ -1166,4 +1166,114 @@ fn a_settled_call_stays_until_its_calls_are_answered() {
     );
     echo(&mut agg);
     assert!(agg.state.llm_call("c1").is_none(), "answered: released");
+}
+
+#[test]
+fn a_call_with_messages_inside_a_branch_starts_a_child_that_reports_to_it() {
+    let mut agg = turn_with_side_call(BranchMode::Detached);
+    reply(&mut agg, "t1", said("Paris weather", 100));
+    let (d, _) = live_decision(&agg);
+    assert_eq!(agg.state.decision_branch(&d), Some("title"));
+    submit_decision(
+        &mut agg,
+        d,
+        vec![],
+        vec![explicit("x2", vec![node_msg("", Role::User, "shorter")])],
+    );
+    let child = agg.state.open_branch("x2").expect("a child branch");
+    assert_eq!(child.parent.as_deref(), Some("title"));
+    assert_eq!(prompt_texts(&agg, "x2"), ["shorter"]);
+
+    reply(&mut agg, "x2", said("Paris", 10));
+    let (d, _) = live_decision(&agg);
+    assert_eq!(agg.state.decision_branch(&d), Some("x2"));
+    let events = submit_decision(&mut agg, d, vec![], vec![]);
+    assert_eq!(branch_closed(&events, "x2"), Some(BranchEnd::Done));
+    let (_, on) = branch_finished(&events).expect("the child reports back");
+    assert_eq!(on.as_deref(), Some("title"));
+}
+
+#[test]
+fn a_call_with_messages_too_deep_for_a_branch_is_answered_with_an_error() {
+    let mut agg = turn_with_side_call(BranchMode::Detached);
+    reply(&mut agg, "t1", said("Paris weather", 100));
+    let mut calling = "title".to_string();
+    for level in 2.. {
+        let (d, _) = live_decision(&agg);
+        let id = format!("x{level}");
+        let events = submit_decision(
+            &mut agg,
+            d,
+            vec![],
+            vec![explicit(&id, vec![node_msg("", Role::User, "deeper")])],
+        );
+        if agg.state.open_branch(&id).is_none() {
+            assert_eq!(
+                agg.state.branch_depth(Some(&calling)),
+                crate::command::branch::MAX_BRANCH_DEPTH
+            );
+            let refused = events.iter().find_map(|e| match e {
+                EventPayload::DecisionQueued(q) => match &q.trigger {
+                    Trigger::LlmFinished {
+                        id: call,
+                        ok: false,
+                        error: Some(error),
+                        ..
+                    } if *call == id => Some((error.code.clone(), q.branch.clone())),
+                    _ => None,
+                },
+                _ => None,
+            });
+            assert_eq!(refused, Some((ErrorCode::Unroutable, Some(calling))));
+            break;
+        }
+        reply(&mut agg, &id, said("deeper", 10));
+        calling = id;
+    }
+}
+
+#[test]
+fn a_call_with_messages_asked_again_after_its_branch_ended_does_nothing() {
+    let mut agg = configured();
+    let ask = |agg: &mut Session| {
+        dispatch(
+            agg,
+            CommandPayload::RequestLlmCall {
+                source: PromptSource::tree(),
+                llm: "claude".to_string(),
+                call_id: "x1".to_string(),
+                request: request_with(vec![node_msg("", Role::User, "a title")]),
+                stream: false,
+                retry: RetryPolicy::no_retry(),
+                handler: LlmHandler::Server,
+                format: None,
+            },
+            &system(),
+        )
+    };
+    ask(&mut agg);
+    reply(&mut agg, "x1", said("A title", 10));
+    let (d, _) = live_decision(&agg);
+    let events = submit_decision(&mut agg, d, vec![], vec![]);
+    assert_eq!(branch_closed(&events, "x1"), Some(BranchEnd::Done));
+    assert!(ask(&mut agg).is_empty());
+}
+
+#[test]
+fn a_call_with_messages_neither_counts_as_the_conversations_read_nor_its_turn() {
+    let mut agg = configured();
+    user_turn(&mut agg, "u1", "hi", "turn-1");
+    let (d, _) = live_decision(&agg);
+    submit_decision(
+        &mut agg,
+        d,
+        vec![node_msg("u1", Role::User, "hi")],
+        vec![explicit(
+            "sum-1",
+            vec![node_msg("", Role::User, "summarize")],
+        )],
+    );
+    reply(&mut agg, "sum-1", said("a summary", 9_000));
+    assert!(agg.state.last_read.is_none());
+    assert!(!agg.state.turn_called);
 }

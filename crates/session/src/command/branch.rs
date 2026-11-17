@@ -11,6 +11,15 @@ use crate::Caller;
 
 pub const MAX_BRANCH_DEPTH: usize = 5;
 
+pub(super) enum Unstarted {
+    Known,
+    Refused(ErrorInfo),
+}
+
+fn refused(message: &str) -> Unstarted {
+    Unstarted::Refused(ErrorInfo::new(ErrorCode::Unroutable, message))
+}
+
 impl SessionState {
     pub fn branch_and_below(&self, id: &str) -> Vec<String> {
         let mut found = vec![id.to_string()];
@@ -195,15 +204,13 @@ impl Working {
         &mut self,
         start: BranchStart,
         messages: Vec<DraftMessage>,
-    ) -> Option<String> {
+    ) -> Result<String, Unstarted> {
         let parent = self.scope.clone();
         if self.branches.contains_key(&start.id) || self.tree.branch(&start.id).is_some() {
-            tracing::debug!(branch = %start.id, "branch already started; nothing to do");
-            return None;
+            return Err(Unstarted::Known);
         }
         if self.branch_depth(parent.as_deref()) >= MAX_BRANCH_DEPTH {
-            tracing::warn!(branch = %start.id, "branch too deep; not started");
-            return None;
+            return Err(refused("The branch would be nested too deep."));
         }
         let from = match &start.from {
             BranchFrom::Root => None,
@@ -212,8 +219,9 @@ impl Working {
         };
         if let Some(node) = from.as_deref() {
             if !self.has_node(node) {
-                tracing::warn!(branch = %start.id, node, "branch forks at an unknown node");
-                return None;
+                return Err(refused(
+                    "The branch forks at a node that is not in the log.",
+                ));
             }
             let open = self
                 .tree
@@ -221,17 +229,13 @@ impl Working {
                 .and_then(|m| self.tree.get(&m))
                 .is_some_and(|n| n.message().is_some_and(|m| !m.tool_calls.is_empty()));
             if open {
-                tracing::warn!(
-                    branch = %start.id,
-                    node,
-                    "a branch cannot fork at a message whose tool calls are unanswered"
-                );
-                return None;
+                return Err(refused(
+                    "A branch cannot fork at a message whose tool calls are unanswered.",
+                ));
             }
         }
         if from.is_none() && messages.is_empty() {
-            tracing::warn!(branch = %start.id, "a root branch needs messages");
-            return None;
+            return Err(refused("A branch from the root needs messages."));
         }
         let agent = match (&start.agent, &from) {
             (BranchConfig::Inherit, None) => BranchConfig::None,
@@ -274,19 +278,16 @@ impl Working {
                 branch: Some(start.id.clone()),
             }));
         }
-        Some(start.id)
+        Ok(start.id)
     }
 
     pub(super) fn explicit_branch(
         &mut self,
         call_id: &str,
         messages: Vec<DraftMessage>,
-    ) -> Option<String> {
+    ) -> Result<String, Unstarted> {
         if self.branches.contains_key(call_id) {
-            return Some(call_id.to_string());
-        }
-        if self.tree.branch(call_id).is_some() {
-            return None;
+            return Ok(call_id.to_string());
         }
         let (from, shared) = self.recorded_prefix(&messages);
         let start = BranchStart {
@@ -300,6 +301,13 @@ impl Working {
             mode: BranchMode::Blocking,
         };
         self.start_branch(start, messages.into_iter().skip(shared).collect())
+    }
+
+    pub(super) fn unstarted(&mut self, call: &str, unstarted: Unstarted) {
+        if let Unstarted::Refused(error) = unstarted {
+            let scope = self.scope.clone();
+            self.queue_decision_on(Trigger::llm_err(call.to_string(), error), scope);
+        }
     }
 
     pub(super) fn start_subagent_branch(&mut self, call: &str) {
