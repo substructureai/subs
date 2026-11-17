@@ -377,8 +377,7 @@ impl SessionState {
                     messages,
                     client,
                     turn_id: turn_id.clone(),
-                    merge: mode == QueueMode::Merge,
-                    join,
+                    queue: mode,
                     metadata,
                 },
             )];

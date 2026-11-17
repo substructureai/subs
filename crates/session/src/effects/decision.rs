@@ -4,6 +4,7 @@ use crate::cx::Cx;
 use crate::decision::Trigger;
 use crate::events::*;
 use crate::protocol::EffectStatus;
+use crate::protocol::QueueMode;
 use crate::schedule::Dep;
 use crate::state::{DecisionPark, EffectKind, QueueEntry, SessionState};
 use crate::Caller;
@@ -177,7 +178,7 @@ fn own_turn_started(state: &SessionState, id: &str) -> Option<EventPayload> {
 
 fn turn_joined(state: &SessionState, trigger: &Trigger) -> Option<EventPayload> {
     let Trigger::ClientMessage {
-        join: true,
+        queue: QueueMode::Join,
         turn_id,
         metadata,
         ..

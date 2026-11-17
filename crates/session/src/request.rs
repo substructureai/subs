@@ -7,6 +7,7 @@ use crate::attachments;
 use crate::decision::Trigger;
 use crate::ids::Ids;
 use crate::propose::{propose, Proposing};
+use crate::protocol::QueueMode;
 use crate::protocol::{
     AgentConfig, BranchView, ClientContext, DecisionRequest, DecisionResponse, DecisionTrigger,
     DecisionTurn, DeferToolsStrategy, DraftMessage, Effect, InterruptResumption, LlmFormat,
@@ -113,11 +114,14 @@ impl Session {
             .find(|d| d.decision_id == decision_id)?;
         let worker_decision = self.state.worker_decision(decision_id)?;
         let mut trigger = worker_decision.trigger.clone();
-        if let Trigger::ClientMessage { join, .. } = &mut trigger {
-            *join &= !worker_decision
+        if let Trigger::ClientMessage { queue, .. } = &mut trigger {
+            let owns = worker_decision
                 .turn
                 .as_ref()
                 .is_some_and(|t| worker_decision.trigger.owns_turn(decision_id, &t.id));
+            if owns && *queue == QueueMode::Join {
+                *queue = QueueMode::Turn;
+            }
         }
         let worker = self.state.worker.clone();
         let branch_id = worker_decision.branch.as_deref();
@@ -248,9 +252,15 @@ pub fn wire_trigger(
         Trigger::ClientMessage {
             messages,
             client,
-            join,
+            queue,
             ..
-        } => appended_transcript(messages, client, join, active_path, tree),
+        } => appended_transcript(
+            messages,
+            client,
+            queue == QueueMode::Join,
+            active_path,
+            tree,
+        ),
         Trigger::SubagentNotice { messages, .. } => {
             appended_transcript(messages, ClientContext::default(), false, active_path, tree)
         }

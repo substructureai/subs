@@ -283,6 +283,7 @@ pub fn wake_at(state: &SessionState, now: DateTime<Utc>) -> Option<DateTime<Utc>
 mod tests {
 
     use super::*;
+    use crate::protocol::QueueMode;
     use crate::protocol::{
         AgentConfig, InterruptOrigin, McpServer, Message, NewMessage, RetryPolicy, Role,
     };
@@ -433,8 +434,7 @@ mod tests {
             messages: vec![],
             client: Default::default(),
             turn_id: None,
-            merge: false,
-            join: false,
+            queue: QueueMode::Refuse,
             metadata: Default::default(),
         }
     }
@@ -444,8 +444,7 @@ mod tests {
             messages: vec![],
             client: Default::default(),
             turn_id: Some(turn_id.to_string()),
-            merge: false,
-            join: false,
+            queue: QueueMode::Refuse,
             metadata: Default::default(),
         }
     }

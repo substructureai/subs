@@ -46,7 +46,7 @@ impl Trace {
             .filter_map(|e| match &e.decision()?.trigger {
                 Trigger::ClientMessage {
                     messages,
-                    join: true,
+                    queue: QueueMode::Join,
                     ..
                 } => Some(texts(messages)),
                 _ => None,
@@ -165,7 +165,10 @@ fn a_joined_message_waits_for_the_running_work_and_runs_in_the_turn() {
     let joined = t.joined(tool_message("tc-1", "rendered"), vec![]);
     assert!(matches!(
         t.live_trigger(),
-        Trigger::ClientMessage { join: true, .. }
+        Trigger::ClientMessage {
+            queue: QueueMode::Join,
+            ..
+        }
     ));
     assert_eq!(t.live_turn().as_deref(), Some("turn-1"));
     assert!(t.asked_to_join(), "the worker sees the message joins");
@@ -207,7 +210,10 @@ fn a_joined_message_on_an_idle_session_starts_a_turn() {
     assert_eq!(t.agg.state.phase.active_turn_id(), Some("turn-1"));
     assert!(matches!(
         t.live_trigger(),
-        Trigger::ClientMessage { join: false, .. }
+        Trigger::ClientMessage {
+            queue: QueueMode::Turn | QueueMode::Refuse | QueueMode::Merge,
+            ..
+        }
     ));
     assert_eq!(
         t.started,
@@ -231,7 +237,10 @@ fn a_joined_message_keeps_the_turn_past_the_models_final_answer() {
     assert!(t.agg.state.recent_turns.is_empty());
     assert!(matches!(
         t.live_trigger(),
-        Trigger::ClientMessage { join: true, .. }
+        Trigger::ClientMessage {
+            queue: QueueMode::Join,
+            ..
+        }
     ));
     assert_eq!(t.live_turn().as_deref(), Some("turn-1"));
     assert_eq!(t.started.len(), 1, "no turn starts for it");
@@ -265,7 +274,10 @@ fn a_worker_that_ends_the_turn_sends_a_joined_message_to_the_next_turn() {
     assert_eq!(t.agg.state.recent_turns, vec!["turn-1".to_string()]);
     assert!(matches!(
         t.live_trigger(),
-        Trigger::ClientMessage { join: true, .. }
+        Trigger::ClientMessage {
+            queue: QueueMode::Join,
+            ..
+        }
     ));
     assert_eq!(t.live_turn().as_deref(), Some("turn-2"));
     assert!(
@@ -298,7 +310,10 @@ fn a_worker_that_calls_the_model_anyway_keeps_the_joined_message_in_the_turn() {
     t.decide_appending(reply("call-2", "done", vec![]), vec![]);
     assert!(matches!(
         t.live_trigger(),
-        Trigger::ClientMessage { join: true, .. }
+        Trigger::ClientMessage {
+            queue: QueueMode::Join,
+            ..
+        }
     ));
     assert_eq!(t.live_turn().as_deref(), Some("turn-1"));
 }
@@ -326,7 +341,10 @@ fn a_joined_message_waits_for_every_parallel_call() {
                 t.decide_appending(tool_message(&id, "rendered"), vec![]);
                 finished.push(id);
             }
-            Trigger::ClientMessage { join: true, .. } => break,
+            Trigger::ClientMessage {
+                queue: QueueMode::Join,
+                ..
+            } => break,
             other => panic!("unexpected {other:?}"),
         }
     }
@@ -396,7 +414,10 @@ fn a_joined_message_waits_for_a_subagent() {
     t.decide_appending(tool_message("tc-1", "answer"), vec![]);
     assert!(matches!(
         t.live_trigger(),
-        Trigger::ClientMessage { join: true, .. }
+        Trigger::ClientMessage {
+            queue: QueueMode::Join,
+            ..
+        }
     ));
     assert_eq!(t.live_turn().as_deref(), Some("turn-1"));
 }
@@ -501,7 +522,10 @@ fn a_joined_message_waits_for_the_whole_script() {
     t.decide_appending(tool_message("tc-1", "3°C"), vec![]);
     assert!(matches!(
         t.live_trigger(),
-        Trigger::ClientMessage { join: true, .. }
+        Trigger::ClientMessage {
+            queue: QueueMode::Join,
+            ..
+        }
     ));
     assert_eq!(t.live_turn().as_deref(), Some("turn-1"));
 }
@@ -696,7 +720,10 @@ fn a_resume_leaves_the_model_call_to_a_joined_message() {
     t.decide(t.recorded(), vec![]);
     assert!(matches!(
         t.live_trigger(),
-        Trigger::ClientMessage { join: true, .. }
+        Trigger::ClientMessage {
+            queue: QueueMode::Join,
+            ..
+        }
     ));
     assert_eq!(t.live_turn().as_deref(), Some("turn-1"));
 }
@@ -741,7 +768,10 @@ fn a_declined_call_leaves_the_model_call_to_a_joined_message() {
     t.decide(t.asked().proposed.messages, vec![]);
     assert!(matches!(
         t.live_trigger(),
-        Trigger::ClientMessage { join: true, .. }
+        Trigger::ClientMessage {
+            queue: QueueMode::Join,
+            ..
+        }
     ));
     assert_eq!(t.live_turn().as_deref(), Some("turn-1"));
 }
@@ -766,7 +796,10 @@ fn a_session_message_joins_the_running_turn_once() {
     t.decide_appending(tool_message("tc-1", "rendered"), vec![]);
     assert!(matches!(
         t.live_trigger(),
-        Trigger::ClientMessage { join: true, .. }
+        Trigger::ClientMessage {
+            queue: QueueMode::Join,
+            ..
+        }
     ));
     assert_eq!(t.live_turn().as_deref(), Some("turn-1"));
     assert_eq!(t.started.len(), 1, "no turn starts for it");
@@ -801,7 +834,7 @@ fn a_session_message_on_an_idle_session_opens_its_turn() {
     assert!(matches!(
         t.live_trigger(),
         Trigger::ClientMessage {
-            join: false,
+            queue: QueueMode::Turn | QueueMode::Refuse | QueueMode::Merge,
             turn_id: None,
             ..
         }
@@ -847,7 +880,10 @@ fn a_cancel_keeps_a_joined_message_for_the_next_turn() {
     assert_eq!(t.agg.state.recent_turns, vec!["turn-1".to_string()]);
     assert!(matches!(
         t.live_trigger(),
-        Trigger::ClientMessage { join: true, .. }
+        Trigger::ClientMessage {
+            queue: QueueMode::Join,
+            ..
+        }
     ));
     assert_eq!(t.live_turn().as_deref(), Some("turn-2"));
 }

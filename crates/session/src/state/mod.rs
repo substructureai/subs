@@ -42,6 +42,7 @@ use crate::protocol::{
     SpawnMode, SubagentTools, Usage, WorkerRef, WorkerState,
 };
 
+use crate::protocol::QueueMode;
 use crate::retry::RetryState;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -807,7 +808,7 @@ impl SessionState {
                 messages,
                 client,
                 turn_id: Some(turn_id),
-                merge: true,
+                queue: QueueMode::Merge,
                 ..
             } => Some(WaitingMerge {
                 decision_id: &last.id,

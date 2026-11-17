@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::connectors::ConnectionPath;
+use crate::protocol::QueueMode;
 use crate::protocol::{
     AgentConfig, BranchMode, ClientContext, ContextReason, ContextStrategyKind, DeferToolsStrategy,
     DraftMessage, ErrorInfo, Handler, HeldCall, LlmFormat, LlmRequest, LlmResponse, RetryOverride,
@@ -141,10 +142,7 @@ pub enum Trigger {
         client: ClientContext,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        merge: bool,
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        join: bool,
+        queue: QueueMode,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         metadata: BTreeMap<String, String>,
     },
@@ -335,7 +333,7 @@ impl Trigger {
             Trigger::ClientAction { turn_id, .. }
             | Trigger::ClientMessage {
                 turn_id,
-                join: true,
+                queue: QueueMode::Join,
                 ..
             } => Some(turn_id.as_deref()),
             _ => None,
@@ -343,7 +341,13 @@ impl Trigger {
     }
 
     pub fn is_join(&self) -> bool {
-        matches!(self, Trigger::ClientMessage { join: true, .. })
+        matches!(
+            self,
+            Trigger::ClientMessage {
+                queue: QueueMode::Join,
+                ..
+            }
+        )
     }
 
     /// Work the running turn waits for before it ends.
@@ -370,11 +374,9 @@ impl Trigger {
 
     pub fn deferred_turn_id(&self) -> Option<&str> {
         match self {
-            Trigger::ClientMessage {
-                turn_id,
-                join: false,
-                ..
-            } => turn_id.as_deref(),
+            Trigger::ClientMessage { turn_id, queue, .. } if *queue != QueueMode::Join => {
+                turn_id.as_deref()
+            }
             Trigger::SubagentNotice { turn_id, .. } => Some(turn_id),
             _ => None,
         }
