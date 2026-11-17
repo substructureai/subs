@@ -10,6 +10,13 @@ crates/subs              → The `subs` CLI
 @substructure.ai/cli     → npm wrapper shipping the Rust CLI binary
 ```
 
+### Session model
+1. The log is the truth. Every change is an event, and one append is one transaction.
+2. The conversation is a tree of immutable nodes. A node knows only its parent; an edit is a new sibling.
+3. A line is a leaf. The conversation, a branch, and an old version are the same thing: a pointer read upward from.
+4. A prompt is a pure function of a path. The same path gives the same bytes.
+5. A session holds only what is open. Everything else is read from the log.
+
 ### Coding guidelines:
 Keep comments to an absolute minimum and use as few words as possible.
 
