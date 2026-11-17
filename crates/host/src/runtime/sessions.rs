@@ -11,6 +11,7 @@ use substructure_session::{Command, CommandResult, Entry, Session, Settings, Sto
 use tokio::sync::{mpsc, oneshot};
 
 use crate::protocol::MessageTree;
+use substructure_session::state::SessionState;
 
 use crate::runtime::event_store::{BroadcastBus, EventBus, EventFilter, EventTap, StoreError};
 pub use crate::runtime::inbox::{execute, ExecuteError, ExecuteInput, ExecuteOutput};
@@ -22,6 +23,12 @@ use crate::runtime::wake::Alarms;
 pub type SharedStore = Arc<dyn Store + Send + Sync>;
 
 pub type SessionKey = (String, String);
+
+pub struct SessionView {
+    pub state: SessionState,
+    pub tree: MessageTree,
+    pub versions: std::collections::BTreeMap<String, Vec<String>>,
+}
 
 pub trait SessionStores: Send + Sync {
     fn open(&self, tenant_id: &str, session_id: &str) -> SharedStore;
@@ -486,17 +493,40 @@ impl Sessions {
             .map_err(|e| StoreError::Other(e.to_string()))
     }
 
-    pub async fn whole_tree(
+    pub async fn view(
         &self,
         tenant_id: &str,
         session_id: &str,
-        head_id: Option<String>,
-    ) -> Result<MessageTree, StoreError> {
+        leaf: Option<String>,
+    ) -> Result<Option<SessionView>, substructure_session::Error> {
         let store = self.stores.open(tenant_id, session_id);
-        let nodes = blocking(store, move |store| Ok(store.messages()?))
-            .await
-            .map_err(|e| StoreError::Other(e.to_string()))?;
-        Ok(MessageTree { nodes, head_id })
+        let (id, tenant, settings) = (
+            session_id.to_string(),
+            tenant_id.to_string(),
+            self.settings.clone(),
+        );
+        blocking(store, move |store| {
+            let session = Session::load(store, id, tenant, settings)?;
+            if !session.exists() {
+                return Ok(None);
+            }
+            let state = session.state();
+            let at = match leaf {
+                Some(leaf) => Some(state.tree.newest(&leaf)),
+                None => state.head_id.clone(),
+            };
+            let tree = state.at(at.as_deref()).message_tree();
+            let versions = state.versions(&tree);
+            if let Some(error) = state.tree.failed() {
+                return Err(error.into());
+            }
+            Ok(Some(SessionView {
+                state: session.into_state(),
+                tree,
+                versions,
+            }))
+        })
+        .await
     }
 
     pub fn subscribe(&self) -> EventTap {
@@ -1236,7 +1266,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_whole_tree_comes_from_the_log() {
+    async fn a_view_reads_one_version_and_names_the_others() {
         let disk = testing::disk();
         use crate::protocol::{
             ClientMessage, ClientPayload, Content, DraftMessage, QueueMode, Role,
@@ -1309,16 +1339,23 @@ mod tests {
         ])
         .await;
 
-        let session = s.load("t", "s1").await.unwrap().unwrap();
-        assert_eq!(session.state().tree.fresh().count(), 0);
-        let tree = s
-            .whole_tree("t", "s1", session.state().head_id.clone())
-            .await
-            .unwrap();
-        let mut ids: Vec<&str> = tree.nodes.iter().map(|n| n.message.id.as_str()).collect();
-        ids.sort();
-        assert_eq!(ids, vec!["a1", "b1", "u1", "x1"]);
-        assert_eq!(tree.head_id.as_deref(), Some("b1"));
+        let view = s.view("t", "s1", None).await.unwrap().unwrap();
+        assert_eq!(view.state.tree.fresh().count(), 0);
+        let ids = |tree: &MessageTree| -> Vec<String> {
+            tree.nodes.iter().map(|n| n.message.id.clone()).collect()
+        };
+        assert_eq!(ids(&view.tree), ["u1", "b1"]);
+        assert_eq!(
+            view.versions.get("b1").cloned(),
+            Some(vec!["a1".into(), "b1".into()])
+        );
+
+        let old = s.view("t", "s1", Some("a1".into())).await.unwrap().unwrap();
+        assert_eq!(
+            ids(&old.tree),
+            ["u1", "a1", "x1"],
+            "a version reads to its newest end"
+        );
     }
 
     #[tokio::test]

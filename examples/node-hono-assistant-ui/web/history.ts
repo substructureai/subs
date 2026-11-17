@@ -4,7 +4,11 @@ import { useEffect } from "react";
 import type { Message, MessageTree } from "../protocol";
 
 type Interrupt = { interrupt_id: string; reason: string; anchor?: string | null };
-type SessionView = { message_tree: MessageTree; interrupts?: Interrupt[] };
+type SessionView = {
+    message_tree: MessageTree;
+    versions?: Record<string, string[]>;
+    interrupts?: Interrupt[];
+};
 type WireMessage = Message & { metadata?: unknown };
 type Engine = { url: string; token: string; sessionId: string };
 
@@ -16,16 +20,35 @@ type Engine = { url: string; token: string; sessionId: string };
 export function useSessionHistory(runtime: AssistantRuntime, engine: Engine) {
     useEffect(() => {
         let stale = false;
-        fetch(`${engine.url}/api/client/sessions/${engine.sessionId}`, {
-            headers: { authorization: `Bearer ${engine.token}` },
-        }).then(async (res) => {
-            if (!res.ok || stale) return; // 404: not created yet
-            runtime.thread.import(toRepository(await res.json()));
+        load(engine).then((view) => {
+            if (!view || stale) return; // not created yet
+            runtime.thread.import(toRepository(view));
         });
         return () => {
             stale = true;
         };
     }, [runtime, engine.url, engine.token, engine.sessionId]);
+}
+
+// The engine sends one version at a time: the head, and the ids of every other
+// version of its messages. Read each of those once and merge them into one tree.
+async function load(engine: Engine): Promise<SessionView | undefined> {
+    const get = async (leaf?: string): Promise<SessionView | undefined> => {
+        const query = leaf ? `?leaf=${encodeURIComponent(leaf)}` : "";
+        const res = await fetch(`${engine.url}/api/client/sessions/${engine.sessionId}${query}`, {
+            headers: { authorization: `Bearer ${engine.token}` },
+        });
+        return res.ok ? res.json() : undefined;
+    };
+    const head = await get();
+    if (!head) return undefined;
+    const nodes = new Map(head.message_tree.nodes.map((n) => [n.message.id, n]));
+    const others = Object.values(head.versions ?? {})
+        .flat()
+        .filter((id) => !nodes.has(id));
+    for (const view of await Promise.all(others.map(get)))
+        for (const n of view?.message_tree.nodes ?? []) nodes.set(n.message.id, n);
+    return { ...head, message_tree: { ...head.message_tree, nodes: [...nodes.values()] } };
 }
 
 // The wire tree has one node per message, but assistant-ui folds tool results

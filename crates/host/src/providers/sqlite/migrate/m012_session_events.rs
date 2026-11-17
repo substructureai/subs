@@ -39,6 +39,7 @@ pub fn up(conn: &Connection) -> rusqlite::Result<()> {
             parent_id  TEXT,
             kind       INTEGER,
             branch     TEXT,
+            prev       TEXT,
             answers    TEXT,
             envelope   BLOB NOT NULL,
             payload    BLOB NOT NULL,
@@ -53,6 +54,8 @@ pub fn up(conn: &Connection) -> rusqlite::Result<()> {
             WHERE node_id IS NOT NULL;
          CREATE INDEX idx_session_events_branch
             ON session_events (tenant_id, session_id, branch, seq) WHERE branch IS NOT NULL;
+         CREATE INDEX idx_session_events_versions
+            ON session_events (tenant_id, session_id, prev, branch, seq) WHERE kind = 0;
          CREATE INDEX idx_session_events_answers
             ON session_events (tenant_id, session_id, answers) WHERE answers IS NOT NULL;
          CREATE TABLE session_heads (

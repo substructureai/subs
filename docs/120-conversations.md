@@ -16,10 +16,10 @@ the head to the root is the conversation that the model sees.
 
 A decision request holds that path as `messages`.
 
-The engine keeps the active branch in memory, and the last message of every
-earlier version. Everything else stays in the session log. When a view names a
-message on another branch, the engine loads that branch again. The
-[client API](./250-api.md) returns the whole tree.
+The tree lives in the session log, and the engine reads the parts it needs
+from there, so a long session costs no more to run than a short one. The
+[client API](./250-api.md) returns one version at a time, with the ids of every
+other version of its messages.
 
 ## Submit input
 

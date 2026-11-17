@@ -17,8 +17,8 @@ use crate::transport::session_sse::{merge_session_stream, resume_cursor};
 use crate::{Caller, HandleClientInput, InterruptSessionInput, RuntimeError};
 
 use super::types::{
-    session_response, ClientInputRequest, ClientInputResponse, InterruptSessionRequest,
-    InterruptSessionResponse, StreamSessionEventsParams,
+    session_response, ClientInputRequest, ClientInputResponse, GetSessionParams,
+    InterruptSessionRequest, InterruptSessionResponse, StreamSessionEventsParams,
 };
 use super::ClientHttpState;
 
@@ -147,6 +147,7 @@ pub async fn get_session(
     State(state): State<ClientHttpState>,
     Extension(caller): Extension<Caller>,
     Path(session_id): Path<String>,
+    Query(params): Query<GetSessionParams>,
 ) -> Response {
     let events = match state
         .runtime
@@ -160,24 +161,15 @@ pub async fn get_session(
         return runtime_error_response(RuntimeError::Session(SessionError::SessionNotCreated));
     }
 
-    let session = match state
+    let view = match state
         .runtime
-        .get_session(caller.tenant_id(), &session_id)
+        .session_view(caller.tenant_id(), &session_id, params.leaf)
         .await
     {
-        Ok(session) => session.into_state(),
+        Ok(view) => view,
         Err(e) => return runtime_error_response(e),
     };
-
-    let tree = match state
-        .runtime
-        .whole_tree(caller.tenant_id(), &session_id, session.head_id.clone())
-        .await
-    {
-        Ok(tree) => tree,
-        Err(e) => return runtime_error_response(e),
-    };
-    Json(session_response(session_id, &session, tree)).into_response()
+    Json(session_response(session_id, &view)).into_response()
 }
 
 pub async fn stream_session_events(

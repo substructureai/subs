@@ -135,6 +135,8 @@ pub trait Nodes: Send + Sync {
     fn children(&self, parent: &str, branch: Option<&str>) -> Result<Vec<Shared>, StoreError>;
     fn answers(&self, tool_call_id: &str) -> Result<Vec<Shared>, StoreError>;
     fn branch(&self, id: &str) -> Result<Option<BranchRecord>, StoreError>;
+    fn versions(&self, prev: Option<&str>, branch: Option<&str>)
+        -> Result<Vec<Shared>, StoreError>;
     fn remember(&self, _nodes: Vec<Shared>) {}
 }
 
@@ -265,6 +267,34 @@ impl Tree {
         );
         found.sort_by_key(|n| n.seq);
         found
+    }
+
+    pub fn versions(&self, message: &str) -> Vec<String> {
+        let Some(node) = self.get(message).filter(|n| n.message().is_some()) else {
+            return Vec::new();
+        };
+        let prev = self.message_at(node.parent());
+        let branch = node.branch().map(str::to_string);
+        let mut found = self.read(|s| s.versions(prev.as_deref(), branch.as_deref()));
+        found.extend(
+            self.fresh
+                .values()
+                .filter(|n| n.message().is_some() && n.branch() == branch.as_deref())
+                .filter(|n| self.message_at(n.parent()) == prev)
+                .cloned(),
+        );
+        found.sort_by_key(|n| n.seq);
+        found.dedup_by(|a, b| a.id() == b.id());
+        found.into_iter().map(|n| n.id().to_string()).collect()
+    }
+
+    pub fn newest(&self, from: &str) -> String {
+        let mut at = from.to_string();
+        let branch = self.get(from).and_then(|n| n.branch().map(str::to_string));
+        while let Some(next) = self.children(&at, branch.as_deref()).pop() {
+            at = next.id().to_string();
+        }
+        at
     }
 
     pub fn path_ids(&self, leaf: &str) -> HashSet<String> {

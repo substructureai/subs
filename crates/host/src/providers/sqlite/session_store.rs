@@ -8,7 +8,7 @@ use quick_cache::{Equivalent, Weighter};
 use rusqlite::{params, OptionalExtension, Row, Transaction, TransactionBehavior};
 use substructure_session::delivery::Start;
 use substructure_session::events::EventPayload;
-use substructure_session::protocol::{NewMessage, Role};
+use substructure_session::protocol::Role;
 use substructure_session::state::Logged;
 use substructure_session::tree::{BranchRecord, Fact, Node, Nodes, Shared};
 use substructure_session::{
@@ -229,13 +229,30 @@ impl SqliteSessionStore {
             .prepare_cached(
                 "INSERT INTO session_events
                     (tenant_id, session_id, seq, version, node_id, parent_id, kind, branch,
-                     answers, envelope, payload)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                     prev, answers, envelope, payload)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            )
+            .map_err(unavailable)?;
+        let mut above = tx
+            .prepare_cached(
+                "SELECT CASE WHEN kind = 0 THEN node_id ELSE prev END FROM session_events
+                  WHERE tenant_id = ?1 AND session_id = ?2 AND node_id = ?3
+                  ORDER BY seq LIMIT 1",
             )
             .map_err(unavailable)?;
         for event in &entry.events {
             let (envelope, payload) = split(event)?;
             let node = Node::of_event(&event.payload);
+            let prev: Option<String> = match node.as_ref().and_then(Node::parent) {
+                Some(parent) => above
+                    .query_row(params![self.tenant_id, self.session_id, parent], |row| {
+                        row.get(0)
+                    })
+                    .optional()
+                    .map_err(unavailable)?
+                    .flatten(),
+                None => None,
+            };
             let answers = node.as_ref().and_then(|n| {
                 n.message()
                     .filter(|m| m.role == Role::Tool)
@@ -253,6 +270,7 @@ impl SqliteSessionStore {
                     node.as_ref()
                         .and_then(Node::branch)
                         .or_else(|| branch_of(&event.payload)),
+                    prev,
                     answers,
                     envelope,
                     payload,
@@ -578,29 +596,6 @@ impl Store for SqliteSessionStore {
             serde_json::from_slice(&result).map_err(|e| StoreError::Corrupt(e.to_string()))?;
         Ok(Some((result, at)))
     }
-
-    fn messages(&self) -> Result<Vec<NewMessage>, StoreError> {
-        let conn = self.reader()?;
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT payload FROM session_events
-                  WHERE tenant_id = ?1 AND session_id = ?2 AND kind = 0
-                  ORDER BY seq",
-            )
-            .map_err(unavailable)?;
-        let rows = stmt
-            .query_map(params![self.tenant_id, self.session_id], |row| {
-                row.get::<_, Vec<u8>>(0)
-            })
-            .map_err(unavailable)?;
-        let mut nodes = Vec::new();
-        for row in rows {
-            if let EventPayload::NewMessage(node) = parse(&row.map_err(unavailable)?)? {
-                nodes.push(node);
-            }
-        }
-        Ok(nodes)
-    }
 }
 
 impl Nodes for SqliteSessionStore {
@@ -697,6 +692,20 @@ impl Nodes for SqliteSessionStore {
         Ok(substructure_session::tree::branch_record(
             events.iter().map(|(seq, event)| (*seq, event)),
         ))
+    }
+
+    fn versions(
+        &self,
+        prev: Option<&str>,
+        branch: Option<&str>,
+    ) -> Result<Vec<Shared>, StoreError> {
+        self.select_nodes(
+            "SELECT seq, payload FROM session_events
+              WHERE tenant_id = ?1 AND session_id = ?2 AND prev IS ?3 AND branch IS ?4
+                AND kind = 0
+              ORDER BY seq",
+            params![self.tenant_id, self.session_id, prev, branch],
+        )
     }
 
     fn remember(&self, nodes: Vec<Shared>) {
@@ -859,22 +868,17 @@ mod tests {
             .collect();
         assert_eq!(found, vec![u1.seq]);
 
-        let scanned: Vec<String> = Session::events(store.as_ref(), 0, usize::MAX)
+        let versions: Vec<String> = nodes
+            .versions(None, None)
             .unwrap()
-            .into_iter()
-            .filter_map(|e| match e.payload {
-                substructure_session::events::EventPayload::NewMessage(m) => Some(m.message.id),
-                _ => None,
-            })
+            .iter()
+            .map(|n| n.id().to_string())
             .collect();
-        let read: Vec<String> = store
-            .messages()
-            .unwrap()
-            .into_iter()
-            .map(|m| m.message.id)
-            .collect();
-        assert_eq!(read, scanned);
-        assert_eq!(read, vec!["u1"]);
+        assert_eq!(
+            versions,
+            vec!["u1"],
+            "the first message is its only version"
+        );
     }
 
     #[test]

@@ -22,6 +22,9 @@ CREATE INDEX idx_session_events_node
 CREATE INDEX idx_session_events_version
             ON session_events (tenant_id, session_id, version);
 
+CREATE INDEX idx_session_events_versions
+            ON session_events (tenant_id, session_id, prev, branch, seq) WHERE kind = 0;
+
 CREATE INDEX idx_session_index_activity
              ON session_index (tenant_id, top_level, activity, last_event_at DESC, session_id DESC);
 
@@ -137,6 +140,7 @@ CREATE TABLE session_events (
             parent_id  TEXT,
             kind       INTEGER,
             branch     TEXT,
+            prev       TEXT,
             answers    TEXT,
             envelope   BLOB NOT NULL,
             payload    BLOB NOT NULL,

@@ -756,16 +756,17 @@ impl Runtime {
             .map_err(|e| RuntimeError::Internal(e.to_string()))
     }
 
-    pub async fn whole_tree(
+    pub async fn session_view(
         &self,
         tenant_id: &str,
         session_id: &str,
-        head_id: Option<String>,
-    ) -> Result<crate::protocol::MessageTree, RuntimeError> {
+        leaf: Option<String>,
+    ) -> Result<crate::runtime::sessions::SessionView, RuntimeError> {
         self.sessions
-            .whole_tree(tenant_id, session_id, head_id)
+            .view(tenant_id, session_id, leaf)
             .await
-            .map_err(|e| RuntimeError::Internal(e.to_string()))
+            .map_err(|e| RuntimeError::Internal(e.to_string()))?
+            .ok_or(RuntimeError::Session(SessionError::SessionNotCreated))
     }
 
     pub async fn read_session_events(

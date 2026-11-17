@@ -1,7 +1,10 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::{ClientInput, InterruptOrigin, Message, MessageTree};
-use crate::session::state::{SessionState, SessionStatus};
+use crate::runtime::sessions::SessionView;
+use crate::session::state::SessionStatus;
 use crate::transport::http::NamedBody;
 
 #[derive(Debug, Deserialize)]
@@ -53,6 +56,8 @@ pub struct ClientSessionResponse {
     pub interrupts: Vec<ClientSessionInterrupt>,
     pub messages: Vec<Message>,
     pub message_tree: MessageTree,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub versions: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -64,21 +69,18 @@ pub struct ClientSessionInterrupt {
     pub anchor: Option<String>,
 }
 
-pub fn session_response(
-    session_id: String,
-    session: &SessionState,
-    message_tree: MessageTree,
-) -> ClientSessionResponse {
+pub fn session_response(session_id: String, view: &SessionView) -> ClientSessionResponse {
+    let session = &view.state;
     let status = match session.projected_status() {
         SessionStatus::Idle => "idle",
         SessionStatus::Done => "done",
         SessionStatus::Interrupted { .. } => "interrupted",
     };
-    let loaded = session.message_tree();
-    let messages = loaded
+    let messages = view
+        .tree
         .head_id
         .clone()
-        .map(|h| loaded.path_to(&h))
+        .map(|h| view.tree.path_to(&h))
         .unwrap_or_default();
     ClientSessionResponse {
         session_id,
@@ -95,8 +97,15 @@ pub fn session_response(
             })
             .collect(),
         messages,
-        message_tree,
+        message_tree: view.tree.clone(),
+        versions: view.versions.clone(),
     }
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct GetSessionParams {
+    #[serde(default)]
+    pub leaf: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,11 +124,20 @@ pub struct StreamSessionEventsParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::state::SessionState;
 
     #[test]
     fn client_input_accepts_a_tool_result() {
         let body = r#"{"input":{"type":"tool.result","id":"tc-1","attempt":0,"result":{"content":[{"type":"text","text":"x"}]}}}"#;
         assert!(serde_json::from_str::<ClientInputRequest>(body).is_ok());
+    }
+
+    fn view_of(state: SessionState) -> SessionView {
+        SessionView {
+            tree: state.message_tree(),
+            versions: Default::default(),
+            state,
+        }
     }
 
     fn session_with_interrupt(anchor: Option<&str>) -> SessionState {
@@ -142,8 +160,7 @@ mod tests {
     fn session_response_reports_interrupts_and_head_resolved_status() {
         let json = serde_json::to_value(session_response(
             "s1".into(),
-            &session_with_interrupt(None),
-            session_with_interrupt(None).message_tree(),
+            &view_of(session_with_interrupt(None)),
         ))
         .unwrap();
         assert_eq!(json["status"], "interrupted");
@@ -156,8 +173,7 @@ mod tests {
     #[test]
     fn session_response_reports_an_escaped_interrupt_without_parking_the_status() {
         let s = session_with_interrupt(Some("m-elsewhere"));
-        let json =
-            serde_json::to_value(session_response("s1".into(), &s, s.message_tree())).unwrap();
+        let json = serde_json::to_value(session_response("s1".into(), &view_of(s))).unwrap();
         assert_eq!(json["status"], "idle");
         assert_eq!(json["interrupts"][0]["anchor"], "m-elsewhere");
     }
@@ -166,8 +182,7 @@ mod tests {
     fn session_response_omits_nothing_when_idle() {
         let mut s = SessionState::new("s1".to_string());
         s.status = SessionStatus::Idle;
-        let json =
-            serde_json::to_value(session_response("s1".into(), &s, s.message_tree())).unwrap();
+        let json = serde_json::to_value(session_response("s1".into(), &view_of(s))).unwrap();
         assert_eq!(json["status"], "idle");
         assert_eq!(json["interrupts"], serde_json::json!([]));
         assert!(json.get("agent_id").is_none());
@@ -200,8 +215,7 @@ mod tests {
         s.tree.push(node("a1", Role::Assistant, Some("u1")));
         s.tree.push(node("a2", Role::Assistant, Some("u1")));
         s.head_id = Some("a1".to_string());
-        let json =
-            serde_json::to_value(session_response("s1".into(), &s, s.message_tree())).unwrap();
+        let json = serde_json::to_value(session_response("s1".into(), &view_of(s))).unwrap();
         let ids: Vec<&str> = json["messages"]
             .as_array()
             .unwrap()

@@ -2701,6 +2701,16 @@ impl SessionState {
         self.at_head().message_tree()
     }
 
+    pub fn versions(&self, tree: &MessageTree) -> BTreeMap<String, Vec<String>> {
+        tree.nodes
+            .iter()
+            .filter_map(|n| {
+                let versions = self.tree.versions(&n.message.id);
+                (versions.len() > 1).then(|| (n.message.id.clone(), versions))
+            })
+            .collect()
+    }
+
     pub fn waiting_on_client(&self) -> bool {
         waiting_on_client(&self.effects())
     }

@@ -4,7 +4,6 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Utc};
 
 use crate::entry::{CommandId, CommandResult, Entry};
-use crate::protocol::NewMessage;
 use crate::session::{Session, SessionEvent};
 use crate::state::Logged;
 use crate::tree::{BranchRecord, Node, Nodes, Shared};
@@ -31,7 +30,6 @@ pub trait Store {
     fn cursors(&self) -> Result<BTreeMap<String, u64>, StoreError>;
     fn set_cursor(&self, consumer: &str, seq: u64) -> Result<(), StoreError>;
     fn nodes(&self) -> Arc<dyn Nodes>;
-    fn messages(&self) -> Result<Vec<NewMessage>, StoreError>;
     fn handled(&self, id: &CommandId)
         -> Result<Option<(CommandResult, DateTime<Utc>)>, StoreError>;
 }
@@ -172,19 +170,6 @@ impl Store for MemoryStore {
             .collect())
     }
 
-    fn messages(&self) -> Result<Vec<NewMessage>, StoreError> {
-        Ok(self
-            .space()
-            .log
-            .values()
-            .flat_map(|entry| entry.events.iter())
-            .filter_map(|event| match &event.payload {
-                crate::events::EventPayload::NewMessage(node) => Some(node.clone()),
-                _ => None,
-            })
-            .collect())
-    }
-
     fn set_cursor(&self, consumer: &str, seq: u64) -> Result<(), StoreError> {
         let mut space = self.space();
         let cursor = space.cursors.entry(consumer.to_string()).or_default();
@@ -237,6 +222,35 @@ impl Nodes for MemoryStore {
                 .filter(|e| touches(&e.payload, id))
                 .map(|e| (e.seq, &e.payload)),
         ))
+    }
+
+    fn versions(
+        &self,
+        prev: Option<&str>,
+        branch: Option<&str>,
+    ) -> Result<Vec<Shared>, StoreError> {
+        let space = self.space();
+        let message_at = |from: Option<&str>| -> Option<String> {
+            let mut cursor = from.map(str::to_string);
+            while let Some(node) = cursor
+                .as_deref()
+                .and_then(|id| space.ids.get(id))
+                .and_then(|seq| space.nodes.get(seq))
+            {
+                if node.message().is_some() {
+                    return Some(node.id().to_string());
+                }
+                cursor = node.parent().map(str::to_string);
+            }
+            None
+        };
+        Ok(space
+            .nodes
+            .values()
+            .filter(|n| n.message().is_some() && n.branch() == branch)
+            .filter(|n| message_at(n.parent()).as_deref() == prev)
+            .cloned()
+            .collect())
     }
 
     fn answers(&self, tool_call_id: &str) -> Result<Vec<Shared>, StoreError> {
