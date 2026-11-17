@@ -762,7 +762,7 @@ fn a_retried_click_opens_its_own_turn_after_the_joined_turn_ends() {
     );
     t.decide(vec![], vec![done()]);
     t.decide(vec![], vec![done()]);
-    assert_eq!(t.agg.state.completed_turn_ids, vec!["turn-1".to_string()]);
+    assert_eq!(t.agg.state.recent_turns, vec!["turn-1".to_string()]);
 
     t.advance(2);
     t.wake();
@@ -791,7 +791,7 @@ fn a_click_while_a_turn_ends_waits_for_it() {
     assert!(matches!(t.live_trigger(), Trigger::TurnFinished { .. }));
 
     t.decide(vec![], vec![done()]);
-    assert_eq!(t.agg.state.completed_turn_ids, vec!["turn-1".to_string()]);
+    assert_eq!(t.agg.state.recent_turns, vec!["turn-1".to_string()]);
     assert!(matches!(t.live_trigger(), Trigger::ClientAction { .. }));
     assert_eq!(t.live_turn().as_deref(), Some("turn-2"));
     assert_eq!(
@@ -859,7 +859,7 @@ fn an_ending_turn_waits_for_the_work_its_last_step_starts() {
     t.click("turn-2", &[]);
 
     t.decide(vec![], vec![call_llm("call-9", RetryPolicy::no_retry())]);
-    assert!(t.agg.state.completed_turn_ids.is_empty(), "turn-1 waits");
+    assert!(t.agg.state.recent_turns.is_empty(), "turn-1 waits");
     assert_eq!(t.agg.state.phase.turn_id(), Some("turn-1"));
 
     t.run(
@@ -875,7 +875,7 @@ fn an_ending_turn_waits_for_the_work_its_last_step_starts() {
     assert_eq!(t.live_turn().as_deref(), Some("turn-1"));
 
     t.decide(vec![], vec![done()]);
-    assert_eq!(t.agg.state.completed_turn_ids, vec!["turn-1".to_string()]);
+    assert_eq!(t.agg.state.recent_turns, vec!["turn-1".to_string()]);
     assert!(matches!(t.live_trigger(), Trigger::ClientAction { .. }));
     assert_eq!(t.live_turn().as_deref(), Some("turn-2"));
 }
@@ -1866,7 +1866,7 @@ fn trace_direct_commands_then_cancel() {
     let mut t = flow_direct_commands_then_cancel();
     assert!(t.agg.state.phase.turn_id().is_none(), "the run ends");
     assert_eq!(
-        t.agg.state.completed_turn_ids,
+        t.agg.state.recent_turns,
         vec!["turn-1".to_string(), "turn-2".to_string()]
     );
     assert!(

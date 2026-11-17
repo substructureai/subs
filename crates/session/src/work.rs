@@ -220,7 +220,7 @@ impl Session {
                 .as_ref()
                 .and_then(|o| o.requester.subject.as_ref())
                 .map(|s| s.id.clone()),
-            turns: state.completed_turn_ids.len() as u64 + u64::from(running),
+            turns: state.turns + u64::from(running),
             running,
             last_turn_failed: state.last_turn_failed,
             usage: {

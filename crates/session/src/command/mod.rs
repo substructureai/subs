@@ -728,7 +728,7 @@ impl Working {
     }
 
     fn turn_taken(&self, turn_id: &str) -> Result<(), SessionError> {
-        if self.completed_turn_ids.iter().any(|t| t == turn_id) {
+        if self.turn_completed(turn_id) {
             return Err(SessionError::TurnAlreadyCompleted {
                 turn_id: turn_id.to_string(),
             });

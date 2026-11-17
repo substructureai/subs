@@ -140,7 +140,7 @@ impl KindSpec for DecisionSpec {
         };
         let mut events = Vec::new();
         if let Some(turn_id) = decision.trigger.deferred_turn_id() {
-            if state.completed_turn_ids.iter().any(|t| t == turn_id) {
+            if state.turn_completed(turn_id) {
                 return vec![state.decision_dropped(id)];
             }
             events.push(EventPayload::TurnStarted(TurnStarted {
@@ -160,7 +160,7 @@ impl KindSpec for DecisionSpec {
 
 fn own_turn_started(state: &SessionState, id: &str) -> Option<EventPayload> {
     let decision = state.worker_decision(id)?;
-    let completed = |turn: &str| state.completed_turn_ids.iter().any(|t| t == turn);
+    let completed = |turn: &str| state.turn_completed(turn);
     if decision.turn.as_ref().is_some_and(|t| !completed(&t.id)) {
         return None;
     }

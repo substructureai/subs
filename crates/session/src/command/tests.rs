@@ -6771,7 +6771,7 @@ fn a_new_turn_completes_the_finalizing_one_first() {
         "the old turn closes before the new one opens"
     );
     assert_eq!(agg.state.phase.turn_id(), Some("t2"));
-    assert_eq!(agg.state.completed_turn_ids, vec!["t1".to_string()]);
+    assert_eq!(agg.state.recent_turns, vec!["t1".to_string()]);
 }
 
 #[test]
@@ -6832,7 +6832,7 @@ fn a_continuing_submit_joins_the_running_turn() {
         Some("t1"),
         "t1 keeps the session"
     );
-    assert_eq!(agg.state.completed_turn_ids, Vec::<String>::new());
+    assert_eq!(agg.state.recent_turns, Vec::<String>::new());
 }
 
 #[test]
@@ -6900,7 +6900,7 @@ fn turn_finished_echo_completes_the_turn() {
         turn_finished_decision(&p2).is_none(),
         "no new turn.finished queued; got {p2:?}"
     );
-    assert_eq!(agg.state.completed_turn_ids.len(), 1);
+    assert_eq!(agg.state.recent_turns.len(), 1);
     assert!(agg.state.phase.finalizing().is_none(), "finalizing cleared");
 }
 
@@ -7026,7 +7026,7 @@ fn turn_finished_terminal_failure_completes_as_failed_run() {
     );
     assert!(has_session_done(&events));
     assert!(!agg.state.has_effect(EffectKind::Decision, &tf));
-    assert_eq!(agg.state.completed_turn_ids.len(), 1);
+    assert_eq!(agg.state.recent_turns.len(), 1);
     assert!(agg.state.phase.finalizing().is_none(), "finalizing cleared");
 }
 

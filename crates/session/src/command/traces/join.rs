@@ -228,7 +228,7 @@ fn a_joined_message_keeps_the_turn_past_the_models_final_answer() {
     assert!(t.asked().joining);
 
     let joined = t.joined(reply("call-1", "hello", vec![]), vec![]);
-    assert!(t.agg.state.completed_turn_ids.is_empty());
+    assert!(t.agg.state.recent_turns.is_empty());
     assert!(matches!(
         t.live_trigger(),
         Trigger::ClientMessage { join: true, .. }
@@ -262,7 +262,7 @@ fn a_worker_that_ends_the_turn_sends_a_joined_message_to_the_next_turn() {
     assert_eq!(t.joins().len(), 1, "the ending turn keeps the message");
 
     t.decide(vec![], vec![done()]);
-    assert_eq!(t.agg.state.completed_turn_ids, vec!["turn-1".to_string()]);
+    assert_eq!(t.agg.state.recent_turns, vec!["turn-1".to_string()]);
     assert!(matches!(
         t.live_trigger(),
         Trigger::ClientMessage { join: true, .. }
@@ -522,7 +522,7 @@ fn a_joined_message_that_fails_fails_the_turn() {
         ),
         &system(),
     );
-    assert_eq!(t.agg.state.completed_turn_ids, vec!["turn-1".to_string()]);
+    assert_eq!(t.agg.state.recent_turns, vec!["turn-1".to_string()]);
     assert!(t.joins().is_empty());
     assert!(!t.agg.state.has_pending_worker_decision());
 }
@@ -543,7 +543,7 @@ fn a_joined_message_while_a_turn_ends_runs_as_the_next_turn() {
     );
 
     t.decide(vec![], vec![done()]);
-    assert_eq!(t.agg.state.completed_turn_ids, vec!["turn-1".to_string()]);
+    assert_eq!(t.agg.state.recent_turns, vec!["turn-1".to_string()]);
     assert_eq!(t.live_turn().as_deref(), Some("turn-2"));
 }
 
@@ -557,7 +557,7 @@ fn a_failed_turn_keeps_a_joined_message_for_the_next_turn() {
             error: ErrorInfo::internal("boom".to_string()),
         }],
     );
-    assert_eq!(t.agg.state.completed_turn_ids, vec!["turn-1".to_string()]);
+    assert_eq!(t.agg.state.recent_turns, vec!["turn-1".to_string()]);
     assert_eq!(t.live_turn().as_deref(), Some("turn-2"));
 }
 
@@ -817,7 +817,7 @@ fn a_session_message_while_a_turn_ends_runs_as_the_next_turn() {
     t.run(mail(user_message("later"), Some("mail-1")), &system());
 
     t.decide(vec![], vec![done()]);
-    assert_eq!(t.agg.state.completed_turn_ids, vec!["turn-1".to_string()]);
+    assert_eq!(t.agg.state.recent_turns, vec!["turn-1".to_string()]);
     assert_eq!(t.live_turn().as_deref(), Some("mail-1"));
 }
 
@@ -844,7 +844,7 @@ fn a_cancel_keeps_a_joined_message_for_the_next_turn() {
         CommandPayload::CancelSession { drop_queued: false },
         &frontend(),
     );
-    assert_eq!(t.agg.state.completed_turn_ids, vec!["turn-1".to_string()]);
+    assert_eq!(t.agg.state.recent_turns, vec!["turn-1".to_string()]);
     assert!(matches!(
         t.live_trigger(),
         Trigger::ClientMessage { join: true, .. }

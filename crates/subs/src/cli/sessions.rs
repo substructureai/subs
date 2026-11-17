@@ -899,10 +899,7 @@ mod cancel_tests {
         for (id, turn) in [(&child, "c1"), (&grandchild, "g1")] {
             let session = load(id);
             assert!(session.state().phase.turn_id().is_none(), "{id} still runs");
-            assert!(session
-                .state()
-                .completed_turn_ids
-                .contains(&turn.to_string()));
+            assert!(session.state().turn_completed(turn));
         }
     }
 }

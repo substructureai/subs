@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -635,6 +635,15 @@ impl Anchored for OpenInterrupt {
     }
 }
 
+const REMEMBERED_TURNS: usize = 64;
+
+fn remember(turns: &mut Vec<String>, turn_id: &str) {
+    turns.retain(|t| t != turn_id);
+    turns.push(turn_id.to_string());
+    let over = turns.len().saturating_sub(REMEMBERED_TURNS);
+    turns.drain(..over);
+}
+
 fn trigger_effect(trigger: &Trigger) -> Option<(EffectKind, &str)> {
     match trigger {
         Trigger::ToolFinished { id, .. }
@@ -972,8 +981,11 @@ pub struct SessionState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_started_seq: Option<u64>,
 
+    #[serde(default)]
+    pub turns: u64,
+
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub completed_turn_ids: Vec<String>,
+    pub recent_turns: Vec<String>,
 
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub last_turn_failed: bool,
@@ -982,8 +994,8 @@ pub struct SessionState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
 
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub detached_turns: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub detached_turns: Vec<String>,
 
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub deliveries: BTreeMap<String, crate::delivery::Delivery>,
@@ -1037,10 +1049,11 @@ impl SessionState {
             schedule_queue: Vec::new(),
             phase: TurnPhase::default(),
             turn_started_seq: None,
-            completed_turn_ids: Vec::new(),
+            turns: 0,
+            recent_turns: Vec::new(),
             last_turn_failed: false,
             title: None,
-            detached_turns: BTreeSet::new(),
+            detached_turns: Vec::new(),
             head_id: None,
             tree: crate::tree::Tree::default(),
             open_interrupts: Vec::new(),
@@ -1236,10 +1249,14 @@ impl SessionState {
         self.release();
     }
 
+    pub fn turn_completed(&self, turn_id: &str) -> bool {
+        self.recent_turns.iter().any(|t| t == turn_id)
+    }
+
     pub fn turn_id(&self) -> Option<&str> {
         self.phase
             .turn_id()
-            .or_else(|| self.completed_turn_ids.last().map(String::as_str))
+            .or_else(|| self.recent_turns.last().map(String::as_str))
     }
 
     pub fn effect(&self, kind: EffectKind, id: &str) -> Option<&EffectState> {
@@ -1985,7 +2002,7 @@ impl SessionState {
                 let stamped = self
                     .worker_decision(&p.id)
                     .and_then(|d| d.turn.as_ref())
-                    .is_some_and(|t| !self.completed_turn_ids.contains(&t.id));
+                    .is_some_and(|t| !self.turn_completed(&t.id));
                 if let Some(e) = self.effect_mut(EffectKind::Decision, &p.id) {
                     e.tracking.dispatch(now);
                     if let Some(d) = e.decision_mut() {
@@ -2114,7 +2131,7 @@ impl SessionState {
                 self.turn_calls.subagent.tokens.add(&payload.token_usage);
                 self.turn_calls.subagent.errors += u32::from(payload.error.is_some());
                 if let Some(turn_id) = &payload.turn_id {
-                    self.detached_turns.insert(turn_id.clone());
+                    remember(&mut self.detached_turns, turn_id);
                 }
                 if let Some(e) = self.effect_mut(EffectKind::Subagent, &payload.id) {
                     if let Some(sa) = e.subagent_mut() {
@@ -2153,7 +2170,8 @@ impl SessionState {
                 self.turn_started_at = Some(now);
             }
             EventPayload::TurnCompleted(payload) => {
-                self.completed_turn_ids.push(payload.turn_id.clone());
+                self.turns += 1;
+                remember(&mut self.recent_turns, &payload.turn_id);
                 self.last_turn_failed = payload.error.is_some();
                 if !matches!(self.phase, TurnPhase::Finalizing(_)) {
                     self.last_turn_at = Some(now);
