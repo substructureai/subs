@@ -1170,7 +1170,14 @@ mod cold {
         }
 
         fn reloaded(&self) -> Session {
-            Session::load(self.store.as_ref(), "s1", "t", Settings::default()).unwrap()
+            let loaded =
+                Session::load(self.store.as_ref(), "s1", "t", Settings::default()).unwrap();
+            assert_eq!(
+                serde_json::to_value(loaded.open_work()).unwrap(),
+                serde_json::to_value(self.session.open_work()).unwrap(),
+                "the work built from a reload is the work built live"
+            );
+            loaded
         }
     }
 

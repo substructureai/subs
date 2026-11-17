@@ -138,6 +138,7 @@ fn op() -> impl Strategy<Value = Op> {
 
 struct World {
     agg: Session,
+    store: Option<Counted>,
     now: DateTime<Utc>,
     log: Vec<(u64, DateTime<Utc>, EventPayload)>,
     next_id: u32,
@@ -148,12 +149,25 @@ struct World {
 
 impl World {
     fn new() -> Self {
-        let mut world = World {
-            agg: Session::with_state(
+        World::with(None)
+    }
+
+    fn stored() -> Self {
+        World::with(Some(Counted::default()))
+    }
+
+    fn with(store: Option<Counted>) -> Self {
+        let agg = match &store {
+            Some(store) => Session::load(store, "sess-1", TENANT, settings()).unwrap(),
+            None => Session::with_state(
                 "sess-1".to_string(),
                 TENANT.to_string(),
                 SessionState::new("sess-1".to_string()),
             ),
+        };
+        let mut world = World {
+            agg,
+            store,
             now: DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
@@ -200,6 +214,21 @@ impl World {
             _ => self.now,
         };
         self.trace.push(format!("{cmd:?}"));
+        if let Some(store) = self.store.clone() {
+            let id = format!("cmd-{}", self.trace.len());
+            let ran = self
+                .agg
+                .run(
+                    &store,
+                    self.now,
+                    crate::Command::new(id, caller.clone(), cmd),
+                )
+                .unwrap();
+            for event in ran.written.map(|e| e.events).unwrap_or_default() {
+                self.log.push((event.seq, event.occurred_at, event.payload));
+            }
+            return;
+        }
         let Ok(events) = self.agg.handle(cmd, caller, self.now) else {
             return;
         };
@@ -616,6 +645,128 @@ fn pick(ids: &[String], index: usize) -> Option<String> {
     Some(ids[index % ids.len()].clone())
 }
 
+fn settings() -> crate::Settings {
+    crate::Settings {
+        snapshot_every: 3,
+        ..crate::Settings::default()
+    }
+}
+
+#[derive(Clone, Default)]
+struct Counted {
+    store: crate::MemoryStore,
+    reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+struct CountedNodes {
+    nodes: std::sync::Arc<dyn crate::tree::Nodes>,
+    reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl CountedNodes {
+    fn read(&self) -> &dyn crate::tree::Nodes {
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.nodes.as_ref()
+    }
+}
+
+impl crate::tree::Nodes for CountedNodes {
+    fn node(&self, id: &str) -> Result<Option<crate::tree::Shared>, crate::StoreError> {
+        self.read().node(id)
+    }
+    fn ancestors(
+        &self,
+        id: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::tree::Shared>, crate::StoreError> {
+        self.read().ancestors(id, limit)
+    }
+    fn children(
+        &self,
+        parent: &str,
+        branch: Option<&str>,
+    ) -> Result<Vec<crate::tree::Shared>, crate::StoreError> {
+        self.read().children(parent, branch)
+    }
+    fn answers(&self, id: &str) -> Result<Vec<crate::tree::Shared>, crate::StoreError> {
+        self.read().answers(id)
+    }
+    fn branch(&self, id: &str) -> Result<Option<crate::tree::BranchRecord>, crate::StoreError> {
+        self.read().branch(id)
+    }
+    fn versions(
+        &self,
+        prev: Option<&str>,
+        branch: Option<&str>,
+    ) -> Result<Vec<crate::tree::Shared>, crate::StoreError> {
+        self.read().versions(prev, branch)
+    }
+}
+
+impl crate::Store for Counted {
+    fn append(&self, entry: &crate::Entry) -> Result<(), crate::StoreError> {
+        self.store.append(entry)
+    }
+    fn read(&self, after: u64) -> Result<Vec<crate::Entry>, crate::StoreError> {
+        self.store.read(after)
+    }
+    fn events(
+        &self,
+        after: u64,
+        max: usize,
+    ) -> Result<Vec<crate::SessionEvent>, crate::StoreError> {
+        self.store.events(after, max)
+    }
+    fn events_at(&self, seqs: &[u64]) -> Result<Vec<crate::SessionEvent>, crate::StoreError> {
+        self.store.events_at(seqs)
+    }
+    fn snapshot(&self, session: &Session) -> Result<(), crate::StoreError> {
+        self.store.snapshot(session)
+    }
+    fn latest(&self) -> Result<Option<Session>, crate::StoreError> {
+        self.store.latest()
+    }
+    fn cursors(&self) -> Result<std::collections::BTreeMap<String, u64>, crate::StoreError> {
+        self.store.cursors()
+    }
+    fn set_cursor(&self, consumer: &str, seq: u64) -> Result<(), crate::StoreError> {
+        self.store.set_cursor(consumer, seq)
+    }
+    fn nodes(&self) -> std::sync::Arc<dyn crate::tree::Nodes> {
+        std::sync::Arc::new(CountedNodes {
+            nodes: self.store.nodes(),
+            reads: self.reads.clone(),
+        })
+    }
+    fn handled(
+        &self,
+        id: &crate::CommandId,
+    ) -> Result<Option<(crate::CommandResult, DateTime<Utc>)>, crate::StoreError> {
+        self.store.handled(id)
+    }
+}
+
+fn transcripts(session: &Session) -> Vec<(Option<String>, Vec<String>)> {
+    let state = session.state();
+    std::iter::once(None)
+        .chain(state.branches.keys().cloned().map(Some))
+        .map(|b| {
+            let ids = state
+                .at_scope(b.as_deref())
+                .transcript()
+                .into_iter()
+                .map(|m| m.id)
+                .collect();
+            (b, ids)
+        })
+        .collect()
+}
+
+fn work(session: &Session) -> serde_json::Value {
+    serde_json::to_value(session.open_work()).unwrap()
+}
+
 fn round_trip(state: &SessionState) -> SessionState {
     let json = serde_json::to_string(state).expect("a session state serializes");
     let mut back: SessionState = serde_json::from_str(&json).expect("and deserializes");
@@ -673,6 +824,43 @@ proptest! {
                     "the schedule tail left work ready: {ready:?}\ncommands:\n{commands}"
                 );
             }
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 64,
+        failure_persistence: Some(Box::new(FileFailurePersistence::SourceParallel(
+            "tests/proptest-regressions"
+        ))),
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn a_session_reloaded_from_its_log_is_the_session_that_ran(
+        ops in proptest::collection::vec(op(), 1..24)
+    ) {
+        let mut world = World::stored();
+        for op in ops {
+            world.step(op);
+            let commands = world.trace.join("\n");
+            let store = world.store.clone().expect("a stored world");
+            store.reads.store(0, std::sync::atomic::Ordering::Relaxed);
+            let loaded = Session::load(&store, "sess-1", TENANT, settings()).unwrap();
+            prop_assert_eq!(
+                serde_json::to_value(loaded.state()).unwrap(),
+                serde_json::to_value(world.agg.state()).unwrap(),
+                "reload diverged\ncommands:\n{}", commands
+            );
+            prop_assert_eq!(
+                transcripts(&loaded), transcripts(&world.agg),
+                "a branch reads differently after a reload\ncommands:\n{}", commands
+            );
+            prop_assert_eq!(
+                work(&loaded), work(&world.agg),
+                "the work built from a reload differs\ncommands:\n{}", commands
+            );
         }
     }
 }
