@@ -25,10 +25,9 @@ use crate::{CommitContext, Session};
 
 fn placed_by(agg: &Session, id: &str) -> Vec<crate::prompt_context::Placed> {
     agg.state
-        .context_versions
-        .iter()
-        .filter(|v| v.value.call == id)
-        .map(|v| v.value.clone())
+        .placed()
+        .into_iter()
+        .filter(|p| p.call == id)
         .collect()
 }
 
@@ -1199,10 +1198,11 @@ fn request_llm_call_emits_requested() {
             events.as_slice(),
             [
                 EventPayload::LlmCallRequested(_),
+                EventPayload::ContextPlaced(_),
                 EventPayload::LlmCallDispatched(_),
             ]
         ),
-        "expected [LlmCallRequested, LlmCallDispatched]; got {events:?}"
+        "expected [LlmCallRequested, ContextPlaced, LlmCallDispatched]; got {events:?}"
     );
     let call = agg
         .state
@@ -2388,6 +2388,7 @@ fn worker_handled_llm_call_emits_request_trigger() {
             events.as_slice(),
             [
                 EventPayload::LlmCallRequested(_),
+                EventPayload::ContextPlaced(_),
                 EventPayload::LlmCallDispatched(_),
                 EventPayload::DecisionQueued(_),
                 EventPayload::DecisionDispatched(_),
@@ -2442,6 +2443,7 @@ fn server_handled_llm_call_does_not_emit_request_trigger() {
             events.as_slice(),
             [
                 EventPayload::LlmCallRequested(_),
+                EventPayload::ContextPlaced(_),
                 EventPayload::LlmCallDispatched(_),
             ]
         ),
@@ -14657,7 +14659,7 @@ fn an_explicit_call_first_leaves_the_context_for_the_tree_call() {
     let title = vec![node_msg("", Role::User, "write a 3-word title")];
     send(&mut agg, "title-1", PromptSource::Explicit, title);
     assert_eq!(sent(&agg, "title-1").len(), 1, "nothing is merged");
-    assert!(agg.state.context_versions.is_empty(), "nothing is said");
+    assert!(agg.state.placed().is_empty(), "nothing is said");
 
     send(&mut agg, "call-1", PromptSource::tree(), vec![]);
     let first = sent(&agg, "call-1");
@@ -14725,8 +14727,8 @@ fn a_tree_call_survives_a_snapshot_and_an_older_one_loads_as_legacy() {
     assert!(placed_by(&agg, "call-2").is_empty());
 
     let mut old = snapshot.to_string();
-    old = old.replace(r#""source":{"at":"u1","kind":"tree"},"#, "");
-    old = old.replace(r#""source":{"kind":"tree","at":"u1"},"#, "");
+    old = old.replace(r#""source":{"at":"call-1:ctx","kind":"tree"},"#, "");
+    old = old.replace(r#""source":{"kind":"tree","at":"call-1:ctx"},"#, "");
     assert!(!old.contains("\"kind\":\"tree\""), "the source is cut out");
     let old: SessionState = serde_json::from_str(&old).unwrap();
     assert_eq!(

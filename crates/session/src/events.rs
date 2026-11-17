@@ -119,6 +119,8 @@ pub enum EventPayload {
     DeliveryResumed(DeliveryResumed),
     #[serde(rename = "context.limited")]
     ContextLimited(Box<ContextLimited>),
+    #[serde(rename = "context.placed")]
+    ContextPlaced(ContextPlaced),
     #[serde(rename = "context.replaced")]
     ContextReplaced(ContextReplaced),
     #[serde(rename = "context.kept")]
@@ -307,6 +309,15 @@ pub struct LlmCallRequested {
     pub defer_tools_strategy: DeferToolsStrategy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextPlaced {
+    #[serde(flatten)]
+    pub node: crate::tree::Place,
+    pub call: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub placed: Vec<crate::prompt_context::Placed>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

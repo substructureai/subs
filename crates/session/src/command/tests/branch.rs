@@ -240,7 +240,11 @@ fn a_fork_reads_the_conversation_and_then_its_own_messages() {
     let agg = turn_with_side_call(BranchMode::Detached);
     let branch = agg.state.open_branch("title").expect("the branch started");
     assert_eq!(branch.from.as_deref(), Some("u1"));
-    assert_eq!(agg.state.head_id.as_deref(), Some("u1"), "the head stays");
+    assert_eq!(
+        agg.state.message_tree().head_id.as_deref(),
+        Some("u1"),
+        "the head stays"
+    );
     let own = branch.leaf.clone().expect("its message is its own node");
     assert_eq!(agg.state.node_branch(&own).as_deref(), Some("title"));
 
@@ -552,7 +556,7 @@ fn a_branch_with_work_out_cannot_be_promoted() {
             id: "title".to_string(),
         }],
     );
-    assert_eq!(agg.state.head_id.as_deref(), Some("u1"));
+    assert_eq!(agg.state.message_tree().head_id.as_deref(), Some("u1"));
     assert!(agg.state.open_branch("title").is_some());
 }
 
@@ -641,10 +645,7 @@ fn an_explicit_call_runs_on_its_own_branch_as_written() {
         "the worker's prompt and what followed, as written"
     );
     assert_eq!(agg.state.head_id.as_deref(), Some("u1"));
-    assert!(
-        agg.state.context_versions.is_empty(),
-        "no config told it anything"
-    );
+    assert!(agg.state.placed().is_empty(), "no config told it anything");
 }
 
 #[test]

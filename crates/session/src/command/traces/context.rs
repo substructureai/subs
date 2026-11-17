@@ -252,7 +252,7 @@ fn emitted(t: &Trace) -> Vec<&str> {
     t.names
         .iter()
         .map(String::as_str)
-        .filter(|n| n.starts_with("context."))
+        .filter(|n| n.starts_with("context.") && *n != "context.placed")
         .collect()
 }
 
@@ -288,6 +288,7 @@ fn a_quiet_session_starts_over_with_the_turns_own_messages() {
         .state
         .tree
         .fresh()
+        .filter(|n| n.message().is_some())
         .max_by_key(|n| n.seq)
         .and_then(|n| match &n.fact {
             crate::tree::Fact::Message { copied_from, .. } => Some(copied_from.clone()),

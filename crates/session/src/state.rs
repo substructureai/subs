@@ -66,10 +66,10 @@ use rust_decimal::Decimal;
 
 pub use crate::protocol::EffectKind;
 use crate::protocol::{
-    AgentConfig, BranchMode, BranchView, ClientContext, Content, ContextReason, DecisionTurn,
-    DraftMessage, Effect, EffectStatus, HeldCall, InterruptOrigin, LlmFormat, LlmRequest, LlmTool,
-    Message, MessageTree, NewMessage, ReasoningConfig, RetryConfig, RetryPolicy, Role,
-    SessionOwner, SpawnMode, SubagentTools, Usage, WorkerRef, WorkerState,
+    AgentConfig, BranchMode, BranchView, ClientContext, ContextReason, DecisionTurn, DraftMessage,
+    Effect, EffectStatus, HeldCall, InterruptOrigin, LlmFormat, LlmRequest, LlmTool, Message,
+    MessageTree, NewMessage, ReasoningConfig, RetryConfig, RetryPolicy, Role, SessionOwner,
+    SpawnMode, SubagentTools, Usage, WorkerRef, WorkerState,
 };
 use crate::retry::RetryState;
 
@@ -422,39 +422,6 @@ pub struct LlmCallState {
 }
 
 impl LlmCallState {
-    pub fn placed_in_prompt(&self, id: &str) -> Vec<prompt_context::Placed> {
-        if self.context_ids.is_empty() {
-            return Vec::new();
-        }
-        let tag = format!("{id}-ctx-");
-        self.prompt
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| m.id.starts_with(&tag))
-            .filter_map(|(i, m)| {
-                let content = match m.content.as_ref()? {
-                    Content::Text(text) => text.clone(),
-                    Content::Parts(_) => return None,
-                };
-                let (placement, after) = match m.role {
-                    Role::System => (prompt_context::Placement::System, None),
-                    _ => (
-                        prompt_context::Placement::Own,
-                        i.checked_sub(1).map(|j| self.prompt[j].id.clone()),
-                    ),
-                };
-                Some(prompt_context::Placed {
-                    call: id.to_string(),
-                    message: m.id.clone(),
-                    placement,
-                    content,
-                    after,
-                    ids: Vec::new(),
-                })
-            })
-            .collect()
-    }
-
     /// The request the model gets: its prompt, and the tools it was sent.
     pub fn sent_request(&self) -> LlmRequest {
         let mut request = self.spec.to_request(self.prompt.clone());
@@ -591,19 +558,12 @@ pub struct ConnectorSyncState {
     pub auth: Option<AuthNeed>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Versioned<T> {
-    pub value: T,
-    pub anchor: Option<String>,
-}
-
-pub type ContextVersion = Versioned<prompt_context::Placed>;
-
 #[derive(Debug, Clone)]
 pub struct Outgoing {
     pub node: Option<String>,
     pub prompt: Vec<Message>,
     pub placed: Vec<prompt_context::Placed>,
+    pub places: bool,
     context_ids: Vec<String>,
 }
 
@@ -660,12 +620,6 @@ pub trait Anchored {
 impl<T: Anchored> Anchored for Logged<T> {
     fn anchor(&self) -> Option<&str> {
         self.entry.anchor()
-    }
-}
-
-impl<T> Anchored for Versioned<T> {
-    fn anchor(&self) -> Option<&str> {
-        self.anchor.as_deref()
     }
 }
 
@@ -958,9 +912,6 @@ pub struct SessionState {
     pub subagent_token_usage: Usage,
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub context_versions: Vec<Logged<ContextVersion>>,
-
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ancestry: Vec<String>,
 
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
@@ -1042,7 +993,6 @@ impl SessionState {
             quiet_end: None,
             context_kept: false,
             subagent_token_usage: Usage::default(),
-            context_versions: Vec::new(),
             ancestry: Vec::new(),
             data: serde_json::Value::Null,
             worker_retry: None,
@@ -1162,7 +1112,12 @@ impl SessionState {
         let id = node.id().to_string();
         let user = node.message().is_some_and(|m| m.role == Role::User);
         let branch = node.branch().map(str::to_string);
+        let forks = !matches!(node.fact, crate::tree::Fact::Context { .. });
+        let parent = node.parent().map(str::to_string);
         self.tree.push(Logged { seq, entry: node });
+        if !forks && parent != self.scope_node(branch.as_deref()) {
+            return;
+        }
         match branch.and_then(|b| self.branches.get_mut(&b)) {
             Some(branch) => branch.leaf = Some(id),
             None => {
@@ -1458,31 +1413,6 @@ impl SessionState {
     }
 
     fn settle_prompt(&mut self, id: &str) {
-        let Some(effect) = self.effect(EffectKind::LlmCall, id) else {
-            return;
-        };
-        let Some(call) = effect.llm().filter(|c| !c.prompt.is_empty()) else {
-            return;
-        };
-        let recorded = self.context_versions.iter().any(|v| v.value.call == id);
-        let placed = match recorded {
-            true => Vec::new(),
-            false => call.placed_in_prompt(id),
-        };
-        let anchor = effect.anchor.clone();
-        let at = self
-            .context_versions
-            .partition_point(|v| v.seq == 0 && v.value.call.as_str() <= id);
-        self.context_versions.splice(
-            at..at,
-            placed.into_iter().map(|value| Logged {
-                seq: 0,
-                entry: ContextVersion {
-                    value,
-                    anchor: anchor.clone(),
-                },
-            }),
-        );
         if let Some(call) = self
             .effect_mut(EffectKind::LlmCall, id)
             .and_then(|e| e.llm_mut())
@@ -1575,14 +1505,6 @@ impl SessionState {
                 call.dispatched_seq = Some(ctx.sequence);
             }
         }
-        self.context_versions
-            .extend(out.placed.into_iter().map(|value| Logged {
-                seq: ctx.sequence,
-                entry: ContextVersion {
-                    value,
-                    anchor: out.node.clone(),
-                },
-            }));
         self.dequeue(EffectKind::LlmCall, &payload.id);
     }
 
@@ -1878,6 +1800,20 @@ impl SessionState {
             }
             EventPayload::LlmCallRequested(payload) => self.apply_llm_requested(payload, ctx),
             EventPayload::LlmCallDispatched(payload) => self.apply_llm_dispatched(payload, ctx),
+            EventPayload::ContextPlaced(payload) => {
+                if let Some(node) = crate::tree::Node::of_event(event) {
+                    self.grow(node, ctx.sequence);
+                }
+                let at = Some(payload.node.id.clone());
+                if let Some(effect) = self.effect_mut(EffectKind::LlmCall, &payload.call) {
+                    effect.anchor = at.clone();
+                    if let Some(call) = effect.llm_mut() {
+                        if let PromptSource::Tree { at: source } = &mut call.source {
+                            *source = at;
+                        }
+                    }
+                }
+            }
             EventPayload::LlmCallCompleted(payload) => {
                 let branch = self.effect_branch(EffectKind::LlmCall, &payload.id);
                 match &payload.response.usage {
@@ -2722,6 +2658,20 @@ impl SessionState {
             .collect()
     }
 
+    #[cfg(test)]
+    pub fn placed(&self) -> Vec<prompt_context::Placed> {
+        let mut nodes: Vec<&crate::tree::Shared> = self.tree.fresh().collect();
+        nodes.sort_by_key(|n| n.seq);
+        nodes
+            .into_iter()
+            .filter_map(|n| match &n.fact {
+                crate::tree::Fact::Context { placed, .. } => Some(placed.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
     pub fn has_node(&self, id: &str) -> bool {
         self.tree.has(id)
     }
@@ -2874,19 +2824,6 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
 
     fn up(&self) -> crate::tree::Up<'a> {
         self.state.tree.up(self.node)
-    }
-
-    fn context_path(&self) -> std::collections::HashSet<String> {
-        let mut path = std::collections::HashSet::new();
-        for node in self.up() {
-            path.insert(node.id().to_string());
-            if let crate::tree::Fact::BranchStart { agent } = &node.fact {
-                if *agent != BranchConfig::Inherit {
-                    break;
-                }
-            }
-        }
-        path
     }
 
     pub fn message_tree(&self) -> MessageTree {
@@ -3154,22 +3091,22 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
             .collect()
     }
 
+    fn contexts(&self) -> Vec<prompt_context::Placed> {
+        let mut placed: Vec<Vec<prompt_context::Placed>> = Vec::new();
+        for node in self.up() {
+            match &node.fact {
+                crate::tree::Fact::Context { placed: here, .. } => placed.push(here.clone()),
+                crate::tree::Fact::BranchStart { agent } if *agent != BranchConfig::Inherit => {
+                    break
+                }
+                _ => {}
+            }
+        }
+        placed.into_iter().rev().flatten().collect()
+    }
+
     pub fn said(&self) -> std::collections::HashSet<String> {
-        let path = self.context_path();
-        let legacy = self
-            .state
-            .effects
-            .values()
-            .filter(|e| SessionState::anchored_on(&path, e.anchor.as_deref()))
-            .filter_map(EffectState::llm)
-            .flat_map(|call| call.context_ids.iter().cloned());
-        self.state
-            .context_versions
-            .iter()
-            .filter(|v| SessionState::anchored_on(&path, v.anchor.as_deref()))
-            .flat_map(|v| v.value.ids.iter().cloned())
-            .chain(legacy)
-            .collect()
+        self.contexts().into_iter().flat_map(|p| p.ids).collect()
     }
 
     pub fn outgoing(
@@ -3184,6 +3121,7 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
             node,
             prompt: given.to_vec(),
             placed: Vec::new(),
+            places: false,
             context_ids: applied.to_vec(),
         };
         match source {
@@ -3204,69 +3142,52 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
                     .map(|(i, m)| m.recorded(format!("{id}:{i}")))
                     .collect();
                 prompt_context::restore(&mut out.prompt, &self.placed_on_path());
+                let open = self.system_prefix_open(id);
                 prompt_context::merge(
                     &mut out.prompt,
                     &mut Vec::new(),
                     &mut out.placed,
                     id,
-                    self.system_prefix_open(id),
+                    open,
                     prompt_context::owed(*self),
                 );
+                out.places = open || !out.placed.is_empty();
             }
             PromptSource::Legacy => {
                 if !self.state.is_summary_call(id) {
                     prompt_context::carry(&mut out.prompt, &self.placed_on_path());
                 }
+                let open = self.system_prefix_open(id);
                 prompt_context::merge(
                     &mut out.prompt,
                     &mut out.context_ids,
                     &mut out.placed,
                     id,
-                    self.system_prefix_open(id),
+                    open,
                     prompt_context::owed(*self),
                 );
+                out.places = open || !out.placed.is_empty();
             }
         }
         out
     }
 
     pub fn placed_on_path(&self) -> Vec<prompt_context::Placed> {
-        let path = self.context_path();
-        let recorded: std::collections::HashSet<&str> = self
-            .state
-            .context_versions
-            .iter()
-            .map(|v| v.value.call.as_str())
-            .collect();
-        let mut placed: Vec<(u64, prompt_context::Placed)> = self
-            .state
-            .effects
-            .values()
-            .filter(|e| !recorded.contains(e.id.as_str()))
-            .filter(|e| SessionState::anchored_on(&path, e.anchor.as_deref()))
-            .filter_map(|e| e.llm().map(|call| call.placed_in_prompt(&e.id)))
-            .flatten()
-            .map(|p| (0, p))
-            .collect();
-        placed.extend(
-            self.state
-                .context_versions
-                .iter()
-                .filter(|v| SessionState::anchored_on(&path, v.anchor.as_deref()))
-                .map(|v| (v.seq, v.value.clone())),
-        );
-        placed.sort_by_key(|(seq, _)| *seq);
-        placed.into_iter().map(|(_, p)| p).collect()
+        self.contexts()
     }
 
     pub fn system_prefix_open(&self, exclude: &str) -> bool {
+        let placed = self
+            .up()
+            .any(|n| matches!(&n.fact, crate::tree::Fact::Context { call, .. } if call != exclude));
         let path = self.path_set();
-        !self.state.effects.values().any(|e| {
-            e.id != exclude
-                && e.llm().is_some_and(|c| c.source != PromptSource::Explicit)
-                && SessionState::anchored_on(&path, e.anchor.as_deref())
-                && e.tracking.status() != EffectStatus::Queued
-        })
+        !placed
+            && !self.state.effects.values().any(|e| {
+                e.id != exclude
+                    && e.llm().is_some_and(|c| c.source != PromptSource::Explicit)
+                    && SessionState::anchored_on(&path, e.anchor.as_deref())
+                    && e.tracking.status() != EffectStatus::Queued
+            })
     }
 
     pub fn call_tool_target(&self, named: &str) -> Option<CallTarget> {

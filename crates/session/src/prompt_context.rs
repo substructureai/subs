@@ -903,15 +903,11 @@ mod tests {
                 branch: None,
             }),
         );
-        apply(
-            state,
-            seq + 1,
-            EventPayload::LlmCallDispatched(crate::events::LlmCallDispatched {
-                fingerprint: None,
-                id: id.to_string(),
-                attempt: 0,
-            }),
-        );
+        let dispatched =
+            crate::effects::KindSpec::dispatch(&crate::effects::llm::LlmSpec, state, id);
+        for (i, event) in dispatched.into_iter().enumerate() {
+            apply(state, seq + 1 + i as u64, event);
+        }
         state.llm_call(id).unwrap().prompt.clone()
     }
 
@@ -927,11 +923,7 @@ mod tests {
             "a held call sent again from the request it was held with reads what it read"
         );
         assert_eq!(
-            state
-                .context_versions
-                .iter()
-                .filter(|v| v.value.call == "call-1")
-                .count(),
+            state.placed().iter().filter(|p| p.call == "call-1").count(),
             1,
             "placed once"
         );

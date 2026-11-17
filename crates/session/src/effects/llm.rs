@@ -78,13 +78,25 @@ impl KindSpec for LlmSpec {
         let Some(effect) = state.effect(EffectKind::LlmCall, id) else {
             return void_events(EffectKind::LlmCall, id.to_string());
         };
-        vec![EventPayload::LlmCallDispatched(LlmCallDispatched {
+        let out = state.outgoing(id);
+        let mut events = Vec::new();
+        if let Some(out) = out.as_ref().filter(|out| out.places) {
+            events.push(EventPayload::ContextPlaced(ContextPlaced {
+                node: crate::tree::Place {
+                    id: format!("{id}:ctx"),
+                    parent_id: out.node.clone(),
+                    branch: effect.branch.clone(),
+                },
+                call: id.to_string(),
+                placed: out.placed.clone(),
+            }));
+        }
+        events.push(EventPayload::LlmCallDispatched(LlmCallDispatched {
             id: id.to_string(),
             attempt: effect.tracking.retry.attempts,
-            fingerprint: state
-                .outgoing(id)
-                .map(|out| crate::prompt_context::fingerprint(&out.prompt)),
-        })]
+            fingerprint: out.map(|out| crate::prompt_context::fingerprint(&out.prompt)),
+        }));
+        events
     }
 
     fn execute_trigger(&self, state: &SessionState, id: &str) -> Option<Trigger> {

@@ -35,6 +35,11 @@ pub enum Fact {
         #[serde(default)]
         agent: BranchConfig,
     },
+    Context {
+        call: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        placed: Vec<crate::prompt_context::Placed>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -323,6 +328,13 @@ impl Node {
                 place: v.node.clone(),
                 fact: Fact::Config {
                     config: v.config.clone(),
+                },
+            },
+            EventPayload::ContextPlaced(c) => Node {
+                place: c.node.clone(),
+                fact: Fact::Context {
+                    call: c.call.clone(),
+                    placed: c.placed.clone(),
                 },
             },
             EventPayload::BranchStarted(b) => Node {
