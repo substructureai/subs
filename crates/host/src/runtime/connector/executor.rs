@@ -139,19 +139,34 @@ pub async fn answer_locally(
     blobs: &dyn BlobStore,
     plugins: &dyn PluginResolver,
 ) -> Result<Option<StoredResult>, String> {
-    let state = session.state();
-    if let Some(call) = state.attachment_call(tool_call_id) {
+    use crate::runtime::sessions::read;
+    let id = tool_call_id.to_string();
+    let (attachment, skill) = read(session, move |state| {
+        (state.attachment_call(&id), state.skill_call(&id))
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    if let Some(call) = attachment {
         return Ok(Some(crate::attachments::tools::answer(call, blobs).await));
     }
-    let Some(call) = state.skill_call(tool_call_id) else {
+    let Some(call) = skill else {
         return Ok(None);
     };
     let bundle = match call.plugin_id.is_empty() {
         true => None,
         false => plugins.resolve(session.tenant_id(), &call.plugin_id).await,
     };
-    let at = state.at(call.node.as_deref());
-    let stored = match engine_tools::stored_file(at, bundle.as_ref(), &call.arguments) {
+    let (asked, held) = (call.clone(), bundle.clone());
+    let file = read(session, move |state| {
+        engine_tools::stored_file(
+            state.at(asked.node.as_deref()),
+            held.as_ref(),
+            &asked.arguments,
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    let stored = match file {
         Some(file) => match read_text(&file, blobs).await {
             Ok(text) => Some(text),
             Err(BlobError::NotFound) => {
@@ -163,13 +178,18 @@ pub async fn answer_locally(
         },
         None => None,
     };
-    Ok(Some(engine_tools::skill_answer(
-        at,
-        bundle.as_ref(),
-        &call.arguments,
-        call.scripted,
-        stored.as_deref(),
-    )))
+    let answer = read(session, move |state| {
+        engine_tools::skill_answer(
+            state.at(call.node.as_deref()),
+            bundle.as_ref(),
+            &call.arguments,
+            call.scripted,
+            stored.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(Some(answer))
 }
 
 async fn read_text(file: &FileRef, blobs: &dyn BlobStore) -> Result<String, BlobError> {

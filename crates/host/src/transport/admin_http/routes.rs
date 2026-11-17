@@ -250,7 +250,7 @@ pub async fn connect_session_ag_ui(
             .get_session(caller.tenant_id(), &session_id)
             .await
         {
-            Ok(session) => Some(session.into_state()),
+            Ok(session) => Some(session),
             Err(e) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -260,7 +260,27 @@ pub async fn connect_session_ag_ui(
             }
         }
     };
-    let frames = snapshot_events(session_id, input.run_id, session.as_ref())
+    let frames = match session {
+        Some(session) => {
+            let run_id = input.run_id;
+            match crate::runtime::sessions::read(&session, move |state| {
+                snapshot_events(session_id, run_id, Some(state))
+            })
+            .await
+            {
+                Ok(frames) => frames,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": e.to_string()})),
+                    )
+                        .into_response()
+                }
+            }
+        }
+        None => snapshot_events(session_id, input.run_id, None),
+    };
+    let frames = frames
         .into_iter()
         .map(|e| Ok::<_, std::convert::Infallible>(e.to_sse()));
     Sse::new(futures_util::stream::iter(frames))

@@ -26,6 +26,7 @@ pub type SessionKey = (String, String);
 
 pub struct SessionView {
     pub state: SessionState,
+    pub status: substructure_session::state::SessionStatus,
     pub tree: MessageTree,
     pub versions: std::collections::BTreeMap<String, Vec<String>>,
 }
@@ -517,10 +518,12 @@ impl Sessions {
             };
             let tree = state.at(at.as_deref()).message_tree();
             let versions = state.versions(&tree);
+            let status = state.projected_status();
             if let Some(error) = state.tree.failed() {
                 return Err(error.into());
             }
             Ok(Some(SessionView {
+                status,
                 state: session.into_state(),
                 tree,
                 versions,
@@ -843,6 +846,22 @@ async fn step<T: Send + 'static>(
             ),
         }),
     }
+}
+
+pub async fn read<T: Send + 'static>(
+    session: &Session,
+    f: impl FnOnce(&SessionState) -> T + Send + 'static,
+) -> Result<T, StoreError> {
+    let session = session.clone();
+    tokio::task::spawn_blocking(move || {
+        let read = f(session.state());
+        match session.state().tree.failed() {
+            Some(error) => Err(error),
+            None => Ok(read),
+        }
+    })
+    .await
+    .unwrap_or_else(|e| Err(StoreError::Unavailable(e.to_string())))
 }
 
 async fn blocking<T: Send + 'static>(

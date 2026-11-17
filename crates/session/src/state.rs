@@ -1152,12 +1152,7 @@ impl SessionState {
         let id = node.id().to_string();
         let user = node.message().is_some_and(|m| m.role == Role::User);
         let branch = node.branch().map(str::to_string);
-        let forks = !matches!(node.fact, crate::tree::Fact::Context { .. });
-        let parent = node.parent().map(str::to_string);
         self.tree.push(Logged { seq, entry: node });
-        if !forks && parent != self.scope_node(branch.as_deref()) {
-            return;
-        }
         match branch {
             Some(b) => {
                 if let Some(branch) = self.branches.get_mut(&b) {
@@ -2893,10 +2888,16 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
     }
 
     pub fn active_interrupt_for(&self) -> Option<&'a OpenInterrupt> {
+        if self.state.open_interrupts.is_empty() {
+            return None;
+        }
         resolve_on_path(&self.state.open_interrupts, &self.path_set())
     }
 
     pub fn interrupts_for(&self) -> Vec<&'a OpenInterrupt> {
+        if self.state.open_interrupts.is_empty() {
+            return Vec::new();
+        }
         let on_path = self.path_set();
         self.state
             .open_interrupts

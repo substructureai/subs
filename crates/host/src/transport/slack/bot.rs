@@ -851,11 +851,9 @@ impl SlackBot {
         };
         match ctx.get_session(&ws.tenant_id, session_id).await {
             Ok(session) => {
-                let tree = session.state().message_tree();
-                match &tree.head_id {
-                    Some(head) => tree.path_to(head),
-                    None => Vec::new(),
-                }
+                crate::runtime::sessions::read(&session, |state| state.at_head().transcript())
+                    .await
+                    .unwrap_or_default()
             }
             Err(_) => Vec::new(),
         }
@@ -877,7 +875,11 @@ impl SlackBot {
         let Ok(session) = ctx.get_session(&ws.tenant_id, session_id).await else {
             return;
         };
-        let Some(open) = session.state().at_head().active_interrupt_for() else {
+        let open = crate::runtime::sessions::read(&session, |state| {
+            state.at_head().active_interrupt_for().cloned()
+        })
+        .await;
+        let Ok(Some(open)) = open else {
             return;
         };
         let Some(text) = Self::still_waiting(&open.payload) else {

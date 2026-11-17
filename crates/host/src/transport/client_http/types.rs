@@ -71,7 +71,7 @@ pub struct ClientSessionInterrupt {
 
 pub fn session_response(session_id: String, view: &SessionView) -> ClientSessionResponse {
     let session = &view.state;
-    let status = match session.projected_status() {
+    let status = match view.status {
         SessionStatus::Idle => "idle",
         SessionStatus::Done => "done",
         SessionStatus::Interrupted { .. } => "interrupted",
@@ -134,6 +134,7 @@ mod tests {
 
     fn view_of(state: SessionState) -> SessionView {
         SessionView {
+            status: state.projected_status(),
             tree: state.message_tree(),
             versions: Default::default(),
             state,

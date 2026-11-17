@@ -86,13 +86,16 @@ async fn run(
     }
 
     let open: Vec<String> = match ctx.get_session(caller.tenant_id(), &session_id).await {
-        Ok(session) => session
-            .state()
-            .at_head()
-            .interrupts_for()
-            .into_iter()
-            .map(|i| i.interrupt_id.clone())
-            .collect(),
+        Ok(session) => crate::runtime::sessions::read(&session, |state| {
+            state
+                .at_head()
+                .interrupts_for()
+                .into_iter()
+                .map(|i| i.interrupt_id.clone())
+                .collect()
+        })
+        .await
+        .unwrap_or_default(),
         Err(_) => Vec::new(),
     };
     let addressed: std::collections::HashSet<&str> = input
@@ -217,13 +220,29 @@ async fn connect(
         None
     } else {
         match ctx.get_session(caller.tenant_id(), &input.thread_id).await {
-            Ok(session) => Some(session.into_state()),
+            Ok(session) => Some(session),
             Err(e) => return runtime_error_response(e),
         }
     };
 
     let run_id = input.run_id.unwrap_or_else(|| Uuid::now_v7().to_string());
-    let frames = snapshot_events(input.thread_id, run_id, session.as_ref())
+    let frames = match session {
+        Some(session) => {
+            let thread_id = input.thread_id;
+            match crate::runtime::sessions::read(&session, move |state| {
+                snapshot_events(thread_id, run_id, Some(state))
+            })
+            .await
+            {
+                Ok(frames) => frames,
+                Err(e) => {
+                    return runtime_error_response(crate::RuntimeError::Internal(e.to_string()))
+                }
+            }
+        }
+        None => snapshot_events(input.thread_id, run_id, None),
+    };
+    let frames = frames
         .into_iter()
         .map(|ev| Ok::<_, std::convert::Infallible>(ev.to_sse()))
         .collect::<Vec<_>>();

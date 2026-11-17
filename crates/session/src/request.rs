@@ -190,6 +190,10 @@ impl Session {
             turn: worker_decision.turn.as_deref().cloned(),
             branch,
         };
+        if let Some(error) = self.state.tree.failed() {
+            tracing::warn!(%error, decision_id, "a decision request could not read its tree");
+            return None;
+        }
         Some((request, prompt))
     }
 

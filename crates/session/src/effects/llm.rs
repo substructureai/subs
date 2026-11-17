@@ -80,8 +80,12 @@ impl KindSpec for LlmSpec {
         };
         let out = state.outgoing(id);
         let placed = effect.llm().is_some_and(|c| c.context.is_some());
+        let leaf = state.scope_node(effect.branch.as_deref());
         let mut events = Vec::new();
-        if let Some(out) = out.as_ref().filter(|out| out.places && !placed) {
+        if let Some(out) = out
+            .as_ref()
+            .filter(|out| out.places && !placed && out.node == leaf)
+        {
             events.push(EventPayload::ContextPlaced(ContextPlaced {
                 node: crate::tree::Place {
                     id: format!("{id}:ctx"),

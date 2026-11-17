@@ -10,12 +10,12 @@ use crate::decision::{LlmHandler, ToolHandler};
 use crate::entry::{Command, CommandId};
 use crate::events::{ConnectorTarget, EventPayload};
 use crate::protocol::{
-    DeferToolsStrategy, DraftMessage, EffectKind, EffectStatus, LlmRequest, RetryPolicy, Role,
+    DeferToolsStrategy, DraftMessage, EffectKind, EffectStatus, LlmRequest, RetryPolicy,
     SessionOwner, Usage,
 };
 use crate::request::{PendingPrompt, WorkerDecisionRequest};
 use crate::session::{Session, SessionEvent};
-use crate::state::{title, EffectState, SessionStatus};
+use crate::state::{EffectState, SessionStatus};
 use crate::system1::{transcript_state, System1Request};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -192,15 +192,7 @@ impl Session {
         let state = &self.state;
         let meta = state.event_meta(self.last_event_at.unwrap_or_default());
         let running = state.phase.turn_id().is_some();
-        let title = state.title.clone().or_else(|| {
-            state
-                .at_head()
-                .transcript()
-                .into_iter()
-                .find(|m| m.role == Role::User)
-                .and_then(|m| m.content)
-                .and_then(|c| title(&c.text_owned()))
-        });
+        let title = state.title.clone();
         Summary {
             session_id: self.id.clone(),
             tenant_id: self.tenant_id.clone(),

@@ -118,14 +118,17 @@ impl SessionState {
 
     fn land_view(&self, view: &[DraftMessage], scope: Option<&str>, regenerate: bool) -> Landed {
         let leaf = self.scope_node(scope);
-        let line = match scope {
-            Some(_) => None,
-            None => leaf.as_deref().map(|h| self.path_ids(h)),
+        let line = std::cell::OnceCell::new();
+        let on_line = |id: &str| {
+            line.get_or_init(|| {
+                leaf.as_deref()
+                    .map(|h| self.path_ids(h))
+                    .unwrap_or_default()
+            })
+            .contains(id)
         };
         let full = self.tree.shared(view, |_, node| {
-            scope.is_some()
-                || node.branch().is_none()
-                || line.as_ref().is_some_and(|l| l.contains(node.id()))
+            scope.is_some() || node.branch().is_none() || on_line(node.id())
         });
         let shared = match regenerate && full == view.len() {
             true => settled(view).len(),
@@ -178,10 +181,18 @@ impl SessionState {
     }
 
     pub(super) fn drop_recorded(&self, payload: ClientPayload) -> Option<ClientPayload> {
-        let head = self.head_id.as_deref().map(|h| self.path_ids(h));
+        let head = std::cell::OnceCell::new();
         let fresh = |m: &DraftMessage| {
             m.id.as_deref().is_none_or(|id| {
-                !self.has_node(id) || head.as_ref().is_some_and(|path| path.contains(id))
+                !self.has_node(id)
+                    || head
+                        .get_or_init(|| {
+                            self.head_id
+                                .as_deref()
+                                .map(|h| self.path_ids(h))
+                                .unwrap_or_default()
+                        })
+                        .contains(id)
             })
         };
         match payload {
