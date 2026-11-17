@@ -188,8 +188,9 @@ pub fn request(
         )])
     };
     let config = state.at_scope(state.scope()).config().unwrap_or_default();
-    if !config.may_spawn_subagent(state.depth() + state.branch_depth(state.scope()) as u32) {
-        let limit = config.depth_limit();
+    let budget = state.at_head().config().unwrap_or_default();
+    if !budget.may_spawn_subagent(state.depth() + state.branch_depth(state.scope()) as u32) {
+        let limit = budget.depth_limit();
         return answer(ErrorInfo::new(
             ErrorCode::BudgetExceeded,
             errors::subagent_depth(limit),

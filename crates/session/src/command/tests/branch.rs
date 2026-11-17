@@ -1327,3 +1327,33 @@ fn a_subagent_asked_for_on_a_calls_own_branch_counts_that_branch() {
     });
     assert!(refused, "{events:?}");
 }
+
+#[test]
+fn a_message_branch_spawns_within_the_sessions_subagent_limit() {
+    let mut agg = create_session_with_config(
+        "sess-b",
+        "tenant-a",
+        "user-1",
+        Some(AgentConfig {
+            max_subagent_depth: Some(1),
+            ..agent_config("m1")
+        }),
+    );
+    user_turn(&mut agg, "u1", "hi", "turn-1");
+    let (d, _) = live_decision(&agg);
+    submit_decision(
+        &mut agg,
+        d,
+        vec![node_msg("u1", Role::User, "hi")],
+        vec![explicit("x1", vec![node_msg("", Role::User, "deeper")])],
+    );
+    reply(&mut agg, "x1", said("deeper", 10));
+    let (d, _) = live_decision(&agg);
+    let events = spawn(&mut agg, d);
+    let refused = events.iter().any(|e| {
+        matches!(e, EventPayload::DecisionQueued(q) if matches!(&q.trigger,
+            Trigger::SubagentFinished { ok: false, error: Some(error), .. }
+                if error.code == ErrorCode::BudgetExceeded))
+    });
+    assert!(refused, "{events:?}");
+}
