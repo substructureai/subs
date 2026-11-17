@@ -1478,6 +1478,7 @@ mod tests {
                 defer_tools_strategy: Default::default(),
                 context_ids: Vec::new(),
                 sent_tools: None,
+                unanswered: Vec::new(),
                 format: None,
                 llm: "claude".to_string(),
                 prompt: vec![],

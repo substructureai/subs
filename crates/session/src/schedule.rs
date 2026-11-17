@@ -352,6 +352,7 @@ mod tests {
                 script_file_bytes: 0,
                 script_skill_files: None,
                 script_asked: Vec::new(),
+                recorded: false,
             }),
         ));
     }
@@ -365,6 +366,7 @@ mod tests {
                 defer_tools_strategy: Default::default(),
                 context_ids: Vec::new(),
                 sent_tools: None,
+                unanswered: Vec::new(),
                 format: None,
                 llm: "claude".to_string(),
                 prompt: vec![],

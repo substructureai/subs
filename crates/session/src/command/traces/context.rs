@@ -208,8 +208,8 @@ fn lowered(action: DecisionAction, id: &str) -> Action {
 
 fn requested(t: &Trace, id: &str) -> Vec<String> {
     t.agg
-        .state
-        .sent_prompt(id)
+        .sent
+        .get(id)
         .expect("requested")
         .iter()
         .map(|m| {

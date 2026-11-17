@@ -101,6 +101,9 @@ pub struct Session {
     pub(crate) version: u64,
     #[serde(skip)]
     settings: Settings,
+    #[cfg(test)]
+    #[serde(skip)]
+    pub(crate) sent: std::collections::BTreeMap<String, Vec<crate::protocol::Message>>,
 }
 
 impl Session {
@@ -116,6 +119,8 @@ impl Session {
             wake_at: None,
             version: 0,
             settings,
+            #[cfg(test)]
+            sent: Default::default(),
         }
     }
 
@@ -138,7 +143,6 @@ impl Session {
             .unwrap_or_else(|| Self::new(id, tenant_id, Settings::default()));
         session.settings = settings;
         session.state.tree = crate::tree::Tree::over(store.nodes());
-        session.state.settle_prompts();
         for entry in store.read(session.version)? {
             session.apply(&entry);
         }
@@ -449,6 +453,11 @@ impl Session {
                     sequence: seq,
                 },
             );
+            if let EventPayload::LlmCallDispatched(d) = &payload {
+                if let Some(call) = self.state.llm_call(&d.id) {
+                    self.sent.insert(d.id.clone(), call.prompt.clone());
+                }
+            }
             emitted.push((payload, self.state.event_meta(context.occurred_at)));
         }
         let events = self.stamp(emitted, &context.span, context.occurred_at, None);

@@ -419,6 +419,8 @@ pub struct LlmCallState {
     /// keeps the tools the call asked for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sent_tools: Option<Vec<LlmTool>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unanswered: Vec<String>,
 }
 
 impl LlmCallState {
@@ -515,6 +517,8 @@ pub struct ToolCallState {
     /// started or refused yet.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub script_asked: Vec<ScriptAsk>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub recorded: bool,
 }
 
 pub(crate) fn is_zero(n: &u64) -> bool {
@@ -626,6 +630,20 @@ impl<T: Anchored> Anchored for Logged<T> {
 impl Anchored for OpenInterrupt {
     fn anchor(&self) -> Option<&str> {
         self.anchor.as_deref()
+    }
+}
+
+fn trigger_effect(trigger: &Trigger) -> Option<(EffectKind, &str)> {
+    match trigger {
+        Trigger::ToolFinished { id, .. }
+        | Trigger::ToolExecute { id, .. }
+        | Trigger::CodemodeCalls { id, .. } => Some((EffectKind::ToolCall, id)),
+        Trigger::SubagentFinished { id, .. } => Some((EffectKind::Subagent, id)),
+        Trigger::LlmFinished { id, .. } | Trigger::LlmExecute { id, .. } => {
+            Some((EffectKind::LlmCall, id))
+        }
+        Trigger::System1Finished { id, .. } => Some((EffectKind::System1Call, id)),
+        _ => None,
     }
 }
 
@@ -1139,19 +1157,73 @@ impl SessionState {
 
     pub fn trigger_branch(&self, trigger: &Trigger) -> Option<String> {
         match trigger {
-            Trigger::ToolFinished { id, .. }
-            | Trigger::ToolExecute { id, .. }
-            | Trigger::CodemodeCalls { id, .. } => self.effect_branch(EffectKind::ToolCall, id),
-            Trigger::SubagentFinished { id, .. } => self.effect_branch(EffectKind::Subagent, id),
-            Trigger::LlmFinished { id, .. } | Trigger::LlmExecute { id, .. } => {
-                self.effect_branch(EffectKind::LlmCall, id)
-            }
-            Trigger::System1Finished { id, .. } => self.effect_branch(EffectKind::System1Call, id),
             Trigger::BranchFinished { id, .. } => {
                 self.branches.get(id).and_then(|b| b.parent.clone())
             }
-            _ => None,
+            _ => {
+                let (kind, id) = trigger_effect(trigger)?;
+                self.effect_branch(kind, id)
+            }
         }
+    }
+
+    fn release(&mut self) {
+        let held: std::collections::HashSet<(EffectKind, String)> = self
+            .effects_of(EffectKind::Decision)
+            .filter_map(|e| trigger_effect(&e.decision()?.trigger))
+            .map(|(kind, id)| (kind, id.to_string()))
+            .chain(
+                self.effects_of(EffectKind::LlmCall)
+                    .filter_map(EffectState::llm)
+                    .flat_map(|c| c.unanswered.iter())
+                    .map(|id| (EffectKind::ToolCall, id.clone())),
+            )
+            .collect();
+        let running: std::collections::HashSet<String> = self
+            .effects_of(EffectKind::ToolCall)
+            .filter(|e| e.tracking.is_unsettled())
+            .map(|e| e.id.clone())
+            .collect();
+        let released: Vec<(EffectKind, String)> = self
+            .effects
+            .iter()
+            .filter(|(key, e)| {
+                !e.tracking.is_unsettled()
+                    && !matches!(
+                        key.0,
+                        EffectKind::Decision | EffectKind::ConnectorSync | EffectKind::Subagent
+                    )
+                    && !held.contains(*key)
+                    && e.llm().is_none_or(|c| c.unanswered.is_empty())
+                    && e.tool().is_none_or(|t| match &t.script {
+                        Some(script) => !running.contains(&script.parent),
+                        None => t.recorded,
+                    })
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for (kind, id) in released {
+            self.remove_effect(kind, &id);
+            self.dequeue(kind, &id);
+        }
+    }
+
+    fn answered(&mut self, message: &Message, branch: Option<&str>) {
+        let Some(answer) = message.tool_call_id.as_deref() else {
+            return;
+        };
+        for e in self
+            .effects
+            .values_mut()
+            .filter(|e| e.branch.as_deref() == branch)
+        {
+            match &mut e.payload {
+                EffectPayload::LlmCall(call) => call.unanswered.retain(|id| id != answer),
+                EffectPayload::ToolCall(tool) if e.id == answer => tool.recorded = true,
+                _ => {}
+            }
+        }
+        self.release();
     }
 
     pub fn turn_id(&self) -> Option<&str> {
@@ -1369,6 +1441,7 @@ impl SessionState {
                     context_ids: Vec::new(),
                     dispatched_seq: None,
                     sent_tools: None,
+                    unanswered: Vec::new(),
                     defer_tools_strategy: payload.defer_tools_strategy,
                 }),
                 payload.branch.as_deref(),
@@ -1379,7 +1452,6 @@ impl SessionState {
             ) {
                 e.anchor = at.clone();
             }
-            self.drop_answered_tools(payload.branch.as_deref(), &payload.id);
         }
         match &mut self.limited {
             Some(l) if l.open() && l.call.id != payload.id && payload.branch.is_none() => {
@@ -1404,72 +1476,12 @@ impl SessionState {
         )
     }
 
-    pub fn sent_prompt(&self, id: &str) -> Option<Vec<Message>> {
-        let call = self.llm_call(id)?;
-        if !call.prompt.is_empty() || !call.source.is_tree() {
-            return Some(call.prompt.clone());
-        }
-        Some(self.outgoing(id)?.prompt)
-    }
-
     fn settle_prompt(&mut self, id: &str) {
         if let Some(call) = self
             .effect_mut(EffectKind::LlmCall, id)
             .and_then(|e| e.llm_mut())
         {
             call.prompt = Vec::new();
-        }
-    }
-
-    pub fn settle_prompts(&mut self) {
-        let settled: Vec<String> = self
-            .effects_of(EffectKind::LlmCall)
-            .filter(|e| !e.tracking.is_unsettled())
-            .map(|e| e.id.clone())
-            .collect();
-        for id in settled {
-            self.settle_prompt(&id);
-            if self.tools_answered(&id) {
-                self.drop_tools(&id);
-            }
-        }
-    }
-
-    fn tools_answered(&self, id: &str) -> bool {
-        let Some(reply) = self.tree.get(id) else {
-            return true;
-        };
-        reply.message().is_none_or(|m| {
-            m.tool_calls
-                .iter()
-                .all(|c| !self.tree.answers(&c.id).is_empty())
-        })
-    }
-
-    fn drop_tools(&mut self, id: &str) {
-        if let Some(call) = self
-            .effect_mut(EffectKind::LlmCall, id)
-            .and_then(|e| e.llm_mut())
-        {
-            call.spec.tools = None;
-            call.sent_tools = None;
-        }
-    }
-
-    fn drop_answered_tools(&mut self, branch: Option<&str>, except: &str) {
-        let done: Vec<String> = self
-            .effects_of(EffectKind::LlmCall)
-            .filter(|e| e.id != except && e.branch.as_deref() == branch)
-            .filter(|e| !e.tracking.is_unsettled())
-            .filter(|e| {
-                e.llm()
-                    .is_some_and(|c| c.spec.tools.is_some() || c.sent_tools.is_some())
-            })
-            .map(|e| e.id.clone())
-            .filter(|id| self.tools_answered(id))
-            .collect();
-        for id in done {
-            self.drop_tools(&id);
         }
     }
 
@@ -1542,6 +1554,7 @@ impl SessionState {
                     script_file_bytes: 0,
                     script_skill_files: None,
                     script_asked: Vec::new(),
+                    recorded: false,
                 }),
                 payload.branch.as_deref(),
             );
@@ -1731,6 +1744,7 @@ impl SessionState {
                 self.events = payload.events.clone();
             }
             EventPayload::NewMessage(payload) => {
+                self.answered(&payload.message, payload.branch.as_deref());
                 self.grow(crate::tree::Node::of_message(payload), ctx.sequence);
             }
             EventPayload::BranchStarted(p) => {
@@ -1841,8 +1855,16 @@ impl SessionState {
                     e.tracking.complete();
                 }
                 self.settle_prompt(&payload.id);
-                if payload.response.tool_calls.is_empty() {
-                    self.drop_tools(&payload.id);
+                if let Some(call) = self
+                    .effect_mut(EffectKind::LlmCall, &payload.id)
+                    .and_then(|e| e.llm_mut())
+                {
+                    call.unanswered = payload
+                        .response
+                        .tool_calls
+                        .iter()
+                        .map(|c| c.id.clone())
+                        .collect();
                 }
             }
             EventPayload::LlmCallErrored(payload) => {
@@ -2009,6 +2031,7 @@ impl SessionState {
                 }
                 self.remove_effect(EffectKind::Decision, &p.id);
                 self.dequeue(EffectKind::Decision, &p.id);
+                self.release();
             }
             EventPayload::DecisionErrored(p) => self.apply_decision_errored(p, now),
             EventPayload::SessionMessageRequested(_) => {}
@@ -2032,6 +2055,7 @@ impl SessionState {
             EventPayload::DecisionDropped(p) => {
                 self.remove_effect(EffectKind::Decision, &p.id);
                 self.dequeue(EffectKind::Decision, &p.id);
+                self.release();
             }
             EventPayload::CallVoided(p) => self.apply_call_voided(p),
             EventPayload::ConnectorSyncRequested(p) => {
@@ -3025,19 +3049,36 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
 
     /// The skills loaded on this path: each `skill` call that answered.
     pub fn loaded_skills(&self) -> std::collections::HashSet<String> {
+        let named = |arguments: &str| -> Option<String> {
+            let arguments: serde_json::Value = serde_json::from_str(arguments).ok()?;
+            Some(arguments.get("name")?.as_str()?.to_string())
+        };
+        let mut answered = std::collections::HashSet::new();
+        let mut loaded = std::collections::HashSet::new();
+        for node in self.up() {
+            let Some(m) = node.message() else { continue };
+            if let Some(id) = &m.tool_call_id {
+                answered.insert(id.clone());
+            }
+            loaded.extend(
+                m.tool_calls
+                    .iter()
+                    .filter(|c| c.function.name == SKILL && answered.contains(&c.id))
+                    .filter_map(|c| named(&c.function.arguments)),
+            );
+        }
         let path = self.path_set();
-        self.state
-            .effects
-            .values()
-            .filter(|e| SessionState::anchored_on(&path, e.anchor.as_deref()))
-            .filter(|e| e.tracking.status() == EffectStatus::Completed)
-            .filter_map(EffectState::tool)
-            .filter(|tc| tc.name == SKILL)
-            .filter_map(|tc| {
-                let arguments: serde_json::Value = serde_json::from_str(&tc.arguments).ok()?;
-                Some(arguments.get("name")?.as_str()?.to_string())
-            })
-            .collect()
+        loaded.extend(
+            self.state
+                .effects
+                .values()
+                .filter(|e| SessionState::anchored_on(&path, e.anchor.as_deref()))
+                .filter(|e| e.tracking.status() == EffectStatus::Completed)
+                .filter_map(EffectState::tool)
+                .filter(|tc| tc.name == SKILL)
+                .filter_map(|tc| named(&tc.arguments)),
+        );
+        loaded
     }
 
     pub fn locked_tools(&self) -> BTreeMap<String, Vec<String>> {
@@ -3372,6 +3413,7 @@ mod open_llm_calls_tests {
                 defer_tools_strategy: Default::default(),
                 context_ids: Vec::new(),
                 sent_tools: None,
+                unanswered: Vec::new(),
                 format: None,
                 llm: "claude".to_string(),
                 prompt: vec![],

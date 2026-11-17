@@ -262,47 +262,6 @@ fn a_finished_draft_is_promoted_from_the_log_and_a_reload_agrees() {
     );
 }
 
-#[test]
-fn a_session_loaded_from_an_old_snapshot_drops_the_prompts_of_settled_calls() {
-    let mut run = Run::new();
-    run.send(CommandPayload::SubmitClientPayload {
-        payload: ClientPayload::Message(ClientMessage {
-            message: text(Some("u1"), Role::User, "hi"),
-            stream: false,
-        }),
-        turn: TurnTarget::Open("turn-1".into()),
-        queue: QueueMode::Refuse,
-        metadata: Default::default(),
-    });
-    let d = run.live();
-    run.decide(
-        d,
-        vec![text(Some("u1"), Role::User, "hi")],
-        vec![call("a1", vec![], None)],
-    );
-    run.reply("a1", "hello");
-
-    let mut old = run.session.state().clone();
-    let settled = old
-        .effects
-        .values_mut()
-        .find(|e| e.id == "a1")
-        .and_then(|e| e.llm_mut())
-        .unwrap();
-    assert!(settled.prompt.is_empty());
-    settled.prompt = vec![serde_json::from_value(
-        serde_json::json!({ "id": "a1:0", "role": "user", "content": "hi" }),
-    )
-    .unwrap()];
-    old.settle_prompts();
-    assert!(old.llm_call("a1").unwrap().prompt.is_empty());
-    assert_eq!(
-        serde_json::to_value(&old).unwrap(),
-        serde_json::to_value(run.session.state()).unwrap(),
-        "an old snapshot settles to what replaying it now gives"
-    );
-}
-
 fn calling(id: &str, arguments: serde_json::Value) -> LlmResponse {
     serde_json::from_value(serde_json::json!({
         "model": "m1",

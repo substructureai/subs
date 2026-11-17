@@ -190,10 +190,11 @@ fn text_of(message: &Message) -> String {
 }
 
 fn prompt_texts(agg: &Session, call: &str) -> Vec<String> {
-    agg.state
-        .outgoing(call)
+    agg.sent
+        .get(call)
+        .cloned()
+        .or_else(|| agg.state.outgoing(call).map(|out| out.prompt))
         .expect("the call builds a prompt")
-        .prompt
         .iter()
         .map(text_of)
         .collect()
@@ -714,7 +715,7 @@ fn dispatched_fingerprint(events: &[EventPayload], id: &str) -> Option<String> {
 }
 
 #[test]
-fn a_settled_call_keeps_no_prompt_and_builds_the_one_it_sent() {
+fn a_settled_call_keeps_no_prompt() {
     let mut agg = configured();
     user_turn(&mut agg, "u1", "what is the weather in Paris?", "turn-1");
     let (d, _) = live_decision(&agg);
@@ -750,14 +751,12 @@ fn a_settled_call_keeps_no_prompt_and_builds_the_one_it_sent() {
     echo(&mut agg);
     reply(&mut agg, "t1", said("Paris weather", 100));
     for (id, fingerprint) in sent {
-        let call = agg.state.llm_call(&id).unwrap();
         assert!(
-            call.prompt.is_empty(),
-            "{id} settled: the tree holds its prompt"
+            agg.state.llm_call(&id).is_none_or(|c| c.prompt.is_empty()),
+            "{id} settled: the state keeps no prompt"
         );
-        let built = agg.state.sent_prompt(&id).expect("built again");
         assert_eq!(
-            crate::prompt_context::fingerprint(&built),
+            crate::prompt_context::fingerprint(&agg.sent[&id]),
             fingerprint,
             "{id}"
         );
@@ -1094,7 +1093,7 @@ fn a_message_a_client_edits_in_place_starts_a_new_path() {
 }
 
 #[test]
-fn a_settled_call_keeps_its_tools_until_its_calls_are_answered() {
+fn a_settled_call_stays_until_its_calls_are_answered() {
     let tools = Some(vec![crate::protocol::LlmTool {
         name: "lookup".to_string(),
         description: "Looks it up.".to_string(),
@@ -1158,9 +1157,5 @@ fn a_settled_call_keeps_its_tools_until_its_calls_are_answered() {
         "the next call asks for the same tools"
     );
     echo(&mut agg);
-    assert!(
-        agg.state.llm_call("c1").unwrap().spec.tools.is_none(),
-        "answered: dropped"
-    );
-    assert!(agg.state.llm_call("c1").unwrap().sent_tools.is_none());
+    assert!(agg.state.llm_call("c1").is_none(), "answered: released");
 }
