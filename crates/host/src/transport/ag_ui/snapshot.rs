@@ -276,6 +276,7 @@ mod tests {
             reason: "confirmation".to_string(),
             payload,
             anchor: anchor.map(str::to_string),
+            branch: None,
         }
     }
 

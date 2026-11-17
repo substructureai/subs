@@ -173,6 +173,7 @@ mod tests {
                 "metadata": { "options": options },
             }),
             anchor: None,
+            branch: None,
         }
     }
 

@@ -582,6 +582,7 @@ mod tests {
             reason: "pause".to_string(),
             payload: serde_json::Value::Null,
             anchor: Some("u1".to_string()),
+            branch: None,
         });
         add_decision(&mut s, "d-1", EffectStatus::Queued, client_message());
         add_tool(&mut s, "tc-1", EffectStatus::Queued);

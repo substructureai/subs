@@ -578,6 +578,8 @@ pub struct OpenInterrupt {
     pub reason: String,
     pub payload: serde_json::Value,
     pub anchor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1117,7 +1119,10 @@ impl SessionState {
                 parent_id: parent,
                 branch: None,
             },
-            fact: crate::tree::Fact::Config { config },
+            fact: crate::tree::Fact::Config {
+                config: Some(config),
+                root: false,
+            },
         });
     }
 
@@ -1639,10 +1644,10 @@ impl SessionState {
                 reason: payload.reason.clone(),
                 payload: payload.payload.clone(),
                 anchor: payload.anchor.clone(),
+                branch: payload.branch.clone(),
             });
         }
-        let branch = payload.anchor.as_deref().and_then(|a| self.node_branch(a));
-        let lane = self.lane(branch.as_deref());
+        let lane = self.lane(payload.branch.as_deref());
         let held: Vec<(EffectKind, String)> = self
             .effects_of(EffectKind::Decision)
             .filter(|e| e.tracking.status() == EffectStatus::Pending)
@@ -1778,19 +1783,9 @@ impl SessionState {
                                 subagent: p.subagent.clone(),
                             },
                         );
-                        self.grow(
-                            crate::tree::Node {
-                                place: crate::tree::Place {
-                                    id: p.node.clone(),
-                                    parent_id: p.from.clone(),
-                                    branch: Some(p.id.clone()),
-                                },
-                                fact: crate::tree::Fact::BranchStart {
-                                    agent: p.agent.clone(),
-                                },
-                            },
-                            ctx.sequence,
-                        );
+                        if let Some(node) = crate::tree::Node::of_event(event) {
+                            self.grow(node, ctx.sequence);
+                        }
                     }
                 }
             }
@@ -2315,8 +2310,8 @@ impl SessionState {
         self.open_interrupts.iter().find(|i| {
             i.anchor
                 .as_deref()
-                .and_then(|a| self.node_branch(a))
-                .is_some_and(|b| self.open_branch(&b).is_some() && !self.detached(Some(&b)))
+                .and(i.branch.as_deref())
+                .is_some_and(|b| self.open_branch(b).is_some() && !self.detached(Some(b)))
         })
     }
 
@@ -2842,10 +2837,6 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
         self.node
     }
 
-    pub fn branch_id(&self) -> Option<String> {
-        self.state.node_branch(self.node?)
-    }
-
     fn up(&self) -> crate::tree::Up<'a> {
         self.state.tree.up(self.node)
     }
@@ -2913,18 +2904,12 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
     }
 
     pub fn resolve_agent_for(&self) -> Option<AgentConfig> {
-        for node in self.up() {
-            match &node.fact {
-                crate::tree::Fact::Config { config } => return Some(config.clone()),
-                crate::tree::Fact::BranchStart { agent } => match agent {
-                    BranchConfig::Inherit => {}
-                    BranchConfig::None => return None,
-                    BranchConfig::Config(config) => return Some((**config).clone()),
-                },
-                _ => {}
-            }
-        }
-        None
+        self.up()
+            .find_map(|n| match &n.fact {
+                crate::tree::Fact::Config { config, .. } => Some(config.clone()),
+                _ => None,
+            })
+            .flatten()
     }
 
     pub fn connector_tool(&self, name: &str) -> Option<ConnectorTool> {
@@ -3137,9 +3122,7 @@ impl<'a, 'n> SessionStateAtNode<'a, 'n> {
         for node in self.up() {
             match &node.fact {
                 crate::tree::Fact::Context { placed: here, .. } => placed.push(here.clone()),
-                crate::tree::Fact::BranchStart { agent } if *agent != BranchConfig::Inherit => {
-                    break
-                }
+                crate::tree::Fact::Config { root: true, .. } => break,
                 _ => {}
             }
         }
@@ -3503,7 +3486,8 @@ mod tree_tests {
             "c0",
             None,
             Fact::Config {
-                config: config("m1"),
+                config: Some(config("m1")),
+                root: false,
             },
         );
         put(&mut s, "s1", Some("c0"), state(1));
@@ -3541,24 +3525,19 @@ mod tree_tests {
             "c0",
             None,
             Fact::Config {
-                config: config("m1"),
+                config: Some(config("m1")),
+                root: false,
             },
         );
         put(&mut s, "s1", Some("c0"), state(1));
         put(&mut s, "u1", Some("s1"), message("u1"));
-        let start = |agent| Fact::BranchStart { agent };
-        put(
-            &mut s,
-            "b1",
-            Some("u1"),
-            start(BranchConfig::Config(Box::new(config("m2")))),
-        );
-        put(&mut s, "b2", Some("u1"), start(BranchConfig::None));
-        put(&mut s, "b3", Some("u1"), start(BranchConfig::Inherit));
+        let start = |config| Fact::Config { config, root: true };
+        put(&mut s, "b1", Some("u1"), start(Some(config("m2"))));
+        put(&mut s, "b2", Some("u1"), start(None));
         let model = |at| s.at(Some(at)).resolve_agent_for().map(|c| c.model);
         assert_eq!(model("b1"), Some("m2".into()));
         assert_eq!(model("b2"), None);
-        assert_eq!(model("b3"), Some("m1".into()));
+        assert_eq!(model("u1"), Some("m1".into()));
         assert_eq!(read(&s, "b1"), serde_json::json!({ "v": 1 }));
     }
 

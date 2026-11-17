@@ -29,11 +29,10 @@ pub enum Fact {
         state: WorkerState,
     },
     Config {
-        config: AgentConfig,
-    },
-    BranchStart {
         #[serde(default)]
-        agent: BranchConfig,
+        config: Option<AgentConfig>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        root: bool,
     },
     Context {
         call: String,
@@ -327,7 +326,8 @@ impl Node {
             EventPayload::AgentConfigUpdated(v) => Node {
                 place: v.node.clone(),
                 fact: Fact::Config {
-                    config: v.config.clone(),
+                    config: Some(v.config.clone()),
+                    root: false,
                 },
             },
             EventPayload::ContextPlaced(c) => Node {
@@ -343,8 +343,13 @@ impl Node {
                     parent_id: b.from.clone(),
                     branch: Some(b.id.clone()),
                 },
-                fact: Fact::BranchStart {
-                    agent: b.agent.clone(),
+                fact: Fact::Config {
+                    config: match &b.agent {
+                        BranchConfig::Inherit => return None,
+                        BranchConfig::None => None,
+                        BranchConfig::Config(config) => Some((**config).clone()),
+                    },
+                    root: true,
                 },
             },
             _ => return None,

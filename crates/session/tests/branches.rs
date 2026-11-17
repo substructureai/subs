@@ -424,7 +424,10 @@ fn a_diverging_reply_on_a_branch_moves_its_leaf_and_stays_off_the_chat() {
     );
     view.truncate(1);
     view.push(text(Some("x1"), Role::Assistant, "Tides pull at the moon"));
-    let start = run.session.state().branches["draft"].node.clone();
+    let start = run.session.state().branches["draft"]
+        .from
+        .clone()
+        .expect("it forks from the chat");
     let events = run.decide(d, view, vec![]);
 
     let written: Vec<_> = events
@@ -473,7 +476,10 @@ fn drafting() -> (Run, String) {
         )],
     );
     run.reply("b1", "Waves fold into foam");
-    let start = run.session.state().branches["draft"].node.clone();
+    let start = run.session.state().branches["draft"]
+        .from
+        .clone()
+        .expect("it forks from the chat");
     (run, start)
 }
 

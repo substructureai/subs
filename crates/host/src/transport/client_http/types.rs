@@ -133,6 +133,7 @@ mod tests {
                 reason: "confirmation".to_string(),
                 payload: serde_json::Value::Null,
                 anchor: anchor.map(str::to_string),
+                branch: None,
             });
         s
     }

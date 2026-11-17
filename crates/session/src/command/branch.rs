@@ -262,7 +262,7 @@ impl Working {
             turn_id,
             subagent: None,
         })));
-        let mut parent_id = Some(node);
+        let mut parent_id = self.scope_node(Some(&start.id));
         for draft in messages {
             let copied_from = draft.id.clone().filter(|id| self.has_node(id));
             let message = match copied_from {
@@ -404,7 +404,7 @@ impl Working {
         }
         messages.push(task);
         if fresh {
-            own = Some(node);
+            own = self.scope_node(Some(&branch));
         }
         for draft in messages {
             let message = draft.record(&self.ids);

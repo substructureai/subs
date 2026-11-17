@@ -205,6 +205,7 @@ mod tests {
             reason: "hold".to_string(),
             payload: serde_json::Value::Null,
             anchor: None,
+            branch: None,
         });
         assert!(prompt(state.at_head()).is_none());
     }

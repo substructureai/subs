@@ -614,6 +614,8 @@ pub struct SessionInterrupted {
     pub payload: serde_json::Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -685,6 +685,7 @@ impl Working {
             reason,
             payload,
             anchor: anchor.clone(),
+            branch: scope,
         }));
         self.void_llm_calls_for_interrupt(anchor);
     }
@@ -1324,9 +1325,8 @@ impl Working {
                 }
                 let parked_head = self.at_head().anchor_on_path(open.anchor.as_deref());
                 let branch = open
-                    .anchor
-                    .as_deref()
-                    .and_then(|a| self.node_branch(a))
+                    .branch
+                    .clone()
                     .filter(|b| self.open_branch(b).is_some());
                 self.emit(EventPayload::InterruptResumed(InterruptResumed {
                     interrupt_id: interrupt_id.clone(),
