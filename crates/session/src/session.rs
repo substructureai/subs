@@ -61,7 +61,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            snapshot_every: 100,
+            snapshot_every: 20,
             retention: chrono::Duration::days(7),
             attempts: 32,
         }
