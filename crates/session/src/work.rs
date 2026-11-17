@@ -190,7 +190,7 @@ impl Session {
     pub fn summary(&self) -> Summary {
         let state = &self.state;
         let meta = state.event_meta(self.last_event_at.unwrap_or_default());
-        let running = state.phase.turn_id().is_some();
+        let running = state.open_turn().is_some();
         Summary {
             session_id: self.id.clone(),
             tenant_id: self.tenant_id.clone(),

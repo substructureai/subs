@@ -656,9 +656,9 @@ fn cancel_closes_the_open_calls_and_keeps_the_session() {
     );
     let last = t.recorded().pop().expect("the call gets a result");
     assert_eq!(last.tool_call_id.as_deref(), Some("tc-1"));
-    assert!(t.agg.state.phase.turn_id().is_none());
+    assert!(t.agg.state.open_turn().is_none());
     t.submit("again", Some("turn-2"));
-    assert_eq!(t.agg.state.phase.turn_id(), Some("turn-2"));
+    assert_eq!(t.agg.state.open_turn(), Some("turn-2"));
 }
 
 #[test]
@@ -782,11 +782,7 @@ fn a_click_while_a_turn_ends_waits_for_it() {
     assert!(matches!(t.live_trigger(), Trigger::TurnFinished { .. }));
 
     t.click("turn-2", &[("ref", "m1")]);
-    assert_eq!(
-        t.agg.state.phase.turn_id(),
-        Some("turn-1"),
-        "turn-1 still ends"
-    );
+    assert_eq!(t.agg.state.open_turn(), Some("turn-1"), "turn-1 still ends");
     assert!(matches!(t.live_trigger(), Trigger::TurnFinished { .. }));
 
     t.decide(vec![], vec![done()]);
@@ -805,7 +801,7 @@ fn a_joined_click_runs_in_its_own_turn_when_the_turn_ends_first() {
     t.decide(vec![], vec![]);
     t.submit("hi", Some("turn-1"));
     t.click("turn-2", &[("ref", "m2")]);
-    assert_eq!(t.agg.state.phase.turn_id(), Some("turn-1"));
+    assert_eq!(t.agg.state.open_turn(), Some("turn-1"));
 
     t.decide_appending(user_message("hi"), vec![done()]);
     t.decide(vec![], vec![done()]);
@@ -824,7 +820,7 @@ fn a_click_turn_does_not_wait_for_a_connector_sync() {
     t.click("turn-a", &[]);
     t.decide_with(vec![], vec![], Some(config_with_mcp("conn-1")));
     assert_eq!(
-        t.agg.state.phase.finalizing().map(|f| f.turn_id.as_str()),
+        t.agg.state.ending().and(t.agg.state.open_turn()),
         Some("turn-a"),
         "a sync is not the turn's work"
     );
@@ -859,7 +855,7 @@ fn an_ending_turn_waits_for_the_work_its_last_step_starts() {
 
     t.decide(vec![], vec![call_llm("call-9", RetryPolicy::no_retry())]);
     assert!(t.agg.state.recent_turns.is_empty(), "turn-1 waits");
-    assert_eq!(t.agg.state.phase.turn_id(), Some("turn-1"));
+    assert_eq!(t.agg.state.open_turn(), Some("turn-1"));
 
     t.run(
         CommandPayload::settle(
@@ -899,7 +895,7 @@ fn a_click_that_resolves_an_interrupt_keeps_its_turn() {
             payload: serde_json::Value::Null,
         }],
     );
-    assert_eq!(t.agg.state.phase.active_turn_id(), Some("turn-a"));
+    assert_eq!(t.agg.state.active_turn_id(), Some("turn-a"));
     assert!(matches!(t.live_trigger(), Trigger::InterruptResumed { .. }));
     assert_eq!(t.live_turn().as_deref(), Some("turn-a"));
 }
@@ -1176,7 +1172,7 @@ fn flow_queued_turn() -> Trace {
 
     t.submit_queued("and another thing", "turn-2");
     assert_eq!(
-        t.agg.state.phase.turn_id(),
+        t.agg.state.open_turn(),
         Some("turn-1"),
         "the running turn keeps the phase"
     );
@@ -1202,7 +1198,7 @@ fn flow_queued_turn() -> Trace {
 fn trace_queued_turn() {
     let t = flow_queued_turn();
     assert_eq!(
-        t.agg.state.phase.turn_id(),
+        t.agg.state.open_turn(),
         Some("turn-2"),
         "the queued turn is the one running now"
     );
@@ -1265,7 +1261,7 @@ fn flow_merged_turn() -> Trace {
 #[test]
 fn trace_merged_turn() {
     let t = flow_merged_turn();
-    assert_eq!(t.agg.state.phase.turn_id(), Some("turn-2"));
+    assert_eq!(t.agg.state.open_turn(), Some("turn-2"));
     let Trigger::ClientMessage {
         messages, client, ..
     } = t.live_trigger()
@@ -1318,12 +1314,15 @@ fn a_merge_with_no_turn_running_starts_at_once() {
         serde_json::json!({"ref": "m0"}),
         &[("ref", "m0")],
     );
-    assert_eq!(t.agg.state.phase.turn_id(), Some("turn-1"));
+    assert_eq!(t.agg.state.open_turn(), Some("turn-1"));
     assert_eq!(
         t.started,
         vec![("turn-1".to_string(), meta(&[("ref", "m0")]))]
     );
-    assert_eq!(t.agg.state.turn_metadata, meta(&[("ref", "m0")]));
+    assert_eq!(
+        t.agg.state.turn.as_ref().unwrap().metadata,
+        meta(&[("ref", "m0")])
+    );
     assert!(t.waiting_turns().is_empty());
 }
 
@@ -1861,7 +1860,7 @@ fn flow_direct_commands_then_cancel() -> Trace {
 #[test]
 fn trace_direct_commands_then_cancel() {
     let mut t = flow_direct_commands_then_cancel();
-    assert!(t.agg.state.phase.turn_id().is_none(), "the run ends");
+    assert!(t.agg.state.open_turn().is_none(), "the run ends");
     assert_eq!(
         t.agg.state.recent_turns,
         vec!["turn-1".to_string(), "turn-2".to_string()]
@@ -1876,7 +1875,7 @@ fn trace_direct_commands_then_cancel() {
     );
     t.submit("and again", Some("turn-3"));
     assert_eq!(
-        t.agg.state.phase.turn_id(),
+        t.agg.state.open_turn(),
         Some("turn-3"),
         "the session is usable"
     );

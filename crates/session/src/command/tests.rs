@@ -1070,7 +1070,7 @@ fn cancelling_ends_the_run_and_keeps_the_session() {
         },
         &frontend(),
     );
-    assert_eq!(agg.state.phase.turn_id(), Some("turn-3"));
+    assert_eq!(agg.state.open_turn(), Some("turn-3"));
 }
 
 #[test]
@@ -2592,16 +2592,9 @@ fn fail_tool_call_emits_errored() {
     assert_eq!(tc.tracking.status(), EffectStatus::Failed);
     assert!(tc.tool().unwrap().is_error);
     assert_eq!(tc.tool().unwrap().result.as_deref(), Some("boom"));
-    assert_eq!(
-        agg.state.turn_calls,
-        crate::events::TurnCalls {
-            tool: crate::events::CallTotals {
-                count: 1,
-                errors: 1,
-                ..Default::default()
-            },
-            ..Default::default()
-        }
+    assert!(
+        agg.state.turn.is_none(),
+        "a call made outside a turn counts toward none"
     );
 }
 
@@ -4619,7 +4612,7 @@ fn an_action_opens_the_turn_it_names() {
     let decision_id = dispatched_action_decision(&mut agg);
     let turn = "turn-a".to_string();
 
-    assert_eq!(agg.state.phase.turn_id(), Some(turn.as_str()));
+    assert_eq!(agg.state.open_turn(), Some(turn.as_str()));
     assert_eq!(
         agg.state
             .worker_decision(&decision_id)
@@ -4718,8 +4711,7 @@ fn an_action_without_a_turn_id_opens_and_ends_its_own_turn() {
     .expect("the action decision dispatches");
     let turn = agg
         .state
-        .phase
-        .turn_id()
+        .open_turn()
         .expect("the action opened a turn")
         .to_string();
 
@@ -6635,8 +6627,8 @@ fn turn_finished_notifies_worker_and_defers_completion() {
         )),
         "the deferred decision is promoted; got {events:?}"
     );
-    let f = agg.state.phase.finalizing().expect("finalizing set");
-    assert_eq!(f.turn_id, "t1");
+    let f = agg.state.ending().expect("finalizing set");
+    assert_eq!(agg.state.open_turn(), Some("t1"));
     assert_eq!(f.data, serde_json::json!("answer"));
 }
 
@@ -6688,11 +6680,7 @@ fn a_submit_during_an_active_turn_is_refused() {
         matches!(err, SessionError::TurnAlreadyActive { ref turn_id } if turn_id == "t1"),
         "the caller is told which turn holds the session; got {err:?}"
     );
-    assert_eq!(
-        agg.state.phase.turn_id(),
-        Some("t1"),
-        "t1 keeps the session"
-    );
+    assert_eq!(agg.state.open_turn(), Some("t1"), "t1 keeps the session");
     assert_eq!(
         agg.state
             .tracking(EffectKind::LlmCall, "call-1")
@@ -6707,7 +6695,7 @@ fn a_new_turn_completes_the_finalizing_one_first() {
     let mut agg = create_session("sess-1", "tenant-a", "user-1");
     drive_turn_done(&mut agg, "t1", serde_json::json!("answer"));
     assert_eq!(
-        agg.state.phase.finalizing().map(|f| f.turn_id.as_str()),
+        agg.state.ending().and(agg.state.open_turn()),
         Some("t1"),
         "t1 is waiting on its finalizer"
     );
@@ -6741,7 +6729,7 @@ fn a_new_turn_completes_the_finalizing_one_first() {
         ended < started,
         "the old turn closes before the new one opens"
     );
-    assert_eq!(agg.state.phase.turn_id(), Some("t2"));
+    assert_eq!(agg.state.open_turn(), Some("t2"));
     assert_eq!(agg.state.recent_turns, vec!["t1".to_string()]);
 }
 
@@ -6798,11 +6786,7 @@ fn a_continuing_submit_joins_the_running_turn() {
         decision_with(&events, |t| matches!(t, Trigger::ClientMessage { .. })).is_some(),
         "the input is still recorded and delivered; got {events:?}"
     );
-    assert_eq!(
-        agg.state.phase.turn_id(),
-        Some("t1"),
-        "t1 keeps the session"
-    );
+    assert_eq!(agg.state.open_turn(), Some("t1"), "t1 keeps the session");
     assert_eq!(agg.state.recent_turns, Vec::<String>::new());
 }
 
@@ -6828,7 +6812,7 @@ fn a_continuing_submit_opens_its_fallback_turn_when_none_is_running() {
             .any(|e| matches!(e, EventPayload::TurnStarted(t) if t.turn_id == "t2")),
         "got {events:?}"
     );
-    assert_eq!(agg.state.phase.turn_id(), Some("t2"));
+    assert_eq!(agg.state.open_turn(), Some("t2"));
 }
 
 #[test]
@@ -6872,7 +6856,7 @@ fn turn_finished_echo_completes_the_turn() {
         "no new turn.finished queued; got {p2:?}"
     );
     assert_eq!(agg.state.recent_turns.len(), 1);
-    assert!(agg.state.phase.finalizing().is_none(), "finalizing cleared");
+    assert!(agg.state.ending().is_none(), "finalizing cleared");
 }
 
 #[test]
@@ -6898,7 +6882,7 @@ fn turn_finished_settled_without_done_still_completes_the_turn() {
     assert_eq!(tc.data, serde_json::json!("answer"));
     assert!(tc.error.is_none());
     assert!(has_session_done(&p2), "SessionDone follows; got {p2:?}");
-    assert!(agg.state.phase.finalizing().is_none(), "finalizing cleared");
+    assert!(agg.state.ending().is_none(), "finalizing cleared");
     assert!(
         agg.state.schedule_queue.is_empty(),
         "the TurnEnd entry is consumed"
@@ -6998,7 +6982,7 @@ fn turn_finished_terminal_failure_completes_as_failed_run() {
     assert!(has_session_done(&events));
     assert!(!agg.state.has_effect(EffectKind::Decision, &tf));
     assert_eq!(agg.state.recent_turns.len(), 1);
-    assert!(agg.state.phase.finalizing().is_none(), "finalizing cleared");
+    assert!(agg.state.ending().is_none(), "finalizing cleared");
 }
 
 #[test]
@@ -7043,7 +7027,7 @@ fn turn_finished_retryable_failure_does_not_complete() {
         "the finalizer is rescheduled for redelivery"
     );
     assert!(
-        agg.state.phase.finalizing().is_some(),
+        agg.state.ending().is_some(),
         "still finalizing pending redelivery"
     );
 }
@@ -11813,7 +11797,7 @@ fn a_queued_submit_is_taken_without_starting_a_turn() {
             .any(|e| matches!(e, EventPayload::DecisionDispatched(p) if p.id == queued)),
         "and it parks rather than dispatching; got {events:?}"
     );
-    assert_eq!(agg.state.phase.turn_id(), Some("turn-1"));
+    assert_eq!(agg.state.open_turn(), Some("turn-1"));
 }
 
 #[test]
@@ -11841,7 +11825,7 @@ fn a_queued_turn_starts_in_the_batch_that_ends_the_one_before_it() {
         vec!["completed:turn-1", "started:turn-2", "dispatched:queued"],
         "got {events:?}"
     );
-    assert_eq!(agg.state.phase.turn_id(), Some("turn-2"));
+    assert_eq!(agg.state.open_turn(), Some("turn-2"));
     assert!(
         agg.state.has_pending_worker_decision(),
         "and the queued decision is now live"
@@ -11868,7 +11852,7 @@ fn a_fail_completes_the_turn_with_the_error_and_takes_the_next_message() {
     assert_eq!(completed.turn_id, "turn-1");
     assert_eq!(completed.error, Some(error));
     assert_eq!(agg.state.status, SessionStatus::Idle);
-    assert_eq!(agg.state.phase.turn_id(), None);
+    assert_eq!(agg.state.open_turn(), None);
 
     let events = dispatch(
         &mut agg,
@@ -11895,7 +11879,7 @@ fn a_queued_submit_defers_while_the_turn_before_it_finalizes() {
             data: serde_json::Value::Null,
         }],
     );
-    assert!(agg.state.phase.finalizing().is_some(), "turn-1 finalizing");
+    assert!(agg.state.ending().is_some(), "turn-1 finalizing");
 
     let events = submit_queued(&mut agg, "and another thing", "turn-2").expect("queued submit");
     assert!(
@@ -11934,7 +11918,7 @@ fn queued_turns_start_one_at_a_time_in_arrival_order() {
 
     let events = end_turn(&mut agg);
     assert_eq!(started_turns(&events), vec!["turn-3"]);
-    assert_eq!(agg.state.phase.turn_id(), Some("turn-3"));
+    assert_eq!(agg.state.open_turn(), Some("turn-3"));
 }
 
 #[test]
@@ -12016,7 +12000,7 @@ fn an_action_mid_turn_joins_the_running_turn() {
             .any(|e| matches!(e, EventPayload::TurnStarted(_))),
         "no second turn opens; got {events:?}"
     );
-    assert_eq!(agg.state.phase.turn_id(), Some("turn-1"));
+    assert_eq!(agg.state.open_turn(), Some("turn-1"));
     assert!(events.iter().any(|e| matches!(
         e,
         EventPayload::DecisionQueued(q)
@@ -12163,7 +12147,7 @@ fn a_queued_turn_id_cannot_be_opened_by_another_path() {
         }],
     );
     assert!(
-        agg.state.phase.finalizing().is_some(),
+        agg.state.ending().is_some(),
         "turn-1 is finalizing, so it no longer holds the phase against a new turn"
     );
 
@@ -12758,12 +12742,15 @@ fn a_system1_call_reads_the_conversation_and_answers_in_a_decision() {
         }
         other => panic!("expected system1.finished, got {other:?}"),
     }
-    assert_eq!(agg.state.turn_cost, rust_decimal::Decimal::new(3, 5));
-    let calls = &agg.state.turn_calls.system1;
+    assert_eq!(
+        agg.state.turn.as_ref().unwrap().cost,
+        rust_decimal::Decimal::new(3, 5)
+    );
+    let calls = &agg.state.turn.as_ref().unwrap().calls.system1;
     assert_eq!((calls.count, calls.errors), (1, 0));
     assert_eq!(calls.cost, rust_decimal::Decimal::new(3, 5));
     assert_eq!(calls.tokens.input, 120);
-    assert_eq!(agg.state.turn_token_usage.input, 120);
+    assert_eq!(agg.state.turn.as_ref().unwrap().usage.input, 120);
 }
 
 #[test]
@@ -12836,7 +12823,7 @@ fn an_open_system1_call_holds_the_turn_until_done_voids_it() {
         ),
         &system(),
     );
-    assert_eq!(agg.state.phase.turn_id(), Some("turn-1"));
+    assert_eq!(agg.state.open_turn(), Some("turn-1"));
 
     let events = decide(
         &mut agg,

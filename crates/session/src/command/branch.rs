@@ -243,7 +243,7 @@ impl Working {
         };
         let turn_id = match start.mode {
             BranchMode::Blocking if !self.detached(parent.as_deref()) => {
-                self.phase.active_turn_id().map(str::to_string)
+                self.active_turn_id().map(str::to_string)
             }
             _ => None,
         };
@@ -334,7 +334,7 @@ impl Working {
         self.then(|s| started.settle(s, call, effects::Outcome::SubagentStarted));
         let turn_id = match mode {
             BranchMode::Blocking if !self.detached(parent.as_deref()) => {
-                self.phase.active_turn_id().map(str::to_string)
+                self.active_turn_id().map(str::to_string)
             }
             _ => None,
         };

@@ -894,10 +894,10 @@ mod cancel_tests {
             let store = stores.open(DEFAULT_TENANT, id);
             Session::load(store.as_ref(), id, DEFAULT_TENANT, Settings::default()).unwrap()
         };
-        assert!(load("parent").state().phase.turn_id().is_none());
+        assert!(load("parent").state().open_turn().is_none());
         for (id, turn) in [(&child, "c1"), (&grandchild, "g1")] {
             let session = load(id);
-            assert!(session.state().phase.turn_id().is_none(), "{id} still runs");
+            assert!(session.state().open_turn().is_none(), "{id} still runs");
             assert!(session.state().turn_completed(turn));
         }
     }

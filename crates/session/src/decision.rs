@@ -10,7 +10,6 @@ use crate::protocol::{
     RetryOverride, RetryPolicy, Role, SpawnMode, StoredResult, ToolResult, Usage,
 };
 use crate::retry::RetryTarget;
-use crate::state::TurnPhase;
 use crate::system1::{System1Request, System1Response};
 
 impl Handler {
@@ -310,15 +309,13 @@ pub fn spare_turn_id(decision_id: &str) -> String {
 }
 
 impl Trigger {
-    pub fn own_turn(&self, decision_id: &str, phase: &TurnPhase) -> Option<String> {
-        match (self.joining_turn_id()?, phase) {
-            (turn_id, TurnPhase::Idle) => Some(
-                turn_id
-                    .map(str::to_string)
-                    .unwrap_or_else(|| spare_turn_id(decision_id)),
-            ),
-            _ => None,
-        }
+    pub fn own_turn(&self, decision_id: &str, idle: bool) -> Option<String> {
+        let turn_id = self.joining_turn_id().filter(|_| idle)?;
+        Some(
+            turn_id
+                .map(str::to_string)
+                .unwrap_or_else(|| spare_turn_id(decision_id)),
+        )
     }
 
     pub fn owns_turn(&self, decision_id: &str, turn_id: &str) -> bool {

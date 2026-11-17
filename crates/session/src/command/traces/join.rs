@@ -187,7 +187,7 @@ fn a_joined_message_waits_for_the_running_work_and_runs_in_the_turn() {
         vec!["render it", "", "rendered", "also make it blue"],
         "the message lands after the tool's result"
     );
-    assert_eq!(t.agg.state.phase.active_turn_id(), Some("turn-1"));
+    assert_eq!(t.agg.state.active_turn_id(), Some("turn-1"));
     assert_eq!(t.started.len(), 1, "no turn starts for it");
 }
 
@@ -207,7 +207,7 @@ fn a_joined_message_on_an_idle_session_starts_a_turn() {
     let mut t = Trace::create();
     t.decide(vec![], vec![]);
     t.join(user_message("hi"), "turn-1", &[("ref", "m1")]);
-    assert_eq!(t.agg.state.phase.active_turn_id(), Some("turn-1"));
+    assert_eq!(t.agg.state.active_turn_id(), Some("turn-1"));
     assert!(matches!(
         t.live_trigger(),
         Trigger::ClientMessage {
@@ -557,14 +557,10 @@ fn a_joined_message_while_a_turn_ends_runs_as_the_next_turn() {
     t.decide(vec![], vec![]);
     t.submit("hi", Some("turn-1"));
     t.decide_appending(user_message("hi"), vec![done()]);
-    assert!(t.agg.state.phase.finalizing().is_some());
+    assert!(t.agg.state.ending().is_some());
 
     t.join(user_message("later"), "turn-2", &[]);
-    assert_eq!(
-        t.agg.state.phase.turn_id(),
-        Some("turn-1"),
-        "turn-1 still ends"
-    );
+    assert_eq!(t.agg.state.open_turn(), Some("turn-1"), "turn-1 still ends");
 
     t.decide(vec![], vec![done()]);
     assert_eq!(t.agg.state.recent_turns, vec!["turn-1".to_string()]);
@@ -830,7 +826,7 @@ fn a_session_message_on_an_idle_session_opens_its_turn() {
         mail(user_message("do it"), Some("open:child:call")),
         &system(),
     );
-    assert_eq!(t.agg.state.phase.active_turn_id(), Some("open:child:call"));
+    assert_eq!(t.agg.state.active_turn_id(), Some("open:child:call"));
     assert!(matches!(
         t.live_trigger(),
         Trigger::ClientMessage {

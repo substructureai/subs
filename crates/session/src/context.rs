@@ -121,7 +121,9 @@ pub fn limit(state: &SessionState, call: &HeldCall, now: DateTime<Utc>) -> Optio
         .limited
         .as_ref()
         .is_some_and(|l| l.open() || l.call.id == call.id);
-    if passes || state.context_kept || state.tracking(EffectKind::LlmCall, &call.id).is_some() {
+    let turn = state.turn.as_ref();
+    let kept = turn.is_some_and(|t| t.context_kept);
+    if passes || kept || state.tracking(EffectKind::LlmCall, &call.id).is_some() {
         return None;
     }
     let at = state.at_head();
@@ -131,7 +133,7 @@ pub fn limit(state: &SessionState, call: &HeldCall, now: DateTime<Utc>) -> Optio
     let window = context.window;
     let call = held(state, call);
     let tokens = read_tokens(state, &call.request);
-    let idle_for = match (state.turn_called, state.last_turn_at) {
+    let idle_for = match (turn.is_some_and(|t| t.called), state.last_turn_at) {
         (false, Some(at)) => Some(u64::try_from((now - at).num_seconds()).unwrap_or_default()),
         _ => None,
     };
@@ -177,8 +179,9 @@ pub fn overflow(state: &SessionState, id: &str) -> Option<ContextLimited> {
 
 pub fn turn_messages(state: &SessionState, path: &[Message]) -> Vec<DraftMessage> {
     let from = state
-        .turn_head
-        .as_deref()
+        .turn
+        .as_ref()
+        .and_then(|t| t.head.as_deref())
         .and_then(|head| path.iter().position(|m| m.id == head))
         .map_or(0, |at| at + 1);
     history(&path[from..])

@@ -276,7 +276,7 @@ fn a_detached_branch_reports_back_without_a_turn() {
         "the detached branch does not hold the turn: {events:?}"
     );
     echo(&mut agg);
-    assert!(agg.state.phase.turn_id().is_none(), "the turn ended");
+    assert!(agg.state.open_turn().is_none(), "the turn ended");
     assert!(
         agg.state.open_branch("title").is_some(),
         "and the branch lives on"
@@ -319,7 +319,7 @@ fn a_blocking_branch_holds_the_turn_until_it_reports() {
         "the reply waits for the branch"
     );
     echo(&mut agg);
-    assert!(agg.state.phase.active_turn_id().is_some());
+    assert!(agg.state.active_turn_id().is_some());
 
     reply(&mut agg, "t1", said("Paris weather", 120));
     echo(&mut agg);
@@ -377,7 +377,7 @@ fn a_detached_branch_outlives_a_cancel() {
         CommandPayload::CancelSession { drop_queued: false },
         &frontend(),
     );
-    assert!(agg.state.phase.turn_id().is_none());
+    assert!(agg.state.open_turn().is_none());
     assert!(agg.state.open_branch("title").is_some());
     assert!(agg
         .state
@@ -453,10 +453,14 @@ fn a_side_call_neither_counts_as_the_conversations_read_nor_its_turn() {
         .expect("the conversation's read");
     assert_eq!((read.call_id.as_str(), read.tokens), ("c1", 9_000));
     assert_eq!(
-        agg.state.turn_calls.llm.count, 1,
+        agg.state.turn.as_ref().unwrap().calls.llm.count,
+        1,
         "the detached call is not the turn's"
     );
-    assert_eq!(agg.state.turn_cost, rust_decimal::Decimal::new(1, 2));
+    assert_eq!(
+        agg.state.turn.as_ref().unwrap().cost,
+        rust_decimal::Decimal::new(1, 2)
+    );
     assert_eq!(
         agg.state.cost,
         rust_decimal::Decimal::new(2, 2),
@@ -1265,7 +1269,7 @@ fn a_call_with_messages_neither_counts_as_the_conversations_read_nor_its_turn() 
     );
     reply(&mut agg, "sum-1", said("a summary", 9_000));
     assert!(agg.state.last_read.is_none());
-    assert!(!agg.state.turn_called);
+    assert!(!agg.state.turn.as_ref().unwrap().called);
 }
 
 fn nested(levels: usize) -> (Session, String) {

@@ -290,8 +290,7 @@ mod tests {
     use crate::retry::RetryTarget;
     use crate::state::{
         ConnectorSyncState, EffectPayload, EffectState, EffectTracking, LlmCallSpec, LlmCallState,
-        OpenInterrupt, QueueEntry, SubagentCallState, ToolCallState, TurnPhase,
-        WorkerDecisionState,
+        OpenInterrupt, QueueEntry, SubagentCallState, ToolCallState, Turn, WorkerDecisionState,
     };
 
     fn epoch() -> DateTime<Utc> {
@@ -601,9 +600,13 @@ mod tests {
     #[test]
     fn a_decision_for_another_turn_is_skipped_not_blocking() {
         let mut s = state();
-        s.phase = TurnPhase::Active {
-            turn_id: "turn-1".to_string(),
-        };
+        s.turn = Some(Turn::new(
+            "turn-1".to_string(),
+            0,
+            epoch(),
+            None,
+            Default::default(),
+        ));
         add_decision(&mut s, "d-2", EffectStatus::Queued, deferred("turn-2"));
         add_tool(&mut s, "tc-1", EffectStatus::Queued);
         queue(&mut s, EffectKind::Decision, "d-2");
@@ -620,7 +623,7 @@ mod tests {
             "and the park names the turn holding the phase"
         );
 
-        s.phase = TurnPhase::Idle;
+        s.turn = None;
         assert_eq!(
             plan(&s, epoch()),
             vec![
@@ -634,9 +637,13 @@ mod tests {
     #[test]
     fn a_deferred_decision_does_not_park_against_its_own_turn() {
         let mut s = state();
-        s.phase = TurnPhase::Active {
-            turn_id: "turn-2".to_string(),
-        };
+        s.turn = Some(Turn::new(
+            "turn-2".to_string(),
+            0,
+            epoch(),
+            None,
+            Default::default(),
+        ));
         add_decision(&mut s, "d-2", EffectStatus::Queued, deferred("turn-2"));
         let at = epoch() + chrono::Duration::seconds(5);
         let t = &mut s.effect_mut(EffectKind::Decision, "d-2").unwrap().tracking;

@@ -165,7 +165,7 @@ fn own_turn_started(state: &SessionState, id: &str) -> Option<EventPayload> {
     if decision.turn.as_ref().is_some_and(|t| !completed(&t.id)) {
         return None;
     }
-    let turn_id = decision.trigger.own_turn(id, &state.phase)?;
+    let turn_id = decision.trigger.own_turn(id, state.turn.is_none())?;
     let turn_id = match completed(&turn_id) {
         true => crate::decision::spare_turn_id(id),
         false => turn_id,
@@ -187,7 +187,7 @@ fn turn_joined(state: &SessionState, trigger: &Trigger) -> Option<EventPayload> 
         return None;
     };
     Some(EventPayload::TurnJoined(TurnJoined {
-        turn_id: state.phase.active_turn_id()?.to_string(),
+        turn_id: state.active_turn_id()?.to_string(),
         next_turn_id: turn_id.clone(),
         metadata: metadata.clone(),
     }))

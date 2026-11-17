@@ -7,7 +7,7 @@ use super::decision::{Action, LlmHandler, Trigger};
 use super::effects::{self, decision_queued, void_events, Settle};
 use super::events::*;
 use super::schedule::{self, ScheduleStep};
-use super::state::{EffectKind, EffectTracking, EventMeta, SessionState, TurnPhase};
+use super::state::{EffectKind, EffectTracking, EventMeta, SessionState};
 use crate::cx::Cx;
 use crate::ids::Ids;
 use crate::protocol::{
@@ -413,19 +413,12 @@ impl SessionState {
     }
 
     fn turn_finished_events(&self, ids: &Ids, data: serde_json::Value) -> Vec<EventPayload> {
-        match &self.phase {
-            TurnPhase::Active { turn_id } => vec![decision_queued(
+        match self.turn.as_ref().filter(|t| t.ending.is_none()) {
+            Some(turn) => vec![decision_queued(
                 ids,
-                Trigger::turn_finished(
-                    turn_id.clone(),
-                    data,
-                    self.turn_cost,
-                    self.turn_token_usage.clone(),
-                ),
+                Trigger::turn_finished(turn.id.clone(), data, turn.cost, turn.usage.clone()),
             )],
-            TurnPhase::Idle | TurnPhase::Finalizing(_) => {
-                vec![EventPayload::SessionDone(SessionDone {})]
-            }
+            None => vec![EventPayload::SessionDone(SessionDone {})],
         }
     }
 }
@@ -525,7 +518,7 @@ impl Working {
         let waiting = self.waiting_join()?;
         self.joining
             .as_deref()
-            .filter(|t| *t == waiting.turn_id && self.phase.active_turn_id().is_some())
+            .filter(|t| *t == waiting.turn_id && self.active_turn_id().is_some())
     }
 
     pub fn finish(self) -> (SessionState, Vec<(EventPayload, EventMeta)>) {
@@ -700,7 +693,7 @@ impl Working {
         let TurnTarget::Open(turn_id) = target else {
             return Ok(None);
         };
-        if !deferrable || self.phase.turn_id().is_none() {
+        if !deferrable || self.open_turn().is_none() {
             return Ok(None);
         }
         self.turn_taken(turn_id)?;
@@ -710,13 +703,13 @@ impl Working {
     fn action_turn(&self, turn: TurnTarget) -> Result<(TurnTarget, String), SessionError> {
         let own = match turn {
             TurnTarget::Open(id) | TurnTarget::Continue(id)
-                if self.phase.active_turn_id() != Some(id.as_str()) =>
+                if self.active_turn_id() != Some(id.as_str()) =>
             {
                 id
             }
             _ => self.ids.next(),
         };
-        if matches!(self.phase, TurnPhase::Idle) {
+        if self.turn.is_none() {
             return Ok((TurnTarget::Open(own.clone()), own));
         }
         self.turn_taken(&own)?;
@@ -729,7 +722,7 @@ impl Working {
                 turn_id: turn_id.to_string(),
             });
         }
-        if self.phase.turn_id() == Some(turn_id) || self.queued_turn_ids().any(|t| t == turn_id) {
+        if self.open_turn() == Some(turn_id) || self.queued_turn_ids().any(|t| t == turn_id) {
             return Err(SessionError::TurnAlreadyActive {
                 turn_id: turn_id.to_string(),
             });
@@ -753,22 +746,17 @@ impl Working {
     ) -> Result<(), SessionError> {
         let turn_id = match target {
             TurnTarget::Detached => return Ok(()),
-            TurnTarget::Continue(_) if matches!(self.phase, TurnPhase::Active { .. }) => {
-                return Ok(())
-            }
+            TurnTarget::Continue(_) if self.active_turn_id().is_some() => return Ok(()),
             TurnTarget::Continue(id) | TurnTarget::Open(id) => id,
         };
         self.turn_taken(&turn_id)?;
-        match &self.phase {
-            TurnPhase::Active { turn_id: active } => {
-                return Err(SessionError::TurnAlreadyActive {
-                    turn_id: active.clone(),
-                })
-            }
-            TurnPhase::Finalizing(_) => {
-                self.then(|s| s.finalize_run(None));
-            }
-            TurnPhase::Idle => {}
+        if let Some(active) = self.active_turn_id() {
+            return Err(SessionError::TurnAlreadyActive {
+                turn_id: active.to_string(),
+            });
+        }
+        if self.ending().is_some() {
+            self.then(|s| s.finalize_run(None));
         }
         self.emit(EventPayload::TurnStarted(TurnStarted { turn_id, metadata }));
         Ok(())
@@ -962,7 +950,7 @@ impl Working {
                 Action::Done { data } => {
                     self.then(|s| s.void_turn_branches());
                     self.then(|s| s.close_open_calls(s.ids(), answered.as_ref()));
-                    let cmd = if self.phase.finalizing().is_some() {
+                    let cmd = if self.ending().is_some() {
                         CommandPayload::CompleteTurn
                     } else {
                         CommandPayload::FinishTurn { data }
@@ -1057,7 +1045,7 @@ impl Working {
                     return Ok(());
                 };
                 let joins = queue == QueueMode::Join
-                    && self.phase.turn_id().is_some()
+                    && self.open_turn().is_some()
                     && matches!(
                         payload,
                         ClientPayload::Message(_) | ClientPayload::Append(_)
@@ -1069,7 +1057,7 @@ impl Working {
                     }
                     false => (turn, None),
                 };
-                let action_waits = self.phase.finalizing().is_some() && !joins;
+                let action_waits = self.ending().is_some() && !joins;
                 let deferred = self.deferred_turn(&turn, queue, &payload)?;
                 if deferred.is_none() {
                     self.begin_turn(turn, metadata.clone())?;
@@ -1091,7 +1079,7 @@ impl Working {
                     )?
                 };
                 self.emit_all(events);
-                match joins && self.phase.finalizing().is_none() {
+                match joins && self.ending().is_none() {
                     true => self.joining = turn,
                     false => self.waiting = turn.or(own_turn.filter(|_| action_waits)),
                 }

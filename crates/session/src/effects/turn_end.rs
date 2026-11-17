@@ -11,7 +11,7 @@ use crate::protocol::{
     ResumeStatus, Role,
 };
 use crate::schedule::Dep;
-use crate::state::{EffectKind, SessionState, TurnPhase};
+use crate::state::{EffectKind, SessionState, Turn};
 
 pub struct TurnEndSpec;
 
@@ -162,8 +162,9 @@ impl SessionState {
     }
 
     pub fn quiet_turn_ended(&self) -> bool {
-        self.quiet_end.is_some()
-            && self.quiet_end.as_deref() == self.phase.active_turn_id()
+        self.turn
+            .as_ref()
+            .is_some_and(|t| t.quiet_end && t.ending.is_none())
             && !self.head_parked()
             && !self.has_open_work()
     }
@@ -198,21 +199,11 @@ impl SessionState {
     }
 
     fn finalized(&self, error: Option<&ErrorInfo>) -> Vec<EventPayload> {
-        match self.phase.finalizing().cloned() {
-            Some(f) => vec![
-                EventPayload::TurnCompleted(TurnCompleted {
-                    turn_id: f.turn_id,
-                    data: f.data,
-                    turn_cost: f.cost,
-                    turn_token_usage: f.usage,
-                    turn_calls: Box::new(self.turn_calls.clone()),
-                    turn_started_at: self.turn_started_at,
-                    error: error.cloned(),
-                }),
-                EventPayload::SessionDone(SessionDone {}),
-            ],
-            None => vec![EventPayload::SessionDone(SessionDone {})],
-        }
+        let ending = self.turn.as_ref().filter(|t| t.ending.is_some());
+        let mut events: Vec<EventPayload> =
+            ending.map(|t| completed(t, error)).into_iter().collect();
+        events.push(EventPayload::SessionDone(SessionDone {}));
+        events
     }
 
     pub fn cancel_run(&self, drop_queued: bool) -> Vec<EventPayload> {
@@ -248,27 +239,15 @@ impl SessionState {
                 .map(|e| self.decision_dropped(&e.id)),
         );
         let error = ErrorInfo::new(ErrorCode::Cancelled, "cancelled");
-        match &self.phase {
-            TurnPhase::Finalizing(_) => events.extend(self.finalized(Some(&error))),
-            TurnPhase::Active { turn_id } => events.extend([
-                EventPayload::TurnCompleted(TurnCompleted {
-                    turn_id: turn_id.clone(),
-                    data: serde_json::Value::Null,
-                    turn_cost: self.turn_cost,
-                    turn_token_usage: self.turn_token_usage.clone(),
-                    turn_calls: Box::new(self.turn_calls.clone()),
-                    turn_started_at: self.turn_started_at,
-                    error: Some(error),
-                }),
-                EventPayload::SessionDone(SessionDone {}),
-            ]),
-            TurnPhase::Idle => {}
+        if let Some(turn) = &self.turn {
+            events.push(completed(turn, Some(&error)));
+            events.push(EventPayload::SessionDone(SessionDone {}));
         }
         events
     }
 
     pub fn cancellable(&self) -> bool {
-        self.phase.turn_id().is_some()
+        self.turn.is_some()
             || !self.open_interrupts.is_empty()
             || self.effects.values().any(|e| {
                 e.tracking.is_unsettled()
@@ -285,23 +264,26 @@ impl SessionState {
         let mut events = self.void_turn_branches();
         events.extend(self.void_effects(|kind, tracking, _| stops(kind, tracking)));
         events.extend(self.drop_queued_decisions());
-        if self.phase.finalizing().is_some() {
-            events.extend(self.finalized(Some(error)));
-            return events;
+        if let Some(turn) = &self.turn {
+            events.push(completed(turn, Some(error)));
+            events.push(EventPayload::SessionDone(SessionDone {}));
         }
-        let TurnPhase::Active { turn_id } = &self.phase else {
-            return events;
-        };
-        events.push(EventPayload::TurnCompleted(TurnCompleted {
-            turn_id: turn_id.clone(),
-            data: serde_json::Value::Null,
-            turn_cost: self.turn_cost,
-            turn_token_usage: self.turn_token_usage.clone(),
-            turn_calls: Box::new(self.turn_calls.clone()),
-            turn_started_at: self.turn_started_at,
-            error: Some(error.clone()),
-        }));
-        events.push(EventPayload::SessionDone(SessionDone {}));
         events
     }
+}
+
+fn completed(turn: &Turn, error: Option<&ErrorInfo>) -> EventPayload {
+    let (data, cost, usage) = match &turn.ending {
+        Some(end) => (end.data.clone(), end.cost, end.usage.clone()),
+        None => (serde_json::Value::Null, turn.cost, turn.usage.clone()),
+    };
+    EventPayload::TurnCompleted(TurnCompleted {
+        turn_id: turn.id.clone(),
+        data,
+        turn_cost: cost,
+        turn_token_usage: usage,
+        turn_calls: Box::new(turn.calls.clone()),
+        turn_started_at: Some(turn.started_at),
+        error: error.cloned(),
+    })
 }

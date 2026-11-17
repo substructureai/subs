@@ -217,47 +217,58 @@ pub struct QueueEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Turn {
+    pub id: String,
+    pub started_seq: u64,
+    pub started_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub called: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub context_kept: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub quiet_end: bool,
+    pub cost: Decimal,
+    pub usage: Usage,
+    pub calls: TurnCalls,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ending: Option<TurnEnd>,
+}
+
+impl Turn {
+    pub fn new(
+        id: String,
+        started_seq: u64,
+        started_at: DateTime<Utc>,
+        head: Option<String>,
+        metadata: BTreeMap<String, String>,
+    ) -> Self {
+        Turn {
+            id,
+            started_seq,
+            started_at,
+            head,
+            metadata,
+            called: false,
+            context_kept: false,
+            quiet_end: false,
+            cost: Decimal::ZERO,
+            usage: Usage::default(),
+            calls: TurnCalls::default(),
+            ending: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnEnd {
-    pub turn_id: String,
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub data: serde_json::Value,
     pub cost: Decimal,
     pub usage: Usage,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(tag = "phase", rename_all = "snake_case")]
-pub enum TurnPhase {
-    #[default]
-    Idle,
-    Active {
-        turn_id: String,
-    },
-    Finalizing(TurnEnd),
-}
-
-impl TurnPhase {
-    pub fn turn_id(&self) -> Option<&str> {
-        match self {
-            TurnPhase::Idle => None,
-            TurnPhase::Active { turn_id } => Some(turn_id),
-            TurnPhase::Finalizing(end) => Some(&end.turn_id),
-        }
-    }
-
-    pub fn active_turn_id(&self) -> Option<&str> {
-        match self {
-            TurnPhase::Active { turn_id } => Some(turn_id),
-            _ => None,
-        }
-    }
-
-    pub fn finalizing(&self) -> Option<&TurnEnd> {
-        match self {
-            TurnPhase::Finalizing(end) => Some(end),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -369,15 +380,6 @@ pub struct SessionState {
 
     pub subagent_cost: Decimal,
 
-    pub turn_cost: Decimal,
-
-    pub turn_token_usage: Usage,
-
-    pub turn_calls: TurnCalls,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub turn_started_at: Option<DateTime<Utc>>,
-
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_turn_at: Option<DateTime<Utc>>,
 
@@ -386,21 +388,6 @@ pub struct SessionState {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limited: Option<Limited>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub turn_head: Option<String>,
-
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub turn_called: bool,
-
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub turn_metadata: BTreeMap<String, String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub quiet_end: Option<String>,
-
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub context_kept: bool,
 
     pub subagent_token_usage: Usage,
 
@@ -424,10 +411,8 @@ pub struct SessionState {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub schedule_queue: Vec<QueueEntry>,
 
-    pub phase: TurnPhase,
-
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub turn_started_seq: Option<u64>,
+    pub turn: Option<Turn>,
 
     pub turns: u64,
 
@@ -469,18 +454,9 @@ impl SessionState {
             token_usage: Usage::default(),
             cost: Decimal::ZERO,
             subagent_cost: Decimal::ZERO,
-            turn_cost: Decimal::ZERO,
-            turn_token_usage: Usage::default(),
-            turn_calls: TurnCalls::default(),
-            turn_started_at: None,
             last_turn_at: None,
             last_read: None,
             limited: None,
-            turn_head: None,
-            turn_called: false,
-            turn_metadata: BTreeMap::new(),
-            quiet_end: None,
-            context_kept: false,
             subagent_token_usage: Usage::default(),
             ancestry: Vec::new(),
             data: serde_json::Value::Null,
@@ -489,8 +465,7 @@ impl SessionState {
             events: None,
             effects: BTreeMap::new(),
             schedule_queue: Vec::new(),
-            phase: TurnPhase::default(),
-            turn_started_seq: None,
+            turn: None,
             turns: 0,
             recent_turns: Vec::new(),
             last_turn_failed: false,
@@ -565,9 +540,23 @@ impl SessionState {
     }
 
     pub fn turn_id(&self) -> Option<&str> {
-        self.phase
-            .turn_id()
+        self.open_turn()
             .or_else(|| self.recent_turns.last().map(String::as_str))
+    }
+
+    pub fn open_turn(&self) -> Option<&str> {
+        self.turn.as_ref().map(|t| t.id.as_str())
+    }
+
+    pub fn active_turn_id(&self) -> Option<&str> {
+        self.turn
+            .as_ref()
+            .filter(|t| t.ending.is_none())
+            .map(|t| t.id.as_str())
+    }
+
+    pub fn ending(&self) -> Option<&TurnEnd> {
+        self.turn.as_ref()?.ending.as_ref()
     }
 
     pub fn check_invariants(&self) -> Result<(), String> {
@@ -621,7 +610,7 @@ impl SessionState {
             .iter()
             .filter(|e| e.kind == EffectKind::TurnEnd)
             .count();
-        if turn_ends > usize::from(self.phase.finalizing().is_some()) {
+        if turn_ends > usize::from(self.ending().is_some()) {
             return Err("a TurnEnd entry exists without a finalizing turn".to_string());
         }
         Ok(())
@@ -711,17 +700,20 @@ impl SessionState {
         if let Some(interrupt) = self.decision_park_interrupt(trigger) {
             return Some(DecisionPark::Interrupt(interrupt));
         }
-        if let (Some(_), Some(end)) = (trigger.joining_turn_id(), self.phase.finalizing()) {
+        if let (Some(_), Some(turn)) = (
+            trigger.joining_turn_id(),
+            self.ending().and(self.open_turn()),
+        ) {
             if !self.head_parked() {
-                return Some(DecisionPark::Turn(&end.turn_id));
+                return Some(DecisionPark::Turn(turn));
             }
         }
-        if trigger.is_join() && self.phase.active_turn_id().is_some() {
+        if trigger.is_join() && self.active_turn_id().is_some() {
             if let Some((kind, id)) = self.open_work().into_iter().next() {
                 return Some(DecisionPark::Work(kind, id));
             }
         }
-        match (trigger.deferred_turn_id(), self.phase.turn_id()) {
+        match (trigger.deferred_turn_id(), self.open_turn()) {
             (Some(turn_id), Some(active)) if active != turn_id => Some(DecisionPark::Turn(active)),
             _ => None,
         }

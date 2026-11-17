@@ -62,7 +62,7 @@ impl SessionState {
         };
         let turn = match self.detached(branch) {
             true => None,
-            false => self.phase.turn_id().map(str::to_string),
+            false => self.open_turn().map(str::to_string),
         };
         self.effects.insert(
             (payload.kind(), id.to_string()),
@@ -116,7 +116,7 @@ impl SessionState {
             }
         } else {
             if !self.detached(payload.branch.as_deref()) {
-                self.turn_calls.llm.count += 1;
+                self.on_turn(|t| t.calls.llm.count += 1);
             }
             self.insert_effect(
                 &payload.id,
@@ -141,7 +141,7 @@ impl SessionState {
             }
         }
         if payload.branch.is_none() {
-            self.turn_called = true;
+            self.on_turn(|t| t.called = true);
         }
         self.enqueue(ctx.sequence, EffectKind::LlmCall, &payload.id);
     }
@@ -197,7 +197,7 @@ impl SessionState {
             }
         } else {
             if !self.detached(payload.branch.as_deref()) {
-                self.turn_calls.tool.count += 1;
+                self.on_turn(|t| t.calls.tool.count += 1);
             }
             let script_language = match payload.target {
                 Some(ConnectorTarget::Code) => self
@@ -255,7 +255,7 @@ impl SessionState {
             }
             None => {
                 if !self.detached(p.branch.as_deref()) {
-                    self.turn_calls.system1.count += 1;
+                    self.on_turn(|t| t.calls.system1.count += 1);
                 }
                 self.insert_effect(
                     &p.id,
@@ -276,7 +276,7 @@ impl SessionState {
             existing.tracking.requeue();
         } else {
             if !self.detached(payload.branch.as_deref()) {
-                self.turn_calls.subagent.count += 1;
+                self.on_turn(|t| t.calls.subagent.count += 1);
             }
             self.insert_effect(
                 &payload.id,
@@ -351,7 +351,7 @@ impl SessionState {
         }
         match &p.trigger {
             Trigger::SessionStart => self.session_start_failed = false,
-            Trigger::TurnFinished { .. } => self.quiet_end = None,
+            Trigger::TurnFinished { .. } => self.on_turn(|t| t.quiet_end = false),
             _ => {}
         }
         let retry_policy = self.worker_retry.clone().unwrap_or(RetryPolicy::no_retry());
@@ -377,11 +377,12 @@ impl SessionState {
         } = &p.trigger
         {
             self.last_turn_at = Some(ctx.occurred_at);
-            self.phase = TurnPhase::Finalizing(TurnEnd {
-                turn_id: turn_id.clone(),
-                data: data.clone(),
-                cost: *cost,
-                usage: usage.clone(),
+            self.on_turn(|t| {
+                t.ending = Some(TurnEnd {
+                    data: data.clone(),
+                    cost: *cost,
+                    usage: usage.clone(),
+                })
             });
             let turn_id = turn_id.clone();
             self.enqueue(ctx.sequence, EffectKind::TurnEnd, &turn_id);
@@ -490,8 +491,8 @@ impl SessionState {
                 if let Some(c) = payload.response.cost {
                     self.cost += c;
                     if in_turn {
-                        self.turn_cost += c;
-                        self.turn_calls.llm.cost += c;
+                        self.on_turn(|t| t.cost += c);
+                        self.on_turn(|t| t.calls.llm.cost += c);
                     }
                 }
                 if let Some(e) = self.effect_mut(EffectKind::LlmCall, &payload.id) {
@@ -511,7 +512,7 @@ impl SessionState {
                 }
             }
             EventPayload::LlmCallErrored(payload) => {
-                self.turn_calls.llm.errors += 1;
+                self.on_turn(|t| t.calls.llm.errors += 1);
                 if let Some(e) = self.effect_mut(EffectKind::LlmCall, &payload.id) {
                     e.tracking.record_error(payload.retryable, now);
                 }
@@ -537,14 +538,14 @@ impl SessionState {
                 );
                 self.token_usage.add(usage);
                 if in_turn {
-                    self.turn_token_usage.add(usage);
-                    self.turn_calls.system1.tokens.add(usage);
+                    self.on_turn(|t| t.usage.add(usage));
+                    self.on_turn(|t| t.calls.system1.tokens.add(usage));
                 }
                 if let Some(c) = p.response.cost {
                     self.cost += c;
                     if in_turn {
-                        self.turn_cost += c;
-                        self.turn_calls.system1.cost += c;
+                        self.on_turn(|t| t.cost += c);
+                        self.on_turn(|t| t.calls.system1.cost += c);
                     }
                 }
                 if let Some(e) = self.effect_mut(EffectKind::System1Call, &p.id) {
@@ -552,7 +553,7 @@ impl SessionState {
                 }
             }
             EventPayload::System1CallErrored(p) => {
-                self.turn_calls.system1.errors += 1;
+                self.on_turn(|t| t.calls.system1.errors += 1);
                 if let Some(e) = self.effect_mut(EffectKind::System1Call, &p.id) {
                     e.tracking.record_error(p.retryable, now);
                 }
@@ -587,7 +588,7 @@ impl SessionState {
                 }
             }
             EventPayload::ToolCallErrored(payload) => {
-                self.turn_calls.tool.errors += 1;
+                self.on_turn(|t| t.calls.tool.errors += 1);
                 if let Some(e) = self.effect_mut(EffectKind::ToolCall, &payload.id) {
                     e.tracking.record_error(payload.retryable, now);
                     let failed = e.tracking.status == EffectStatus::Failed;
@@ -616,7 +617,7 @@ impl SessionState {
                 }
             }
             EventPayload::SubagentErrored(payload) => {
-                self.turn_calls.subagent.errors += 1;
+                self.on_turn(|t| t.calls.subagent.errors += 1);
                 if let Some(e) = self.effect_mut(EffectKind::Subagent, &payload.id) {
                     e.tracking.record_error(payload.retryable, now);
                     let failed = e.tracking.status == EffectStatus::Failed;
@@ -640,10 +641,10 @@ impl SessionState {
                             ..
                         })
                     );
-                let turn = self.phase.turn_id().filter(|_| !turnless).map(|id| {
+                let turn = self.turn.as_ref().filter(|_| !turnless).map(|t| {
                     Box::new(DecisionTurn {
-                        id: id.to_string(),
-                        metadata: self.turn_metadata.clone(),
+                        id: t.id.clone(),
+                        metadata: t.metadata.clone(),
                     })
                 });
                 let stamped = self
@@ -669,8 +670,8 @@ impl SessionState {
                         .owns_turn(&p.id, &turn.id)
                         .then(|| turn.id.clone())
                 });
-                if let Some(turn) = owned.filter(|t| self.phase.active_turn_id() == Some(t)) {
-                    self.quiet_end = Some(turn);
+                if owned.is_some() && owned.as_deref() == self.active_turn_id() {
+                    self.on_turn(|t| t.quiet_end = true);
                 }
                 self.remove_effect(EffectKind::Decision, &p.id);
                 self.dequeue(EffectKind::Decision, &p.id);
@@ -755,12 +756,12 @@ impl SessionState {
             }
             EventPayload::SubagentTurnCompleted(payload) => {
                 self.subagent_cost += payload.cost;
-                self.turn_cost += payload.cost;
+                self.on_turn(|t| t.cost += payload.cost);
                 self.subagent_token_usage.add(&payload.token_usage);
-                self.turn_token_usage.add(&payload.token_usage);
-                self.turn_calls.subagent.cost += payload.cost;
-                self.turn_calls.subagent.tokens.add(&payload.token_usage);
-                self.turn_calls.subagent.errors += u32::from(payload.error.is_some());
+                self.on_turn(|t| t.usage.add(&payload.token_usage));
+                self.on_turn(|t| t.calls.subagent.cost += payload.cost);
+                self.on_turn(|t| t.calls.subagent.tokens.add(&payload.token_usage));
+                self.on_turn(|t| t.calls.subagent.errors += u32::from(payload.error.is_some()));
                 if let Some(turn_id) = &payload.turn_id {
                     remember(&mut self.detached_turns, turn_id);
                 }
@@ -783,39 +784,26 @@ impl SessionState {
                 }
                 self.dequeue(EffectKind::Subagent, &payload.id);
             }
-            EventPayload::TurnJoined(p) => self.turn_metadata.extend(p.metadata.clone()),
+            EventPayload::TurnJoined(p) => self.on_turn(|t| t.metadata.extend(p.metadata.clone())),
             EventPayload::TurnStarted(p) => {
-                self.phase = TurnPhase::Active {
-                    turn_id: p.turn_id.clone(),
-                };
-                self.turn_started_seq = Some(ctx.sequence);
-                self.turn_head = self.head_id.clone();
-                self.turn_metadata = p.metadata.clone();
-                self.quiet_end = None;
-                self.turn_called = false;
-                self.context_kept = false;
-                self.turn_cost = Decimal::ZERO;
-                self.turn_token_usage = Usage::default();
-                self.turn_calls = TurnCalls::default();
-                self.turn_started_at = Some(now);
+                self.turn = Some(Turn::new(
+                    p.turn_id.clone(),
+                    ctx.sequence,
+                    now,
+                    self.head_id.clone(),
+                    p.metadata.clone(),
+                ));
             }
             EventPayload::TurnCompleted(payload) => {
                 self.turns += 1;
                 remember(&mut self.recent_turns, &payload.turn_id);
                 self.last_turn_failed = payload.error.is_some();
-                if !matches!(self.phase, TurnPhase::Finalizing(_)) {
+                if self.ending().is_none() {
                     self.last_turn_at = Some(now);
                 }
                 self.data = payload.data.clone();
-                self.turn_cost = Decimal::ZERO;
-                self.turn_token_usage = Usage::default();
-                self.turn_calls = TurnCalls::default();
-                self.turn_started_at = None;
-                self.phase = TurnPhase::Idle;
-                self.turn_started_seq = None;
+                self.turn = None;
                 self.limited = None;
-                self.turn_metadata.clear();
-                self.quiet_end = None;
                 self.dequeue(EffectKind::TurnEnd, &payload.turn_id);
             }
             EventPayload::WorkUnsent(p) => {
@@ -870,7 +858,7 @@ impl SessionState {
                 }
             }
             EventPayload::ContextKept => {
-                self.context_kept = true;
+                self.on_turn(|t| t.context_kept = true);
                 if let Some(l) = &mut self.limited {
                     l.released = true;
                 }
@@ -891,10 +879,16 @@ impl SessionState {
         }
     }
 
+    fn on_turn(&mut self, f: impl FnOnce(&mut Turn)) {
+        if let Some(turn) = self.turn.as_mut() {
+            f(turn);
+        }
+    }
+
     fn track_turn_usage(&mut self, usage: &Option<Usage>) {
         if let Some(u) = usage {
-            self.turn_token_usage.add(u);
-            self.turn_calls.llm.tokens.add(u);
+            self.on_turn(|t| t.usage.add(u));
+            self.on_turn(|t| t.calls.llm.tokens.add(u));
         }
     }
 }
