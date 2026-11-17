@@ -697,7 +697,7 @@ mod tests {
             "id": id,
             "attempt": 0,
             "llm": "claude",
-            "request": { "model": "m", "messages": [] },
+            "spec": {"model": "m"},
             "stream": true,
             "retry": serde_json::from_str::<Value>(RETRY).unwrap(),
         });
@@ -897,7 +897,7 @@ mod tests {
         t.on_event(
             ev(json!({
                 "type": "llm.call.requested", "handler": "server", "defer_tools_strategy": crate::protocol::DeferToolsStrategy::default(), "id": "c1", "attempt": 0, "llm": "claude",
-                "request": {"model": "m", "messages": []}, "stream": true,
+                "spec": {"model": "m"}, "stream": true,
                 "retry": serde_json::from_str::<Value>(RETRY).unwrap(),
             })),
             false,
@@ -1077,7 +1077,7 @@ mod tests {
         t.on_event(
             ev(json!({
                 "type": "llm.call.requested", "handler": "server", "defer_tools_strategy": crate::protocol::DeferToolsStrategy::default(), "id": "c9", "attempt": 0, "llm": "claude",
-                "request": {"model": "m", "messages": []}, "stream": true,
+                "spec": {"model": "m"}, "stream": true,
                 "retry": serde_json::from_str::<Value>(RETRY).unwrap(),
             })),
             false,

@@ -1267,3 +1267,59 @@ fn a_call_with_messages_neither_counts_as_the_conversations_read_nor_its_turn() 
     assert!(agg.state.last_read.is_none());
     assert!(!agg.state.turn_called);
 }
+
+fn nested(levels: usize) -> (Session, String) {
+    let mut agg = configured();
+    user_turn(&mut agg, "u1", "hi", "turn-1");
+    let mut transcript = vec![node_msg("u1", Role::User, "hi")];
+    for level in 1..=levels {
+        let (d, _) = live_decision(&agg);
+        let id = format!("x{level}");
+        submit_decision(
+            &mut agg,
+            d,
+            std::mem::take(&mut transcript),
+            vec![explicit(&id, vec![node_msg("", Role::User, "deeper")])],
+        );
+        reply(&mut agg, &id, said("deeper", 10));
+    }
+    let (d, _) = live_decision(&agg);
+    (agg, d)
+}
+
+fn spawn(agg: &mut Session, decision: String) -> Vec<EventPayload> {
+    submit_decision(
+        agg,
+        decision,
+        vec![],
+        vec![Action::SpawnSubagent {
+            session_id: None,
+            agent_id: "researcher".to_string(),
+            tool_call_id: "s1".to_string(),
+            message: Some(node_msg("", Role::User, "look it up")),
+            retry: RetryPolicy::no_retry(),
+            mode: None,
+            config: None,
+        }],
+    )
+}
+
+#[test]
+fn a_subagent_asked_for_on_a_calls_own_branch_counts_that_branch() {
+    let (mut agg, d) = nested(4);
+    assert_eq!(agg.state.branch_depth(agg.state.decision_branch(&d)), 4);
+    let events = spawn(&mut agg, d);
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, EventPayload::SubagentRequested(_))));
+
+    let (mut agg, d) = nested(5);
+    assert_eq!(agg.state.branch_depth(agg.state.decision_branch(&d)), 5);
+    let events = spawn(&mut agg, d);
+    let refused = events.iter().any(|e| {
+        matches!(e, EventPayload::DecisionQueued(q) if matches!(&q.trigger,
+            Trigger::SubagentFinished { ok: false, error: Some(error), .. }
+                if error.code == ErrorCode::BudgetExceeded))
+    });
+    assert!(refused, "{events:?}");
+}

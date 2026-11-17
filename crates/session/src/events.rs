@@ -10,9 +10,9 @@ use crate::connectors::{AuthNeed, RemoteTool};
 pub use crate::protocol::EffectKind;
 use crate::protocol::{
     AgentConfig, BranchMode, ClientContext, ConnectorToolKind, ContextReason, ContextStrategyKind,
-    DeferToolsStrategy, DraftMessage, ErrorInfo, HeldCall, InterruptOrigin, LlmFormat, LlmRequest,
-    LlmResponse, Message, MessageTree, NewMessage, RetryPolicy, SessionOwner, SpawnMode,
-    StoredResult, Usage, WorkerRef, WorkerState,
+    DeferToolsStrategy, DraftMessage, ErrorInfo, HeldCall, InterruptOrigin, LlmFormat, LlmResponse,
+    Message, MessageTree, NewMessage, RetryPolicy, SessionOwner, SpawnMode, StoredResult, Usage,
+    WorkerRef, WorkerState,
 };
 use crate::system1::{System1Request, System1Response};
 
@@ -294,7 +294,7 @@ pub struct LlmCallRequested {
     pub id: String,
     pub attempt: u32,
     pub llm: String,
-    pub request: LlmRequest,
+    pub spec: crate::state::LlmCallSpec,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub at: Option<String>,
     pub stream: bool,

@@ -828,7 +828,7 @@ mod tests {
                 id: id.to_string(),
                 attempt: 0,
                 llm: "claude".to_string(),
-                request,
+                spec: crate::state::LlmCallSpec::from(&request),
                 at: state.head_id.clone(),
                 stream: false,
                 retry: RetryPolicy::no_retry(),

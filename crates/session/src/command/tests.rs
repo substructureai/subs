@@ -9531,7 +9531,7 @@ fn a_re_prompt_does_not_offer_a_connector_tool_twice() {
     let names: Vec<String> = events
         .iter()
         .find_map(|e| match e {
-            EventPayload::LlmCallRequested(p) => p.request.tools.clone(),
+            EventPayload::LlmCallRequested(p) => p.spec.tools.clone(),
             _ => None,
         })
         .expect("an llm call")
@@ -11377,7 +11377,7 @@ fn interrupt_voiding_is_scoped_to_the_parked_path() {
             format: None,
             id: id.to_string(),
             attempt: 0,
-            request: request_with(vec![]),
+            spec: crate::state::LlmCallSpec::from(&request_with(vec![])),
             at: Some(at.to_string()),
             stream: false,
             retry: RetryPolicy::no_retry(),
@@ -14500,9 +14500,8 @@ fn a_tree_call_reads_the_config_the_context_and_the_path() {
     record(&mut agg, "hi", vec![u1.clone()]);
     let requested = send_events(&mut agg, "call-1");
     assert!(
-        matches!(&requested, Some(r) if r.request.messages.is_empty()
-            && r.at.as_deref() == Some("u1")),
-        "the request names the node it reads from and holds no prompt: {requested:?}"
+        matches!(&requested, Some(r) if r.at.as_deref() == Some("u1")),
+        "the request names the node it reads from: {requested:?}"
     );
     let first = sent(&agg, "call-1");
     assert_eq!(first.len(), 3, "{first:?}");
@@ -14656,7 +14655,7 @@ fn a_retried_tree_call_is_built_again_and_places_nothing_twice() {
     let [EventPayload::LlmCallRequested(r)] = &again[..] else {
         panic!("a request: {again:?}");
     };
-    assert!(r.at.is_some() && r.request.messages.is_empty());
+    assert!(r.at.is_some());
     let out = agg.state.outgoing("call-1").expect("the call");
     assert!(out.placed.is_empty(), "its context is on the tree already");
     let texts: Vec<_> = out

@@ -281,7 +281,7 @@ impl Working {
         Ok(start.id)
     }
 
-    pub(super) fn explicit_branch(
+    pub(super) fn message_branch(
         &mut self,
         call_id: &str,
         messages: Vec<DraftMessage>,

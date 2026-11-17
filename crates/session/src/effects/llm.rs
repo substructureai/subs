@@ -140,7 +140,7 @@ impl KindSpec for LlmSpec {
             id: id.to_string(),
             attempt: t.retry.attempts,
             llm: call.llm.clone(),
-            request: call.spec.to_request(Vec::new()),
+            spec: call.spec.clone(),
             at: effect.asked_at.clone(),
             stream: call.stream,
             retry: t.retry_policy.clone(),
@@ -208,10 +208,6 @@ pub fn request(
         );
         return Ok(Vec::new());
     }
-    let request = LlmRequest {
-        messages: Vec::new(),
-        ..request
-    };
     let defer_tools_strategy = state
         .at_scope(state.scope())
         .config()
@@ -221,7 +217,7 @@ pub fn request(
         id: call_id,
         attempt: 0,
         llm,
-        request,
+        spec: crate::state::LlmCallSpec::from(&request),
         at: state.scope_node(state.scope()),
         stream,
         retry,

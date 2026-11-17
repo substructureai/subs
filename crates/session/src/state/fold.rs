@@ -101,7 +101,7 @@ impl SessionState {
     }
 
     fn apply_llm_requested(&mut self, payload: &LlmCallRequested, ctx: &ApplyContext) {
-        let spec = LlmCallSpec::from(&payload.request);
+        let spec = payload.spec.clone();
         if let Some(existing) = self.effect_mut(EffectKind::LlmCall, &payload.id) {
             existing.tracking.requeue();
             existing.asked_at = payload.at.clone();
