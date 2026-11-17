@@ -160,7 +160,7 @@ interrupt holds only the branch it was raised on.
 
 | Event | Meaning |
 | --- | --- |
-| `branch.started` | `{ id, from?, parent?, agent, name?, mode, turn_id?, subagent? }` |
+| `branch.started` | `{ id, from?, parent?, agent, name?, mode, turn_id?, subagent?, leaf? }` |
 | `branch.closed` | `{ id, reason, data?, error? }`. `reason` is `done`, `failed`, `voided`, `closed`, or `promoted`. |
 | `message.new` | With `branch`, a branch message. It does not move the head. |
 

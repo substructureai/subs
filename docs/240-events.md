@@ -57,7 +57,8 @@ Render a chat from these.
 | --- | --- |
 | `session.created` | The session exists. |
 | `message.new` | A message joined the tree: `{ message, parent_id?, copied_from? }`. `copied_from` names the original of a copy. |
-| `head.moved` | The active leaf changed. A client branched or edited. |
+| `head.moved` | The active leaf changed: `{ head_id, branch? }`. A client switched versions, or a reply dropped messages. With `branch`, that branch's leaf moved. |
+| `context.placed` | `{ id, parent_id?, branch?, call, placed? }`. What a model call put into its prompt, as a node on the path, so later calls send the same prefix. |
 | `turn.started` | A turn began: `{ turn_id, metadata? }`. `metadata` is the `metadata` the turn was submitted with. For a merged turn, a later submit's key wins. |
 | `turn.joined` | Messages sent with `queue: "join"` run in the running turn: `{ turn_id, next_turn_id?, metadata? }`. `next_turn_id` is the `next_turn_id` their submit got. `metadata` is the keys they add to the turn. |
 | `turn.completed` | A turn ended: `{ turn_id, data?, turn_cost, turn_token_usage, turn_calls, turn_started_at?, error? }`. See [Turn calls](#turn-calls). |
@@ -143,7 +144,7 @@ stream with that to watch the child.
 
 | Event | Payload |
 | --- | --- |
-| `session.interrupted` | `{ interrupt_id, origin, reason, payload, anchor? }`. `anchor` is the head it pauses. Without it, every branch pauses. |
+| `session.interrupted` | `{ interrupt_id, origin, reason, payload, anchor?, branch? }`. `anchor` is the head it pauses, on `branch`. Without it, every branch pauses. |
 | `session.interrupt_resumed` | `{ interrupt_id, payload }`. |
 
 ## State and config
@@ -202,21 +203,12 @@ the same attempt.
 
 | Event | Meaning |
 | --- | --- |
-| `branch.started` | `{ id, from?, parent?, agent, name?, mode, turn_id?, subagent? }`. A [branch](./125-branches.md) started, or a subagent's went on. |
+| `branch.started` | `{ id, from?, parent?, agent, name?, mode, turn_id?, subagent?, leaf? }`. A [branch](./125-branches.md) started, or a subagent's went on from `leaf`. |
 | `branch.closed` | `{ id, reason, data?, error? }`. `reason` is `done`, `failed`, `voided`, `closed`, or `promoted`. |
 
 A `message.new` with `branch` is written on that branch. It does not move the
 head, and a client shows it as no part of the conversation. A call's
 `*.requested` event names its `branch` too.
-
-Engine bookkeeping: the engine keeps the conversation and the open branches in
-memory, and loads others from the log when a view needs them. These events go
-to no reader.
-
-| Event | Meaning |
-| --- | --- |
-| `branch.loaded` | Messages came back into memory from the log. |
-| `branch.unloaded` | Messages off every open path left memory. They stay in the log. |
 
 ## AG-UI
 
