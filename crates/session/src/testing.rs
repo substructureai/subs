@@ -1146,7 +1146,6 @@ pub fn check(
 ) -> Result<(), TestCaseError> {
     let mut world = World::stored(store);
     let mut sent: HashMap<String, serde_json::Value> = HashMap::new();
-    let mut reads = 0;
     for op in ops {
         world.step(op);
         let commands = world.trace.join("\n");
@@ -1194,7 +1193,12 @@ pub fn check(
         }
         counted.reads.store(0, std::sync::atomic::Ordering::Relaxed);
         let loaded = Session::load(&counted, SESSION, TENANT, settings()).unwrap();
-        reads = reads.max(counted.reads.load(std::sync::atomic::Ordering::Relaxed));
+        prop_assert_eq!(
+            counted.reads.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a replay read the tree\ncommands:\n{}",
+            commands
+        );
         prop_assert_eq!(
             serde_json::to_value(loaded.state()).unwrap(),
             serde_json::to_value(world.agg.state()).unwrap(),
@@ -1210,8 +1214,7 @@ pub fn check(
         prop_assert_eq!(
             work(&loaded),
             work(&world.agg),
-            "the work built from a reload differs (replay read the tree {} times)\ncommands:\n{}",
-            reads,
+            "the work built from a reload differs\ncommands:\n{}",
             commands
         );
     }
