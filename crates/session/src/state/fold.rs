@@ -338,11 +338,6 @@ impl SessionState {
                 self.events = payload.events.clone();
             }
             EventPayload::BranchStarted(p) => {
-                if let Some(l) = self.limited.as_mut().filter(|l| l.open()) {
-                    if p.parent.is_none() && crate::context::is_summary_branch(&l.call.id, &p.id) {
-                        l.summary = Some(p.id.clone());
-                    }
-                }
                 self.branches
                     .entry(BranchId::from(p.id.as_str()))
                     .or_insert_with(|| Open {
@@ -732,7 +727,6 @@ impl SessionState {
                 self.limited = Some(Limited {
                     reason: p.reason,
                     call: p.call.clone(),
-                    summary: None,
                     released: false,
                 });
             }

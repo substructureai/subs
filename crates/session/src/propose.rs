@@ -69,6 +69,7 @@ fn for_room(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionResp
     if p.scope.is_some() {
         return None;
     }
+    let held = state.limited.as_ref().filter(|l| l.open()).map(|l| &l.call);
     let summarized =
         |held: &HeldCall, summary: Option<String>, overflowed: bool, size: usize| match summary {
             Some(summary) => vec![
@@ -81,7 +82,9 @@ fn for_room(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionResp
             None => {
                 let smaller = overflowed
                     .then(|| {
-                        context::summary_call(config, &summarize(), &path, Some(size / 2), &held.id)
+                        let most = size / 2;
+                        let branch = format!("{}.{most}", summary_branch(&held.id));
+                        context::summary_call(config, &summarize(), &path, Some(most), branch)
                     })
                     .flatten();
                 vec![smaller.unwrap_or_else(|| context::reissue(held))]
@@ -100,10 +103,14 @@ fn for_room(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionResp
                 ]
             }
             Some(ContextStrategyKind::Summarize) => {
-                vec![
-                    context::summary_call(config, &summarize(), &path, None, &call.id)
-                        .unwrap_or_else(|| context::reissue(call)),
-                ]
+                vec![context::summary_call(
+                    config,
+                    &summarize(),
+                    &path,
+                    None,
+                    summary_branch(&call.id),
+                )
+                .unwrap_or_else(|| context::reissue(call))]
             }
             _ => vec![context::reissue(call)],
         },
@@ -113,8 +120,8 @@ fn for_room(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionResp
             data,
             error,
             ..
-        } if state.limited.as_ref().and_then(|l| l.summary.as_deref()) == Some(id) => {
-            let held = &state.limited.as_ref()?.call;
+        } if held.is_some_and(|h| is_summary_branch(&h.id, id)) => {
+            let held = held?;
             let summary = data
                 .as_str()
                 .map(str::to_string)
@@ -122,7 +129,7 @@ fn for_room(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionResp
             let overflowed = error
                 .as_ref()
                 .is_some_and(|e| e.code == ErrorCode::ContextOverflow);
-            summarized(held, summary, overflowed, context::summary_size(state, id))
+            summarized(held, summary, overflowed, summary_size(state, id))
         }
         DecisionTrigger::LlmFinished {
             id,
@@ -132,8 +139,15 @@ fn for_room(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionResp
             refused,
             error,
             ..
-        } if state.is_summary_call(id) => {
-            let held = &state.limited.as_ref()?.call;
+        } if held.is_some_and(|h| {
+            is_summary_branch(&h.id, id)
+                || state
+                    .effect(crate::protocol::EffectKind::LlmCall, id)
+                    .and_then(|e| e.branch.name())
+                    .is_some_and(|b| is_summary_branch(&h.id, b))
+        }) =>
+        {
+            let held = held?;
             let summary = message
                 .as_ref()
                 .and_then(|m| m.content.as_ref())
@@ -142,7 +156,7 @@ fn for_room(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionResp
             let overflowed = error
                 .as_ref()
                 .is_some_and(|e| e.code == ErrorCode::ContextOverflow);
-            summarized(held, summary, overflowed, context::summary_size(state, id))
+            summarized(held, summary, overflowed, summary_size(state, id))
         }
         _ => return None,
     };
@@ -151,6 +165,31 @@ fn for_room(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionResp
         actions,
         ..Default::default()
     })
+}
+
+fn summary_size(state: &crate::state::View, id: &str) -> usize {
+    let chars = |path: &[Message]| path.iter().map(|m| context::text(m).chars().count()).sum();
+    let key = crate::state::BranchId::from(id);
+    let leaf = match state.branches.contains_key(&key) {
+        true => Some(state.leaf(&key).map(str::to_string)),
+        false => state.tree.stored(&key).map(|s| s.leaf.or(s.from)),
+    };
+    match leaf {
+        Some(leaf) => chars(&state.at(leaf.as_deref()).transcript()),
+        None => state.prompt(id).map(|p| chars(&p)).unwrap_or_default(),
+    }
+}
+
+fn summary_branch(held: &str) -> String {
+    format!("{held}.summary")
+}
+
+fn is_summary_branch(held: &str, branch: &str) -> bool {
+    let named = summary_branch(held);
+    branch == named
+        || branch
+            .strip_prefix(&named)
+            .is_some_and(|r| r.starts_with('.'))
 }
 
 fn stopped_for_auth(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionAction> {

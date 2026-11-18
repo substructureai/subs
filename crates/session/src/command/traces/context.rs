@@ -315,7 +315,6 @@ fn a_full_session_is_summarized_and_keeps_its_recent_messages() {
     assert!(!asked.contains("q3"), "the kept message is not summarized");
 
     plan(&mut t, "sum-1");
-    assert!(t.agg.state.is_summary_call("sum-1"));
     let branch = t.agg.state.effect(EffectKind::LlmCall, "sum-1").unwrap();
     assert_eq!(branch.branch.name(), Some("call-3.summary"));
     answered(&mut t, "sum-1", "they asked twice", 50);
@@ -353,7 +352,25 @@ fn a_summary_too_long_for_the_model_is_asked_again_shorter() {
     }
     ask(&mut t, 4);
     plan(&mut t, "sum-1");
-    let first = crate::context::summary_size(&t.agg.state, "call-4.summary");
+    let size = |t: &Trace, call: &str| -> (String, usize) {
+        let branch = t
+            .agg
+            .state
+            .effect(EffectKind::LlmCall, call)
+            .and_then(|e| e.branch.name().map(str::to_string))
+            .expect("on a branch");
+        let chars = t
+            .agg
+            .state
+            .on(&BranchId::from(branch.as_str()))
+            .transcript()
+            .iter()
+            .map(|m| crate::context::text(m).chars().count())
+            .sum();
+        (branch, chars)
+    };
+    let (named, first) = size(&t, "sum-1");
+    assert_eq!(named, "call-4.summary");
     t.run(
         CommandPayload::settle(
             EffectKind::LlmCall,
@@ -372,17 +389,9 @@ fn a_summary_too_long_for_the_model_is_asked_again_shorter() {
         Trigger::BranchFinished { ok: false, .. }
     ));
     plan(&mut t, "sum-2");
-    assert!(t.agg.state.is_summary_call("sum-2"));
-    let second = t
-        .agg
-        .state
-        .limited
-        .as_ref()
-        .unwrap()
-        .summary
-        .clone()
-        .unwrap();
-    assert!(crate::context::summary_size(&t.agg.state, &second) < first);
+    let (named, second) = size(&t, "sum-2");
+    assert!(named.starts_with("call-4.summary."), "{named}");
+    assert!(second < first);
 }
 
 #[test]

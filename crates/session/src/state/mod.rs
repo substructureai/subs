@@ -68,8 +68,6 @@ pub struct LastRead {
 pub struct Limited {
     pub reason: ContextReason,
     pub call: HeldCall,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub summary: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub released: bool,
 }
@@ -632,15 +630,6 @@ impl SessionState {
             _ => None,
         }
         .and_then(|e| e.asked_at.as_deref())
-    }
-
-    pub fn is_summary_call(&self, id: &str) -> bool {
-        let summary = self.limited.as_ref().and_then(|l| l.summary.as_deref());
-        summary.is_some()
-            && (summary == Some(id)
-                || self
-                    .effect(EffectKind::LlmCall, id)
-                    .is_some_and(|e| e.branch.name() == summary))
     }
 
     pub fn holds(&self, id: &str) -> bool {

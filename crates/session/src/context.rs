@@ -224,7 +224,7 @@ pub fn kept(path: &[Message], strategy: &ContextStrategy) -> Vec<DraftMessage> {
         .collect()
 }
 
-fn text(message: &Message) -> String {
+pub(crate) fn text(message: &Message) -> String {
     message
         .content
         .as_ref()
@@ -276,37 +276,12 @@ fn tail(text: String, chars: Option<usize>) -> String {
     prompts::left_out(&text[skip..])
 }
 
-pub fn summary_size(state: &View, id: &str) -> usize {
-    let chars = |path: &[Message]| path.iter().map(|m| text(m).chars().count()).sum();
-    let key = BranchId::from(id);
-    let leaf = match state.branches.contains_key(&key) {
-        true => Some(state.leaf(&key).map(str::to_string)),
-        false => state.tree.stored(&key).map(|s| s.leaf.or(s.from)),
-    };
-    match leaf {
-        Some(leaf) => chars(&state.at(leaf.as_deref()).transcript()),
-        None => state.prompt(id).map(|p| chars(&p)).unwrap_or_default(),
-    }
-}
-
-pub fn summary_branch(held: &str) -> String {
-    format!("{held}.summary")
-}
-
-pub fn is_summary_branch(held: &str, branch: &str) -> bool {
-    let named = summary_branch(held);
-    branch == named
-        || branch
-            .strip_prefix(&named)
-            .is_some_and(|r| r.starts_with('.'))
-}
-
 pub fn summary_call(
     config: Option<&AgentConfig>,
     strategy: &ContextStrategy,
     path: &[Message],
     most_chars: Option<usize>,
-    held: &str,
+    branch: String,
 ) -> Option<DecisionAction> {
     let messages = history(path);
     let at = cut(&messages, keep_tokens(strategy));
@@ -347,10 +322,7 @@ pub fn summary_call(
         stream: Some(false),
         retry: None,
         branch: Some(BranchRequest {
-            id: Some(match most_chars {
-                Some(most) => format!("{}.{most}", summary_branch(held)),
-                None => summary_branch(held),
-            }),
+            id: Some(branch),
             from: None,
             agent: None,
             name: Some("summary".to_string()),
