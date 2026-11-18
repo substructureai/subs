@@ -37,8 +37,10 @@ model reads its messages as written, with no system prompt, tools, or context.
 What a branch inherits, it reads as it was when the branch started. A later
 change to the conversation's config or state does not reach it.
 
-`id` is optional. A branch already started is not started again. `name` is a
-label for your worker and the dashboard. The engine never reads it.
+`id` is optional. A branch is never closed, only the work on it ends. Start an
+id that ran before and it goes on from where it ended, under the call or turn
+that starts it now. Start one that is running and its new messages join it.
+`name` is a label for your worker and the dashboard. The engine never reads it.
 
 A branch cannot fork at a message whose tool calls are unanswered.
 
@@ -114,11 +116,12 @@ it.
 { "type": "branch.promote", "id": "draft-a" }
 ```
 
-`branch.close` stops a branch, and cancels its calls. `branch.promote` makes a
-branch the conversation: the head moves to its newest node. A branch that
-finished, or one with no call out, can be promoted. A conversation response
-never lands on a branch: a branch message in its view is copied into the
-conversation.
+`branch.close` stops the work on a branch, and cancels its calls. Its
+messages stay, and starting it again goes on from them. `branch.promote` makes
+a branch the conversation: the head moves to its newest node. Any branch with a
+message of its own and nothing still out on it, or below it, can be promoted;
+work that is idle on it stops. A conversation response never lands on a branch:
+a branch message in its view is copied into the conversation.
 
 Best of two:
 
@@ -133,9 +136,11 @@ Each `branch.finished` arrives in turn. Judge the two, then promote the winner.
 
 ## Calls with your own prompt
 
-An `llm.call` with `messages` and no `branch` runs on a branch of its own, with
-no config. The model reads the messages as written. The branch forks where its
-leading messages already are in the tree, so only the rest are stored.
+An `llm.call` with `messages` and no `branch` runs on a branch of its own, named
+by the call, with no config. The model reads the messages as written. The branch
+forks where its leading messages already are in the tree, so only the rest are
+stored. Call again with the same id and the branch goes on: its messages are
+matched against what it holds, and only what is new is written.
 
 Made from inside a branch, the call starts a child of that branch. A branch
 that cannot start, too deep or forked at unanswered tool calls, answers the
@@ -164,8 +169,8 @@ interrupt holds only the branch it was raised on.
 
 | Event | Meaning |
 | --- | --- |
-| `branch.started` | `{ id, from?, parent?, agent, name?, mode, turn_id?, subagent?, leaf? }` |
-| `branch.closed` | `{ id, reason, data?, error? }`. `reason` is `done`, `failed`, `voided`, `closed`, or `promoted`. |
+| `branch.started` | `{ id, from?, parent?, agent, name?, mode, depth, detached?, turn_id?, subagent?, leaf? }`. With `leaf`, work on a branch that ran before goes on from there. |
+| `branch.finished` | `{ id, outcome, data?, error? }`. The work on a branch ended: `outcome` is `done`, `failed`, `voided`, or `stopped`. |
 | `message.new` | With `branch`, a branch message. It does not move the head. |
 
 ## Next steps

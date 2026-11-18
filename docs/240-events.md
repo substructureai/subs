@@ -203,8 +203,8 @@ the same attempt.
 
 | Event | Meaning |
 | --- | --- |
-| `branch.started` | `{ id, from?, parent?, agent, name?, mode, depth, detached?, turn_id?, subagent?, leaf? }`. A [branch](./125-branches.md) started, or a subagent's went on from `leaf`. `depth` counts the branches it sits in, itself included, and `detached` holds for it and everything below a detached branch. |
-| `branch.closed` | `{ id, reason, data?, error? }`. `reason` is `done`, `failed`, `voided`, `closed`, or `promoted`. |
+| `branch.started` | `{ id, from?, parent?, agent, name?, mode, depth, detached?, turn_id?, subagent?, leaf? }`. A [branch](./125-branches.md) started, or one that ran before went on from `leaf`. `depth` counts the branches it sits in, itself included, and `detached` holds for it and everything below a detached branch. |
+| `branch.finished` | `{ id, outcome, data?, error? }`. The work on a branch ended: `outcome` is `done`, `failed`, `voided`, or `stopped`. The branch stays, and starting it again goes on from its leaf. |
 
 A `message.new` with `branch` is written on that branch. It does not move the
 head, and a client shows it as no part of the conversation. A call's
