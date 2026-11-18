@@ -8,7 +8,10 @@ use quick_cache::{Equivalent, Weighter};
 use rusqlite::{params, OptionalExtension, Row, Transaction, TransactionBehavior};
 use substructure_session::delivery::Start;
 use substructure_session::events::{BranchClosed, BranchStarted, EventPayload};
-use substructure_session::tree::{index, BranchChange, BranchRecord, Fact, Node, NodeRef, Nodes};
+use substructure_session::state::BranchId;
+use substructure_session::tree::{
+    index, BranchChange, BranchRecord, Fact, Node, NodeRef, Nodes, Stored,
+};
 use substructure_session::{
     CommandId, CommandResult, Entry, Session, SessionEvent, Store, StoreError, Tail,
 };
@@ -269,18 +272,25 @@ impl SqliteSessionStore {
     fn write_branches(&self, tx: &Transaction, entry: &Entry) -> Result<(), StoreError> {
         let corrupt = |e: serde_json::Error| StoreError::Corrupt(e.to_string());
         for event in &entry.events {
-            match index(event.seq, &event.payload).change {
+            let indexed = index(event.seq, &event.payload);
+            let key = indexed.branch.unwrap_or_default();
+            match &indexed.change {
                 Some(BranchChange::Started(p)) => {
                     tx.execute(
-                        "INSERT OR REPLACE INTO session_branches
-                            (tenant_id, session_id, branch_id, seq, started, closed)
-                         VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+                        "INSERT INTO session_branches
+                            (tenant_id, session_id, branch_id, seq, started, closed, leaf, from_node)
+                         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7)
+                         ON CONFLICT (tenant_id, session_id, branch_id) DO UPDATE SET
+                            seq = excluded.seq, started = excluded.started, closed = NULL,
+                            leaf = excluded.leaf, from_node = excluded.from_node",
                         params![
                             self.tenant_id,
                             self.session_id,
-                            p.id,
+                            key,
                             event.seq as i64,
-                            serde_json::to_vec(p).map_err(corrupt)?
+                            serde_json::to_vec(p).map_err(corrupt)?,
+                            p.leaf,
+                            p.from
                         ],
                     )
                     .map_err(unavailable)?;
@@ -292,13 +302,23 @@ impl SqliteSessionStore {
                         params![
                             self.tenant_id,
                             self.session_id,
-                            p.id,
+                            key,
                             serde_json::to_vec(p).map_err(corrupt)?
                         ],
                     )
                     .map_err(unavailable)?;
                 }
                 None => {}
+            }
+            if let Some(leaf) = &indexed.leaf {
+                tx.execute(
+                    "INSERT INTO session_branches (tenant_id, session_id, branch_id, leaf)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT (tenant_id, session_id, branch_id) DO UPDATE SET
+                        leaf = excluded.leaf",
+                    params![self.tenant_id, self.session_id, key, leaf],
+                )
+                .map_err(unavailable)?;
             }
         }
         Ok(())
@@ -652,7 +672,8 @@ impl Nodes for SqliteSessionStore {
             .reader()?
             .query_row(
                 "SELECT seq, started, closed FROM session_branches
-                  WHERE tenant_id = ?1 AND session_id = ?2 AND branch_id = ?3",
+                  WHERE tenant_id = ?1 AND session_id = ?2 AND branch_id = ?3
+                    AND started IS NOT NULL",
                 params![self.tenant_id, self.session_id, id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
@@ -673,6 +694,27 @@ impl Nodes for SqliteSessionStore {
             Some(closed) => BranchChange::Closed(closed).record(seq, record),
             None => record,
         })
+    }
+
+    fn stored(&self, branch: &BranchId) -> Result<Option<Stored>, StoreError> {
+        self.reader()?
+            .query_row(
+                "SELECT leaf, from_node FROM session_branches
+                  WHERE tenant_id = ?1 AND session_id = ?2 AND branch_id = ?3",
+                params![
+                    self.tenant_id,
+                    self.session_id,
+                    branch.name().unwrap_or_default()
+                ],
+                |row| {
+                    Ok(Stored {
+                        leaf: row.get(0)?,
+                        from: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(unavailable)
     }
 
     fn versions(
@@ -944,7 +986,6 @@ mod cold {
     use substructure_session::{Command, Settings, Work};
 
     use super::*;
-    use substructure_session::state::BranchId;
 
     struct Cold {
         _dir: tempfile::TempDir,

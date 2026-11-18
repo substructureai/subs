@@ -49,9 +49,11 @@ pub fn up(conn: &Connection) -> rusqlite::Result<()> {
             tenant_id  TEXT NOT NULL,
             session_id TEXT NOT NULL,
             branch_id  TEXT NOT NULL,
-            seq        INTEGER NOT NULL,
-            started    BLOB NOT NULL,
+            seq        INTEGER,
+            started    BLOB,
             closed     BLOB,
+            leaf       TEXT,
+            from_node  TEXT,
             PRIMARY KEY (tenant_id, session_id, branch_id)
          ) WITHOUT ROWID;
          CREATE TABLE session_heads (

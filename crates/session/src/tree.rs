@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::decision::BranchConfig;
 use crate::events::{BranchClosed, BranchEnd, BranchStarted, EventPayload};
 use crate::protocol::{AgentConfig, DraftMessage, Message, NewMessage, WorkerState};
-use crate::state::{BranchState, Logged};
+use crate::state::{BranchId, BranchState, Logged};
 use crate::store::StoreError;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -93,12 +93,25 @@ pub struct BranchRecord {
     pub closed: Option<BranchEnd>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Stored {
+    pub leaf: Option<String>,
+    pub from: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct Pending {
+    started: Option<Stored>,
+    leaf: Option<String>,
+}
+
 pub trait Nodes: Send + Sync {
     fn node(&self, id: &str) -> Result<Option<NodeRef>, StoreError>;
     fn ancestors(&self, id: &str, limit: usize) -> Result<Vec<NodeRef>, StoreError>;
     fn children(&self, parent: &str, branch: Option<&str>) -> Result<Vec<NodeRef>, StoreError>;
     fn answers(&self, tool_call_id: &str) -> Result<Vec<NodeRef>, StoreError>;
     fn branch(&self, id: &str) -> Result<Option<BranchRecord>, StoreError>;
+    fn stored(&self, branch: &BranchId) -> Result<Option<Stored>, StoreError>;
     fn versions(
         &self,
         prev: Option<&str>,
@@ -112,6 +125,7 @@ pub struct Tree {
     source: Option<Arc<dyn Nodes>>,
     unwritten: HashMap<String, NodeRef>,
     branches: HashMap<String, BranchRecord>,
+    pending: HashMap<BranchId, Pending>,
     poisoned: Mutex<Option<StoreError>>,
 }
 
@@ -121,6 +135,7 @@ impl Clone for Tree {
             source: self.source.clone(),
             unwritten: self.unwritten.clone(),
             branches: self.branches.clone(),
+            pending: self.pending.clone(),
             poisoned: Mutex::default(),
         }
     }
@@ -189,6 +204,36 @@ impl Tree {
                 self.branches.insert(id.to_string(), record);
             }
         }
+        let key = BranchId::from(indexed.branch);
+        if let Some(BranchChange::Started(p)) = &indexed.change {
+            self.pending.insert(
+                key.clone(),
+                Pending {
+                    started: Some(Stored {
+                        leaf: p.leaf.clone(),
+                        from: p.from.clone(),
+                    }),
+                    leaf: None,
+                },
+            );
+        }
+        if let Some(leaf) = &indexed.leaf {
+            self.pending.entry(key).or_default().leaf = Some(leaf.clone());
+        }
+    }
+
+    pub fn stored(&self, branch: &BranchId) -> Option<Stored> {
+        let Some(pending) = self.pending.get(branch) else {
+            return self.read(|s| s.stored(branch));
+        };
+        let mut stored = match &pending.started {
+            Some(started) => Some(started.clone()),
+            None => self.read(|s| s.stored(branch)),
+        };
+        if let Some(leaf) = &pending.leaf {
+            stored.get_or_insert_with(Stored::default).leaf = Some(leaf.clone());
+        }
+        stored
     }
 
     #[cfg(any(test, feature = "testing"))]
@@ -210,6 +255,7 @@ impl Tree {
             return;
         };
         self.branches.clear();
+        self.pending.clear();
         source.cache(self.unwritten.drain().map(|(_, node)| node).collect());
     }
 
@@ -427,9 +473,28 @@ pub struct Indexed<'a> {
     pub node: Option<NodeRef>,
     pub change: Option<BranchChange<'a>>,
     pub branch: Option<&'a str>,
+    pub leaf: Option<String>,
 }
 
 impl Indexed<'_> {
+    pub fn stored(&self, known: Option<Stored>) -> Option<Stored> {
+        let mut stored = match &self.change {
+            Some(BranchChange::Started(p)) => Some(Stored {
+                leaf: p.leaf.clone(),
+                from: p.from.clone(),
+            }),
+            _ => known,
+        };
+        if let Some(leaf) = &self.leaf {
+            stored.get_or_insert_with(Stored::default).leaf = Some(leaf.clone());
+        }
+        stored
+    }
+
+    pub fn moves(&self) -> bool {
+        self.leaf.is_some() || matches!(self.change, Some(BranchChange::Started(_)))
+    }
+
     pub fn answers(&self) -> Option<&str> {
         let message = self.node.as_ref()?.message()?;
         (message.role == crate::protocol::Role::Tool)
@@ -449,11 +514,17 @@ pub fn index(seq: u64, event: &EventPayload) -> Indexed<'_> {
         EventPayload::ContextPlaced(c) => (None, c.node.branch.as_deref()),
         _ => (None, None),
     };
+    let node = Node::of_event(event).map(|entry| Arc::new(Logged { seq, entry }));
+    let leaf = match event {
+        EventPayload::BranchMoved(p) => Some(p.leaf.clone()),
+        _ => node.as_ref().map(|n| n.id().to_string()),
+    };
     Indexed {
         seq,
-        node: Node::of_event(event).map(|entry| Arc::new(Logged { seq, entry })),
+        node,
         change,
         branch,
+        leaf,
     }
 }
 

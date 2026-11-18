@@ -1053,6 +1053,10 @@ impl crate::tree::Nodes for CountedNodes {
     fn branch(&self, id: &str) -> Result<Option<crate::tree::BranchRecord>, crate::StoreError> {
         self.read().branch(id)
     }
+    fn stored(&self, branch: &BranchId) -> Result<Option<crate::tree::Stored>, crate::StoreError> {
+        self.read().stored(branch)
+    }
+
     fn versions(
         &self,
         prev: Option<&str>,
@@ -1168,6 +1172,20 @@ pub fn check(
                 &*first,
                 &now,
                 "an open call's work changed after it was sent\ncommands:\n{}",
+                commands
+            );
+        }
+        let nodes = counted.store.nodes();
+        for (id, open) in &world.agg.state().branches {
+            if !id.is_main() && open.started.is_none() {
+                continue;
+            }
+            let stored = nodes.stored(id).unwrap().and_then(|s| s.leaf);
+            prop_assert_eq!(
+                &stored,
+                &open.leaf,
+                "the store's leaf of {:?} is not the session's\ncommands:\n{}",
+                id,
                 commands
             );
         }

@@ -5,7 +5,8 @@ use chrono::{DateTime, Utc};
 
 use crate::entry::{CommandId, CommandResult, Entry, Tail};
 use crate::session::{Session, SessionEvent};
-use crate::tree::{index, BranchRecord, NodeRef, Nodes};
+use crate::state::BranchId;
+use crate::tree::{index, BranchRecord, NodeRef, Nodes, Stored};
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum StoreError {
@@ -62,6 +63,7 @@ struct Space {
     ids: BTreeMap<String, u64>,
     handled: BTreeMap<CommandId, (CommandResult, DateTime<Utc>)>,
     branches: BTreeMap<String, BranchRecord>,
+    leaves: BTreeMap<BranchId, Stored>,
 }
 
 #[derive(Clone, Default)]
@@ -101,6 +103,13 @@ impl Store for MemoryStore {
             if let Some(node) = &indexed.node {
                 space.ids.insert(node.id().to_string(), indexed.seq);
                 space.nodes.insert(indexed.seq, node.clone());
+            }
+            if indexed.moves() {
+                let key = BranchId::from(indexed.branch);
+                let known = space.leaves.remove(&key);
+                if let Some(stored) = indexed.stored(known) {
+                    space.leaves.insert(key, stored);
+                }
             }
             if let Some(change) = &indexed.change {
                 let known = space.branches.remove(change.id());
@@ -233,6 +242,10 @@ impl Nodes for MemoryStore {
 
     fn branch(&self, id: &str) -> Result<Option<BranchRecord>, StoreError> {
         Ok(self.space().branches.get(id).cloned())
+    }
+
+    fn stored(&self, branch: &BranchId) -> Result<Option<Stored>, StoreError> {
+        Ok(self.space().leaves.get(branch).cloned())
     }
 
     fn versions(
