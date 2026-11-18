@@ -111,15 +111,6 @@ impl SessionState {
         calls.into_iter().map(|(_, e)| e).collect()
     }
 
-    /// Whether a `run_code` call's script can take its next step: none of
-    /// its calls is open, and no interrupt holds it.
-    pub fn script_runs(&self, parent: &str) -> bool {
-        let anchor = self
-            .effect(EffectKind::ToolCall, parent)
-            .and_then(|e| e.asked_at.as_deref());
-        !self.script_waits(parent) && !self.anchor_parked(anchor)
-    }
-
     fn script_waits(&self, parent: &str) -> bool {
         !self.script_asked(parent).is_empty()
             || self
@@ -709,6 +700,17 @@ pub struct WorkerDecisionState {
 impl WorkerDecisionState {
     pub fn built_at(&self) -> u64 {
         self.dispatched_seq.unwrap_or(self.source_event_sequence)
+    }
+}
+
+impl View {
+    /// Whether a `run_code` call's script can take its next step: none of
+    /// its calls is open, and no interrupt holds it.
+    pub fn script_runs(&self, parent: &str) -> bool {
+        let anchor = self
+            .effect(EffectKind::ToolCall, parent)
+            .and_then(|e| e.asked_at.as_deref());
+        !self.script_waits(parent) && !self.anchor_parked(anchor)
     }
 }
 

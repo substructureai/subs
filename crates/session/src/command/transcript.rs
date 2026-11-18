@@ -10,6 +10,7 @@ use crate::protocol::{
     ClientAppend, ClientContext, ClientMessage, ClientMessages, ClientPayload, Content,
     DraftMessage, EffectStatus, NewMessage, QueueMode, Role,
 };
+use crate::state::View;
 use crate::state::{BranchId, EffectKind, SessionState};
 use crate::Caller;
 
@@ -39,6 +40,26 @@ fn settled(view: &[DraftMessage]) -> &[DraftMessage] {
 }
 
 impl SessionState {
+    fn pending_client_result(&self, m: &DraftMessage) -> Option<(String, String, String)> {
+        if m.role != Role::Tool {
+            return None;
+        }
+        let id = m.tool_call_id.as_deref()?;
+        let effect = self.effect(EffectKind::ToolCall, id)?;
+        let tc = effect.tool()?;
+        if tc.handler != ToolHandler::Client || effect.tracking.status() != EffectStatus::Pending {
+            return None;
+        }
+        let content = m
+            .content
+            .as_ref()
+            .map(Content::text_owned)
+            .unwrap_or_default();
+        Some((id.to_string(), tc.name.clone(), content))
+    }
+}
+
+impl View {
     pub(super) fn write_response(
         &self,
         ids: &Ids,
@@ -114,11 +135,9 @@ impl SessionState {
         }
         events
     }
+}
 
-    pub(crate) fn land(&self, view: &[DraftMessage], scope: &BranchId) -> Landed {
-        self.land_view(view, scope, false)
-    }
-
+impl View {
     fn land_view(&self, view: &[DraftMessage], scope: &BranchId, regenerate: bool) -> Landed {
         let leaf = self.leaf(scope).map(str::to_string);
         let line = std::cell::OnceCell::new();
@@ -170,15 +189,116 @@ impl SessionState {
         }
     }
 
-    fn view_point(&self, view: &[DraftMessage]) -> Landed {
-        self.land_view(view, &BranchId::MAIN, true)
+    fn recorded_result_node(
+        &self,
+        tool_call_id: &str,
+        on_path: &std::collections::HashSet<String>,
+    ) -> Option<String> {
+        let answers = self.tree.answers(tool_call_id);
+        answers
+            .iter()
+            .find(|n| on_path.contains(n.id()))
+            .or(answers.first())
+            .map(|n| n.id().to_string())
     }
 
-    pub fn read_point(&self, trigger: &Trigger, branch: &BranchId) -> Landed {
-        match (branch.is_main(), trigger) {
-            (true, Trigger::ClientTranscript { messages, .. }) => self.view_point(messages),
-            _ => Landed::stay(self.leaf(branch).map(str::to_string)),
+    fn edits_as_new(&self, messages: Vec<DraftMessage>) -> Vec<DraftMessage> {
+        let text = |c: Option<&Content>| c.map(Content::text_owned).unwrap_or_default();
+        messages
+            .into_iter()
+            .map(|m| {
+                let edited = m.role == Role::User
+                    && m.id.as_deref().is_some_and(|id| {
+                        self.tree.get(id).is_some_and(|node| {
+                            node.message().is_some_and(|n| {
+                                n.role == Role::User
+                                    && text(n.content.as_ref()) != text(m.content.as_ref())
+                            })
+                        })
+                    });
+                match edited {
+                    true => DraftMessage { id: None, ..m },
+                    false => m,
+                }
+            })
+            .collect()
+    }
+
+    fn client_view_events(
+        &self,
+        ids: &Ids,
+        messages: Vec<DraftMessage>,
+        client: ClientContext,
+    ) -> Result<Vec<EventPayload>, SessionError> {
+        let messages = self.normalize_client_view(self.edits_as_new(messages));
+
+        let mut seen = std::collections::HashSet::new();
+        let completions: Vec<Completion> = messages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, m)| {
+                self.pending_client_result(m)
+                    .map(|(tc, name, result)| Completion {
+                        index,
+                        tool_call_id: tc,
+                        name,
+                        result,
+                    })
+            })
+            .filter(|c| seen.insert(c.tool_call_id.clone()))
+            .collect();
+
+        let landing = self.view_point(&messages).at;
+        let single_answer = completions.len() == 1
+            && completions[0].index + 1 == messages.len()
+            && self
+                .tree
+                .shared(&messages, |_, node| node.branch().is_none())
+                + 1
+                == messages.len();
+
+        if completions.is_empty() && self.at(landing.as_deref()).active_interrupt_for().is_some() {
+            return Err(SessionError::SessionInterrupted);
         }
+
+        if single_answer {
+            return Ok(match completions.into_iter().next() {
+                Some(c) => {
+                    tool::complete(ids, c.tool_call_id, c.name, StoredResult::text(c.result))
+                }
+                None => Vec::new(),
+            });
+        }
+
+        let mut events: Vec<EventPayload> = completions
+            .into_iter()
+            .map(|c| {
+                EventPayload::ToolCallCompleted(ToolCallCompleted {
+                    id: c.tool_call_id,
+                    name: c.name,
+                    result: StoredResult::text(c.result),
+                })
+            })
+            .collect();
+        events.push(decision_queued(
+            ids,
+            Trigger::ClientTranscript {
+                messages,
+                new_from: 0,
+                client,
+            },
+        ));
+        Ok(events)
+    }
+}
+
+impl View {
+    pub(crate) fn land(&self, view: &[DraftMessage], scope: &BranchId) -> Landed {
+        self.land_view(view, scope, false)
+    }
+
+    fn view_point(&self, view: &[DraftMessage]) -> Landed {
+        self.land_view(view, &BranchId::MAIN, true)
     }
 
     pub(super) fn drop_recorded(&self, payload: ClientPayload) -> Option<ClientPayload> {
@@ -205,37 +325,6 @@ impl SessionState {
             }
             other => Some(other),
         }
-    }
-
-    fn pending_client_result(&self, m: &DraftMessage) -> Option<(String, String, String)> {
-        if m.role != Role::Tool {
-            return None;
-        }
-        let id = m.tool_call_id.as_deref()?;
-        let effect = self.effect(EffectKind::ToolCall, id)?;
-        let tc = effect.tool()?;
-        if tc.handler != ToolHandler::Client || effect.tracking.status() != EffectStatus::Pending {
-            return None;
-        }
-        let content = m
-            .content
-            .as_ref()
-            .map(Content::text_owned)
-            .unwrap_or_default();
-        Some((id.to_string(), tc.name.clone(), content))
-    }
-
-    fn recorded_result_node(
-        &self,
-        tool_call_id: &str,
-        on_path: &std::collections::HashSet<String>,
-    ) -> Option<String> {
-        let answers = self.tree.answers(tool_call_id);
-        answers
-            .iter()
-            .find(|n| on_path.contains(n.id()))
-            .or(answers.first())
-            .map(|n| n.id().to_string())
     }
 
     pub fn normalize_client_view(&self, messages: Vec<DraftMessage>) -> Vec<DraftMessage> {
@@ -410,93 +499,13 @@ impl SessionState {
         })];
         (queued, Some(waiting.turn_id.to_string()))
     }
+}
 
-    fn edits_as_new(&self, messages: Vec<DraftMessage>) -> Vec<DraftMessage> {
-        let text = |c: Option<&Content>| c.map(Content::text_owned).unwrap_or_default();
-        messages
-            .into_iter()
-            .map(|m| {
-                let edited = m.role == Role::User
-                    && m.id.as_deref().is_some_and(|id| {
-                        self.tree.get(id).is_some_and(|node| {
-                            node.message().is_some_and(|n| {
-                                n.role == Role::User
-                                    && text(n.content.as_ref()) != text(m.content.as_ref())
-                            })
-                        })
-                    });
-                match edited {
-                    true => DraftMessage { id: None, ..m },
-                    false => m,
-                }
-            })
-            .collect()
-    }
-
-    fn client_view_events(
-        &self,
-        ids: &Ids,
-        messages: Vec<DraftMessage>,
-        client: ClientContext,
-    ) -> Result<Vec<EventPayload>, SessionError> {
-        let messages = self.normalize_client_view(self.edits_as_new(messages));
-
-        let mut seen = std::collections::HashSet::new();
-        let completions: Vec<Completion> = messages
-            .iter()
-            .enumerate()
-            .filter_map(|(index, m)| {
-                self.pending_client_result(m)
-                    .map(|(tc, name, result)| Completion {
-                        index,
-                        tool_call_id: tc,
-                        name,
-                        result,
-                    })
-            })
-            .filter(|c| seen.insert(c.tool_call_id.clone()))
-            .collect();
-
-        let landing = self.view_point(&messages).at;
-        let single_answer = completions.len() == 1
-            && completions[0].index + 1 == messages.len()
-            && self
-                .tree
-                .shared(&messages, |_, node| node.branch().is_none())
-                + 1
-                == messages.len();
-
-        if completions.is_empty() && self.at(landing.as_deref()).active_interrupt_for().is_some() {
-            return Err(SessionError::SessionInterrupted);
+impl View {
+    pub fn read_point(&self, trigger: &Trigger, branch: &BranchId) -> Landed {
+        match (branch.is_main(), trigger) {
+            (true, Trigger::ClientTranscript { messages, .. }) => self.view_point(messages),
+            _ => Landed::stay(self.leaf(branch).map(str::to_string)),
         }
-
-        if single_answer {
-            return Ok(match completions.into_iter().next() {
-                Some(c) => {
-                    tool::complete(ids, c.tool_call_id, c.name, StoredResult::text(c.result))
-                }
-                None => Vec::new(),
-            });
-        }
-
-        let mut events: Vec<EventPayload> = completions
-            .into_iter()
-            .map(|c| {
-                EventPayload::ToolCallCompleted(ToolCallCompleted {
-                    id: c.tool_call_id,
-                    name: c.name,
-                    result: StoredResult::text(c.result),
-                })
-            })
-            .collect();
-        events.push(decision_queued(
-            ids,
-            Trigger::ClientTranscript {
-                messages,
-                new_from: 0,
-                client,
-            },
-        ));
-        Ok(events)
     }
 }

@@ -1,17 +1,17 @@
 use std::ops::Deref;
 
 use crate::ids::Ids;
-use crate::state::{BranchId, SessionState, MAIN_BRANCH};
+use crate::state::{BranchId, View, MAIN_BRANCH};
 
 #[derive(Clone, Copy)]
 pub struct Cx<'a> {
-    state: &'a SessionState,
+    state: &'a View,
     ids: &'a Ids,
     scope: &'a BranchId,
 }
 
 impl<'a> Cx<'a> {
-    pub fn new(state: &'a SessionState, ids: &'a Ids) -> Self {
+    pub fn new(state: &'a View, ids: &'a Ids) -> Self {
         Self {
             state,
             ids,
@@ -30,7 +30,7 @@ impl<'a> Cx<'a> {
         self.scope
     }
 
-    pub fn state(&self) -> &'a SessionState {
+    pub fn state(&self) -> &'a View {
         self.state
     }
 
@@ -44,9 +44,9 @@ impl<'a> Cx<'a> {
 }
 
 impl Deref for Cx<'_> {
-    type Target = SessionState;
+    type Target = View;
 
-    fn deref(&self) -> &SessionState {
+    fn deref(&self) -> &View {
         self.state
     }
 }

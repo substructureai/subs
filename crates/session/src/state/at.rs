@@ -1,55 +1,11 @@
 use super::*;
 
 impl SessionState {
-    pub fn at<'a, 'n>(&'a self, node: Option<&'n str>) -> At<'a, 'n> {
-        At { state: self, node }
-    }
-
     pub fn leaf(&self, branch: &BranchId) -> Option<&str> {
         let open = self.branches.get(branch)?;
         open.leaf
             .as_deref()
             .or_else(|| open.run.as_ref()?.from.as_deref())
-    }
-
-    pub fn on(&self, branch: &BranchId) -> At<'_, '_> {
-        self.at(self.leaf(branch))
-    }
-
-    pub fn path_ids(&self, node: &str) -> std::collections::HashSet<String> {
-        self.tree.path_ids(node)
-    }
-
-    #[cfg(test)]
-    pub fn placed(&self) -> Vec<prompt_context::Placed> {
-        let mut nodes: Vec<&crate::tree::NodeRef> = self.tree.unwritten().collect();
-        nodes.sort_by_key(|n| n.seq);
-        nodes
-            .into_iter()
-            .filter_map(|n| match &n.fact {
-                crate::tree::Fact::Context { placed, .. } => Some(placed.clone()),
-                _ => None,
-            })
-            .flatten()
-            .collect()
-    }
-
-    pub fn has_node(&self, id: &str) -> bool {
-        self.tree.has(id)
-    }
-
-    pub fn message_tree(&self) -> MessageTree {
-        self.on(&BranchId::MAIN).message_tree()
-    }
-
-    pub fn versions(&self, tree: &MessageTree) -> BTreeMap<String, Vec<String>> {
-        tree.nodes
-            .iter()
-            .filter_map(|n| {
-                let versions = self.tree.versions(&n.message.id);
-                (versions.len() > 1).then(|| (n.message.id.clone(), versions))
-            })
-            .collect()
     }
 }
 
@@ -103,12 +59,16 @@ pub struct SkillCall {
 
 #[derive(Clone, Copy)]
 pub struct At<'a, 'n> {
-    state: &'a SessionState,
+    state: &'a View,
     node: Option<&'n str>,
 }
 
 impl<'a, 'n> At<'a, 'n> {
-    pub fn session(&self) -> &'a SessionState {
+    pub(super) fn new(state: &'a View, node: Option<&'n str>) -> Self {
+        Self { state, node }
+    }
+
+    pub fn session(&self) -> &'a View {
         self.state
     }
 
@@ -532,6 +492,48 @@ impl<'a, 'n> At<'a, 'n> {
     }
 }
 
+impl View {
+    #[cfg(test)]
+    pub fn placed(&self) -> Vec<prompt_context::Placed> {
+        let mut nodes: Vec<&crate::tree::NodeRef> = self.tree.unwritten().collect();
+        nodes.sort_by_key(|n| n.seq);
+        nodes
+            .into_iter()
+            .filter_map(|n| match &n.fact {
+                crate::tree::Fact::Context { placed, .. } => Some(placed.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    pub fn message_tree(&self) -> MessageTree {
+        self.on(&BranchId::MAIN).message_tree()
+    }
+
+    pub fn on(&self, branch: &BranchId) -> At<'_, '_> {
+        self.at(self.leaf(branch))
+    }
+
+    pub fn path_ids(&self, node: &str) -> std::collections::HashSet<String> {
+        self.tree.path_ids(node)
+    }
+
+    pub fn has_node(&self, id: &str) -> bool {
+        self.tree.has(id)
+    }
+
+    pub fn versions(&self, tree: &MessageTree) -> BTreeMap<String, Vec<String>> {
+        tree.nodes
+            .iter()
+            .filter_map(|n| {
+                let versions = self.tree.versions(&n.message.id);
+                (versions.len() > 1).then(|| (n.message.id.clone(), versions))
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod open_llm_calls_tests {
     use super::*;
@@ -618,7 +620,7 @@ mod open_llm_calls_tests {
 
     #[test]
     fn a_call_is_open_until_its_tool_answer_is_recorded() {
-        let mut s = SessionState::new("sess-1".to_string());
+        let mut s = View::new("sess-1".to_string());
         s.seed_message(node(user("u1"), None).entry);
         s.seed_message(node(assistant_calling("call-1", "tc-1"), Some("u1")).entry);
         s.branches.insert(
@@ -666,7 +668,7 @@ mod tree_tests {
             .unwrap()
     }
 
-    fn put(s: &mut SessionState, id: &str, parent: Option<&str>, fact: Fact) {
+    fn put(s: &mut View, id: &str, parent: Option<&str>, fact: Fact) {
         s.seed(Node {
             place: Place {
                 id: id.to_string(),
@@ -690,13 +692,13 @@ mod tree_tests {
         }
     }
 
-    fn read(s: &SessionState, at: &str) -> serde_json::Value {
+    fn read(s: &View, at: &str) -> serde_json::Value {
         s.at(Some(at)).worker_state().0
     }
 
     #[test]
     fn the_nearest_write_above_a_node_is_what_it_reads() {
-        let mut s = SessionState::new("s".into());
+        let mut s = View::new("s".into());
         put(
             &mut s,
             "c0",
@@ -724,7 +726,7 @@ mod tree_tests {
 
     #[test]
     fn a_write_after_a_fork_is_not_on_the_fork() {
-        let mut s = SessionState::new("s".into());
+        let mut s = View::new("s".into());
         put(&mut s, "u1", None, message("u1"));
         put(&mut s, "s1", Some("u1"), state(1));
         put(&mut s, "x1", Some("u1"), message("x1"));
@@ -734,7 +736,7 @@ mod tree_tests {
 
     #[test]
     fn a_branch_with_its_own_config_reads_it_and_inherits_state() {
-        let mut s = SessionState::new("s".into());
+        let mut s = View::new("s".into());
         put(
             &mut s,
             "c0",
@@ -757,7 +759,7 @@ mod tree_tests {
 
     #[test]
     fn an_update_keeps_what_was_placed_above_and_a_reset_cuts_it() {
-        let mut s = SessionState::new("s".into());
+        let mut s = View::new("s".into());
         put(
             &mut s,
             "c0",
@@ -816,7 +818,7 @@ mod tree_tests {
 
     #[test]
     fn context_owed_after_an_earlier_call_takes_a_message_of_its_own() {
-        let mut s = SessionState::new("s".into());
+        let mut s = View::new("s".into());
         let skilled = AgentConfig {
             skills: vec![crate::protocol::AgentSkill {
                 name: "visits".to_string(),
@@ -878,7 +880,7 @@ mod tree_tests {
             placed: Vec::new(),
             tools,
         };
-        let mut s = SessionState::new("s".into());
+        let mut s = View::new("s".into());
         put(
             &mut s,
             "c0",
@@ -919,7 +921,7 @@ mod tree_tests {
 
     #[test]
     fn a_reset_to_no_config_reads_none() {
-        let mut s = SessionState::new("s".into());
+        let mut s = View::new("s".into());
         put(
             &mut s,
             "c0",
@@ -939,7 +941,7 @@ mod tree_tests {
 
     #[test]
     fn the_message_view_skips_other_nodes() {
-        let mut s = SessionState::new("s".into());
+        let mut s = View::new("s".into());
         put(&mut s, "u1", None, message("u1"));
         put(&mut s, "s1", Some("u1"), state(1));
         put(&mut s, "u2", Some("s1"), message("u2"));

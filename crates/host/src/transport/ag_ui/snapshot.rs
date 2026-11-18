@@ -1,5 +1,5 @@
 use crate::protocol::{Content, Message, MessageTree, Role, StoredContent};
-use crate::session::state::SessionState;
+use crate::session::state::View;
 
 use super::events::{AgUiEvent, AgUiInterrupt, RunOutcome, SnapshotMessage};
 use substructure_session::state::BranchId;
@@ -36,7 +36,7 @@ fn to_snapshot(message: Message) -> SnapshotMessage {
     }
 }
 
-pub fn open_interrupts(session: &SessionState) -> Vec<AgUiInterrupt> {
+pub fn open_interrupts(session: &View) -> Vec<AgUiInterrupt> {
     session
         .on(&BranchId::MAIN)
         .interrupts_for()
@@ -48,9 +48,9 @@ pub fn open_interrupts(session: &SessionState) -> Vec<AgUiInterrupt> {
 pub fn snapshot_events(
     thread_id: String,
     run_id: String,
-    session: Option<&SessionState>,
+    session: Option<&View>,
 ) -> Vec<AgUiEvent> {
-    let tree = session.map(SessionState::message_tree).unwrap_or_default();
+    let tree = session.map(View::message_tree).unwrap_or_default();
     let outcome = session.and_then(|s| {
         let interrupts = open_interrupts(s);
         (!interrupts.is_empty()).then_some(RunOutcome::Interrupt { interrupts })
@@ -259,8 +259,8 @@ mod tests {
         assert!(session_messages(&MessageTree::default()).is_empty());
     }
 
-    fn session_of(tree: MessageTree) -> SessionState {
-        let mut s = SessionState::new("s".to_string());
+    fn session_of(tree: MessageTree) -> View {
+        let mut s = View::new("s".to_string());
         for node in &tree.nodes {
             s.tree.seed(crate::runtime::session::state::Logged {
                 seq: 0,

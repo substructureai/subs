@@ -4,6 +4,7 @@ use crate::decision::Trigger;
 use crate::events::*;
 use crate::ids::Ids;
 use crate::protocol::{DraftMessage, HeldCall, NewMessage, Role, WorkerState};
+use crate::state::View;
 use crate::state::{BranchId, SessionState};
 
 impl Working {
@@ -56,7 +57,9 @@ impl Working {
     }
 }
 
-impl SessionState {
+impl SessionState {}
+
+impl View {
     fn restart(
         &self,
         ids: &Ids,

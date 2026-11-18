@@ -8,7 +8,7 @@ use crate::entry::{Accepted, Command, CommandId, CommandResult, Entry, Handled, 
 use crate::events::EventPayload;
 use crate::ids::Ids;
 use crate::span::SpanContext;
-use crate::state::{waiting_on_client, ApplyContext, EventMeta, SessionState};
+use crate::state::{waiting_on_client, ApplyContext, EventMeta, View};
 use crate::store::{Store, StoreError};
 
 pub struct CommitContext {
@@ -85,14 +85,14 @@ pub struct Ran {
 
 struct Draft {
     entry: Entry,
-    state: Option<SessionState>,
+    state: Option<View>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub(crate) id: String,
     pub(crate) tenant_id: String,
-    pub(crate) state: SessionState,
+    pub(crate) state: View,
     pub(crate) seq: u64,
     pub(crate) first_event_at: Option<DateTime<Utc>>,
     pub(crate) last_event_at: Option<DateTime<Utc>>,
@@ -106,7 +106,7 @@ impl Session {
     pub fn new(id: impl Into<String>, tenant_id: impl Into<String>, settings: Settings) -> Self {
         let id = id.into();
         Self {
-            state: SessionState::new(id.clone()),
+            state: View::new(id.clone()),
             id,
             tenant_id: tenant_id.into(),
             seq: 0,
@@ -119,7 +119,7 @@ impl Session {
     }
 
     #[cfg(any(test, feature = "testing"))]
-    pub(crate) fn with_state(id: String, tenant_id: String, state: SessionState) -> Self {
+    pub(crate) fn with_state(id: String, tenant_id: String, state: View) -> Self {
         Self {
             state,
             ..Self::new(id, tenant_id, Settings::default())
@@ -136,21 +136,20 @@ impl Session {
             .latest()?
             .unwrap_or_else(|| Self::new(id, tenant_id, Settings::default()));
         session.settings = settings;
-        session.state.tree = crate::tree::Tree::over(store.nodes());
         let tail = store.read(session.seq)?;
         for event in &tail.events {
-            session.apply_event(event);
+            session.state.state.apply(
+                &event.payload,
+                &ApplyContext {
+                    occurred_at: event.occurred_at,
+                    sequence: event.seq,
+                },
+            );
+            session.record_event(event);
         }
         session.version = tail.version;
-        session.state.tree.written();
-        session.checked()
-    }
-
-    fn checked(self) -> Result<Self, Error> {
-        match self.state.tree.poisoned() {
-            Some(error) => Err(error.into()),
-            None => Ok(self),
-        }
+        session.state.tree = crate::tree::Tree::over(store.nodes());
+        Ok(session)
     }
 
     pub fn id(&self) -> &str {
@@ -161,11 +160,11 @@ impl Session {
         &self.tenant_id
     }
 
-    pub fn state(&self) -> &SessionState {
+    pub fn state(&self) -> &View {
         &self.state
     }
 
-    pub fn into_state(self) -> SessionState {
+    pub fn into_state(self) -> View {
         self.state
     }
 

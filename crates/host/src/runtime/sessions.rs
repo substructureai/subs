@@ -11,7 +11,7 @@ use substructure_session::{Command, CommandResult, Entry, Session, Settings, Sto
 use tokio::sync::{mpsc, oneshot};
 
 use crate::protocol::MessageTree;
-use substructure_session::state::{BranchId, SessionState};
+use substructure_session::state::{BranchId, View};
 
 use crate::runtime::event_store::{BroadcastBus, EventBus, EventFilter, EventTap, StoreError};
 pub use crate::runtime::inbox::{execute, ExecuteError, ExecuteInput, ExecuteOutput};
@@ -25,7 +25,7 @@ pub type SharedStore = Arc<dyn Store + Send + Sync>;
 pub type SessionKey = (String, String);
 
 pub struct SessionView {
-    pub state: SessionState,
+    pub state: View,
     pub status: substructure_session::state::SessionStatus,
     pub tree: MessageTree,
     pub versions: std::collections::BTreeMap<String, Vec<String>>,
@@ -850,7 +850,7 @@ async fn step<T: Send + 'static>(
 
 pub async fn read<T: Send + 'static>(
     session: Arc<Session>,
-    f: impl FnOnce(&SessionState) -> T + Send + 'static,
+    f: impl FnOnce(&View) -> T + Send + 'static,
 ) -> Result<T, StoreError> {
     tokio::task::spawn_blocking(move || {
         let read = f(session.state());

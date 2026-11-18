@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::prompt_context;
 use crate::protocol::{ConnectorTool, DraftMessage, EffectKind, LlmRequest, LlmTool, Message};
+use crate::state::View;
 use crate::state::{At, SessionState};
 
 #[derive(Debug, Clone)]
@@ -10,34 +11,7 @@ pub struct Placing {
     pub placed: Vec<prompt_context::Placed>,
 }
 
-impl SessionState {
-    pub fn prompt(&self, id: &str) -> Option<Vec<Message>> {
-        let effect = self.effect(EffectKind::LlmCall, id)?;
-        let node = effect
-            .llm()?
-            .reads_from
-            .as_deref()
-            .or(effect.asked_at.as_deref());
-        Some(self.at(node).prompt(id))
-    }
-
-    /// The tools a call was sent, or asked for before it was dispatched.
-    pub fn tools_sent(&self, id: &str) -> Option<Vec<LlmTool>> {
-        let call = self.llm_call(id)?;
-        match call.reads_from.as_deref() {
-            Some(node) => self.tree.tools(node),
-            None => call.spec.tools.clone(),
-        }
-    }
-
-    /// The request the model gets: its prompt, and the tools it was sent.
-    pub fn sent_request(&self, id: &str) -> Option<LlmRequest> {
-        let call = self.llm_call(id)?;
-        let mut request = call.spec.to_request(self.prompt(id)?);
-        request.tools = self.tools_sent(id);
-        Some(request)
-    }
-}
+impl SessionState {}
 
 impl At<'_, '_> {
     pub fn prompt(&self, call: &str) -> Vec<Message> {
@@ -156,4 +130,37 @@ pub fn fingerprint(prompt: &[Message], tools: &Option<Vec<crate::protocol::LlmTo
     }
     hasher.update(&serde_json::to_vec(tools).unwrap_or_default());
     format!("{:016x}", hasher.digest())
+}
+
+impl View {
+    pub fn prompt(&self, id: &str) -> Option<Vec<Message>> {
+        let effect = self.effect(EffectKind::LlmCall, id)?;
+        let node = effect
+            .llm()?
+            .reads_from
+            .as_deref()
+            .or(effect.asked_at.as_deref());
+        Some(self.at(node).prompt(id))
+    }
+}
+
+impl View {
+    /// The tools a call was sent, or asked for before it was dispatched.
+    pub fn tools_sent(&self, id: &str) -> Option<Vec<LlmTool>> {
+        let call = self.llm_call(id)?;
+        match call.reads_from.as_deref() {
+            Some(node) => self.tree.tools(node),
+            None => call.spec.tools.clone(),
+        }
+    }
+}
+
+impl View {
+    /// The request the model gets: its prompt, and the tools it was sent.
+    pub fn sent_request(&self, id: &str) -> Option<LlmRequest> {
+        let call = self.llm_call(id)?;
+        let mut request = call.spec.to_request(self.prompt(id)?);
+        request.tools = self.tools_sent(id);
+        Some(request)
+    }
 }

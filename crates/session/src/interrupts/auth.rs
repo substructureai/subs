@@ -93,7 +93,8 @@ mod tests {
         Subject,
     };
     use crate::state::BranchId;
-    use crate::state::{ApplyContext, OpenInterrupt, SessionState};
+    use crate::state::View;
+    use crate::state::{ApplyContext, OpenInterrupt};
 
     fn ctx() -> ApplyContext {
         ApplyContext {
@@ -116,8 +117,8 @@ mod tests {
         }
     }
 
-    fn needing_auth(need: AuthNeed, policy: McpAuthFailure) -> SessionState {
-        let mut s = SessionState::new("s1".to_string());
+    fn needing_auth(need: AuthNeed, policy: McpAuthFailure) -> View {
+        let mut s = View::new("s1".to_string());
         s.owner = Some(SessionOwner {
             tenant_id: "t".to_string(),
             requester: crate::protocol::Requester::new(
@@ -213,6 +214,6 @@ mod tests {
 
     #[test]
     fn a_session_with_nothing_wrong_is_not_asked_about() {
-        assert!(prompt(SessionState::new("s1".to_string()).on(&BranchId::MAIN)).is_none());
+        assert!(prompt(View::new("s1".to_string()).on(&BranchId::MAIN)).is_none());
     }
 }

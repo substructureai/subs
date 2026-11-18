@@ -22,7 +22,7 @@ pub trait Sent {
     fn request(&self, call: &str) -> Option<LlmRequest>;
 }
 
-impl Sent for crate::state::SessionState {
+impl Sent for crate::state::View {
     fn tools(&self, call: &str) -> Option<Vec<LlmTool>> {
         self.tools_sent(call)
     }

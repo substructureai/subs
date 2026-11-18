@@ -124,7 +124,7 @@ pub struct StreamSessionEventsParams {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::state::SessionState;
+    use crate::session::state::View;
     use substructure_session::state::BranchId;
     use substructure_session::state::Open;
 
@@ -134,7 +134,7 @@ mod tests {
         assert!(serde_json::from_str::<ClientInputRequest>(body).is_ok());
     }
 
-    fn view_of(state: SessionState) -> SessionView {
+    fn view_of(state: View) -> SessionView {
         SessionView {
             status: state.projected_status(),
             tree: state.message_tree(),
@@ -143,8 +143,8 @@ mod tests {
         }
     }
 
-    fn session_with_interrupt(anchor: Option<&str>) -> SessionState {
-        let mut s = SessionState::new("s1".to_string());
+    fn session_with_interrupt(anchor: Option<&str>) -> View {
+        let mut s = View::new("s1".to_string());
         s.agent_id = Some("a1".to_string());
         s.status = SessionStatus::Idle;
         s.open_interrupts
@@ -183,7 +183,7 @@ mod tests {
 
     #[test]
     fn session_response_omits_nothing_when_idle() {
-        let mut s = SessionState::new("s1".to_string());
+        let mut s = View::new("s1".to_string());
         s.status = SessionStatus::Idle;
         let json = serde_json::to_value(session_response("s1".into(), &view_of(s))).unwrap();
         assert_eq!(json["status"], "idle");
@@ -212,7 +212,7 @@ mod tests {
                 branch: None,
             }),
         };
-        let mut s = SessionState::new("s1".to_string());
+        let mut s = View::new("s1".to_string());
         s.status = SessionStatus::Idle;
         s.tree.seed(node("u1", Role::User, None));
         s.tree.seed(node("a1", Role::Assistant, Some("u1")));

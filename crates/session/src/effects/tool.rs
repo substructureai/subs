@@ -12,6 +12,7 @@ use crate::protocol::{
 };
 use crate::protocol::{RetryOverride, RetryPolicy};
 use crate::schedule::Dep;
+use crate::state::View;
 use crate::state::{inner_arguments, At, BranchId, CallTarget, EffectKind, SessionState};
 use crate::tool_contract::{classify_arguments, declared_tool, output_violation, DeclaredTool};
 use crate::Caller;
@@ -24,7 +25,7 @@ impl KindSpec for ToolSpec {
     }
 
     /// An interrupt holds the calls a script makes, as it holds decisions.
-    fn park(&self, state: &SessionState, id: &str) -> Option<Dep> {
+    fn park(&self, state: &View, id: &str) -> Option<Dep> {
         let effect = state.effect(EffectKind::ToolCall, id)?;
         effect.tool()?.script.as_ref()?;
         let interrupt = state.anchor_interrupt(effect.asked_at.as_deref())?;
@@ -182,7 +183,7 @@ fn finished(state: &Cx<'_>, id: &str, name: String, result: StoredResult) -> Vec
     events
 }
 
-fn with_skill_tools(state: &SessionState, id: &str, mut result: StoredResult) -> StoredResult {
+fn with_skill_tools(state: &View, id: &str, mut result: StoredResult) -> StoredResult {
     let Some(tc) = state.tool_call(id) else {
         return result;
     };
@@ -270,7 +271,7 @@ pub enum AskAnswer {
     Spawn,
 }
 
-pub fn answer_ask(state: &SessionState, id: &str, answer: AskAnswer) -> Vec<EventPayload> {
+pub fn answer_ask(state: &View, id: &str, answer: AskAnswer) -> Vec<EventPayload> {
     let Some((parent, ask)) = state.script_ask(id) else {
         return Vec::new();
     };
@@ -294,7 +295,7 @@ pub fn answer_ask(state: &SessionState, id: &str, answer: AskAnswer) -> Vec<Even
 
 /// Ends with an error each call a script asked for that nothing can answer
 /// any more: no decision about it waits, and no interrupt holds it.
-pub fn unanswered(state: &SessionState) -> Vec<EventPayload> {
+pub fn unanswered(state: &View) -> Vec<EventPayload> {
     let triggers: Vec<&Trigger> = state
         .effects_of(EffectKind::Decision)
         .filter_map(|e| Some(&e.decision()?.trigger))
@@ -330,7 +331,7 @@ pub fn unanswered(state: &SessionState) -> Vec<EventPayload> {
 /// A call a script asked for, as `(name, arguments)` says to run it. The
 /// script's records keep what it `asked`, so a replay matches.
 fn scripted(
-    state: &SessionState,
+    state: &View,
     id: String,
     script: ScriptCaller,
     asked: ScriptCall,
@@ -435,7 +436,7 @@ pub fn complete(ids: &Ids, id: String, name: String, result: StoredResult) -> Ve
 }
 
 pub fn request(
-    state: &SessionState,
+    state: &View,
     tool_call_id: String,
     name: String,
     arguments: String,
@@ -467,7 +468,7 @@ pub fn request(
 }
 
 fn requested(
-    state: &SessionState,
+    state: &View,
     id: String,
     name: String,
     arguments: String,
@@ -635,7 +636,9 @@ fn argument(arguments: &str, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-impl SessionState {
+impl SessionState {}
+
+impl View {
     /// The output schema `name` declares, for this call: a script's call is
     /// made against the tool as code mode declares it, the model's against
     /// the tools its call sent.

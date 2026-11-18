@@ -1,33 +1,7 @@
 use super::*;
 
 impl SessionState {
-    #[cfg(test)]
-    pub fn seed(&mut self, node: crate::tree::Node) {
-        let seq = self.tree.unwritten().count() as u64;
-        self.grow(&node);
-        self.tree.seed(Logged { seq, entry: node });
-    }
-
-    #[cfg(test)]
-    pub fn seed_config(&mut self, config: AgentConfig) {
-        let parent = self.leaf(&BranchId::MAIN).map(str::to_string);
-        let id = format!("seed-config-{}", self.tree.unwritten().count());
-        self.seed(crate::tree::Node {
-            place: crate::tree::Place {
-                id,
-                parent_id: parent,
-                branch: None,
-            },
-            fact: crate::tree::Fact::Config { config },
-        });
-    }
-
-    #[cfg(test)]
-    pub fn seed_message(&mut self, message: crate::protocol::NewMessage) {
-        self.seed(crate::tree::Node::of_message(&message));
-    }
-
-    fn grow(&mut self, node: &crate::tree::Node) {
+    pub(super) fn grow(&mut self, node: &crate::tree::Node) {
         let id = node.id().to_string();
         let user = node.message().is_some_and(|m| m.role == Role::User);
         let branch = BranchId::from(node.branch());
@@ -349,7 +323,11 @@ impl SessionState {
         self.dequeue(kind, &p.id);
     }
 
-    pub fn apply(&mut self, event: &EventPayload, ctx: &ApplyContext) {
+    pub fn apply<'e>(
+        &mut self,
+        event: &'e EventPayload,
+        ctx: &ApplyContext,
+    ) -> crate::tree::Indexed<'e> {
         let now = ctx.occurred_at;
         match event {
             EventPayload::SessionCreated(payload) => {
@@ -804,7 +782,7 @@ impl SessionState {
         if let Some(node) = &indexed.node {
             self.grow(&node.entry);
         }
-        self.tree.push(&indexed);
+        indexed
     }
 
     fn track_usage(&mut self, usage: &Option<Usage>) {

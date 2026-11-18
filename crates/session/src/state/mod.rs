@@ -1,10 +1,12 @@
 mod at;
 mod effects;
 mod fold;
+mod view;
 
 pub use at::*;
 pub use effects::*;
 pub use fold::*;
+pub use view::*;
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -500,9 +502,6 @@ pub struct SessionState {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub deliveries: BTreeMap<String, crate::delivery::Delivery>,
 
-    #[serde(skip)]
-    pub tree: crate::tree::Tree,
-
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub open_interrupts: Vec<OpenInterrupt>,
 
@@ -539,7 +538,6 @@ impl SessionState {
             recent_turns: Vec::new(),
             last_turn_failed: false,
             detached_turns: Vec::new(),
-            tree: crate::tree::Tree::default(),
             open_interrupts: Vec::new(),
             session_start_failed: false,
             branches: BTreeMap::from([(BranchId::MAIN, Open::default())]),
@@ -561,20 +559,6 @@ impl SessionState {
             .filter_map(|(id, open)| Some((id.name()?, open.run.as_ref()?)))
     }
 
-    pub fn parallel_branches(&self) -> bool {
-        self.on(&BranchId::MAIN)
-            .config()
-            .and_then(|c| c.parallel_branches)
-            .unwrap_or(false)
-    }
-
-    pub fn lane(&self, branch: &BranchId) -> BranchId {
-        match self.parallel_branches() {
-            true => branch.clone(),
-            false => BranchId::MAIN,
-        }
-    }
-
     pub fn detached(&self, branch: &BranchId) -> bool {
         self.open_run(branch).is_some_and(|b| b.detached)
     }
@@ -583,14 +567,6 @@ impl SessionState {
         self.side_branches()
             .filter(|(_, b)| b.mode == BranchMode::Blocking && b.parent == *parent)
             .count()
-    }
-
-    pub fn node_branch(&self, id: &str) -> BranchId {
-        BranchId::from(
-            self.tree
-                .get(id)
-                .and_then(|n| n.branch().map(str::to_string)),
-        )
     }
 
     pub fn decision_branch(&self, id: &str) -> &BranchId {
@@ -633,81 +609,14 @@ impl SessionState {
         self.turn.as_ref()?.ending.as_ref()
     }
 
-    pub fn check_invariants(&self) -> Result<(), String> {
-        let mut lanes: BTreeMap<BranchId, usize> = BTreeMap::new();
-        for e in self
-            .effects_of(EffectKind::Decision)
-            .filter(|e| e.tracking.status == EffectStatus::Pending)
-        {
-            *lanes.entry(self.lane(&e.branch)).or_default() += 1;
-        }
-        if lanes.values().any(|n| *n > 1) {
-            return Err(format!("decision slot violated: {lanes:?} live decisions"));
-        }
-        if self
-            .effects_of(EffectKind::Decision)
-            .filter(|e| e.tracking.status == EffectStatus::Pending)
-            .filter_map(|e| e.decision())
-            .any(|d| self.on(&d.branch).has_pending_connector_sync())
-        {
-            return Err(
-                "a decision is live while a fetch its config owes is in flight".to_string(),
-            );
-        }
-        let queued_statuses = self
-            .effects
-            .values()
-            .filter(|e| e.kind() != EffectKind::ConnectorSync)
-            .filter(|e| e.tracking.status == EffectStatus::Queued)
-            .count();
-        let effect_entries = self
-            .schedule_queue
-            .iter()
-            .filter(|e| e.kind != EffectKind::TurnEnd)
-            .count();
-        if queued_statuses != effect_entries {
-            return Err(format!(
-                "queue ({effect_entries}) and Queued statuses ({queued_statuses}) disagree"
-            ));
-        }
-        let turn_ends = self
-            .schedule_queue
-            .iter()
-            .filter(|e| e.kind == EffectKind::TurnEnd)
-            .count();
-        if turn_ends > usize::from(self.ending().is_some()) {
-            return Err("a TurnEnd entry exists without a finalizing turn".to_string());
-        }
-        Ok(())
-    }
-
     pub fn open_interrupt(&self, id: &str) -> Option<&OpenInterrupt> {
         self.open_interrupts.iter().find(|i| i.interrupt_id == id)
-    }
-
-    pub fn head_parked(&self) -> bool {
-        self.on(&BranchId::MAIN).active_interrupt_for().is_some()
     }
 
     pub fn branch_interrupt(&self) -> Option<&OpenInterrupt> {
         self.open_interrupts.iter().find(|i| {
             i.anchor.is_some() && self.open_run(&i.branch).is_some() && !self.detached(&i.branch)
         })
-    }
-
-    pub fn projected_status(&self) -> SessionStatus {
-        match self
-            .on(&BranchId::MAIN)
-            .active_interrupt_for()
-            .or_else(|| self.branch_interrupt())
-        {
-            Some(i) => SessionStatus::Interrupted {
-                interrupt_id: i.interrupt_id.clone(),
-                origin: i.origin,
-                reason: i.reason.clone(),
-            },
-            None => self.status.clone(),
-        }
     }
 
     pub fn trigger_anchor(&self, trigger: &Trigger) -> Option<&str> {
@@ -738,63 +647,6 @@ impl SessionState {
         self.limited
             .as_ref()
             .is_some_and(|l| l.open() && l.call.id == id)
-    }
-
-    pub fn anchor_parked(&self, anchor: Option<&str>) -> bool {
-        self.anchor_interrupt(anchor).is_some()
-    }
-
-    /// The interrupt that holds work anchored at `anchor`, if one does.
-    pub fn anchor_interrupt(&self, anchor: Option<&str>) -> Option<&OpenInterrupt> {
-        match anchor {
-            Some(a) if !self.on(&BranchId::MAIN).anchor_on_path(Some(a)) => {
-                self.at(Some(a)).active_interrupt_for()
-            }
-            _ => self.on(&BranchId::MAIN).active_interrupt_for(),
-        }
-    }
-
-    pub fn decision_parked(&self, trigger: &Trigger) -> bool {
-        self.decision_park(trigger).is_some()
-    }
-
-    pub fn decision_park(&self, trigger: &Trigger) -> Option<DecisionPark<'_>> {
-        if let Some(interrupt) = self.decision_park_interrupt(trigger) {
-            return Some(DecisionPark::Interrupt(interrupt));
-        }
-        if let (Some(_), Some(turn)) = (
-            trigger.joining_turn_id(),
-            self.ending().and(self.open_turn()),
-        ) {
-            if !self.head_parked() {
-                return Some(DecisionPark::Turn(turn));
-            }
-        }
-        if trigger.is_join() && self.active_turn_id().is_some() {
-            if let Some((kind, id)) = self.open_work().into_iter().next() {
-                return Some(DecisionPark::Work(kind, id));
-            }
-        }
-        match (trigger.deferred_turn_id(), self.open_turn()) {
-            (Some(turn_id), Some(active)) if active != turn_id => Some(DecisionPark::Turn(active)),
-            _ => None,
-        }
-    }
-
-    fn decision_park_interrupt(&self, trigger: &Trigger) -> Option<&OpenInterrupt> {
-        if matches!(trigger, Trigger::ClientAction { .. }) {
-            return None;
-        }
-        if let Trigger::ClientTranscript { .. } = trigger {
-            return self
-                .at(self.read_point(trigger, &BranchId::MAIN).at.as_deref())
-                .active_interrupt_for();
-        }
-        let at = match self.trigger_anchor(trigger) {
-            Some(a) if !self.on(&BranchId::MAIN).anchor_on_path(Some(a)) => self.at(Some(a)),
-            _ => self.on(&BranchId::MAIN),
-        };
-        at.active_interrupt_for()
     }
 
     pub fn queued_subagent_notice(&self) -> Option<QueuedNotice<'_>> {
@@ -887,14 +739,6 @@ impl SessionState {
             .filter(move |e| e.tracking.status == status)
     }
 
-    pub fn tool_handler_for(&self, name: &str) -> ToolHandler {
-        self.on(&BranchId::MAIN).tool_handler(name)
-    }
-
-    pub fn connector_tool_for(&self, name: &str) -> Option<ConnectorTool> {
-        self.on(&BranchId::MAIN).connector_tool(name)
-    }
-
     pub fn connector_tools_for_config(&self, config: &AgentConfig) -> filter::Merged {
         let servers = self.servers_for(config);
         let may_spawn = config.may_spawn_subagent(self.depth());
@@ -952,6 +796,94 @@ impl SessionState {
         filter::merge(resolutions, taken)
     }
 
+    pub fn skill_call(&self, tool_call_id: &str) -> Option<SkillCall> {
+        let effect = self.effect(EffectKind::ToolCall, tool_call_id)?;
+        let tc = effect.tool()?;
+        let ConnectorTarget::Skill { plugin, .. } = tc.target.as_ref()? else {
+            return None;
+        };
+        Some(SkillCall {
+            node: effect.asked_at.clone(),
+            plugin_id: plugin.clone(),
+            arguments: tc.arguments.clone(),
+            scripted: tc.script.is_some(),
+        })
+    }
+
+    pub(crate) fn anchored_on(
+        path: &std::collections::HashSet<String>,
+        anchor: Option<&str>,
+    ) -> bool {
+        anchor.is_none_or(|a| path.contains(a))
+    }
+
+    pub fn depth(&self) -> u32 {
+        self.ancestry.len() as u32
+    }
+
+    pub fn servers_for(&self, config: &AgentConfig) -> Vec<BoundServer> {
+        let plugin_servers = config
+            .plugins
+            .iter()
+            .flat_map(|p| p.servers.iter().map(|name| p.server(name)));
+        config
+            .mcp
+            .iter()
+            .map(McpServer::bind)
+            .chain(plugin_servers)
+            .collect()
+    }
+
+    pub fn waiting_on_client(&self) -> bool {
+        waiting_on_client(&self.effects())
+    }
+}
+
+/// Whether the only open calls wait on the client. A `run_code` call only
+/// waits on the calls its script made, so it does not count.
+pub fn waiting_on_client(calls: &[Effect]) -> bool {
+    let mut open = calls
+        .iter()
+        .filter(|c| c.name.as_deref() != Some(RUN_CODE))
+        .peekable();
+    open.peek().is_some() && open.all(|c| c.handler == Some(Handler::Client))
+}
+
+impl View {
+    pub fn node_branch(&self, id: &str) -> BranchId {
+        BranchId::from(
+            self.tree
+                .get(id)
+                .and_then(|n| n.branch().map(str::to_string)),
+        )
+    }
+
+    /// The interrupt that holds work anchored at `anchor`, if one does.
+    pub fn anchor_interrupt(&self, anchor: Option<&str>) -> Option<&OpenInterrupt> {
+        match anchor {
+            Some(a) if !self.on(&BranchId::MAIN).anchor_on_path(Some(a)) => {
+                self.at(Some(a)).active_interrupt_for()
+            }
+            _ => self.on(&BranchId::MAIN).active_interrupt_for(),
+        }
+    }
+
+    fn decision_park_interrupt(&self, trigger: &Trigger) -> Option<&OpenInterrupt> {
+        if matches!(trigger, Trigger::ClientAction { .. }) {
+            return None;
+        }
+        if let Trigger::ClientTranscript { .. } = trigger {
+            return self
+                .at(self.read_point(trigger, &BranchId::MAIN).at.as_deref())
+                .active_interrupt_for();
+        }
+        let at = match self.trigger_anchor(trigger) {
+            Some(a) if !self.on(&BranchId::MAIN).anchor_on_path(Some(a)) => self.at(Some(a)),
+            _ => self.on(&BranchId::MAIN),
+        };
+        at.active_interrupt_for()
+    }
+
     pub fn local_connector_answer(&self, tool_call_id: &str) -> Option<StoredResult> {
         let effect = self.effect(EffectKind::ToolCall, tool_call_id)?;
         let node = effect.asked_at.clone();
@@ -982,6 +914,134 @@ impl SessionState {
         }
         super::engine_tools::answer(at, target.kind(), &tc.arguments)
     }
+}
+
+impl View {
+    pub fn parallel_branches(&self) -> bool {
+        self.on(&BranchId::MAIN)
+            .config()
+            .and_then(|c| c.parallel_branches)
+            .unwrap_or(false)
+    }
+
+    pub fn check_invariants(&self) -> Result<(), String> {
+        let mut lanes: BTreeMap<BranchId, usize> = BTreeMap::new();
+        for e in self
+            .effects_of(EffectKind::Decision)
+            .filter(|e| e.tracking.status == EffectStatus::Pending)
+        {
+            *lanes.entry(self.lane(&e.branch)).or_default() += 1;
+        }
+        if lanes.values().any(|n| *n > 1) {
+            return Err(format!("decision slot violated: {lanes:?} live decisions"));
+        }
+        if self
+            .effects_of(EffectKind::Decision)
+            .filter(|e| e.tracking.status == EffectStatus::Pending)
+            .filter_map(|e| e.decision())
+            .any(|d| self.on(&d.branch).has_pending_connector_sync())
+        {
+            return Err(
+                "a decision is live while a fetch its config owes is in flight".to_string(),
+            );
+        }
+        let queued_statuses = self
+            .effects
+            .values()
+            .filter(|e| e.kind() != EffectKind::ConnectorSync)
+            .filter(|e| e.tracking.status == EffectStatus::Queued)
+            .count();
+        let effect_entries = self
+            .schedule_queue
+            .iter()
+            .filter(|e| e.kind != EffectKind::TurnEnd)
+            .count();
+        if queued_statuses != effect_entries {
+            return Err(format!(
+                "queue ({effect_entries}) and Queued statuses ({queued_statuses}) disagree"
+            ));
+        }
+        let turn_ends = self
+            .schedule_queue
+            .iter()
+            .filter(|e| e.kind == EffectKind::TurnEnd)
+            .count();
+        if turn_ends > usize::from(self.ending().is_some()) {
+            return Err("a TurnEnd entry exists without a finalizing turn".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn head_parked(&self) -> bool {
+        self.on(&BranchId::MAIN).active_interrupt_for().is_some()
+    }
+
+    pub fn projected_status(&self) -> SessionStatus {
+        match self
+            .on(&BranchId::MAIN)
+            .active_interrupt_for()
+            .or_else(|| self.branch_interrupt())
+        {
+            Some(i) => SessionStatus::Interrupted {
+                interrupt_id: i.interrupt_id.clone(),
+                origin: i.origin,
+                reason: i.reason.clone(),
+            },
+            None => self.status.clone(),
+        }
+    }
+
+    pub fn anchor_parked(&self, anchor: Option<&str>) -> bool {
+        self.anchor_interrupt(anchor).is_some()
+    }
+
+    pub fn decision_park(&self, trigger: &Trigger) -> Option<DecisionPark<'_>> {
+        if let Some(interrupt) = self.decision_park_interrupt(trigger) {
+            return Some(DecisionPark::Interrupt(interrupt));
+        }
+        if let (Some(_), Some(turn)) = (
+            trigger.joining_turn_id(),
+            self.ending().and(self.open_turn()),
+        ) {
+            if !self.head_parked() {
+                return Some(DecisionPark::Turn(turn));
+            }
+        }
+        if trigger.is_join() && self.active_turn_id().is_some() {
+            if let Some((kind, id)) = self.open_work().into_iter().next() {
+                return Some(DecisionPark::Work(kind, id));
+            }
+        }
+        match (trigger.deferred_turn_id(), self.open_turn()) {
+            (Some(turn_id), Some(active)) if active != turn_id => Some(DecisionPark::Turn(active)),
+            _ => None,
+        }
+    }
+
+    pub fn tool_handler_for(&self, name: &str) -> ToolHandler {
+        self.on(&BranchId::MAIN).tool_handler(name)
+    }
+
+    pub fn connector_tool_for(&self, name: &str) -> Option<ConnectorTool> {
+        self.on(&BranchId::MAIN).connector_tool(name)
+    }
+
+    pub fn retry_config(&self) -> Option<RetryConfig> {
+        self.on(&BranchId::MAIN).retry_config()
+    }
+}
+
+impl View {
+    pub fn lane(&self, branch: &BranchId) -> BranchId {
+        match self.parallel_branches() {
+            true => branch.clone(),
+            false => BranchId::MAIN,
+        }
+    }
+
+    pub fn decision_parked(&self, trigger: &Trigger) -> bool {
+        self.decision_park(trigger).is_some()
+    }
 
     pub fn attachment_call(&self, tool_call_id: &str) -> Option<crate::attachments::tools::Call> {
         let effect = self.effect(EffectKind::ToolCall, tool_call_id)?;
@@ -997,52 +1057,6 @@ impl SessionState {
                 effect.asked_at.as_deref(),
             ),
         })
-    }
-
-    pub fn skill_call(&self, tool_call_id: &str) -> Option<SkillCall> {
-        let effect = self.effect(EffectKind::ToolCall, tool_call_id)?;
-        let tc = effect.tool()?;
-        let ConnectorTarget::Skill { plugin, .. } = tc.target.as_ref()? else {
-            return None;
-        };
-        Some(SkillCall {
-            node: effect.asked_at.clone(),
-            plugin_id: plugin.clone(),
-            arguments: tc.arguments.clone(),
-            scripted: tc.script.is_some(),
-        })
-    }
-
-    pub(crate) fn anchored_on(
-        path: &std::collections::HashSet<String>,
-        anchor: Option<&str>,
-    ) -> bool {
-        anchor.is_none_or(|a| path.contains(a))
-    }
-
-    pub fn retry_config(&self) -> Option<RetryConfig> {
-        self.on(&BranchId::MAIN).retry_config()
-    }
-
-    pub fn depth(&self) -> u32 {
-        self.ancestry.len() as u32
-    }
-
-    pub fn servers_for(&self, config: &AgentConfig) -> Vec<BoundServer> {
-        let plugin_servers = config
-            .plugins
-            .iter()
-            .flat_map(|p| p.servers.iter().map(|name| p.server(name)));
-        config
-            .mcp
-            .iter()
-            .map(McpServer::bind)
-            .chain(plugin_servers)
-            .collect()
-    }
-
-    pub fn waiting_on_client(&self) -> bool {
-        waiting_on_client(&self.effects())
     }
 
     pub fn event_meta(&self, now: DateTime<Utc>) -> EventMeta {
@@ -1094,14 +1108,4 @@ impl SessionState {
             decisions,
         }
     }
-}
-
-/// Whether the only open calls wait on the client. A `run_code` call only
-/// waits on the calls its script made, so it does not count.
-pub fn waiting_on_client(calls: &[Effect]) -> bool {
-    let mut open = calls
-        .iter()
-        .filter(|c| c.name.as_deref() != Some(RUN_CODE))
-        .peekable();
-    open.peek().is_some() && open.all(|c| c.handler == Some(Handler::Client))
 }

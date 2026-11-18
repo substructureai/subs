@@ -8,6 +8,7 @@ use crate::protocol::{
     RetryPolicy, Role, StoredContent,
 };
 use crate::schedule::Dep;
+use crate::state::View;
 use crate::state::{BranchId, EffectKind, QueueEntry, SessionState};
 use crate::Caller;
 
@@ -123,7 +124,7 @@ impl KindSpec for LlmSpec {
         })
     }
 
-    fn deps(&self, state: &SessionState, entry: &QueueEntry) -> Vec<Dep> {
+    fn deps(&self, state: &View, entry: &QueueEntry) -> Vec<Dep> {
         let effect = state.effect(EffectKind::LlmCall, &entry.id);
         if let Some(branch) = effect.map(|e| &e.branch).filter(|b| !b.is_main()) {
             return super::connector::owed(state.on(branch));

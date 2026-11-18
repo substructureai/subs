@@ -6,6 +6,7 @@ use crate::protocol::{
     AgentConfig, BranchMode, BranchRequest, Content, ContextConfig, ContextReason, ContextStrategy,
     ContextStrategyKind, DecisionAction, DraftMessage, HeldCall, LlmRequest, Message, Role,
 };
+use crate::state::View;
 use crate::state::{BranchId, EffectKind, SessionState};
 
 pub const RESERVE_TOKENS: u64 = 16_000;
@@ -105,7 +106,7 @@ pub fn strategy(config: Option<&AgentConfig>, kind: ContextStrategyKind) -> Cont
         })
 }
 
-fn held(state: &SessionState, call: &HeldCall) -> HeldCall {
+fn held(state: &View, call: &HeldCall) -> HeldCall {
     let placing = state.on(&BranchId::MAIN).place(&call.id);
     HeldCall {
         request: LlmRequest {
@@ -116,7 +117,7 @@ fn held(state: &SessionState, call: &HeldCall) -> HeldCall {
     }
 }
 
-pub fn limit(state: &SessionState, call: &HeldCall, now: DateTime<Utc>) -> Option<ContextLimited> {
+pub fn limit(state: &View, call: &HeldCall, now: DateTime<Utc>) -> Option<ContextLimited> {
     let passes = state
         .limited
         .as_ref()
@@ -149,7 +150,7 @@ pub fn limit(state: &SessionState, call: &HeldCall, now: DateTime<Utc>) -> Optio
     })
 }
 
-pub fn overflow(state: &SessionState, id: &str) -> Option<ContextLimited> {
+pub fn overflow(state: &View, id: &str) -> Option<ContextLimited> {
     if state
         .limited
         .as_ref()
@@ -275,7 +276,7 @@ fn tail(text: String, chars: Option<usize>) -> String {
     prompts::left_out(&text[skip..])
 }
 
-pub fn summary_size(state: &SessionState, id: &str) -> usize {
+pub fn summary_size(state: &View, id: &str) -> usize {
     let chars = |path: &[Message]| path.iter().map(|m| text(m).chars().count()).sum();
     let key = BranchId::from(id);
     let leaf = match state.branches.contains_key(&key) {

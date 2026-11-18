@@ -7,6 +7,7 @@ use crate::protocol::{AgentConfig, RetryPolicy};
 use crate::retry::RetryTarget;
 use crate::schedule::Dep;
 use crate::state::EffectTracking;
+use crate::state::View;
 use crate::state::{At, BranchId, EffectKind, SessionState};
 
 pub struct ConnectorSpec;
@@ -155,7 +156,9 @@ fn report_failure(
     }
 }
 
-impl SessionState {
+impl SessionState {}
+
+impl View {
     fn report_filter(
         &self,
         connection_id: &ConnectionPath,

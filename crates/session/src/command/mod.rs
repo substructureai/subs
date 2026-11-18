@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use crate::state::View;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 
@@ -375,33 +376,6 @@ impl SessionState {
             .collect()
     }
 
-    fn void_stranded_work(&self, scope: &BranchId) -> Vec<EventPayload> {
-        let path = self
-            .leaf(scope)
-            .map(|n| self.path_ids(n))
-            .unwrap_or_default();
-        let on_path = |anchor: Option<&str>| SessionState::anchored_on(&path, anchor);
-        let mut events = self.void_effects_where(|e| {
-            e.branch == *scope
-                && crate::effects::stops(e.kind(), &e.tracking)
-                && !on_path(e.asked_at.as_deref())
-        });
-        for e in self.effects_of(EffectKind::Decision) {
-            let Some(wd) = e.decision() else { continue };
-            if wd.branch == *scope
-                && matches!(
-                    e.tracking.status(),
-                    EffectStatus::Queued | EffectStatus::RetryScheduled
-                )
-                && !on_path(self.trigger_anchor(&wd.trigger))
-            {
-                events.push(self.decision_dropped(&e.id));
-            }
-        }
-        events.extend(self.void_stranded_branches(scope));
-        events
-    }
-
     fn finish_turn_events(
         &self,
         ids: &Ids,
@@ -424,7 +398,7 @@ impl SessionState {
 }
 
 pub struct Working {
-    state: SessionState,
+    state: View,
     ids: Ids,
     seq: u64,
     now: DateTime<Utc>,
@@ -436,14 +410,14 @@ pub struct Working {
 }
 
 impl std::ops::Deref for Working {
-    type Target = SessionState;
-    fn deref(&self) -> &SessionState {
+    type Target = View;
+    fn deref(&self) -> &View {
         &self.state
     }
 }
 
 impl Working {
-    pub fn new(state: SessionState, seq: u64, now: DateTime<Utc>) -> Self {
+    pub fn new(state: View, seq: u64, now: DateTime<Utc>) -> Self {
         let ids = Ids::new(&state.session_id, seq, now);
         Self {
             state,
@@ -521,7 +495,7 @@ impl Working {
             .filter(|t| *t == waiting.turn_id && self.active_turn_id().is_some())
     }
 
-    pub fn finish(self) -> (SessionState, Vec<(EventPayload, EventMeta)>) {
+    pub fn finish(self) -> (View, Vec<(EventPayload, EventMeta)>) {
         (self.state, self.events)
     }
 
@@ -1450,6 +1424,35 @@ pub mod branch;
 mod context;
 mod delivery;
 pub(crate) mod transcript;
+
+impl View {
+    fn void_stranded_work(&self, scope: &BranchId) -> Vec<EventPayload> {
+        let path = self
+            .leaf(scope)
+            .map(|n| self.path_ids(n))
+            .unwrap_or_default();
+        let on_path = |anchor: Option<&str>| SessionState::anchored_on(&path, anchor);
+        let mut events = self.void_effects_where(|e| {
+            e.branch == *scope
+                && crate::effects::stops(e.kind(), &e.tracking)
+                && !on_path(e.asked_at.as_deref())
+        });
+        for e in self.effects_of(EffectKind::Decision) {
+            let Some(wd) = e.decision() else { continue };
+            if wd.branch == *scope
+                && matches!(
+                    e.tracking.status(),
+                    EffectStatus::Queued | EffectStatus::RetryScheduled
+                )
+                && !on_path(self.trigger_anchor(&wd.trigger))
+            {
+                events.push(self.decision_dropped(&e.id));
+            }
+        }
+        events.extend(self.void_stranded_branches(scope));
+        events
+    }
+}
 
 #[cfg(test)]
 mod tests;

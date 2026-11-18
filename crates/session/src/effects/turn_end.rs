@@ -11,6 +11,7 @@ use crate::protocol::{
     ResumeStatus, Role,
 };
 use crate::schedule::Dep;
+use crate::state::View;
 use crate::state::{BranchId, EffectKind, SessionState, Turn};
 
 pub struct TurnEndSpec;
@@ -28,7 +29,7 @@ impl KindSpec for TurnEndSpec {
         false
     }
 
-    fn park(&self, state: &SessionState, _id: &str) -> Option<Dep> {
+    fn park(&self, state: &View, _id: &str) -> Option<Dep> {
         let (kind, id) = state.open_work().into_iter().next()?;
         Some(match kind {
             EffectKind::Decision => Dep::DecisionSettled {
@@ -49,126 +50,6 @@ impl KindSpec for TurnEndSpec {
 pub const CANCELLED_AT_TURN_END: &str = "cancelled: the turn ended";
 
 impl SessionState {
-    pub fn close_open_calls(&self, ids: &Ids, answering: Option<&Trigger>) -> Vec<EventPayload> {
-        let at = self.on(&BranchId::MAIN);
-        let transcript = at.transcript();
-        let answered: HashSet<&str> = transcript
-            .iter()
-            .filter_map(|m| m.tool_call_id.as_deref())
-            .collect();
-        let settled: HashMap<&str, Content> = self
-            .effects_of(EffectKind::Decision)
-            .filter_map(|e| e.decision().map(|d| &d.trigger))
-            .chain(answering)
-            .filter_map(|trigger| match trigger {
-                Trigger::ToolFinished {
-                    id,
-                    ok,
-                    result,
-                    error,
-                    ..
-                } => Some((id.as_str(), settled_content(*ok, result, error))),
-                Trigger::SubagentFinished {
-                    id,
-                    ok,
-                    session_id,
-                    result,
-                    error,
-                    ..
-                } => Some((
-                    id.as_str(),
-                    Content::Text(subagent_text(*ok, session_id, result, error)),
-                )),
-                _ => None,
-            })
-            .collect();
-        let mut events = Vec::new();
-        let mut parent = self.leaf(&BranchId::MAIN).map(str::to_string);
-        let mut closed = HashSet::new();
-        for call in transcript.iter().flat_map(|m| &m.tool_calls) {
-            if answered.contains(call.id.as_str()) || !closed.insert(call.id.clone()) {
-                continue;
-            }
-            let content = settled
-                .get(call.id.as_str())
-                .cloned()
-                .unwrap_or_else(|| Content::Text(CANCELLED_AT_TURN_END.to_string()));
-            let message = DraftMessage {
-                id: None,
-                role: Role::Tool,
-                content: Some(content),
-                tool_calls: None,
-                tool_call_id: Some(call.id.clone()),
-                name: Some(call.function.name.clone()),
-                reasoning: None,
-            }
-            .record(ids);
-            let id = message.id.clone();
-            events.push(EventPayload::NewMessage(NewMessage {
-                message,
-                parent_id: parent.replace(id),
-                copied_from: None,
-                branch: None,
-            }));
-        }
-        let voided: Vec<(EffectKind, String)> = self
-            .effects
-            .values()
-            .filter(|e| {
-                matches!(
-                    e.kind(),
-                    EffectKind::ToolCall
-                        | EffectKind::Subagent
-                        | EffectKind::LlmCall
-                        | EffectKind::System1Call
-                )
-            })
-            .filter(|e| e.branch.is_main())
-            .filter(|e| closed.contains(&e.id) || at.anchor_on_path(e.asked_at.as_deref()))
-            .filter(|e| e.tracking.is_unsettled())
-            .map(|e| (e.kind(), e.id.clone()))
-            .collect();
-        let gone = |kind: EffectKind, id: &str| {
-            closed.contains(id) || voided.iter().any(|(k, v)| *k == kind && v == id)
-        };
-        for e in self.effects_of(EffectKind::Decision) {
-            let Some(d) = e.decision() else { continue };
-            let about = match &d.trigger {
-                Trigger::ToolExecute { id, .. }
-                | Trigger::ToolFinished { id, .. }
-                | Trigger::CodemodeCalls { id, .. } => gone(EffectKind::ToolCall, id),
-                Trigger::SubagentFinished { id, .. } => gone(EffectKind::Subagent, id),
-                Trigger::LlmExecute { id, .. } | Trigger::LlmFinished { id, .. } => {
-                    gone(EffectKind::LlmCall, id)
-                }
-                Trigger::System1Finished { id, .. } => gone(EffectKind::System1Call, id),
-                _ => false,
-            };
-            if about
-                && matches!(
-                    e.tracking.status(),
-                    EffectStatus::Queued | EffectStatus::RetryScheduled
-                )
-            {
-                events.push(self.decision_dropped(&e.id));
-            }
-        }
-        events.extend(
-            voided
-                .into_iter()
-                .map(|(kind, id)| EventPayload::CallVoided(CallVoided { kind, id })),
-        );
-        events
-    }
-
-    pub fn quiet_turn_ended(&self) -> bool {
-        self.turn
-            .as_ref()
-            .is_some_and(|t| t.quiet_end && t.ending.is_none())
-            && !self.head_parked()
-            && !self.has_open_work()
-    }
-
     pub fn has_open_work(&self) -> bool {
         !self.open_work().is_empty()
     }
@@ -286,4 +167,128 @@ fn completed(turn: &Turn, error: Option<&ErrorInfo>) -> EventPayload {
         turn_started_at: Some(turn.started_at),
         error: error.cloned(),
     })
+}
+
+impl View {
+    pub fn close_open_calls(&self, ids: &Ids, answering: Option<&Trigger>) -> Vec<EventPayload> {
+        let at = self.on(&BranchId::MAIN);
+        let transcript = at.transcript();
+        let answered: HashSet<&str> = transcript
+            .iter()
+            .filter_map(|m| m.tool_call_id.as_deref())
+            .collect();
+        let settled: HashMap<&str, Content> = self
+            .effects_of(EffectKind::Decision)
+            .filter_map(|e| e.decision().map(|d| &d.trigger))
+            .chain(answering)
+            .filter_map(|trigger| match trigger {
+                Trigger::ToolFinished {
+                    id,
+                    ok,
+                    result,
+                    error,
+                    ..
+                } => Some((id.as_str(), settled_content(*ok, result, error))),
+                Trigger::SubagentFinished {
+                    id,
+                    ok,
+                    session_id,
+                    result,
+                    error,
+                    ..
+                } => Some((
+                    id.as_str(),
+                    Content::Text(subagent_text(*ok, session_id, result, error)),
+                )),
+                _ => None,
+            })
+            .collect();
+        let mut events = Vec::new();
+        let mut parent = self.leaf(&BranchId::MAIN).map(str::to_string);
+        let mut closed = HashSet::new();
+        for call in transcript.iter().flat_map(|m| &m.tool_calls) {
+            if answered.contains(call.id.as_str()) || !closed.insert(call.id.clone()) {
+                continue;
+            }
+            let content = settled
+                .get(call.id.as_str())
+                .cloned()
+                .unwrap_or_else(|| Content::Text(CANCELLED_AT_TURN_END.to_string()));
+            let message = DraftMessage {
+                id: None,
+                role: Role::Tool,
+                content: Some(content),
+                tool_calls: None,
+                tool_call_id: Some(call.id.clone()),
+                name: Some(call.function.name.clone()),
+                reasoning: None,
+            }
+            .record(ids);
+            let id = message.id.clone();
+            events.push(EventPayload::NewMessage(NewMessage {
+                message,
+                parent_id: parent.replace(id),
+                copied_from: None,
+                branch: None,
+            }));
+        }
+        let voided: Vec<(EffectKind, String)> = self
+            .effects
+            .values()
+            .filter(|e| {
+                matches!(
+                    e.kind(),
+                    EffectKind::ToolCall
+                        | EffectKind::Subagent
+                        | EffectKind::LlmCall
+                        | EffectKind::System1Call
+                )
+            })
+            .filter(|e| e.branch.is_main())
+            .filter(|e| closed.contains(&e.id) || at.anchor_on_path(e.asked_at.as_deref()))
+            .filter(|e| e.tracking.is_unsettled())
+            .map(|e| (e.kind(), e.id.clone()))
+            .collect();
+        let gone = |kind: EffectKind, id: &str| {
+            closed.contains(id) || voided.iter().any(|(k, v)| *k == kind && v == id)
+        };
+        for e in self.effects_of(EffectKind::Decision) {
+            let Some(d) = e.decision() else { continue };
+            let about = match &d.trigger {
+                Trigger::ToolExecute { id, .. }
+                | Trigger::ToolFinished { id, .. }
+                | Trigger::CodemodeCalls { id, .. } => gone(EffectKind::ToolCall, id),
+                Trigger::SubagentFinished { id, .. } => gone(EffectKind::Subagent, id),
+                Trigger::LlmExecute { id, .. } | Trigger::LlmFinished { id, .. } => {
+                    gone(EffectKind::LlmCall, id)
+                }
+                Trigger::System1Finished { id, .. } => gone(EffectKind::System1Call, id),
+                _ => false,
+            };
+            if about
+                && matches!(
+                    e.tracking.status(),
+                    EffectStatus::Queued | EffectStatus::RetryScheduled
+                )
+            {
+                events.push(self.decision_dropped(&e.id));
+            }
+        }
+        events.extend(
+            voided
+                .into_iter()
+                .map(|(kind, id)| EventPayload::CallVoided(CallVoided { kind, id })),
+        );
+        events
+    }
+}
+
+impl View {
+    pub fn quiet_turn_ended(&self) -> bool {
+        self.turn
+            .as_ref()
+            .is_some_and(|t| t.quiet_end && t.ending.is_none())
+            && !self.head_parked()
+            && !self.has_open_work()
+    }
 }

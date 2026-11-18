@@ -217,7 +217,7 @@ impl Trace {
             agg: Session::with_state(
                 "sess-1".to_string(),
                 TENANT.to_string(),
-                SessionState::new("sess-1".to_string()),
+                View::new("sess-1".to_string()),
             ),
             names: Vec::new(),
             started: Vec::new(),

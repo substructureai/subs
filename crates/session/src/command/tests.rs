@@ -107,7 +107,7 @@ fn create_session_with_config(
     let mut agg = Session::with_state(
         session_id.to_string(),
         tenant_id.to_string(),
-        SessionState::new(session_id.to_string()),
+        View::new(session_id.to_string()),
     );
     let events = dispatch(
         &mut agg,
@@ -2956,7 +2956,7 @@ fn the_default_depth_limit_stops_a_spawn_five_deep() {
     let mut agg = Session::with_state(
         "sess-4".to_string(),
         "tenant-a".to_string(),
-        SessionState::new("sess-4".to_string()),
+        View::new("sess-4".to_string()),
     );
     dispatch(
         &mut agg,
@@ -5649,7 +5649,7 @@ fn frontend_caller_with_mismatched_tenant_on_create_session_is_denied() {
     let agg = Session::with_state(
         session_id.clone(),
         "tenant-a".to_string(),
-        SessionState::new(session_id),
+        View::new(session_id),
     );
 
     let caller = Caller::Frontend {
@@ -5692,7 +5692,7 @@ fn a_session_opens_with_the_config_its_creation_carries() {
     let mut agg = Session::with_state(
         "sess-1".to_string(),
         "tenant-a".to_string(),
-        SessionState::new("sess-1".to_string()),
+        View::new("sess-1".to_string()),
     );
     let events = dispatch(
         &mut agg,
@@ -5732,7 +5732,7 @@ fn a_session_records_the_worker_its_creation_names() {
     let mut agg = Session::with_state(
         "sess-1".to_string(),
         "tenant-a".to_string(),
-        SessionState::new("sess-1".to_string()),
+        View::new("sess-1".to_string()),
     );
     let named = crate::protocol::WorkerRef {
         id: "customers".to_string(),
@@ -5764,7 +5764,7 @@ fn a_session_records_the_worker_its_creation_names() {
     let err = Session::with_state(
         "sess-2".to_string(),
         "tenant-a".to_string(),
-        SessionState::new("sess-2".to_string()),
+        View::new("sess-2".to_string()),
     )
     .try_handle(
         CommandPayload::CreateSession {
@@ -5792,7 +5792,7 @@ fn a_session_records_the_worker_its_creation_names() {
     let mut agg = Session::with_state(
         "sess-3".to_string(),
         "tenant-a".to_string(),
-        SessionState::new("sess-3".to_string()),
+        View::new("sess-3".to_string()),
     );
     let bare = crate::protocol::WorkerRef {
         id: "customers".to_string(),
@@ -5831,7 +5831,7 @@ fn a_frontend_cannot_open_a_session_with_its_own_config() {
     let agg = Session::with_state(
         "sess-1".to_string(),
         "tenant-a".to_string(),
-        SessionState::new("sess-1".to_string()),
+        View::new("sess-1".to_string()),
     );
     let err = agg
         .try_handle(
@@ -6671,7 +6671,7 @@ fn create_session_with_retry(retry: RetryPolicy) -> Session {
     let mut agg = Session::with_state(
         "sess-1".to_string(),
         "tenant-a".to_string(),
-        SessionState::new("sess-1".to_string()),
+        View::new("sess-1".to_string()),
     );
     dispatch(
         &mut agg,
@@ -9872,7 +9872,7 @@ fn create_session_emits_session_start_before_client_input() {
     let mut agg = Session::with_state(
         "sess-1".to_string(),
         "tenant-a".to_string(),
-        SessionState::new("sess-1".to_string()),
+        View::new("sess-1".to_string()),
     );
     let events = dispatch(
         &mut agg,
@@ -9913,7 +9913,7 @@ fn create_session_writes_seeded_state_before_session_start() {
     let mut agg = Session::with_state(
         "sess-1".to_string(),
         "tenant-a".to_string(),
-        SessionState::new("sess-1".to_string()),
+        View::new("sess-1".to_string()),
     );
     let events = dispatch(
         &mut agg,
@@ -9960,7 +9960,7 @@ fn create_session_without_a_seed_writes_no_state() {
     let mut agg = Session::with_state(
         "sess-1".to_string(),
         "tenant-a".to_string(),
-        SessionState::new("sess-1".to_string()),
+        View::new("sess-1".to_string()),
     );
     let events = dispatch(
         &mut agg,
@@ -9995,7 +9995,7 @@ fn a_frontend_cannot_seed_state() {
     let agg = Session::with_state(
         "sess-1".to_string(),
         "tenant-a".to_string(),
-        SessionState::new("sess-1".to_string()),
+        View::new("sess-1".to_string()),
     );
     let owner = SessionOwner {
         tenant_id: "tenant-a".to_string(),
@@ -10032,7 +10032,7 @@ fn session_start_config_is_visible_to_a_queued_client_decision() {
     let mut agg = Session::with_state(
         "sess-1".to_string(),
         "tenant-a".to_string(),
-        SessionState::new("sess-1".to_string()),
+        View::new("sess-1".to_string()),
     );
     dispatch(
         &mut agg,
@@ -10119,7 +10119,7 @@ fn client_message_parks_while_session_start_retry_is_scheduled() {
     let mut agg = Session::with_state(
         "sess-1".to_string(),
         "tenant-a".to_string(),
-        SessionState::new("sess-1".to_string()),
+        View::new("sess-1".to_string()),
     );
     let created = dispatch(
         &mut agg,
@@ -10250,7 +10250,7 @@ fn terminal_session_start_failure_restarts_on_the_next_message() {
     let mut agg = Session::with_state(
         "sess-1".to_string(),
         "tenant-a".to_string(),
-        SessionState::new("sess-1".to_string()),
+        View::new("sess-1".to_string()),
     );
     let created = dispatch(
         &mut agg,
@@ -11242,7 +11242,7 @@ fn fork_drops_a_retrying_settle_decision() {
     let mut agg = Session::with_state(
         "sess-1".to_string(),
         "tenant-a".to_string(),
-        SessionState::new("sess-1".to_string()),
+        View::new("sess-1".to_string()),
     );
     dispatch(
         &mut agg,
@@ -11887,7 +11887,7 @@ fn escape_decision_retry_fires_while_the_head_is_parked() {
     let mut agg = Session::with_state(
         "sess-1".to_string(),
         "tenant-a".to_string(),
-        SessionState::new("sess-1".to_string()),
+        View::new("sess-1".to_string()),
     );
     dispatch(
         &mut agg,
@@ -12523,7 +12523,7 @@ fn an_admin_can_cancel_a_session_and_an_end_user_cannot() {
 
 #[test]
 fn only_a_worker_answers_an_llm_call() {
-    let state = SessionState::new("sess-1".to_string());
+    let state = View::new("sess-1".to_string());
     assert!(matches!(
         state.check_llm_call_caller(None, &machine()),
         Err(SessionError::EffectNotFound)
@@ -12550,7 +12550,7 @@ fn an_admin_is_bound_to_its_tenant() {
 
 #[test]
 fn an_admin_does_not_answer_to_a_session_owner() {
-    let state = SessionState::new("sess-1".to_string());
+    let state = View::new("sess-1".to_string());
     assert!(state.ensure_owns_session(&admin()).is_ok());
 }
 

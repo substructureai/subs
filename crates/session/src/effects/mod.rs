@@ -144,11 +144,11 @@ pub trait KindSpec: Sync {
         false
     }
 
-    fn park(&self, _state: &SessionState, _id: &str) -> Option<Dep> {
+    fn park(&self, _state: &crate::state::View, _id: &str) -> Option<Dep> {
         None
     }
 
-    fn deps(&self, _state: &SessionState, _entry: &QueueEntry) -> Vec<Dep> {
+    fn deps(&self, _state: &crate::state::View, _entry: &QueueEntry) -> Vec<Dep> {
         Vec::new()
     }
 }

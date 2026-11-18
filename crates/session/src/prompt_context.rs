@@ -380,10 +380,11 @@ mod tests {
         AgentConfig, AgentPlugin, ErrorCode, ErrorInfo, McpServer, McpToolSyncFailure, RetryPolicy,
         SkillMeta, StoredContent,
     };
+    use crate::state::ApplyContext;
     use crate::state::BranchId;
-    use crate::state::{ApplyContext, SessionState};
+    use crate::state::View;
 
-    fn apply(state: &mut SessionState, seq: u64, payload: EventPayload) {
+    fn apply(state: &mut View, seq: u64, payload: EventPayload) {
         state.apply(
             &payload,
             &ApplyContext {
@@ -393,8 +394,8 @@ mod tests {
         );
     }
 
-    fn plugin_state(settled: bool) -> SessionState {
-        let mut s = SessionState::new("sess-1".to_string());
+    fn plugin_state(settled: bool) -> View {
+        let mut s = View::new("sess-1".to_string());
         apply(
             &mut s,
             1,
@@ -470,7 +471,7 @@ mod tests {
         s
     }
 
-    fn owed_ids(state: &SessionState) -> Vec<String> {
+    fn owed_ids(state: &View) -> Vec<String> {
         owed(state.on(&BranchId::MAIN))
             .into_iter()
             .map(|c| c.id)
@@ -481,8 +482,8 @@ mod tests {
         ConnectionPath::parse("mcp.sentry").expect("path")
     }
 
-    fn failed_state(policy: McpToolSyncFailure, auth: Option<AuthNeed>) -> SessionState {
-        let mut s = SessionState::new("sess-1".to_string());
+    fn failed_state(policy: McpToolSyncFailure, auth: Option<AuthNeed>) -> View {
+        let mut s = View::new("sess-1".to_string());
         apply(
             &mut s,
             1,
@@ -830,7 +831,7 @@ mod tests {
         (prompt, placed)
     }
 
-    fn request_and_send(state: &mut SessionState, seq: u64, id: &str) -> Vec<Message> {
+    fn request_and_send(state: &mut View, seq: u64, id: &str) -> Vec<Message> {
         let request = crate::protocol::LlmRequest {
             model: "m1".to_string(),
             messages: Vec::new(),
@@ -890,7 +891,7 @@ mod tests {
     fn placed_context_survives_a_snapshot() {
         let mut state = plugin_state(true);
         let first = request_and_send(&mut state, 10, "call-1");
-        let mut loaded: SessionState =
+        let mut loaded: View =
             serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
         loaded.tree = state.tree.clone();
         let next = request_and_send(&mut loaded, 20, "call-2");
@@ -1055,7 +1056,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let mut s = SessionState::new("sess-1".to_string());
+        let mut s = View::new("sess-1".to_string());
         apply(
             &mut s,
             1,

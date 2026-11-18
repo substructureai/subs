@@ -6,6 +6,7 @@ use crate::events::*;
 use crate::protocol::EffectStatus;
 use crate::protocol::QueueMode;
 use crate::schedule::Dep;
+use crate::state::View;
 use crate::state::{DecisionPark, EffectKind, QueueEntry, SessionState};
 use crate::Caller;
 
@@ -89,7 +90,7 @@ impl KindSpec for DecisionSpec {
         false
     }
 
-    fn park(&self, state: &SessionState, id: &str) -> Option<Dep> {
+    fn park(&self, state: &View, id: &str) -> Option<Dep> {
         let park = state
             .worker_decision(id)
             .and_then(|d| state.decision_park(&d.trigger))?;
@@ -110,7 +111,7 @@ impl KindSpec for DecisionSpec {
         })
     }
 
-    fn deps(&self, state: &SessionState, entry: &QueueEntry) -> Vec<Dep> {
+    fn deps(&self, state: &View, entry: &QueueEntry) -> Vec<Dep> {
         let lane = state.lane(state.decision_branch(&entry.id));
         let mut deps: Vec<Dep> = state
             .effects_of(EffectKind::Decision)

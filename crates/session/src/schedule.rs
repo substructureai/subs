@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::state::View;
 use chrono::{DateTime, Utc};
 
 use super::decision::Trigger;
@@ -57,7 +58,7 @@ impl ScheduleStep {
     }
 }
 
-pub fn plan(state: &SessionState, now: DateTime<Utc>) -> Vec<ScheduleStep> {
+pub fn plan(state: &View, now: DateTime<Utc>) -> Vec<ScheduleStep> {
     let fetches = owed_fetches(state);
     if !fetches.is_empty() {
         return fetches;
@@ -72,7 +73,7 @@ pub fn plan(state: &SessionState, now: DateTime<Utc>) -> Vec<ScheduleStep> {
     sweep(state, now).into_iter().collect()
 }
 
-fn owed_fetches(state: &SessionState) -> Vec<ScheduleStep> {
+fn owed_fetches(state: &View) -> Vec<ScheduleStep> {
     let mut owed = Vec::new();
     for id in state.branches.keys() {
         for path in state.on(id).unsynced_connectors() {
@@ -101,7 +102,7 @@ fn is_resume_decision(state: &SessionState, entry: &QueueEntry) -> bool {
             .is_some_and(|d| matches!(d.trigger, Trigger::InterruptResumed { .. }))
 }
 
-fn walk(state: &SessionState) -> Vec<ScheduleStep> {
+fn walk(state: &View) -> Vec<ScheduleStep> {
     let mut steps = Vec::new();
     let lanes = |e: &crate::state::EffectState| state.lane(&e.branch);
     let mut taken: std::collections::HashSet<BranchId> = state
@@ -144,7 +145,7 @@ fn step_for(state: &SessionState, entry: &QueueEntry) -> ScheduleStep {
     }
 }
 
-fn sweep(state: &SessionState, now: DateTime<Utc>) -> Option<ScheduleStep> {
+fn sweep(state: &View, now: DateTime<Utc>) -> Option<ScheduleStep> {
     if let Some((kind, id)) = first_timed_out(state, now) {
         return Some(ScheduleStep::TimeOut { kind, id });
     }
@@ -199,7 +200,7 @@ fn first_due_retry(state: &SessionState, now: DateTime<Utc>) -> Option<(EffectKi
     })
 }
 
-fn due_decision(state: &SessionState, now: DateTime<Utc>) -> Option<String> {
+fn due_decision(state: &View, now: DateTime<Utc>) -> Option<String> {
     let mut due: Vec<QueueEntry> = state
         .effects_of(EffectKind::Decision)
         .filter(|e| {
@@ -220,23 +221,23 @@ fn due_decision(state: &SessionState, now: DateTime<Utc>) -> Option<String> {
         .map(|entry| entry.id)
 }
 
-pub fn entry_parked(state: &SessionState, entry: &QueueEntry) -> bool {
+pub fn entry_parked(state: &View, entry: &QueueEntry) -> bool {
     entry_park(state, entry).is_some()
 }
 
-pub fn entry_park(state: &SessionState, entry: &QueueEntry) -> Option<Dep> {
+pub fn entry_park(state: &View, entry: &QueueEntry) -> Option<Dep> {
     entry.kind.spec().park(state, &entry.id)
 }
 
-pub fn entry_blocked(state: &SessionState, entry: &QueueEntry) -> bool {
+pub fn entry_blocked(state: &View, entry: &QueueEntry) -> bool {
     !deps(state, entry).is_empty()
 }
 
-pub fn deps(state: &SessionState, entry: &QueueEntry) -> Vec<Dep> {
+pub fn deps(state: &View, entry: &QueueEntry) -> Vec<Dep> {
     entry.kind.spec().deps(state, entry)
 }
 
-pub fn waiting_on(state: &SessionState) -> HashMap<(EffectKind, String), Vec<String>> {
+pub fn waiting_on(state: &View) -> HashMap<(EffectKind, String), Vec<String>> {
     let mut out = HashMap::new();
     let mut head_of_line: Option<Dep> = None;
     for entry in walk_order(state) {
@@ -261,7 +262,7 @@ pub fn waiting_on(state: &SessionState) -> HashMap<(EffectKind, String), Vec<Str
     out
 }
 
-pub fn wake_at(state: &SessionState, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+pub fn wake_at(state: &View, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     if matches!(state.status, SessionStatus::Done) {
         return None;
     }
@@ -301,8 +302,8 @@ mod tests {
             .with_timezone(&Utc)
     }
 
-    fn state() -> SessionState {
-        let mut s = SessionState::new("sess-1".to_string());
+    fn state() -> View {
+        let mut s = View::new("sess-1".to_string());
         s.status = SessionStatus::Idle;
         s
     }
@@ -328,7 +329,7 @@ mod tests {
         t
     }
 
-    fn queue(s: &mut SessionState, kind: EffectKind, id: &str) {
+    fn queue(s: &mut View, kind: EffectKind, id: &str) {
         let seq = s.schedule_queue.len() as u64 + 1;
         s.schedule_queue.push(QueueEntry {
             seq,
@@ -337,7 +338,7 @@ mod tests {
         });
     }
 
-    fn add_tool(s: &mut SessionState, id: &str, status: EffectStatus) {
+    fn add_tool(s: &mut View, id: &str, status: EffectStatus) {
         s.put_effect(EffectState::new(
             id,
             tracking(status),
@@ -358,7 +359,7 @@ mod tests {
         ));
     }
 
-    fn add_llm(s: &mut SessionState, id: &str, status: EffectStatus) {
+    fn add_llm(s: &mut View, id: &str, status: EffectStatus) {
         s.put_effect(EffectState::new(
             id,
             tracking(status),
@@ -382,7 +383,7 @@ mod tests {
         ));
     }
 
-    fn add_decision(s: &mut SessionState, id: &str, status: EffectStatus, trigger: Trigger) {
+    fn add_decision(s: &mut View, id: &str, status: EffectStatus, trigger: Trigger) {
         let seq = s.effects_of(EffectKind::Decision).count() as u64 + 1;
         s.put_effect(EffectState::new(
             id,
@@ -397,7 +398,7 @@ mod tests {
         ));
     }
 
-    fn add_running_subagent(s: &mut SessionState, id: &str, total: Option<u32>) {
+    fn add_running_subagent(s: &mut View, id: &str, total: Option<u32>) {
         let mut t = EffectTracking::new_queued(RetryPolicy {
             queue_timeout_secs: None,
             run_timeout_secs: None,
@@ -423,7 +424,7 @@ mod tests {
         ));
     }
 
-    fn deadline(s: &mut SessionState, kind: EffectKind, id: &str, at: DateTime<Utc>) {
+    fn deadline(s: &mut View, kind: EffectKind, id: &str, at: DateTime<Utc>) {
         s.effect_mut(kind, id).unwrap().tracking.deadline = Some(at);
     }
 
@@ -462,7 +463,7 @@ mod tests {
         }
     }
 
-    fn set_config(s: &mut SessionState, config: AgentConfig) {
+    fn set_config(s: &mut View, config: AgentConfig) {
         s.seed_config(config);
     }
 

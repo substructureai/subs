@@ -830,6 +830,7 @@ fn appended(transcript: &[Message], message: DraftMessage) -> Vec<DraftMessage> 
 
 #[cfg(test)]
 mod tests {
+    use crate::state::View;
     #[test]
     fn a_stored_block_reaches_the_model_as_a_part() {
         let uri = format!("blob://t1/{}?mime=image%2Fpng&size=5", uuid::Uuid::now_v7());
@@ -876,15 +877,15 @@ mod tests {
     };
     use crate::state::BranchId;
     use crate::state::{
-        ConnectorSyncState, EffectPayload, EffectTracking, LlmCallSpec, SessionState, ToolCallState,
+        ConnectorSyncState, EffectPayload, EffectTracking, LlmCallSpec, ToolCallState,
     };
 
     fn state_of(
         transcript: &[Message],
         llm_calls: &HashMap<String, EffectState>,
         config: Option<&AgentConfig>,
-    ) -> SessionState {
-        let mut s = SessionState::new("sess-1".to_string());
+    ) -> View {
+        let mut s = View::new("sess-1".to_string());
         let mut parent: Option<String> = None;
         if let Some(config) = config {
             s.seed_config(config.clone());
@@ -907,7 +908,7 @@ mod tests {
 
     fn propose_on(
         trigger: &DecisionTrigger,
-        state: &SessionState,
+        state: &View,
         pending_calls: usize,
     ) -> Option<DecisionResponse> {
         super::propose(
@@ -986,7 +987,7 @@ mod tests {
         llm_calls: &HashMap<String, EffectState>,
         config: Option<&AgentConfig>,
         defer: bool,
-    ) -> SessionState {
+    ) -> View {
         let config = with_sentry(config, defer);
         let mut s = state_of(transcript, llm_calls, Some(&config));
         s.put_effect(sentry_sync(ConnectorSyncState {
@@ -2734,7 +2735,7 @@ mod tests {
         );
     }
 
-    fn needing_auth_state(transcript: &[Message], config: Option<&AgentConfig>) -> SessionState {
+    fn needing_auth_state(transcript: &[Message], config: Option<&AgentConfig>) -> View {
         let config = with_sentry(config, false);
         let mut s = state_of(transcript, &HashMap::new(), Some(&config));
         s.put_effect(sentry_sync(ConnectorSyncState {

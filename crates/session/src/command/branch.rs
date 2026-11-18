@@ -6,6 +6,7 @@ use crate::effects::{self, decision_queued_on};
 use crate::events::*;
 use crate::ids::Ids;
 use crate::protocol::{BranchMode, DraftMessage, EffectStatus, ErrorCode, ErrorInfo, NewMessage};
+use crate::state::View;
 use crate::state::{BranchId, EffectKind, SessionState};
 use crate::Caller;
 
@@ -29,27 +30,6 @@ impl SessionState {
             at += 1;
         }
         found
-    }
-
-    pub fn recorded_prefix(&self, messages: &[DraftMessage]) -> (Option<String>, usize) {
-        let shared = self.tree.shared(messages, |draft, node| {
-            node.message().is_some_and(|m| same(draft, m))
-        });
-        let mut path: Vec<&str> = messages[..shared]
-            .iter()
-            .filter_map(|m| m.id.as_deref())
-            .collect();
-        while let Some(last) = path.last() {
-            let answered = self
-                .tree
-                .get(last)
-                .is_none_or(|n| n.message().is_none_or(|m| m.tool_calls.is_empty()));
-            if answered {
-                break;
-            }
-            path.pop();
-        }
-        (path.last().map(|id| id.to_string()), path.len())
     }
 
     pub fn branch_depth(&self, branch: &BranchId) -> usize {
@@ -149,41 +129,6 @@ impl SessionState {
                 self.close_branch(id, RunEnd::Voided, serde_json::Value::Null, None)
             })
             .collect()
-    }
-
-    pub fn void_stranded_branches(&self, scope: &BranchId) -> Vec<EventPayload> {
-        let at = self.on(scope);
-        self.side_branches()
-            .filter(|(_, b)| b.parent == *scope)
-            .filter(|(_, b)| b.mode == BranchMode::Blocking)
-            .filter(|(_, b)| b.from.is_some() && !at.anchor_on_path(b.from.as_deref()))
-            .flat_map(|(id, _)| {
-                self.close_branch(id, RunEnd::Voided, serde_json::Value::Null, None)
-            })
-            .collect()
-    }
-
-    pub fn quiet_branch(&self, ids: &Ids, id: &str) -> Vec<EventPayload> {
-        let key = BranchId::from(id);
-        if self.open_run(&key).is_none() {
-            return Vec::new();
-        }
-        let busy = self.effects.values().any(|e| {
-            e.branch == key
-                && match e.decision() {
-                    Some(_) => e.tracking.is_unsettled(),
-                    None => e.kind() != EffectKind::ConnectorSync && e.tracking.is_unsettled(),
-                }
-        });
-        let waits = self.held_by_branches(&key) > 0
-            || self
-                .side_branches()
-                .any(|(_, b)| b.parent == key && b.mode == BranchMode::Detached);
-        let parked = self.on(&key).active_interrupt_for().is_some();
-        if busy || waits || parked {
-            return Vec::new();
-        }
-        self.finish_branch(ids, id, serde_json::Value::Null, None)
     }
 }
 
@@ -576,4 +521,64 @@ pub fn overflowed() -> ErrorInfo {
         ErrorCode::ContextOverflow,
         "the branch's prompt is larger than the model's window",
     )
+}
+
+impl View {
+    pub fn recorded_prefix(&self, messages: &[DraftMessage]) -> (Option<String>, usize) {
+        let shared = self.tree.shared(messages, |draft, node| {
+            node.message().is_some_and(|m| same(draft, m))
+        });
+        let mut path: Vec<&str> = messages[..shared]
+            .iter()
+            .filter_map(|m| m.id.as_deref())
+            .collect();
+        while let Some(last) = path.last() {
+            let answered = self
+                .tree
+                .get(last)
+                .is_none_or(|n| n.message().is_none_or(|m| m.tool_calls.is_empty()));
+            if answered {
+                break;
+            }
+            path.pop();
+        }
+        (path.last().map(|id| id.to_string()), path.len())
+    }
+}
+
+impl View {
+    pub fn void_stranded_branches(&self, scope: &BranchId) -> Vec<EventPayload> {
+        let at = self.on(scope);
+        self.side_branches()
+            .filter(|(_, b)| b.parent == *scope)
+            .filter(|(_, b)| b.mode == BranchMode::Blocking)
+            .filter(|(_, b)| b.from.is_some() && !at.anchor_on_path(b.from.as_deref()))
+            .flat_map(|(id, _)| {
+                self.close_branch(id, RunEnd::Voided, serde_json::Value::Null, None)
+            })
+            .collect()
+    }
+
+    pub fn quiet_branch(&self, ids: &Ids, id: &str) -> Vec<EventPayload> {
+        let key = BranchId::from(id);
+        if self.open_run(&key).is_none() {
+            return Vec::new();
+        }
+        let busy = self.effects.values().any(|e| {
+            e.branch == key
+                && match e.decision() {
+                    Some(_) => e.tracking.is_unsettled(),
+                    None => e.kind() != EffectKind::ConnectorSync && e.tracking.is_unsettled(),
+                }
+        });
+        let waits = self.held_by_branches(&key) > 0
+            || self
+                .side_branches()
+                .any(|(_, b)| b.parent == key && b.mode == BranchMode::Detached);
+        let parked = self.on(&key).active_interrupt_for().is_some();
+        if busy || waits || parked {
+            return Vec::new();
+        }
+        self.finish_branch(ids, id, serde_json::Value::Null, None)
+    }
 }

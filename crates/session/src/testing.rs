@@ -1,3 +1,4 @@
+use crate::state::View;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -13,7 +14,7 @@ use crate::protocol::{
     SessionOwner, StoredResult, Subject,
 };
 use crate::span::SpanContext;
-use crate::state::{ApplyContext, BranchId, EffectKind, SessionState};
+use crate::state::{ApplyContext, BranchId, EffectKind};
 use crate::{Caller, CommitContext, Session};
 
 pub const TENANT: &str = "tenant-a";
@@ -226,7 +227,7 @@ impl World {
             None => Session::with_state(
                 SESSION.to_string(),
                 TENANT.to_string(),
-                SessionState::new(SESSION.to_string()),
+                View::new(SESSION.to_string()),
             ),
         };
         let mut world = World {
@@ -306,7 +307,7 @@ impl World {
     }
 
     fn unfingerprinted(&self) -> Option<String> {
-        let mut state = SessionState::new(SESSION.to_string());
+        let mut state = View::new(SESSION.to_string());
         for (seq, occurred_at, payload) in &self.log {
             if let EventPayload::LlmCallDispatched(d) = payload {
                 let built = state
@@ -338,7 +339,7 @@ impl World {
                 })
                 .collect()
         };
-        let mut state = SessionState::new(SESSION.to_string());
+        let mut state = View::new(SESSION.to_string());
         let mut sent: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
         for (seq, occurred_at, payload) in &self.log {
             if let EventPayload::LlmCallDispatched(d) = payload {
@@ -375,8 +376,8 @@ impl World {
     }
 
     #[cfg(test)]
-    pub(crate) fn replayed(&self) -> SessionState {
-        let mut state = SessionState::new(SESSION.to_string());
+    pub(crate) fn replayed(&self) -> View {
+        let mut state = View::new(SESSION.to_string());
         for (seq, occurred_at, payload) in &self.log {
             state.apply(
                 payload,
@@ -1129,9 +1130,9 @@ fn work(session: &Session) -> serde_json::Value {
 }
 
 #[cfg(test)]
-pub(crate) fn round_trip(state: &SessionState) -> SessionState {
+pub(crate) fn round_trip(state: &View) -> View {
     let json = serde_json::to_string(state).expect("a session state serializes");
-    let mut back: SessionState = serde_json::from_str(&json).expect("and deserializes");
+    let mut back: View = serde_json::from_str(&json).expect("and deserializes");
     back.tree = state.tree.clone();
     back
 }
