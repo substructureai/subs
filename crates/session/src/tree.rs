@@ -205,12 +205,14 @@ impl Tree {
             }
         }
         let key = BranchId::from(indexed.branch);
-        if let Some(BranchChange::Started(p)) = &indexed.change {
+        if let Some(BranchChange::Started(p)) =
+            indexed.change.as_ref().filter(|_| !indexed.continues())
+        {
             self.pending.insert(
                 key.clone(),
                 Pending {
                     started: Some(Stored {
-                        leaf: p.leaf.clone(),
+                        leaf: None,
                         from: p.from.clone(),
                     }),
                     leaf: None,
@@ -479,8 +481,8 @@ pub struct Indexed<'a> {
 impl Indexed<'_> {
     pub fn stored(&self, known: Option<Stored>) -> Option<Stored> {
         let mut stored = match &self.change {
-            Some(BranchChange::Started(p)) => Some(Stored {
-                leaf: p.leaf.clone(),
+            Some(BranchChange::Started(p)) if p.leaf.is_none() => Some(Stored {
+                leaf: None,
                 from: p.from.clone(),
             }),
             _ => known,
@@ -489,6 +491,10 @@ impl Indexed<'_> {
             stored.get_or_insert_with(Stored::default).leaf = Some(leaf.clone());
         }
         stored
+    }
+
+    pub fn continues(&self) -> bool {
+        matches!(&self.change, Some(BranchChange::Started(p)) if p.leaf.is_some())
     }
 
     pub fn moves(&self) -> bool {
@@ -517,6 +523,7 @@ pub fn index(seq: u64, event: &EventPayload) -> Indexed<'_> {
     let node = Node::of_event(event).map(|entry| Arc::new(Logged { seq, entry }));
     let leaf = match event {
         EventPayload::BranchMoved(p) => Some(p.leaf.clone()),
+        EventPayload::BranchStarted(p) if p.leaf.is_some() => p.leaf.clone(),
         _ => node.as_ref().map(|n| n.id().to_string()),
     };
     Indexed {

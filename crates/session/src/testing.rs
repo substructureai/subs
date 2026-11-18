@@ -1109,16 +1109,19 @@ impl crate::Store for Counted {
     }
 }
 
-fn transcripts(session: &Session) -> Vec<(BranchId, Vec<String>)> {
+fn transcripts(session: &Session, used: &[String]) -> Vec<(BranchId, Vec<String>)> {
     let state = session.state();
-    state
+    let read = |at: crate::state::At<'_, '_>| at.transcript().into_iter().map(|m| m.id).collect();
+    let mut all: Vec<(BranchId, Vec<String>)> = state
         .branches
         .keys()
-        .map(|b| {
-            let ids = state.on(b).transcript().into_iter().map(|m| m.id).collect();
-            (b.clone(), ids)
-        })
-        .collect()
+        .map(|b| (b.clone(), read(state.on(b))))
+        .collect();
+    for id in used.iter().map(BranchId::from) {
+        let stored = state.tree.stored(&id).and_then(|s| s.leaf.or(s.from));
+        all.push((id, read(state.at(stored.as_deref()))));
+    }
+    all
 }
 
 fn work(session: &Session) -> serde_json::Value {
@@ -1199,8 +1202,8 @@ pub fn check(
             commands
         );
         prop_assert_eq!(
-            transcripts(&loaded),
-            transcripts(&world.agg),
+            transcripts(&loaded, &world.branch_ids),
+            transcripts(&world.agg, &world.branch_ids),
             "a branch reads differently after a reload\ncommands:\n{}",
             commands
         );

@@ -837,8 +837,8 @@ impl Working {
                             },
                             &system,
                         ),
-                        Err(unstarted) => {
-                            self.unstarted(&id, unstarted);
+                        Err(error) => {
+                            self.refuse_call(&id, error);
                             Ok(())
                         }
                     }
@@ -1124,8 +1124,8 @@ impl Working {
                     let messages = std::mem::take(&mut request.messages);
                     let branch = match self.message_branch(&call_id, messages) {
                         Ok(branch) => branch,
-                        Err(unstarted) => {
-                            self.unstarted(&call_id, unstarted);
+                        Err(error) => {
+                            self.refuse_call(&call_id, error);
                             return Ok(());
                         }
                     };

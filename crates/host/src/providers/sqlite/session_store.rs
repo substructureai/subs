@@ -279,18 +279,20 @@ impl SqliteSessionStore {
                     tx.execute(
                         "INSERT INTO session_branches
                             (tenant_id, session_id, branch_id, seq, started, closed, leaf, from_node)
-                         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7)
+                         VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6)
                          ON CONFLICT (tenant_id, session_id, branch_id) DO UPDATE SET
                             seq = excluded.seq, started = excluded.started, closed = NULL,
-                            leaf = excluded.leaf, from_node = excluded.from_node",
+                            leaf = CASE WHEN ?7 THEN session_branches.leaf END,
+                            from_node = CASE WHEN ?7 THEN session_branches.from_node
+                                ELSE excluded.from_node END",
                         params![
                             self.tenant_id,
                             self.session_id,
                             key,
                             event.seq as i64,
                             serde_json::to_vec(p).map_err(corrupt)?,
-                            p.leaf,
-                            p.from
+                            p.from,
+                            indexed.continues()
                         ],
                     )
                     .map_err(unavailable)?;

@@ -1234,15 +1234,15 @@ fn a_call_with_messages_too_deep_for_a_branch_is_answered_with_an_error() {
 }
 
 #[test]
-fn a_call_with_messages_asked_again_after_its_branch_ended_does_nothing() {
+fn a_call_with_messages_asked_again_continues_its_branch_with_what_is_new() {
     let mut agg = configured();
-    let ask = |agg: &mut Session| {
+    let ask = |agg: &mut Session, messages: Vec<DraftMessage>| {
         dispatch(
             agg,
             CommandPayload::RequestLlmCall {
                 llm: "claude".to_string(),
                 call_id: "x1".to_string(),
-                request: request_with(vec![node_msg("", Role::User, "a title")]),
+                request: request_with(messages),
                 stream: false,
                 retry: RetryPolicy::no_retry(),
                 handler: LlmHandler::Server,
@@ -1251,12 +1251,45 @@ fn a_call_with_messages_asked_again_after_its_branch_ended_does_nothing() {
             &system(),
         )
     };
-    ask(&mut agg);
+    let written = |events: &[EventPayload]| -> Vec<NewMessage> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                EventPayload::NewMessage(m) => Some(m.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let first = written(&ask(&mut agg, vec![node_msg("", Role::User, "a title")]));
+    let asked = first[0].message.id.clone();
     reply(&mut agg, "x1", said("A title", 10));
     let (d, _) = live_decision(&agg);
     let events = submit_decision(&mut agg, d, vec![], vec![]);
     assert_eq!(branch_closed(&events, "x1"), Some(BranchEnd::Done));
-    assert!(ask(&mut agg).is_empty());
+
+    let again = ask(
+        &mut agg,
+        vec![
+            node_msg(&asked, Role::User, "a title"),
+            node_msg("", Role::User, "shorter"),
+        ],
+    );
+    let leaf = again
+        .iter()
+        .find_map(|e| match e {
+            EventPayload::BranchStarted(b) if b.id == "x1" => b.leaf.clone(),
+            _ => None,
+        })
+        .expect("the branch goes on from where it ended");
+    assert_eq!(agg.state.tree.message_at(Some(&leaf)), Some(asked));
+    let new = written(&again);
+    assert_eq!(new.len(), 1, "only what is new is written");
+    assert_eq!(
+        new[0].parent_id,
+        Some(leaf),
+        "after what the last call read"
+    );
+    assert_eq!(prompt_texts(&agg, "x1"), ["a title", "shorter"]);
 }
 
 #[test]
@@ -1392,4 +1425,39 @@ fn every_branch_reads_the_same_way() {
         ["what is the weather in Paris?"],
         "an older leaf reads the conversation as it was"
     );
+}
+
+#[test]
+fn a_branch_whose_run_failed_is_promoted_from_its_stored_leaf() {
+    let mut agg = turn_with_side_call(BranchMode::Detached);
+    reply(&mut agg, "t1", said("Paris weather", 10));
+    let (d, _) = live_decision(&agg);
+    let events = submit_decision(
+        &mut agg,
+        d,
+        vec![],
+        vec![Action::Fail {
+            error: ErrorInfo::new(ErrorCode::HandlerError, "no title"),
+        }],
+    );
+    assert_eq!(branch_closed(&events, "title"), Some(BranchEnd::Failed));
+    let title = BranchId::from("title");
+    assert!(agg.state.started(&title).is_none(), "its run ended");
+    let leaf = agg
+        .state
+        .tree
+        .stored(&title)
+        .and_then(|s| s.leaf)
+        .expect("the store keeps its leaf");
+
+    let (d, _) = live_decision(&agg);
+    submit_decision(
+        &mut agg,
+        d,
+        vec![],
+        vec![Action::PromoteBranch {
+            id: "title".to_string(),
+        }],
+    );
+    assert_eq!(agg.state.leaf(&BranchId::MAIN), Some(leaf.as_str()));
 }

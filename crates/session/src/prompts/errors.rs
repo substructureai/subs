@@ -177,10 +177,6 @@ pub fn unapproved_detached(tool: &str) -> String {
     format!("`{tool}` needs a person's approval, and this work runs in the background where nobody can give it")
 }
 
-pub fn subagent_branch_unloaded(agent: &str) -> String {
-    format!("the earlier work of `{agent}` could not be loaded to continue; start it again without `session`")
-}
-
 pub fn no_subagent_config(agent: &str) -> String {
     format!("`{agent}` runs on a branch, but no [agent.{agent}] gives it a config")
 }
