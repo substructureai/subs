@@ -102,7 +102,13 @@ pub struct Session {
     settings: Settings,
     #[cfg(test)]
     #[serde(skip)]
-    pub(crate) sent: std::collections::BTreeMap<String, Vec<crate::protocol::Message>>,
+    pub(crate) sent: std::collections::BTreeMap<
+        String,
+        (
+            Vec<crate::protocol::Message>,
+            Option<Vec<crate::protocol::LlmTool>>,
+        ),
+    >,
 }
 
 impl Session {
@@ -460,7 +466,8 @@ impl Session {
             #[cfg(test)]
             if let EventPayload::LlmCallDispatched(d) = &payload {
                 if let Some(call) = self.state.llm_call(&d.id) {
-                    self.sent.insert(d.id.clone(), call.prompt.clone());
+                    let tools = self.state.tools_sent(&d.id);
+                    self.sent.insert(d.id.clone(), (call.prompt.clone(), tools));
                 }
             }
             emitted.push((payload, self.state.event_meta(context.occurred_at)));

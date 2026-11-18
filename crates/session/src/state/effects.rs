@@ -94,6 +94,23 @@ impl SessionState {
         self.effect(EffectKind::LlmCall, id).and_then(|e| e.llm())
     }
 
+    /// The tools a call was sent, or asked for before it was dispatched.
+    pub fn tools_sent(&self, id: &str) -> Option<Vec<LlmTool>> {
+        let call = self.llm_call(id)?;
+        match call.reads_from.as_deref() {
+            Some(node) => self.tree.tools(node),
+            None => call.spec.tools.clone(),
+        }
+    }
+
+    /// The request the model gets: its prompt, and the tools it was sent.
+    pub fn sent_request(&self, id: &str) -> Option<LlmRequest> {
+        let call = self.llm_call(id)?;
+        let mut request = call.spec.to_request(call.prompt.clone());
+        request.tools = self.tools_sent(id);
+        Some(request)
+    }
+
     pub fn tool_call(&self, id: &str) -> Option<&ToolCallState> {
         self.effect(EffectKind::ToolCall, id).and_then(|e| e.tool())
     }
@@ -554,28 +571,8 @@ pub struct LlmCallState {
     pub defer_tools_strategy: DeferToolsStrategy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reads_from: Option<String>,
-    /// The tools the model gets, set at dispatch from `spec.tools`, which
-    /// keeps the tools the call asked for.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sent_tools: Option<Vec<LlmTool>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unanswered: Vec<String>,
-}
-
-impl LlmCallState {
-    /// The request the model gets: its prompt, and the tools it was sent.
-    pub fn sent_request(&self) -> LlmRequest {
-        let mut request = self.spec.to_request(self.prompt.clone());
-        if let Some(tools) = &self.sent_tools {
-            request.tools = Some(tools.clone());
-        }
-        request
-    }
-
-    /// The tools the model was sent, or asked for before dispatch.
-    pub fn sent(&self) -> Option<&[LlmTool]> {
-        self.sent_tools.as_deref().or(self.spec.tools.as_deref())
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

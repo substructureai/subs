@@ -133,7 +133,7 @@ fn wire(t: &Trace) -> DecisionTrigger {
         t.live_trigger(),
         &at.transcript(),
         &t.agg.state.message_tree(),
-        &at.open_llm_calls(),
+        &|id| t.agg.state.tools_sent(id),
     )
     .0
 }
@@ -184,6 +184,7 @@ fn requested(t: &Trace, id: &str) -> Vec<String> {
         .sent
         .get(id)
         .expect("requested")
+        .0
         .iter()
         .map(|m| {
             m.content

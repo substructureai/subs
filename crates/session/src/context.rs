@@ -161,7 +161,7 @@ pub fn overflow(state: &SessionState, id: &str) -> Option<ContextLimited> {
         .effect(EffectKind::LlmCall, id)
         .filter(|e| e.branch.is_main())?;
     let call = effect.llm()?;
-    let request = call.sent_request();
+    let request = state.sent_request(id)?;
     let config = state.on(&BranchId::MAIN).config();
     Some(ContextLimited {
         reason: ContextReason::Overflow,

@@ -234,7 +234,7 @@ pub fn restore(prompt: &mut Vec<Message>, placed: &[Placed]) {
     }
 }
 
-pub fn fingerprint(prompt: &[Message]) -> String {
+pub fn fingerprint(prompt: &[Message], tools: &Option<Vec<crate::protocol::LlmTool>>) -> String {
     let mut hasher = xxhash_rust::xxh3::Xxh3::new();
     for m in prompt {
         let mut m = DraftMessage::from(m.clone());
@@ -242,6 +242,7 @@ pub fn fingerprint(prompt: &[Message]) -> String {
         hasher.update(&serde_json::to_vec(&m).unwrap_or_default());
         hasher.update(b"\n");
     }
+    hasher.update(&serde_json::to_vec(tools).unwrap_or_default());
     format!("{:016x}", hasher.digest())
 }
 
@@ -935,7 +936,7 @@ mod tests {
         );
         let mut next = vec![text("c2:0", Role::System, "be brief")];
         restore(&mut next, &placed);
-        assert_eq!(fingerprint(&next), fingerprint(&sent));
+        assert_eq!(fingerprint(&next, &None), fingerprint(&sent, &None));
     }
 
     #[test]
@@ -972,7 +973,7 @@ mod tests {
         ];
         restore(&mut next, &placed);
         assert_eq!(shape(&next), shape(&sent));
-        assert_eq!(fingerprint(&next), fingerprint(&sent));
+        assert_eq!(fingerprint(&next, &None), fingerprint(&sent, &None));
     }
 
     #[test]

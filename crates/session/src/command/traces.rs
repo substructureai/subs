@@ -1000,14 +1000,7 @@ fn flow_connector_gating() -> Trace {
 #[test]
 fn trace_connector_fetch_gates_an_llm_call() {
     let t = flow_connector_gating();
-    let merged = t
-        .agg
-        .state
-        .llm_call("call-1")
-        .unwrap()
-        .sent_tools
-        .clone()
-        .unwrap_or_default();
+    let merged = t.agg.state.tools_sent("call-1").unwrap_or_default();
     assert_eq!(
         merged.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
         vec!["lookup"],

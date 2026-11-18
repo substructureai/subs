@@ -82,11 +82,13 @@ impl KindSpec for LlmSpec {
             return void_events(EffectKind::LlmCall, id.to_string());
         };
         let mut events = Vec::new();
-        let prompt = match call.reads_from.as_deref() {
-            Some(node) => state.at(Some(node)).prompt(id),
+        let (prompt, tools) = match call.reads_from.as_deref() {
+            Some(node) => (state.at(Some(node)).prompt(id), state.tools_sent(id)),
             None => {
                 let leaf = state.leaf(&effect.branch).map(str::to_string);
-                let placing = state.at(leaf.as_deref()).place(id);
+                let at = state.at(leaf.as_deref());
+                let placing = at.place(id);
+                let (tools, record) = at.sends(call.spec.tools.clone());
                 events.push(EventPayload::ContextPlaced(ContextPlaced {
                     node: crate::tree::Place {
                         id: state.ids().next(),
@@ -95,14 +97,15 @@ impl KindSpec for LlmSpec {
                     },
                     call: id.to_string(),
                     placed: placing.placed,
+                    tools: record,
                 }));
-                placing.prompt
+                (placing.prompt, tools)
             }
         };
         events.push(EventPayload::LlmCallDispatched(LlmCallDispatched {
             id: id.to_string(),
             attempt: effect.tracking.retry.attempts,
-            fingerprint: Some(crate::prompt_context::fingerprint(&prompt)),
+            fingerprint: Some(crate::prompt_context::fingerprint(&prompt, &tools)),
         }));
         events
     }
@@ -112,7 +115,7 @@ impl KindSpec for LlmSpec {
         let call = effect.llm().filter(|c| c.handler == LlmHandler::Worker)?;
         Some(Trigger::LlmExecute {
             id: id.to_string(),
-            request: call.sent_request(),
+            request: state.sent_request(id)?,
             format: call.format,
             defer_tools_strategy: call.defer_tools_strategy,
             stream: call.stream,

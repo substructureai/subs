@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -10,12 +8,12 @@ use crate::propose::{propose, Proposing};
 use crate::protocol::{
     AgentConfig, BranchView, ClientContext, DecisionRequest, DecisionResponse, DecisionTrigger,
     DecisionTurn, DeferToolsStrategy, DraftMessage, Effect, InterruptResumption, LlmFormat,
-    LlmRequest, Message, MessageTree, QueueMode, SessionOwner, WorkerIdentity, WorkerRef,
+    LlmRequest, LlmTool, Message, MessageTree, QueueMode, SessionOwner, WorkerIdentity, WorkerRef,
     WorkerState,
 };
 use crate::session::Session;
 use crate::span::SpanContext;
-use crate::state::{EffectState, EventMeta};
+use crate::state::EventMeta;
 use crate::tool_contract::{classify_arguments, declared_tool, DeclaredTool};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,7 +132,6 @@ impl Session {
         let _ = seq;
         let message_tree = at.message_tree();
         let transcript = at.transcript();
-        let open_llm_calls = at.open_llm_calls();
         let pending_calls = meta.pending_work(decision_id) + self.state.held_by_branches(branch_id);
         let worker_state = at.worker_state();
         let agent_config = at.config();
@@ -147,8 +144,9 @@ impl Session {
         ) {
             attachments::mark(messages, rules, &message_tree);
         }
-        let (mut trigger, prompt) =
-            wire_trigger(trigger, &transcript, &message_tree, &open_llm_calls);
+        let (mut trigger, prompt) = wire_trigger(trigger, &transcript, &message_tree, &|id| {
+            self.state.tools_sent(id)
+        });
         if let DecisionTrigger::ClientTranscript { new_from, .. } = &mut trigger {
             *new_from = read.shared;
         }
@@ -247,7 +245,7 @@ pub fn wire_trigger(
     trigger: Trigger,
     active_path: &[Message],
     tree: &MessageTree,
-    open_llm_calls: &HashMap<String, EffectState>,
+    sent: &dyn Fn(&str) -> Option<Vec<LlmTool>>,
 ) -> (DecisionTrigger, Option<PendingPrompt>) {
     let mut pending = None;
     let trigger = match trigger {
@@ -299,13 +297,11 @@ pub fn wire_trigger(
             attempt,
             deadline,
         } => {
-            let schema = match declared_tool(&id, &name, active_path, |id| {
-                open_llm_calls.get(id).and_then(|e| e.llm())
-            }) {
-                DeclaredTool::Declared(t) => t.input.as_ref(),
+            let schema = match declared_tool(&id, &name, active_path, sent) {
+                DeclaredTool::Declared(t) => t.input,
                 _ => None,
             };
-            let input = classify_arguments(&arguments, schema);
+            let input = classify_arguments(&arguments, schema.as_ref());
             DecisionTrigger::ToolExecute {
                 id,
                 name,

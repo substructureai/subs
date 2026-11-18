@@ -309,9 +309,9 @@ impl World {
         let mut state = SessionState::new(SESSION.to_string());
         for (seq, occurred_at, payload) in &self.log {
             if let EventPayload::LlmCallDispatched(d) = payload {
-                let built = state
-                    .prompt(&d.id)
-                    .map(|prompt| crate::prompt_context::fingerprint(&prompt));
+                let built = state.prompt(&d.id).map(|prompt| {
+                    crate::prompt_context::fingerprint(&prompt, &state.tools_sent(&d.id))
+                });
                 if d.fingerprint.is_some() && d.fingerprint != built {
                     return Some(d.id.clone());
                 }

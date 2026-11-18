@@ -649,8 +649,8 @@ impl SessionState {
         }
         let tree = self.message_tree();
         let path = tree.path_to(tree.head_id.as_deref()?);
-        match declared_tool(tool_call_id, name, &path, |id| self.llm_call(id)) {
-            DeclaredTool::Declared(tool) => tool.output.clone(),
+        match declared_tool(tool_call_id, name, &path, |id| self.tools_sent(id)) {
+            DeclaredTool::Declared(tool) => tool.output,
             _ => None,
         }
     }

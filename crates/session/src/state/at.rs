@@ -310,6 +310,29 @@ impl<'a, 'n> At<'a, 'n> {
     /// In code mode, the one tool the model gets: `run_code`, declaring the
     /// tools a script calls that are not deferred. It does not change while
     /// the session runs, but for tools that connect later.
+    /// The tools a call asking for `asked` is sent from here, and how its
+    /// context node records them.
+    pub fn sends(&self, asked: Option<Vec<LlmTool>>) -> (Option<Vec<LlmTool>>, crate::tree::Tools) {
+        let tools = match self.run_code() {
+            Some(run_code) => Some(vec![run_code]),
+            None => sent_tools(asked, &self.connector_tools().tools, &self.locked_tools()),
+        };
+        let recorded = self.up().find_map(|node| match &node.fact {
+            crate::tree::Fact::Context { tools: here, .. } => {
+                Some((node.id().to_string(), here.clone()))
+            }
+            _ => None,
+        });
+        let record = match recorded {
+            Some((_, crate::tree::Tools::As(set))) if self.state.tree.tools(&set) == tools => {
+                crate::tree::Tools::As(set)
+            }
+            Some((id, crate::tree::Tools::Set(set))) if set == tools => crate::tree::Tools::As(id),
+            _ => crate::tree::Tools::Set(tools.clone()),
+        };
+        (tools, record)
+    }
+
     pub fn run_code(&self) -> Option<LlmTool> {
         let language = self.config()?.codemode?;
         let tools = self.searchable_tools();
@@ -675,7 +698,6 @@ mod open_llm_calls_tests {
             EffectPayload::LlmCall(LlmCallState {
                 defer_tools_strategy: Default::default(),
                 reads_from: None,
-                sent_tools: None,
                 unanswered: Vec::new(),
                 format: None,
                 llm: "claude".to_string(),
@@ -861,6 +883,7 @@ mod tree_tests {
             Fact::Context {
                 call: "call-1".into(),
                 placed: vec![placed],
+                tools: crate::tree::Tools::Set(None),
             },
         );
         put(
@@ -912,6 +935,7 @@ mod tree_tests {
             Fact::Context {
                 call: "call-1".into(),
                 placed: Vec::new(),
+                tools: crate::tree::Tools::Set(None),
             },
         );
         let text = |prompt: Vec<Message>| -> Vec<String> {
@@ -938,6 +962,59 @@ mod tree_tests {
             sent[..],
             "the earlier prompt is a prefix"
         );
+    }
+
+    #[test]
+    fn a_call_records_its_tools_once_and_refers_back_while_they_hold() {
+        let tool = |name: &str| LlmTool {
+            name: name.into(),
+            description: String::new(),
+            input: None,
+            output: None,
+            defer: false,
+        };
+        let context = |tools| Fact::Context {
+            call: "call".into(),
+            placed: Vec::new(),
+            tools,
+        };
+        let mut s = SessionState::new("s".into());
+        put(
+            &mut s,
+            "c0",
+            None,
+            Fact::Config {
+                config: config("m1"),
+            },
+        );
+        put(&mut s, "u1", Some("c0"), message("u1"));
+        let at = s.at(Some("u1"));
+        assert_eq!(
+            at.sends(Some(vec![tool("a")])).1,
+            crate::tree::Tools::Set(Some(vec![tool("a")]))
+        );
+        put(
+            &mut s,
+            "x1",
+            Some("u1"),
+            context(crate::tree::Tools::Set(Some(vec![tool("a")]))),
+        );
+        put(
+            &mut s,
+            "x2",
+            Some("x1"),
+            context(crate::tree::Tools::As("x1".into())),
+        );
+        let at = s.at(Some("x2"));
+        assert_eq!(
+            at.sends(Some(vec![tool("a")])).1,
+            crate::tree::Tools::As("x1".into())
+        );
+        assert_eq!(
+            at.sends(Some(vec![tool("b")])).1,
+            crate::tree::Tools::Set(Some(vec![tool("b")]))
+        );
+        assert_eq!(s.tree.tools("x2"), Some(vec![tool("a")]));
     }
 
     #[test]
@@ -975,7 +1052,7 @@ mod tree_tests {
 
 /// The tools a call sends: those it asked for, then its connections', but
 /// those a skill holds back.
-pub(super) fn sent_tools(
+fn sent_tools(
     asked: Option<Vec<LlmTool>>,
     connector_tools: &[ConnectorTool],
     locked: &BTreeMap<String, Vec<String>>,

@@ -274,9 +274,7 @@ fn derive(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionRespon
         ),
         DecisionTrigger::ToolExecute {
             id, name, input, ..
-        } => match declared_tool(id, name, transcript, |id| {
-            llm_calls.get(id).and_then(|e| e.llm())
-        }) {
+        } => match declared_tool(id, name, transcript, |id| p.state.session().tools_sent(id)) {
             DeclaredTool::Undeclared => Some(tool_error(
                 id,
                 crate::prompts::errors::unknown_tool(name),
@@ -1065,7 +1063,6 @@ mod tests {
             EffectPayload::LlmCall(LlmCallState {
                 defer_tools_strategy: Default::default(),
                 reads_from: None,
-                sent_tools: None,
                 unanswered: Vec::new(),
                 format: None,
                 llm: "claude".to_string(),
@@ -1459,7 +1456,6 @@ mod tests {
         let mut call = call_state("call-1", vec![msg("u1", Role::User, "hi")]);
         let llm = call.llm_mut().unwrap();
         llm.spec.tools = Some(vec![tool("find_bookings"), tool("skill")]);
-        llm.sent_tools = Some(vec![tool("skill")]);
         let llm_calls = HashMap::from([("call-1".to_string(), call)]);
 
         let p = propose(

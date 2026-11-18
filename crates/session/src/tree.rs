@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 use crate::events::{BranchStarted, EventPayload};
-use crate::protocol::{AgentConfig, DraftMessage, Message, NewMessage, WorkerState};
+use crate::protocol::{AgentConfig, DraftMessage, LlmTool, Message, NewMessage, WorkerState};
 use crate::state::{BranchId, Logged};
 use crate::store::StoreError;
 
@@ -39,7 +39,17 @@ pub enum Fact {
         call: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         placed: Vec<crate::prompt_context::Placed>,
+        tools: Tools,
     },
+}
+
+/// The tools a call was sent. `As` names the context node that holds the
+/// same set.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Tools {
+    Set(Option<Vec<LlmTool>>),
+    As(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,6 +179,20 @@ impl Tree {
             }
             T::default()
         })
+    }
+
+    pub fn tools(&self, id: &str) -> Option<Vec<LlmTool>> {
+        match &self.get(id)?.fact {
+            Fact::Context {
+                tools: Tools::As(set),
+                ..
+            } => self.tools(set),
+            Fact::Context {
+                tools: Tools::Set(tools),
+                ..
+            } => tools.clone(),
+            _ => None,
+        }
     }
 
     pub fn get(&self, id: &str) -> Option<NodeRef> {
@@ -506,6 +530,7 @@ impl Node {
                 fact: Fact::Context {
                     call: c.call.clone(),
                     placed: c.placed.clone(),
+                    tools: c.tools.clone(),
                 },
             },
             _ => return None,

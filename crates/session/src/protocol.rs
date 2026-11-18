@@ -1902,7 +1902,7 @@ impl ClientContext {
 
 /// A tool's declared contract. Flat on the wire. A provider that needs it
 /// nested re-wraps it at its own boundary.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[schemars(title = "LlmTool")]
 pub struct LlmTool {
     pub name: String,

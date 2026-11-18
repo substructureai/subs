@@ -628,7 +628,12 @@ mod tests {
         blobs: &dyn BlobStore,
         tenant_id: &str,
     ) -> Result<DecisionTrigger, LlmCallError> {
-        let (mut wire, prompt) = wire_trigger(trigger, active_path, tree, open_llm_calls);
+        let (mut wire, prompt) = wire_trigger(trigger, active_path, tree, &|id| {
+            open_llm_calls
+                .get(id)
+                .and_then(|e| e.llm())
+                .and_then(|c| c.spec.tools.clone())
+        });
         finish_prompt(&mut wire, prompt, blobs, tenant_id).await?;
         Ok(wire)
     }
@@ -1462,7 +1467,6 @@ mod tests {
             EffectPayload::LlmCall(LlmCallState {
                 defer_tools_strategy: Default::default(),
                 reads_from: None,
-                sent_tools: None,
                 unanswered: Vec::new(),
                 format: None,
                 llm: "claude".to_string(),

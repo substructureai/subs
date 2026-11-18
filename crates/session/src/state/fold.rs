@@ -120,7 +120,6 @@ impl SessionState {
                     format: payload.format,
                     reads_from: None,
                     dispatched_seq: None,
-                    sent_tools: None,
                     unanswered: Vec::new(),
                     defer_tools_strategy: payload.defer_tools_strategy,
                 }),
@@ -151,7 +150,7 @@ impl SessionState {
             return;
         };
         if let Some(recorded) = &payload.fingerprint {
-            let built = prompt_context::fingerprint(&prompt);
+            let built = prompt_context::fingerprint(&prompt, &self.tools_sent(&payload.id));
             if *recorded != built {
                 tracing::warn!(
                     call_id = %payload.id,
@@ -161,24 +160,9 @@ impl SessionState {
                 );
             }
         }
-        let node = self
-            .llm_call(&payload.id)
-            .and_then(|c| c.reads_from.clone())
-            .or_else(|| {
-                self.effect(EffectKind::LlmCall, &payload.id)
-                    .and_then(|e| e.asked_at.clone())
-            });
-        let at = self.at(node.as_deref());
-        let connector_tools = at.connector_tools().tools;
-        let locked = at.locked_tools();
-        let run_code = at.run_code();
         if let Some(effect) = self.effect_mut(EffectKind::LlmCall, &payload.id) {
             effect.tracking.dispatch(ctx.occurred_at);
             if let Some(call) = effect.llm_mut() {
-                call.sent_tools = match run_code {
-                    Some(run_code) => Some(vec![run_code]),
-                    None => sent_tools(call.spec.tools.clone(), &connector_tools, &locked),
-                };
                 call.prompt = prompt;
                 call.dispatched_seq = Some(ctx.sequence);
             }

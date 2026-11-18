@@ -2304,15 +2304,29 @@ fn a_retried_call_sends_what_it_sent_before() {
         ),
         &system(),
     );
+    let tools = agg.state.tools_sent("llm-1");
     let later = Utc::now() + chrono::Duration::seconds(120);
-    dispatch(&mut agg, CommandPayload::Wake { now: later }, &system());
+    let events = dispatch(&mut agg, CommandPayload::Wake { now: later }, &system());
     assert_eq!(
         agg.state
             .tracking(EffectKind::LlmCall, "llm-1")
             .map(|t| t.retry.attempts),
         Some(1)
     );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventPayload::LlmCallDispatched(_))),
+        "the retry dispatches"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, EventPayload::ContextPlaced(_))),
+        "a retry reads the node it has and writes none"
+    );
     assert_eq!(sent_texts(&agg, "llm-1"), sent);
+    assert_eq!(agg.state.tools_sent("llm-1"), tools);
 }
 
 fn sent_texts(agg: &Session, id: &str) -> Vec<String> {
@@ -7948,10 +7962,7 @@ fn connector_tools_reach_the_model_and_route_to_the_engine() {
     );
     let offered: Vec<String> = agg
         .state
-        .llm_call("call-1")
-        .unwrap()
-        .sent_tools
-        .clone()
+        .tools_sent("call-1")
         .expect("tools offered")
         .into_iter()
         .map(|t| t.name)
@@ -8341,7 +8352,7 @@ fn a_searched_connector_offers_two_tools_however_many_it_has() {
             .any(|e| matches!(e, EventPayload::LlmCallDispatched(_))),
         "the call dispatches; got {events:?}"
     );
-    let sent = agg.state.llm_call("call-1").unwrap().sent_tools.clone();
+    let sent = agg.state.tools_sent("call-1");
     let carried: Vec<String> = sent
         .as_ref()
         .expect("tools offered")
@@ -9350,10 +9361,7 @@ fn a_call_beside_a_new_connector_waits_for_the_fetch_and_gets_its_tools() {
     );
     let offered: Vec<String> = agg
         .state
-        .llm_call("call-1")
-        .unwrap()
-        .sent_tools
-        .clone()
+        .tools_sent("call-1")
         .unwrap_or_default()
         .into_iter()
         .map(|t| t.name)
@@ -9397,7 +9405,7 @@ fn a_dead_connection_dispatches_the_call_without_its_tools() {
         "a settled failure opens the gate rather than parking forever; got {events:?}"
     );
     assert!(
-        agg.state.llm_call("call-1").unwrap().sent_tools.is_none(),
+        agg.state.tools_sent("call-1").is_none(),
         "no tools to offer"
     );
 }
@@ -13117,8 +13125,8 @@ fn dispatched_tools(agg: &mut Session, call_id: &str) -> Vec<String> {
         },
         &system(),
     );
-    let call = agg.state.llm_call(call_id).expect("the call");
-    call.sent_tools
+    agg.state
+        .tools_sent(call_id)
         .iter()
         .flatten()
         .map(|t| t.name.clone())
@@ -13581,10 +13589,10 @@ fn tools_a_script_can_call_reach_the_model_only_through_run_code() {
     let mut agg = coding_session();
     let tools = dispatched_tools(&mut agg, "llm-1");
     assert_eq!(tools, ["run_code"], "code mode is all or nothing");
-    let call = agg.state.llm_call("llm-1").expect("the call");
-    let run_code = call
-        .sent_tools
-        .iter()
+    let run_code = agg
+        .state
+        .tools_sent("llm-1")
+        .into_iter()
         .flatten()
         .find(|t| t.name == "run_code")
         .expect("run_code");
@@ -14103,7 +14111,8 @@ fn code_mode_sends_the_same_tools_on_every_call() {
     let mut agg = create_session_with_config("sess-1", "tenant-a", "user-1", Some(config));
     dispatched_tools(&mut agg, "call-1");
     let call = agg.state.llm_call("call-1").expect("the call");
-    let first = call.sent_tools.clone();
+    let first = agg.state.tools_sent("call-1");
+    let first_node = call.reads_from.clone().expect("placed");
     let asked = call.spec.tools.clone();
     assert!(
         asked.iter().flatten().any(|t| t.name == "find_bookings"),
@@ -14133,17 +14142,30 @@ fn code_mode_sends_the_same_tools_on_every_call() {
         },
         &system(),
     );
-    let second = agg
-        .state
-        .llm_call("call-2")
-        .expect("the call")
-        .sent_tools
-        .clone();
-    assert!(second.is_some(), "the next call dispatches");
+    assert!(
+        agg.state
+            .llm_call("call-2")
+            .is_some_and(|c| c.reads_from.is_some()),
+        "the next call dispatches"
+    );
+    let second = agg.state.tools_sent("call-2");
     assert_eq!(
         serde_json::to_string(&first).unwrap(),
         serde_json::to_string(&second).unwrap(),
         "a skill that loads changes nothing the model is sent, so the cache holds"
+    );
+    let second_node = agg
+        .state
+        .llm_call("call-2")
+        .and_then(|c| c.reads_from.clone())
+        .and_then(|id| agg.state.tree.get(&id))
+        .expect("placed");
+    assert!(
+        matches!(
+            &second_node.fact,
+            crate::tree::Fact::Context { tools: crate::tree::Tools::As(set), .. } if *set == first_node
+        ),
+        "the same set is recorded once"
     );
 }
 
@@ -14200,8 +14222,7 @@ fn code_mode_lists_each_skill_with_its_tools_once_in_the_conversation() {
     assert!(
         agg.state
             .llm_call("call-2")
-            .and_then(|c| c.sent_tools.as_ref())
-            .is_some(),
+            .is_some_and(|c| c.reads_from.is_some()),
         "the next call dispatches"
     );
     assert_eq!(
@@ -14826,12 +14847,22 @@ fn a_dispatch_records_a_fingerprint_of_the_prompt() {
         })
         .expect("a fingerprint");
     let call = agg.state.llm_call("call-1").unwrap();
-    assert_eq!(recorded, crate::prompt_context::fingerprint(&call.prompt));
+    let tools = agg.state.tools_sent("call-1");
+    assert_eq!(
+        recorded,
+        crate::prompt_context::fingerprint(&call.prompt, &tools)
+    );
     let mut renamed = call.prompt.clone();
     renamed[0].id = "other".to_string();
-    assert_eq!(recorded, crate::prompt_context::fingerprint(&renamed));
+    assert_eq!(
+        recorded,
+        crate::prompt_context::fingerprint(&renamed, &tools)
+    );
     renamed[0].content = Some(Content::Text("be long".to_string()));
-    assert_ne!(recorded, crate::prompt_context::fingerprint(&renamed));
+    assert_ne!(
+        recorded,
+        crate::prompt_context::fingerprint(&renamed, &tools)
+    );
 }
 
 mod branch;

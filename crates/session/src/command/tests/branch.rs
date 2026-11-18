@@ -186,7 +186,7 @@ fn text_of(message: &Message) -> String {
 fn prompt_texts(agg: &Session, call: &str) -> Vec<String> {
     agg.sent
         .get(call)
-        .cloned()
+        .map(|(prompt, _)| prompt.clone())
         .or_else(|| agg.state.prompt(call))
         .expect("the call builds a prompt")
         .iter()
@@ -764,7 +764,7 @@ fn a_settled_call_keeps_no_prompt() {
             "{id} settled: the state keeps no prompt"
         );
         assert_eq!(
-            crate::prompt_context::fingerprint(&agg.sent[&id]),
+            crate::prompt_context::fingerprint(&agg.sent[&id].0, &agg.sent[&id].1),
             fingerprint,
             "{id}"
         );

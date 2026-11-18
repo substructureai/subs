@@ -1,4 +1,3 @@
-use super::state::LlmCallState;
 use crate::protocol::{LlmTool, Message, ToolInput};
 
 impl ToolInput {
@@ -46,28 +45,25 @@ fn json_type(value: &serde_json::Value) -> &'static str {
 }
 
 #[derive(Debug)]
-pub enum DeclaredTool<'a> {
-    Declared(&'a LlmTool),
+pub enum DeclaredTool {
+    Declared(LlmTool),
     Undeclared,
     Unknowable,
 }
 
-pub fn declared_tool<'a>(
+pub fn declared_tool(
     tool_call_id: &str,
     name: &str,
     active_path: &[Message],
-    llm_call: impl Fn(&str) -> Option<&'a LlmCallState>,
-) -> DeclaredTool<'a> {
+    sent: impl Fn(&str) -> Option<Vec<LlmTool>>,
+) -> DeclaredTool {
     let assistant = active_path
         .iter()
         .rev()
         .find(|m| m.tool_calls.iter().any(|c| c.id == tool_call_id));
-    let tools = assistant
-        .and_then(|m| llm_call(&m.id))
-        .and_then(|call| call.sent());
-    match tools {
+    match assistant.and_then(|m| sent(&m.id)) {
         None => DeclaredTool::Unknowable,
-        Some(tools) => match tools.iter().find(|t| t.name == name) {
+        Some(tools) => match tools.into_iter().find(|t| t.name == name) {
             Some(tool) => DeclaredTool::Declared(tool),
             None => DeclaredTool::Undeclared,
         },
@@ -104,9 +100,7 @@ fn schema_violations(schema: &serde_json::Value, value: &serde_json::Value) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decision::LlmHandler;
-    use crate::protocol::{RetryPolicy, Role, ToolCall, ToolCallFunction};
-    use crate::state::{EffectPayload, EffectState, EffectTracking, LlmCallSpec};
+    use crate::protocol::{Role, ToolCall, ToolCallFunction};
 
     fn city_schema() -> serde_json::Value {
         serde_json::json!({
@@ -209,7 +203,10 @@ mod tests {
 
     fn weather_call(
         tools: Option<Vec<LlmTool>>,
-    ) -> (Vec<Message>, std::collections::HashMap<String, EffectState>) {
+    ) -> (
+        Vec<Message>,
+        std::collections::HashMap<String, Vec<LlmTool>>,
+    ) {
         let assistant = Message {
             id: "call-1".to_string(),
             role: Role::Assistant,
@@ -226,32 +223,12 @@ mod tests {
             name: None,
             reasoning: None,
         };
-        let call = EffectState::new(
-            "call-1",
-            EffectTracking::new(RetryPolicy::no_retry(), chrono::Utc::now()),
-            EffectPayload::LlmCall(LlmCallState {
-                defer_tools_strategy: Default::default(),
-                reads_from: None,
-                sent_tools: None,
-                unanswered: Vec::new(),
-                format: None,
-                llm: "claude".to_string(),
-                prompt: vec![],
-                spec: LlmCallSpec {
-                    model: "m".to_string(),
-                    tools,
-                    temperature: None,
-                    max_completion_tokens: None,
-                    reasoning: None,
-                },
-                stream: false,
-                handler: LlmHandler::Server,
-                dispatched_seq: None,
-            }),
-        );
         (
             vec![assistant],
-            std::collections::HashMap::from([("call-1".to_string(), call)]),
+            tools
+                .map(|t| ("call-1".to_string(), t))
+                .into_iter()
+                .collect(),
         )
     }
 
@@ -269,7 +246,7 @@ mod tests {
     fn resolves_a_declared_tool_by_lineage() {
         let (path, calls) = weather_call(Some(vec![weather_tool()]));
         assert!(matches!(
-            declared_tool("tc-1", "get_weather", &path, |id| calls.get(id).and_then(|e| e.llm())),
+            declared_tool("tc-1", "get_weather", &path, |id| calls.get(id).cloned()),
             DeclaredTool::Declared(t) if t.name == "get_weather"
         ));
     }
@@ -278,9 +255,7 @@ mod tests {
     fn a_name_outside_the_declared_list_is_undeclared() {
         let (path, calls) = weather_call(Some(vec![weather_tool()]));
         assert!(matches!(
-            declared_tool("tc-1", "hallucinated", &path, |id| calls
-                .get(id)
-                .and_then(|e| e.llm())),
+            declared_tool("tc-1", "hallucinated", &path, |id| calls.get(id).cloned()),
             DeclaredTool::Undeclared
         ));
     }
@@ -292,7 +267,7 @@ mod tests {
             matches!(
                 declared_tool("tc-other", "get_weather", &path, |id| calls
                     .get(id)
-                    .and_then(|e| e.llm())),
+                    .cloned()),
                 DeclaredTool::Unknowable
             ),
             "a call id absent from the path has no lineage"
@@ -300,9 +275,7 @@ mod tests {
         let (path, calls) = weather_call(None);
         assert!(
             matches!(
-                declared_tool("tc-1", "get_weather", &path, |id| calls
-                    .get(id)
-                    .and_then(|e| e.llm())),
+                declared_tool("tc-1", "get_weather", &path, |id| calls.get(id).cloned()),
                 DeclaredTool::Unknowable
             ),
             "a request that declared no tools can't judge a name"
