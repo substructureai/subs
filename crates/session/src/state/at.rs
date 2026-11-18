@@ -470,26 +470,6 @@ impl<'a, 'n> At<'a, 'n> {
     pub fn transcript(&self) -> Vec<Message> {
         self.state.tree.messages(self.node)
     }
-
-    pub fn open_llm_calls(&self) -> HashMap<String, EffectState> {
-        let path = self.transcript();
-        let answered: std::collections::HashSet<&str> = path
-            .iter()
-            .filter_map(|m| m.tool_call_id.as_deref())
-            .collect();
-        path.iter()
-            .filter(|m| {
-                m.tool_calls
-                    .iter()
-                    .any(|c| !answered.contains(c.id.as_str()))
-            })
-            .filter_map(|m| {
-                self.state
-                    .effect(EffectKind::LlmCall, &m.id)
-                    .map(|e| (m.id.clone(), e.clone()))
-            })
-            .collect()
-    }
 }
 
 impl View {
@@ -535,129 +515,22 @@ impl View {
 }
 
 #[cfg(test)]
-mod open_llm_calls_tests {
-    use super::*;
-    use crate::protocol::{NewMessage, ToolCall, ToolCallFunction};
-
-    fn node(message: Message, parent_id: Option<&str>) -> Logged<NewMessage> {
-        Logged {
-            seq: 0,
-            entry: NewMessage {
-                message,
-                parent_id: parent_id.map(str::to_string),
-                copied_from: None,
-                branch: None,
-            },
-        }
-    }
-
-    fn user(id: &str) -> Message {
-        Message {
-            id: id.to_string(),
-            role: Role::User,
-            content: None,
-            tool_calls: vec![],
-            tool_call_id: None,
-            name: None,
-            reasoning: None,
-        }
-    }
-
-    fn assistant_calling(id: &str, tool_call_id: &str) -> Message {
-        Message {
-            id: id.to_string(),
-            role: Role::Assistant,
-            content: None,
-            tool_calls: vec![ToolCall {
-                id: tool_call_id.to_string(),
-                call_type: "function".to_string(),
-                function: ToolCallFunction {
-                    name: "t".to_string(),
-                    arguments: "{}".to_string(),
-                },
-            }],
-            tool_call_id: None,
-            name: None,
-            reasoning: None,
-        }
-    }
-
-    fn tool_answer(id: &str, tool_call_id: &str) -> Message {
-        Message {
-            id: id.to_string(),
-            role: Role::Tool,
-            content: None,
-            tool_calls: vec![],
-            tool_call_id: Some(tool_call_id.to_string()),
-            name: None,
-            reasoning: None,
-        }
-    }
-
-    fn call_state(call_id: &str) -> EffectState {
-        EffectState::new(
-            call_id,
-            EffectTracking::new(RetryPolicy::no_retry(), Utc::now()),
-            EffectPayload::LlmCall(LlmCallState {
-                defer_tools_strategy: Default::default(),
-                reads_from: None,
-                unanswered: Vec::new(),
-                format: None,
-                llm: "claude".to_string(),
-                spec: LlmCallSpec {
-                    model: "m".to_string(),
-                    tools: None,
-                    temperature: None,
-                    max_completion_tokens: None,
-                    reasoning: None,
-                },
-                stream: false,
-                handler: LlmHandler::Server,
-                dispatched_seq: None,
-            }),
-        )
-    }
-
-    #[test]
-    fn a_call_is_open_until_its_tool_answer_is_recorded() {
-        let mut s = View::new("sess-1".to_string());
-        s.seed_message(node(user("u1"), None).entry);
-        s.seed_message(node(assistant_calling("call-1", "tc-1"), Some("u1")).entry);
-        s.branches.insert(
-            BranchId::MAIN,
-            Open {
-                leaf: Some("call-1".to_string()),
-                run: None,
-            },
-        );
-        s.put_effect(call_state("call-1"));
-
-        assert!(
-            s.on(&BranchId::MAIN)
-                .open_llm_calls()
-                .contains_key("call-1"),
-            "unanswered tool call keeps the parent open"
-        );
-
-        s.seed_message(node(tool_answer("t1", "tc-1"), Some("call-1")).entry);
-        s.branches.insert(
-            BranchId::MAIN,
-            Open {
-                leaf: Some("t1".to_string()),
-                run: None,
-            },
-        );
-        assert!(
-            s.on(&BranchId::MAIN).open_llm_calls().is_empty(),
-            "recorded answer closes the call"
-        );
-    }
-}
-
-#[cfg(test)]
 mod tree_tests {
     use super::*;
     use crate::tree::{Fact, Node, Place};
+
+    fn asked() -> crate::tree::Asked {
+        crate::tree::Asked {
+            llm: "llm".into(),
+            model: "m1".into(),
+            temperature: None,
+            max_completion_tokens: None,
+            reasoning: None,
+            stream: false,
+            retry: crate::protocol::RetryPolicy::no_retry(),
+            tools: crate::tree::Tools::Set(None),
+        }
+    }
 
     fn config(model: &str) -> AgentConfig {
         serde_json::from_value(serde_json::json!({ "model": model })).unwrap()
@@ -786,6 +659,7 @@ mod tree_tests {
                 call: "call-1".into(),
                 placed: vec![placed],
                 tools: crate::tree::Tools::Set(None),
+                asked: asked(),
             },
         );
         put(
@@ -838,6 +712,7 @@ mod tree_tests {
                 call: "call-1".into(),
                 placed: Vec::new(),
                 tools: crate::tree::Tools::Set(None),
+                asked: asked(),
             },
         );
         let text = |prompt: Vec<Message>| -> Vec<String> {
@@ -879,6 +754,7 @@ mod tree_tests {
             call: "call".into(),
             placed: Vec::new(),
             tools,
+            asked: asked(),
         };
         let mut s = View::new("s".into());
         put(
@@ -917,6 +793,45 @@ mod tree_tests {
             crate::tree::Tools::Set(Some(vec![tool("b")]))
         );
         assert_eq!(s.tree.tools("x2"), Some(vec![tool("a")]));
+    }
+
+    #[test]
+    fn what_a_call_asked_and_was_sent_is_read_from_the_path() {
+        let tool = |name: &str| LlmTool {
+            name: name.into(),
+            description: String::new(),
+            input: None,
+            output: None,
+            defer: false,
+        };
+        let mut s = View::new("s".into());
+        put(&mut s, "u1", None, message("u1"));
+        put(
+            &mut s,
+            "x1",
+            Some("u1"),
+            Fact::Context {
+                call: "call-1".into(),
+                placed: Vec::new(),
+                tools: crate::tree::Tools::Set(Some(vec![tool("skill")])),
+                asked: crate::tree::Asked {
+                    temperature: Some(0.5),
+                    tools: crate::tree::Tools::Set(Some(vec![tool("find"), tool("skill")])),
+                    ..asked()
+                },
+            },
+        );
+        put(&mut s, "call-1", Some("x1"), message("call-1"));
+        put(&mut s, "u2", Some("call-1"), message("u2"));
+
+        let sent = s.at(Some("u2")).sent("call-1").expect("on the path");
+        assert_eq!(sent.asked.model, "m1");
+        assert_eq!(sent.asked.temperature, Some(0.5));
+        assert_eq!(sent.asked_tools, Some(vec![tool("find"), tool("skill")]));
+        assert_eq!(sent.tools, Some(vec![tool("skill")]));
+        assert!(s.llm_call("call-1").is_none(), "no effect holds the call");
+        assert_eq!(s.tools_sent("call-1"), Some(vec![tool("skill")]));
+        assert!(s.at(Some("u1")).sent("call-1").is_none(), "nor above it");
     }
 
     #[test]

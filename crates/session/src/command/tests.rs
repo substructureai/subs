@@ -14938,15 +14938,9 @@ fn a_continuation_of_a_tree_call_leaves_the_prompt_to_the_tree() {
     };
     record(&mut agg, "tool done", vec![u1, a1, t1]);
     let transcript = agg.state.on(&BranchId::MAIN).transcript();
-    let calls = HashMap::from([(
-        "call-1".to_string(),
-        agg.state
-            .effect(EffectKind::LlmCall, "call-1")
-            .expect("the call")
-            .clone(),
-    )]);
     let crate::protocol::DecisionAction::CallLlm { messages, .. } =
-        crate::propose::reissue("tc-1", &[], &transcript, &calls).expect("a continuation")
+        crate::propose::reissue("tc-1", &[], &transcript, agg.state.on(&BranchId::MAIN))
+            .expect("a continuation")
     else {
         panic!("an llm.call");
     };

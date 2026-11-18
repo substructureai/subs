@@ -313,6 +313,7 @@ pub struct ContextPlaced {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub placed: Vec<crate::prompt_context::Placed>,
     pub tools: crate::tree::Tools,
+    pub asked: crate::tree::Asked,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

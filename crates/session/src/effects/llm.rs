@@ -90,6 +90,16 @@ impl KindSpec for LlmSpec {
                 let at = state.at(leaf.as_deref());
                 let placing = at.place(id);
                 let (tools, record) = at.sends(call.spec.tools.clone());
+                let asked = crate::tree::Asked {
+                    llm: call.llm.clone(),
+                    model: call.spec.model.clone(),
+                    temperature: call.spec.temperature,
+                    max_completion_tokens: call.spec.max_completion_tokens,
+                    reasoning: call.spec.reasoning.clone(),
+                    stream: call.stream,
+                    retry: effect.tracking.retry_policy.clone(),
+                    tools: at.record(&call.spec.tools, crate::tree::Fact::asked_tools),
+                };
                 events.push(EventPayload::ContextPlaced(ContextPlaced {
                     node: crate::tree::Place {
                         id: state.ids().next(),
@@ -99,6 +109,7 @@ impl KindSpec for LlmSpec {
                     call: id.to_string(),
                     placed: placing.placed,
                     tools: record,
+                    asked,
                 }));
                 (placing.prompt, tools)
             }

@@ -6,6 +6,13 @@ use crate::state::View;
 use crate::state::{At, SessionState};
 
 #[derive(Debug, Clone)]
+pub struct CallSent {
+    pub asked: crate::tree::Asked,
+    pub asked_tools: Option<Vec<LlmTool>>,
+    pub tools: Option<Vec<LlmTool>>,
+}
+
+#[derive(Debug, Clone)]
 pub struct Placing {
     pub prompt: Vec<Message>,
     pub placed: Vec<prompt_context::Placed>,
@@ -81,20 +88,45 @@ impl At<'_, '_> {
             Some(run_code) => Some(vec![run_code]),
             None => sent_tools(asked, &self.connector_tools().tools, &self.locked_tools()),
         };
-        let recorded = self.up().find_map(|node| match &node.fact {
-            crate::tree::Fact::Context { tools: here, .. } => {
-                Some((node.id().to_string(), here.clone()))
-            }
-            _ => None,
-        });
-        let record = match recorded {
-            Some((_, crate::tree::Tools::As(set))) if self.session().tree.tools(&set) == tools => {
-                crate::tree::Tools::As(set)
-            }
-            Some((id, crate::tree::Tools::Set(set))) if set == tools => crate::tree::Tools::As(id),
-            _ => crate::tree::Tools::Set(tools.clone()),
-        };
+        let record = self.record(&tools, crate::tree::Fact::sent_tools);
         (tools, record)
+    }
+
+    /// `tools` as a context node here records them: a reference to the
+    /// nearest one above that holds the same set, or the set.
+    pub fn record(
+        &self,
+        tools: &Option<Vec<LlmTool>>,
+        pick: fn(&crate::tree::Fact) -> Option<&crate::tree::Tools>,
+    ) -> crate::tree::Tools {
+        use crate::tree::Tools;
+        let nearest = self
+            .up()
+            .find_map(|node| Some((node.id().to_string(), pick(&node.fact)?.clone())));
+        match nearest {
+            Some((_, Tools::As(set))) if self.session().tree.resolve(&set, pick) == *tools => {
+                Tools::As(set)
+            }
+            Some((id, Tools::Set(set))) if set == *tools => Tools::As(id),
+            _ => Tools::Set(tools.clone()),
+        }
+    }
+
+    /// What `call` asked for and was sent, from its context node on this
+    /// path.
+    pub fn sent(&self, call: &str) -> Option<CallSent> {
+        let node = self.up().find(|node| {
+            matches!(&node.fact, crate::tree::Fact::Context { call: here, .. } if here == call)
+        })?;
+        let crate::tree::Fact::Context { asked, .. } = &node.fact else {
+            return None;
+        };
+        let tree = &self.session().tree;
+        Some(CallSent {
+            asked: asked.clone(),
+            asked_tools: tree.resolve(node.id(), crate::tree::Fact::asked_tools),
+            tools: tree.tools(node.id()),
+        })
     }
 }
 
@@ -147,10 +179,12 @@ impl View {
 impl View {
     /// The tools a call was sent, or asked for before it was dispatched.
     pub fn tools_sent(&self, id: &str) -> Option<Vec<LlmTool>> {
-        let call = self.llm_call(id)?;
-        match call.reads_from.as_deref() {
-            Some(node) => self.tree.tools(node),
-            None => call.spec.tools.clone(),
+        match self.llm_call(id) {
+            Some(call) => match call.reads_from.as_deref() {
+                Some(node) => self.tree.tools(node),
+                None => call.spec.tools.clone(),
+            },
+            None => self.at(Some(id)).sent(id)?.tools,
         }
     }
 }

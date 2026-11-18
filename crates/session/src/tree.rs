@@ -40,7 +40,45 @@ pub enum Fact {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         placed: Vec<crate::prompt_context::Placed>,
         tools: Tools,
+        asked: Asked,
     },
+}
+
+impl Fact {
+    pub fn sent_tools(&self) -> Option<&Tools> {
+        match self {
+            Fact::Context { tools, .. } => Some(tools),
+            _ => None,
+        }
+    }
+
+    pub fn asked_tools(&self) -> Option<&Tools> {
+        match self {
+            Fact::Context { asked, .. } => Some(&asked.tools),
+            _ => None,
+        }
+    }
+}
+
+/// What a call asked for. Its tools are recorded as the tools it was sent
+/// are.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Asked {
+    pub llm: String,
+    pub model: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::json::option_f64"
+    )]
+    pub temperature: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_completion_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<crate::protocol::ReasoningConfig>,
+    pub stream: bool,
+    pub retry: crate::protocol::RetryPolicy,
+    pub tools: Tools,
 }
 
 /// The tools a call was sent. `As` names the context node that holds the
@@ -176,16 +214,14 @@ impl Tree {
     }
 
     pub fn tools(&self, id: &str) -> Option<Vec<LlmTool>> {
-        match &self.get(id)?.fact {
-            Fact::Context {
-                tools: Tools::As(set),
-                ..
-            } => self.tools(set),
-            Fact::Context {
-                tools: Tools::Set(tools),
-                ..
-            } => tools.clone(),
-            _ => None,
+        self.resolve(id, Fact::sent_tools)
+    }
+
+    pub fn resolve(&self, id: &str, pick: fn(&Fact) -> Option<&Tools>) -> Option<Vec<LlmTool>> {
+        let node = self.get(id)?;
+        match pick(&node.fact)? {
+            Tools::As(set) => self.resolve(set, pick),
+            Tools::Set(tools) => tools.clone(),
         }
     }
 
@@ -524,6 +560,7 @@ impl Node {
                     call: c.call.clone(),
                     placed: c.placed.clone(),
                     tools: c.tools.clone(),
+                    asked: c.asked.clone(),
                 },
             },
             _ => return None,

@@ -8,7 +8,7 @@ pub use effects::*;
 pub use fold::*;
 pub use view::*;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 

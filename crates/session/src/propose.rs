@@ -1,8 +1,6 @@
-use std::collections::HashMap;
-
 use super::context;
 use super::interrupts::{self, approval, auth};
-use super::state::{inner_arguments, At, EffectState};
+use super::state::{inner_arguments, At};
 use super::tool_contract::{declared_tool, violates, DeclaredTool};
 use crate::protocol::StoredContent;
 use crate::protocol::{
@@ -172,7 +170,6 @@ fn stopped_for_auth(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<Deci
 fn derive(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionResponse> {
     let transcript = p.state.transcript();
     let transcript = transcript.as_slice();
-    let llm_calls = &p.state.open_llm_calls();
     let config = p.state.config();
     let config = config.as_ref();
     let connector_tools = p.state.connector_tools().tools;
@@ -231,7 +228,7 @@ fn derive(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionRespon
             name,
             settled_content(*ok, result, error),
             transcript,
-            llm_calls,
+            p.state,
             pending_calls,
         ),
         DecisionTrigger::SubagentFinished {
@@ -269,7 +266,7 @@ fn derive(trigger: &DecisionTrigger, p: &Proposing<'_>) -> Option<DecisionRespon
             agent_id,
             Content::Text(subagent_text(*ok, session_id, result, error)),
             transcript,
-            llm_calls,
+            p.state,
             pending_calls,
         ),
         DecisionTrigger::ToolExecute {
@@ -761,7 +758,7 @@ fn tool_finished(
     name: &str,
     content: Content,
     transcript: &[Message],
-    llm_calls: &HashMap<String, EffectState>,
+    state: At<'_, '_>,
     pending_calls: usize,
 ) -> Option<DecisionResponse> {
     let tool_message = DraftMessage {
@@ -780,7 +777,7 @@ fn tool_finished(
             id,
             std::slice::from_ref(&tool_message),
             transcript,
-            llm_calls,
+            state,
         )?]
     };
     Some(DecisionResponse {
@@ -794,26 +791,28 @@ pub(super) fn reissue(
     tool_call_id: &str,
     tool_messages: &[DraftMessage],
     transcript: &[Message],
-    llm_calls: &HashMap<String, EffectState>,
+    state: At<'_, '_>,
 ) -> Option<DecisionAction> {
-    let assistant_at = transcript
+    let assistant = transcript
         .iter()
-        .rposition(|m| m.tool_calls.iter().any(|c| c.id == tool_call_id))?;
-    let effect = llm_calls.get(&transcript[assistant_at].id)?;
-    let call = effect.llm()?;
+        .rfind(|m| m.tool_calls.iter().any(|c| c.id == tool_call_id))?;
+    let sent = state
+        .session()
+        .at(Some(&assistant.id))
+        .sent(&assistant.id)?;
     let _ = tool_messages;
 
     Some(DecisionAction::CallLlm {
         id: None,
-        llm: Some(call.llm.clone()),
-        model: Some(call.spec.model.clone()),
+        llm: Some(sent.asked.llm),
+        model: Some(sent.asked.model),
         messages: None,
-        tools: call.spec.tools.clone(),
-        temperature: call.spec.temperature,
-        max_completion_tokens: call.spec.max_completion_tokens,
-        reasoning: call.spec.reasoning.clone(),
-        stream: Some(call.stream),
-        retry: Some(effect.tracking.retry_policy.as_override()),
+        tools: sent.asked_tools,
+        temperature: sent.asked.temperature,
+        max_completion_tokens: sent.asked.max_completion_tokens,
+        reasoning: sent.asked.reasoning,
+        stream: Some(sent.asked.stream),
+        retry: Some(sent.asked.retry.as_override()),
         branch: None,
     })
 }
@@ -830,7 +829,9 @@ fn appended(transcript: &[Message], message: DraftMessage) -> Vec<DraftMessage> 
 
 #[cfg(test)]
 mod tests {
-    use crate::state::View;
+    use std::collections::HashMap;
+
+    use crate::state::{EffectState, View};
     #[test]
     fn a_stored_block_reaches_the_model_as_a_part() {
         let uri = format!("blob://t1/{}?mime=image%2Fpng&size=5", uuid::Uuid::now_v7());
@@ -892,6 +893,32 @@ mod tests {
             parent = s.leaf(&BranchId::MAIN).map(str::to_string);
         }
         for m in transcript {
+            if let Some((effect, call)) = llm_calls.get(&m.id).and_then(|e| Some((e, e.llm()?))) {
+                let id = format!("{}-ctx", m.id);
+                s.seed(crate::tree::Node {
+                    place: crate::tree::Place {
+                        id: id.clone(),
+                        parent_id: parent.take(),
+                        branch: None,
+                    },
+                    fact: crate::tree::Fact::Context {
+                        call: m.id.clone(),
+                        placed: Vec::new(),
+                        tools: crate::tree::Tools::Set(call.spec.tools.clone()),
+                        asked: crate::tree::Asked {
+                            llm: call.llm.clone(),
+                            model: call.spec.model.clone(),
+                            temperature: call.spec.temperature,
+                            max_completion_tokens: call.spec.max_completion_tokens,
+                            reasoning: call.spec.reasoning.clone(),
+                            stream: call.stream,
+                            retry: effect.tracking.retry_policy.clone(),
+                            tools: crate::tree::Tools::Set(call.spec.tools.clone()),
+                        },
+                    },
+                });
+                parent = Some(id);
+            }
             s.seed_message(NewMessage {
                 message: m.clone(),
                 parent_id: parent.take(),

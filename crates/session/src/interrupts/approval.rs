@@ -24,7 +24,6 @@ impl InterruptKind for Approval {
     fn resumed(&self, tail: &str, payload: &Value, p: &Proposing<'_>) -> Option<DecisionResponse> {
         let transcript = p.state.transcript();
         let transcript = transcript.as_slice();
-        let llm_calls = &p.state.open_llm_calls();
         let dispatched = p.state.session().dispatched_calls();
         let dispatched = dispatched.as_slice();
         let config = p.state.config();
@@ -78,7 +77,7 @@ impl InterruptKind for Approval {
         }
 
         if actions.is_empty() && pending_calls == 0 && siblings_answered(&call.id, transcript) {
-            actions.extend(reissue(&call.id, &refusals, transcript, llm_calls));
+            actions.extend(reissue(&call.id, &refusals, transcript, p.state));
         }
         let mut messages = recorded(transcript);
         messages.extend(refusals);
