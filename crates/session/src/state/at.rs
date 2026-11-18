@@ -9,7 +9,7 @@ impl SessionState {
         let open = self.branches.get(branch)?;
         open.leaf
             .as_deref()
-            .or_else(|| open.started.as_ref()?.from.as_deref())
+            .or_else(|| open.run.as_ref()?.from.as_deref())
     }
 
     pub fn on(&self, branch: &BranchId) -> At<'_, '_> {
@@ -695,7 +695,7 @@ mod open_llm_calls_tests {
             BranchId::MAIN,
             Open {
                 leaf: Some("call-1".to_string()),
-                started: None,
+                run: None,
             },
         );
         s.put_effect(call_state("call-1"));
@@ -712,7 +712,7 @@ mod open_llm_calls_tests {
             BranchId::MAIN,
             Open {
                 leaf: Some("t1".to_string()),
-                started: None,
+                run: None,
             },
         );
         assert!(

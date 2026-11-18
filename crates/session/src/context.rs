@@ -278,12 +278,9 @@ fn tail(text: String, chars: Option<usize>) -> String {
 pub fn summary_size(state: &SessionState, id: &str) -> usize {
     let chars = |path: &[Message]| path.iter().map(|m| text(m).chars().count()).sum();
     let key = BranchId::from(id);
-    let leaf = match state.started(&key) {
-        Some(_) => Some(state.leaf(&key).map(str::to_string)),
-        None => state
-            .tree
-            .branch(id)
-            .map(|closed| closed.leaf.or(closed.state.from)),
+    let leaf = match state.branches.contains_key(&key) {
+        true => Some(state.leaf(&key).map(str::to_string)),
+        false => state.tree.stored(&key).map(|s| s.leaf.or(s.from)),
     };
     match leaf {
         Some(leaf) => chars(&state.at(leaf.as_deref()).transcript()),

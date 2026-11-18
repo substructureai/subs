@@ -127,7 +127,7 @@ impl Session {
         let branch_id = &worker_decision.branch;
         let branch = branch_id.name().and_then(|b| {
             let leaf = self.state.leaf(branch_id).map(str::to_string);
-            Some(self.state.started(branch_id)?.view(b, leaf))
+            Some(self.state.open_run(branch_id)?.view(b, leaf))
         });
         let read = self.state.read_point(&trigger, branch_id);
         let at = self.state.at(read.at.as_deref());

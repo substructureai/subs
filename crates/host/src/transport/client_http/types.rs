@@ -221,7 +221,7 @@ mod tests {
             BranchId::MAIN,
             Open {
                 leaf: Some("a1".to_string()),
-                started: None,
+                run: None,
             },
         );
         let json = serde_json::to_value(session_response("s1".into(), &view_of(s))).unwrap();

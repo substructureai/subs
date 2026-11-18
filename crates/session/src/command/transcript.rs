@@ -138,7 +138,7 @@ impl SessionState {
             false => full,
         };
         let last = |n: usize| n.checked_sub(1).and_then(|i| view[i].id.as_deref());
-        let floor = self.started(scope).and_then(|b| b.from.as_deref());
+        let floor = self.open_run(scope).and_then(|b| b.from.as_deref());
         if let Some(at) = self.tree.fork_on(leaf.as_deref(), last(full), floor) {
             let at = match shared == full {
                 true => at,

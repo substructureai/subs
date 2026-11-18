@@ -53,17 +53,17 @@ impl SessionState {
     }
 
     pub fn branch_depth(&self, branch: &BranchId) -> usize {
-        self.started(branch).map_or(0, |b| b.depth)
+        self.open_run(branch).map_or(0, |b| b.depth)
     }
 
     pub fn close_branch(
         &self,
         id: &str,
-        reason: BranchEnd,
+        reason: RunEnd,
         data: serde_json::Value,
         error: Option<ErrorInfo>,
     ) -> Vec<EventPayload> {
-        if self.started(&BranchId::from(id)).is_none() {
+        if self.open_run(&BranchId::from(id)).is_none() {
             return Vec::new();
         }
         let closing: HashSet<BranchId> = self
@@ -87,14 +87,9 @@ impl SessionState {
         );
         for b in self.branch_and_below(id).into_iter().rev() {
             let own = b == id;
-            let leaf = self
-                .branches
-                .get(&BranchId::from(b.as_str()))
-                .and_then(|open| open.leaf.clone());
-            events.push(EventPayload::BranchClosed(BranchClosed {
-                leaf,
+            events.push(EventPayload::BranchFinished(BranchFinished {
                 id: b,
-                reason: if own { reason } else { BranchEnd::Closed },
+                outcome: if own { reason } else { RunEnd::Stopped },
                 data: if own {
                     data.clone()
                 } else {
@@ -114,12 +109,12 @@ impl SessionState {
         error: Option<ErrorInfo>,
     ) -> Vec<EventPayload> {
         let key = BranchId::from(id);
-        let Some(branch) = self.started(&key) else {
+        let Some(branch) = self.open_run(&key) else {
             return Vec::new();
         };
         let reason = match error {
-            Some(_) => BranchEnd::Failed,
-            None => BranchEnd::Done,
+            Some(_) => RunEnd::Failed,
+            None => RunEnd::Done,
         };
         let trigger = Trigger::BranchFinished {
             id: id.to_string(),
@@ -138,7 +133,7 @@ impl SessionState {
             return events;
         }
         let mut events = self.close_branch(id, reason, data, error);
-        let voided = !parent.is_main() && self.started(&parent).is_none();
+        let voided = !parent.is_main() && self.open_run(&parent).is_none();
         if !voided {
             events.push(decision_queued_on(ids, trigger, parent.into()));
         }
@@ -151,7 +146,7 @@ impl SessionState {
             .filter(|(_, b)| !self.detached(&b.parent))
             .filter(|(_, b)| b.parent.is_main())
             .flat_map(|(id, _)| {
-                self.close_branch(id, BranchEnd::Voided, serde_json::Value::Null, None)
+                self.close_branch(id, RunEnd::Voided, serde_json::Value::Null, None)
             })
             .collect()
     }
@@ -163,14 +158,14 @@ impl SessionState {
             .filter(|(_, b)| b.mode == BranchMode::Blocking)
             .filter(|(_, b)| b.from.is_some() && !at.anchor_on_path(b.from.as_deref()))
             .flat_map(|(id, _)| {
-                self.close_branch(id, BranchEnd::Voided, serde_json::Value::Null, None)
+                self.close_branch(id, RunEnd::Voided, serde_json::Value::Null, None)
             })
             .collect()
     }
 
     pub fn quiet_branch(&self, ids: &Ids, id: &str) -> Vec<EventPayload> {
         let key = BranchId::from(id);
-        if self.started(&key).is_none() {
+        if self.open_run(&key).is_none() {
             return Vec::new();
         }
         let busy = self.effects.values().any(|e| {
@@ -202,7 +197,7 @@ impl Working {
             return Err(refused("A branch needs an id."));
         }
         let key = BranchId::from(start.id.as_str());
-        if self.started(&key).is_none() {
+        if self.open_run(&key).is_none() {
             match self.stored_leaf(&key) {
                 Some(leaf) => self.continue_branch(&start, leaf)?,
                 None => self.begin_branch(&start, messages.is_empty())?,
@@ -339,7 +334,7 @@ impl Working {
             name: None,
             mode: BranchMode::Blocking,
         };
-        if self.started(&key).is_none() {
+        if self.open_run(&key).is_none() {
             match self.stored_leaf(&key) {
                 Some(leaf) => self.continue_branch(&start(BranchFrom::Head), leaf)?,
                 None => {
@@ -400,7 +395,7 @@ impl Working {
             reasoning: None,
         });
         let key = BranchId::from(branch.as_str());
-        let mut own = match self.started(&key) {
+        let mut own = match self.open_run(&key) {
             Some(_) => self.leaf(&key).map(str::to_string),
             None => self.stored_leaf(&key),
         };
@@ -461,7 +456,7 @@ impl Working {
                 branch: Some(branch.clone()),
             }));
         }
-        let name = self.started(&key).and_then(|b| b.name.clone());
+        let name = self.open_run(&key).and_then(|b| b.name.clone());
         self.queue_decision_on(
             Trigger::BranchStarted {
                 id: branch.clone(),
@@ -515,8 +510,8 @@ impl Working {
             tracing::warn!(branch = id, "a branch with work open cannot be promoted");
             return;
         }
-        if self.started(&key).is_some() {
-            self.then(|s| s.close_branch(id, BranchEnd::Promoted, serde_json::Value::Null, None));
+        if self.open_run(&key).is_some() {
+            self.then(|s| s.close_branch(id, RunEnd::Stopped, serde_json::Value::Null, None));
         }
         self.emit(EventPayload::BranchMoved(BranchMoved {
             leaf,

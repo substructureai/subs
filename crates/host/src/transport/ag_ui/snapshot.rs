@@ -271,7 +271,7 @@ mod tests {
             BranchId::MAIN,
             Open {
                 leaf: tree.head_id.clone(),
-                started: None,
+                run: None,
             },
         );
         s

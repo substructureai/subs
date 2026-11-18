@@ -194,9 +194,9 @@ fn prompt_texts(agg: &Session, call: &str) -> Vec<String> {
         .collect()
 }
 
-fn branch_closed(events: &[EventPayload], id: &str) -> Option<BranchEnd> {
+fn branch_closed(events: &[EventPayload], id: &str) -> Option<RunEnd> {
     events.iter().find_map(|e| match e {
-        EventPayload::BranchClosed(c) if c.id == id => Some(c.reason),
+        EventPayload::BranchFinished(c) if c.id == id => Some(c.outcome),
         _ => None,
     })
 }
@@ -235,7 +235,7 @@ fn a_fork_reads_the_conversation_and_then_its_own_messages() {
     let agg = turn_with_side_call(BranchMode::Detached);
     let branch = agg
         .state
-        .started(&BranchId::from("title"))
+        .open_run(&BranchId::from("title"))
         .expect("the branch started");
     assert_eq!(branch.from.as_deref(), Some("u1"));
     assert_eq!(
@@ -281,7 +281,7 @@ fn a_detached_branch_reports_back_without_a_turn() {
     echo(&mut agg);
     assert!(agg.state.open_turn().is_none(), "the turn ended");
     assert!(
-        agg.state.started(&BranchId::from("title")).is_some(),
+        agg.state.open_run(&BranchId::from("title")).is_some(),
         "and the branch lives on"
     );
 
@@ -294,7 +294,7 @@ fn a_detached_branch_reports_back_without_a_turn() {
         [DecisionAction::Done { data }] if data == &serde_json::json!("Paris weather")
     ));
     let events = echo(&mut agg);
-    assert_eq!(branch_closed(&events, "title"), Some(BranchEnd::Done));
+    assert_eq!(branch_closed(&events, "title"), Some(RunEnd::Done));
     let (finished, on) = branch_finished(&events).expect("its parent hears");
     assert_eq!(on, None, "the conversation started it");
     assert!(matches!(
@@ -361,7 +361,7 @@ fn a_turn_that_ends_takes_its_blocking_branches_with_it() {
             data: serde_json::Value::Null,
         }],
     );
-    assert_eq!(branch_closed(&events, "title"), Some(BranchEnd::Voided));
+    assert_eq!(branch_closed(&events, "title"), Some(RunEnd::Voided));
     assert!(branch_finished(&events).is_none(), "nobody waits for it");
     assert_eq!(
         agg.state
@@ -381,7 +381,7 @@ fn a_detached_branch_outlives_a_cancel() {
         &frontend(),
     );
     assert!(agg.state.open_turn().is_none());
-    assert!(agg.state.started(&BranchId::from("title")).is_some());
+    assert!(agg.state.open_run(&BranchId::from("title")).is_some());
     assert!(agg
         .state
         .tracking(EffectKind::LlmCall, "t1")
@@ -566,7 +566,7 @@ fn a_branch_with_work_out_cannot_be_promoted() {
         }],
     );
     assert_eq!(agg.state.message_tree().head_id.as_deref(), Some("u1"));
-    assert!(agg.state.started(&BranchId::from("title")).is_some());
+    assert!(agg.state.open_run(&BranchId::from("title")).is_some());
 }
 
 #[test]
@@ -590,7 +590,7 @@ fn a_branch_decision_that_leaves_nothing_open_ends_the_branch() {
     let (d, _) = live_decision(&agg);
     let proposed = proposed_for(&agg, &d);
     let events = submit_decision(&mut agg, d, proposed.messages, vec![]);
-    assert_eq!(branch_closed(&events, "title"), Some(BranchEnd::Done));
+    assert_eq!(branch_closed(&events, "title"), Some(RunEnd::Done));
 }
 
 fn explicit(id: &str, messages: Vec<DraftMessage>) -> Action {
@@ -625,13 +625,13 @@ fn an_explicit_call_runs_on_its_own_branch_as_written() {
     );
     let branch = agg
         .state
-        .started(&BranchId::from("x1"))
+        .open_run(&BranchId::from("x1"))
         .expect("its own branch");
     assert_eq!(
         branch.from, None,
         "a system message first: nothing to share"
     );
-    assert_eq!(branch.agent, BranchConfig::None);
+    assert!(agg.state.on(&BranchId::from("x1")).config().is_none());
     assert_eq!(prompt_texts(&agg, "x1"), ["my rules", "what time is it?"]);
     assert_eq!(agg.state.leaf(&BranchId::MAIN), Some("u1"));
 
@@ -674,7 +674,7 @@ fn an_explicit_prompt_that_starts_with_the_conversation_forks_from_it() {
             ],
         )],
     );
-    let branch = agg.state.started(&BranchId::from("x1")).unwrap();
+    let branch = agg.state.open_run(&BranchId::from("x1")).unwrap();
     assert_eq!(
         branch.from.as_deref(),
         Some("u1"),
@@ -710,7 +710,7 @@ fn an_explicit_prompt_edited_on_the_way_is_copied_from_there() {
             vec![node_msg("u1", Role::User, "what time is it in Paris?")],
         )],
     );
-    let branch = agg.state.started(&BranchId::from("x1")).unwrap();
+    let branch = agg.state.open_run(&BranchId::from("x1")).unwrap();
     assert_eq!(branch.from, None);
     assert_eq!(prompt_texts(&agg, "x1"), ["what time is it in Paris?"]);
 }
@@ -841,9 +841,16 @@ fn branch_call_id(agg: &Session, branch: &str) -> String {
 #[test]
 fn a_forked_subagent_reads_the_conversation_and_answers_its_call() {
     let (mut agg, branch) = delegated("researcher", crate::protocol::SubagentBranch::Head);
-    let b = agg.state.started(&BranchId::from(&branch)).unwrap();
+    let b = agg.state.open_run(&BranchId::from(&branch)).unwrap();
     assert_eq!(b.from.as_deref(), Some("c1"), "it forks at the call");
-    assert_eq!(b.agent, BranchConfig::Inherit);
+    assert_eq!(
+        agg.state
+            .on(&BranchId::from(&branch))
+            .config()
+            .map(|c| c.model),
+        agg.state.on(&BranchId::MAIN).config().map(|c| c.model),
+        "it inherits the conversation's config"
+    );
 
     let call = branch_call_id(&agg, &branch);
     let side = prompt_texts(&agg, &call);
@@ -861,7 +868,7 @@ fn a_forked_subagent_reads_the_conversation_and_answers_its_call() {
 
     reply(&mut agg, &call, said("Three causes.", 100));
     let events = echo(&mut agg);
-    assert_eq!(branch_closed(&events, &branch), Some(BranchEnd::Done));
+    assert_eq!(branch_closed(&events, &branch), Some(RunEnd::Done));
     let (_, trigger) = live_decision(&agg);
     assert!(matches!(
         trigger,
@@ -888,7 +895,7 @@ fn a_forked_subagent_reads_the_conversation_and_answers_its_call() {
 #[test]
 fn a_root_subagent_runs_clean_as_its_own_config() {
     let (agg, branch) = delegated("poet", crate::protocol::SubagentBranch::Root);
-    let b = agg.state.started(&BranchId::from(&branch)).unwrap();
+    let b = agg.state.open_run(&BranchId::from(&branch)).unwrap();
     assert_eq!(b.from, None);
     let call = branch_call_id(&agg, &branch);
     assert_eq!(
@@ -906,7 +913,7 @@ fn a_subagent_on_a_branch_ends_with_its_turn() {
         CommandPayload::CancelSession { drop_queued: false },
         &frontend(),
     );
-    assert!(agg.state.started(&BranchId::from(&branch)).is_none());
+    assert!(agg.state.open_run(&BranchId::from(&branch)).is_none());
     assert_eq!(
         agg.state
             .tracking(EffectKind::Subagent, "tc-r")
@@ -942,7 +949,7 @@ fn a_detached_subagent_on_a_branch_reports_back_as_a_message() {
     echo(&mut agg);
     let branch = agg.state.subagent("tc-r").unwrap().session_id.clone();
     assert_eq!(
-        agg.state.started(&BranchId::from(&branch)).unwrap().mode,
+        agg.state.open_run(&BranchId::from(&branch)).unwrap().mode,
         BranchMode::Detached
     );
 
@@ -966,7 +973,7 @@ fn a_detached_subagent_on_a_branch_reports_back_as_a_message() {
     let call = branch_call_id(&agg, &branch);
     reply(&mut agg, &call, said("Found it.", 100));
     echo(&mut agg);
-    assert!(agg.state.started(&BranchId::from(&branch)).is_none());
+    assert!(agg.state.open_run(&BranchId::from(&branch)).is_none());
     let notice = agg
         .state
         .queued_decisions()
@@ -1069,7 +1076,7 @@ fn an_interrupt_on_one_branch_holds_only_that_branch() {
     );
     assert_eq!(pending_lanes(&agg), vec![BranchId::from("draft-b")]);
     assert!(
-        agg.state.started(&BranchId::from("draft-a")).is_some(),
+        agg.state.open_run(&BranchId::from("draft-a")).is_some(),
         "held, not ended"
     );
 }
@@ -1180,7 +1187,7 @@ fn a_call_with_messages_inside_a_branch_starts_a_child_that_reports_to_it() {
     );
     let child = agg
         .state
-        .started(&BranchId::from("x2"))
+        .open_run(&BranchId::from("x2"))
         .expect("a child branch");
     assert_eq!(child.parent.name(), Some("title"));
     assert_eq!(prompt_texts(&agg, "x2"), ["shorter"]);
@@ -1189,7 +1196,7 @@ fn a_call_with_messages_inside_a_branch_starts_a_child_that_reports_to_it() {
     let (d, _) = live_decision(&agg);
     assert_eq!(agg.state.decision_branch(&d).name(), Some("x2"));
     let events = submit_decision(&mut agg, d, vec![], vec![]);
-    assert_eq!(branch_closed(&events, "x2"), Some(BranchEnd::Done));
+    assert_eq!(branch_closed(&events, "x2"), Some(RunEnd::Done));
     let (_, on) = branch_finished(&events).expect("the child reports back");
     assert_eq!(on.as_deref(), Some("title"));
 }
@@ -1208,7 +1215,7 @@ fn a_call_with_messages_too_deep_for_a_branch_is_answered_with_an_error() {
             vec![],
             vec![explicit(&id, vec![node_msg("", Role::User, "deeper")])],
         );
-        if agg.state.started(&BranchId::from(&id)).is_none() {
+        if agg.state.open_run(&BranchId::from(&id)).is_none() {
             assert_eq!(
                 agg.state.branch_depth(&BranchId::from(&calling)),
                 crate::command::branch::MAX_BRANCH_DEPTH
@@ -1265,7 +1272,7 @@ fn a_call_with_messages_asked_again_continues_its_branch_with_what_is_new() {
     reply(&mut agg, "x1", said("A title", 10));
     let (d, _) = live_decision(&agg);
     let events = submit_decision(&mut agg, d, vec![], vec![]);
-    assert_eq!(branch_closed(&events, "x1"), Some(BranchEnd::Done));
+    assert_eq!(branch_closed(&events, "x1"), Some(RunEnd::Done));
 
     let again = ask(
         &mut agg,
@@ -1440,9 +1447,9 @@ fn a_branch_whose_run_failed_is_promoted_from_its_stored_leaf() {
             error: ErrorInfo::new(ErrorCode::HandlerError, "no title"),
         }],
     );
-    assert_eq!(branch_closed(&events, "title"), Some(BranchEnd::Failed));
+    assert_eq!(branch_closed(&events, "title"), Some(RunEnd::Failed));
     let title = BranchId::from("title");
-    assert!(agg.state.started(&title).is_none(), "its run ended");
+    assert!(agg.state.open_run(&title).is_none(), "its run ended");
     let leaf = agg
         .state
         .tree

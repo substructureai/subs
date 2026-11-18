@@ -99,7 +99,7 @@ fn the_random_sequences_reach_every_kind_of_event() {
     for kind in [
         "message.new",
         "branch.started",
-        "branch.closed",
+        "branch.finished",
         "branch.moved",
         "context.placed",
         "context.replaced",

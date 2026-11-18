@@ -432,15 +432,15 @@ impl SessionState {
                     .entry(BranchId::from(p.id.as_str()))
                     .or_insert_with(|| Open {
                         leaf: p.leaf.clone(),
-                        started: Some(BranchState::started(p, ctx.sequence)),
+                        run: Some(Run::started(p, ctx.sequence)),
                     });
             }
-            EventPayload::BranchClosed(p) => {
+            EventPayload::BranchFinished(p) => {
                 let id = BranchId::from(p.id.as_str());
                 match self.names(&id) {
                     true => {
                         if let Some(open) = self.branches.get_mut(&id) {
-                            if let Some(started) = open.started.take() {
+                            if let Some(started) = open.run.take() {
                                 open.leaf = open.leaf.take().or(started.from);
                             }
                         }

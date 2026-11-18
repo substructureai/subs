@@ -123,8 +123,8 @@ pub enum EventPayload {
     ContextKept,
     #[serde(rename = "branch.started")]
     BranchStarted(Box<BranchStarted>),
-    #[serde(rename = "branch.closed")]
-    BranchClosed(BranchClosed),
+    #[serde(rename = "branch.finished")]
+    BranchFinished(BranchFinished),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,24 +152,21 @@ pub struct BranchStarted {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum BranchEnd {
+pub enum RunEnd {
     Done,
     Failed,
     Voided,
-    Closed,
-    Promoted,
+    Stopped,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BranchClosed {
+pub struct BranchFinished {
     pub id: String,
-    pub reason: BranchEnd,
+    pub outcome: RunEnd,
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub data: serde_json::Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<ErrorInfo>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub leaf: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

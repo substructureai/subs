@@ -845,7 +845,7 @@ impl Working {
                 }
                 Action::CloseBranch { id } => {
                     self.then(|s| {
-                        s.close_branch(&id, BranchEnd::Closed, serde_json::Value::Null, None)
+                        s.close_branch(&id, RunEnd::Stopped, serde_json::Value::Null, None)
                     });
                     Ok(())
                 }
@@ -1314,7 +1314,7 @@ impl Working {
                 let parked_head = self
                     .on(&BranchId::MAIN)
                     .anchor_on_path(open.anchor.as_deref());
-                let branch = Some(open.branch.clone()).filter(|b| self.started(b).is_some());
+                let branch = Some(open.branch.clone()).filter(|b| self.open_run(b).is_some());
                 self.emit(EventPayload::InterruptResumed(InterruptResumed {
                     interrupt_id: interrupt_id.clone(),
                     payload: payload.clone(),
@@ -1357,7 +1357,7 @@ impl Working {
                 let completed = EventPayload::DecisionCompleted(DecisionCompleted {
                     id: decision_id.clone(),
                 });
-                if !scope.is_main() && self.started(&scope).is_none() {
+                if !scope.is_main() && self.open_run(&scope).is_none() {
                     self.emit(completed);
                     return Ok(());
                 }

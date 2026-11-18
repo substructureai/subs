@@ -495,9 +495,9 @@ impl World {
             .iter()
             .filter(|id| {
                 let key = BranchId::from(id.as_str());
-                let leaf = match state.started(&key) {
+                let leaf = match state.open_run(&key) {
                     Some(_) => state.branches[&key].leaf.clone(),
-                    None => state.tree.branch(id).and_then(|r| r.leaf),
+                    None => state.tree.stored(&key).and_then(|s| s.leaf),
                 };
                 let own = leaf
                     .and_then(|leaf| state.tree.get(&leaf))
@@ -1050,9 +1050,6 @@ impl crate::tree::Nodes for CountedNodes {
     fn answers(&self, id: &str) -> Result<Vec<crate::tree::NodeRef>, crate::StoreError> {
         self.read().answers(id)
     }
-    fn branch(&self, id: &str) -> Result<Option<crate::tree::BranchRecord>, crate::StoreError> {
-        self.read().branch(id)
-    }
     fn stored(&self, branch: &BranchId) -> Result<Option<crate::tree::Stored>, crate::StoreError> {
         self.read().stored(branch)
     }
@@ -1180,7 +1177,7 @@ pub fn check(
         }
         let nodes = counted.store.nodes();
         for (id, open) in &world.agg.state().branches {
-            if !id.is_main() && open.started.is_none() {
+            if !id.is_main() && open.run.is_none() {
                 continue;
             }
             let stored = nodes.stored(id).unwrap().and_then(|s| s.leaf);

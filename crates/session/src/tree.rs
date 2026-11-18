@@ -4,9 +4,9 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 use crate::decision::BranchConfig;
-use crate::events::{BranchClosed, BranchEnd, BranchStarted, EventPayload};
+use crate::events::{BranchStarted, EventPayload};
 use crate::protocol::{AgentConfig, DraftMessage, Message, NewMessage, WorkerState};
-use crate::state::{BranchId, BranchState, Logged};
+use crate::state::{BranchId, Logged};
 use crate::store::StoreError;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -86,13 +86,6 @@ impl Node {
 
 pub type NodeRef = Arc<Logged<Node>>;
 
-#[derive(Debug, Clone)]
-pub struct BranchRecord {
-    pub state: BranchState,
-    pub leaf: Option<String>,
-    pub closed: Option<BranchEnd>,
-}
-
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Stored {
     pub leaf: Option<String>,
@@ -110,7 +103,6 @@ pub trait Nodes: Send + Sync {
     fn ancestors(&self, id: &str, limit: usize) -> Result<Vec<NodeRef>, StoreError>;
     fn children(&self, parent: &str, branch: Option<&str>) -> Result<Vec<NodeRef>, StoreError>;
     fn answers(&self, tool_call_id: &str) -> Result<Vec<NodeRef>, StoreError>;
-    fn branch(&self, id: &str) -> Result<Option<BranchRecord>, StoreError>;
     fn stored(&self, branch: &BranchId) -> Result<Option<Stored>, StoreError>;
     fn versions(
         &self,
@@ -124,7 +116,6 @@ pub trait Nodes: Send + Sync {
 pub struct Tree {
     source: Option<Arc<dyn Nodes>>,
     unwritten: HashMap<String, NodeRef>,
-    branches: HashMap<String, BranchRecord>,
     pending: HashMap<BranchId, Pending>,
     poisoned: Mutex<Option<StoreError>>,
 }
@@ -134,7 +125,6 @@ impl Clone for Tree {
         Tree {
             source: self.source.clone(),
             unwritten: self.unwritten.clone(),
-            branches: self.branches.clone(),
             pending: self.pending.clone(),
             poisoned: Mutex::default(),
         }
@@ -197,17 +187,8 @@ impl Tree {
                 .entry(node.id().to_string())
                 .or_insert_with(|| node.clone());
         }
-        if let Some(change) = &indexed.change {
-            let id = change.id();
-            let known = self.branch(id);
-            if let Some(record) = change.record(indexed.seq, known) {
-                self.branches.insert(id.to_string(), record);
-            }
-        }
         let key = BranchId::from(indexed.branch);
-        if let Some(BranchChange::Started(p)) =
-            indexed.change.as_ref().filter(|_| !indexed.continues())
-        {
+        if let Some(p) = indexed.started.filter(|_| !indexed.continues()) {
             self.pending.insert(
                 key.clone(),
                 Pending {
@@ -245,18 +226,10 @@ impl Tree {
             .or_insert_with(|| Arc::new(node));
     }
 
-    pub fn branch(&self, id: &str) -> Option<BranchRecord> {
-        match self.branches.get(id) {
-            Some(record) => Some(record.clone()),
-            None => self.read(|s| s.branch(id)),
-        }
-    }
-
     pub fn written(&mut self) {
         let Some(source) = &self.source else {
             return;
         };
-        self.branches.clear();
         self.pending.clear();
         source.cache(self.unwritten.drain().map(|(_, node)| node).collect());
     }
@@ -439,49 +412,18 @@ impl Iterator for Ancestors<'_> {
     }
 }
 
-pub enum BranchChange<'a> {
-    Started(&'a BranchStarted),
-    Closed(&'a BranchClosed),
-}
-
-impl BranchChange<'_> {
-    pub fn id(&self) -> &str {
-        match self {
-            BranchChange::Started(p) => &p.id,
-            BranchChange::Closed(p) => &p.id,
-        }
-    }
-
-    pub fn record(&self, seq: u64, known: Option<BranchRecord>) -> Option<BranchRecord> {
-        match self {
-            BranchChange::Started(p) => Some(BranchRecord {
-                state: BranchState::started(p, seq),
-                leaf: p.leaf.clone(),
-                closed: None,
-            }),
-            BranchChange::Closed(p) => known.map(|mut record| {
-                if let Some(leaf) = &p.leaf {
-                    record.leaf = Some(leaf.clone());
-                }
-                record.closed = Some(p.reason);
-                record
-            }),
-        }
-    }
-}
-
 pub struct Indexed<'a> {
     pub seq: u64,
     pub node: Option<NodeRef>,
-    pub change: Option<BranchChange<'a>>,
+    pub started: Option<&'a BranchStarted>,
     pub branch: Option<&'a str>,
     pub leaf: Option<String>,
 }
 
 impl Indexed<'_> {
     pub fn stored(&self, known: Option<Stored>) -> Option<Stored> {
-        let mut stored = match &self.change {
-            Some(BranchChange::Started(p)) if p.leaf.is_none() => Some(Stored {
+        let mut stored = match self.started {
+            Some(p) if p.leaf.is_none() => Some(Stored {
                 leaf: None,
                 from: p.from.clone(),
             }),
@@ -494,11 +436,11 @@ impl Indexed<'_> {
     }
 
     pub fn continues(&self) -> bool {
-        matches!(&self.change, Some(BranchChange::Started(p)) if p.leaf.is_some())
+        self.started.is_some_and(|p| p.leaf.is_some())
     }
 
     pub fn moves(&self) -> bool {
-        self.leaf.is_some() || matches!(self.change, Some(BranchChange::Started(_)))
+        self.leaf.is_some() || self.started.is_some()
     }
 
     pub fn answers(&self) -> Option<&str> {
@@ -510,9 +452,9 @@ impl Indexed<'_> {
 }
 
 pub fn index(seq: u64, event: &EventPayload) -> Indexed<'_> {
-    let (change, branch) = match event {
-        EventPayload::BranchStarted(p) => (Some(BranchChange::Started(p)), Some(p.id.as_str())),
-        EventPayload::BranchClosed(p) => (Some(BranchChange::Closed(p)), Some(p.id.as_str())),
+    let (started, branch) = match event {
+        EventPayload::BranchStarted(p) => (Some(&**p), Some(p.id.as_str())),
+        EventPayload::BranchFinished(p) => (None, Some(p.id.as_str())),
         EventPayload::BranchMoved(p) => (None, p.branch.as_deref()),
         EventPayload::NewMessage(m) => (None, m.branch.as_deref()),
         EventPayload::StateUpdated(v) => (None, v.node.branch.as_deref()),
@@ -529,7 +471,7 @@ pub fn index(seq: u64, event: &EventPayload) -> Indexed<'_> {
     Indexed {
         seq,
         node,
-        change,
+        started,
         branch,
         leaf,
     }

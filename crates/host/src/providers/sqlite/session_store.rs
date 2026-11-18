@@ -7,11 +7,9 @@ use quick_cache::sync::Cache;
 use quick_cache::{Equivalent, Weighter};
 use rusqlite::{params, OptionalExtension, Row, Transaction, TransactionBehavior};
 use substructure_session::delivery::Start;
-use substructure_session::events::{BranchClosed, BranchStarted, EventPayload};
+use substructure_session::events::EventPayload;
 use substructure_session::state::BranchId;
-use substructure_session::tree::{
-    index, BranchChange, BranchRecord, Fact, Node, NodeRef, Nodes, Stored,
-};
+use substructure_session::tree::{index, Fact, Node, NodeRef, Nodes, Stored};
 use substructure_session::{
     CommandId, CommandResult, Entry, Session, SessionEvent, Store, StoreError, Tail,
 };
@@ -270,47 +268,18 @@ impl SqliteSessionStore {
     }
 
     fn write_branches(&self, tx: &Transaction, entry: &Entry) -> Result<(), StoreError> {
-        let corrupt = |e: serde_json::Error| StoreError::Corrupt(e.to_string());
         for event in &entry.events {
             let indexed = index(event.seq, &event.payload);
             let key = indexed.branch.unwrap_or_default();
-            match &indexed.change {
-                Some(BranchChange::Started(p)) => {
-                    tx.execute(
-                        "INSERT INTO session_branches
-                            (tenant_id, session_id, branch_id, seq, started, closed, leaf, from_node)
-                         VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6)
-                         ON CONFLICT (tenant_id, session_id, branch_id) DO UPDATE SET
-                            seq = excluded.seq, started = excluded.started, closed = NULL,
-                            leaf = CASE WHEN ?7 THEN session_branches.leaf END,
-                            from_node = CASE WHEN ?7 THEN session_branches.from_node
-                                ELSE excluded.from_node END",
-                        params![
-                            self.tenant_id,
-                            self.session_id,
-                            key,
-                            event.seq as i64,
-                            serde_json::to_vec(p).map_err(corrupt)?,
-                            p.from,
-                            indexed.continues()
-                        ],
-                    )
-                    .map_err(unavailable)?;
-                }
-                Some(BranchChange::Closed(p)) => {
-                    tx.execute(
-                        "UPDATE session_branches SET closed = ?4
-                          WHERE tenant_id = ?1 AND session_id = ?2 AND branch_id = ?3",
-                        params![
-                            self.tenant_id,
-                            self.session_id,
-                            key,
-                            serde_json::to_vec(p).map_err(corrupt)?
-                        ],
-                    )
-                    .map_err(unavailable)?;
-                }
-                None => {}
+            if let Some(started) = indexed.started.filter(|_| !indexed.continues()) {
+                tx.execute(
+                    "INSERT INTO session_branches (tenant_id, session_id, branch_id, from_node)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT (tenant_id, session_id, branch_id) DO UPDATE SET
+                        leaf = NULL, from_node = excluded.from_node",
+                    params![self.tenant_id, self.session_id, key, started.from],
+                )
+                .map_err(unavailable)?;
             }
             if let Some(leaf) = &indexed.leaf {
                 tx.execute(
@@ -667,35 +636,6 @@ impl Nodes for SqliteSessionStore {
               ORDER BY seq",
             params![self.tenant_id, self.session_id, tool_call_id],
         )
-    }
-
-    fn branch(&self, id: &str) -> Result<Option<BranchRecord>, StoreError> {
-        let row: Option<(i64, Vec<u8>, Option<Vec<u8>>)> = self
-            .reader()?
-            .query_row(
-                "SELECT seq, started, closed FROM session_branches
-                  WHERE tenant_id = ?1 AND session_id = ?2 AND branch_id = ?3
-                    AND started IS NOT NULL",
-                params![self.tenant_id, self.session_id, id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()
-            .map_err(unavailable)?;
-        let Some((seq, started, closed)) = row else {
-            return Ok(None);
-        };
-        let corrupt = |e: serde_json::Error| StoreError::Corrupt(e.to_string());
-        let started: BranchStarted = serde_json::from_slice(&started).map_err(corrupt)?;
-        let closed: Option<BranchClosed> = closed
-            .map(|c| serde_json::from_slice(&c))
-            .transpose()
-            .map_err(corrupt)?;
-        let seq = seq as u64;
-        let record = BranchChange::Started(&started).record(seq, None);
-        Ok(match &closed {
-            Some(closed) => BranchChange::Closed(closed).record(seq, record),
-            None => record,
-        })
     }
 
     fn stored(&self, branch: &BranchId) -> Result<Option<Stored>, StoreError> {
@@ -1361,14 +1301,13 @@ mod cold {
             "it closed"
         );
 
-        let record = c
+        let stored = c
             .store
             .nodes()
-            .branch("side")
+            .stored(&BranchId::from("side"))
             .unwrap()
             .expect("the log keeps it");
-        assert!(record.closed.is_some());
-        let at = record.leaf.or(record.state.from);
+        let at = stored.leaf.or(stored.from);
         let read = c.session.state().at(at.as_deref());
         assert_eq!(read.config().map(|a| a.model), Some("m2".into()));
         let ancestors = c

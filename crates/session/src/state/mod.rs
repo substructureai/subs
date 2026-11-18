@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 
 use serde::{Deserialize, Serialize};
 
-use super::decision::{BranchConfig, LlmHandler, ToolHandler, Trigger};
+use super::decision::{LlmHandler, ToolHandler, Trigger};
 
 use super::events::*;
 
@@ -211,17 +211,15 @@ pub struct Open {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub leaf: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub started: Option<BranchState>,
+    pub run: Option<Run>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BranchState {
-    pub node: String,
+pub struct Run {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
     #[serde(default, skip_serializing_if = "BranchId::is_main")]
     pub parent: BranchId,
-    pub agent: BranchConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub mode: BranchMode,
@@ -235,13 +233,11 @@ pub struct BranchState {
     pub detached: bool,
 }
 
-impl BranchState {
+impl Run {
     pub fn started(p: &BranchStarted, seq: u64) -> Self {
-        BranchState {
-            node: p.node.clone(),
+        Run {
             from: p.from.clone(),
             parent: BranchId::from(p.parent.clone()),
-            agent: p.agent.clone(),
             name: p.name.clone(),
             mode: p.mode,
             seq,
@@ -550,8 +546,8 @@ impl SessionState {
         }
     }
 
-    pub fn started(&self, branch: &BranchId) -> Option<&BranchState> {
-        self.branches.get(branch)?.started.as_ref()
+    pub fn open_run(&self, branch: &BranchId) -> Option<&Run> {
+        self.branches.get(branch)?.run.as_ref()
     }
 
     pub fn names(&self, branch: &BranchId) -> bool {
@@ -559,10 +555,10 @@ impl SessionState {
             || self.open_interrupts.iter().any(|i| i.branch == *branch)
     }
 
-    pub fn side_branches(&self) -> impl Iterator<Item = (&str, &BranchState)> {
+    pub fn side_branches(&self) -> impl Iterator<Item = (&str, &Run)> {
         self.branches
             .iter()
-            .filter_map(|(id, open)| Some((id.name()?, open.started.as_ref()?)))
+            .filter_map(|(id, open)| Some((id.name()?, open.run.as_ref()?)))
     }
 
     pub fn parallel_branches(&self) -> bool {
@@ -580,7 +576,7 @@ impl SessionState {
     }
 
     pub fn detached(&self, branch: &BranchId) -> bool {
-        self.started(branch).is_some_and(|b| b.detached)
+        self.open_run(branch).is_some_and(|b| b.detached)
     }
 
     pub fn held_by_branches(&self, parent: &BranchId) -> usize {
@@ -604,7 +600,7 @@ impl SessionState {
     pub fn trigger_branch(&self, trigger: &Trigger) -> Option<BranchId> {
         match trigger {
             Trigger::BranchFinished { id, .. } => {
-                Some(self.started(&BranchId::from(id.as_str()))?.parent.clone())
+                Some(self.open_run(&BranchId::from(id.as_str()))?.parent.clone())
             }
             _ => {
                 let (kind, id) = trigger_effect(trigger)?;
@@ -695,7 +691,7 @@ impl SessionState {
 
     pub fn branch_interrupt(&self) -> Option<&OpenInterrupt> {
         self.open_interrupts.iter().find(|i| {
-            i.anchor.is_some() && self.started(&i.branch).is_some() && !self.detached(&i.branch)
+            i.anchor.is_some() && self.open_run(&i.branch).is_some() && !self.detached(&i.branch)
         })
     }
 

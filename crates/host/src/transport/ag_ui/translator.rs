@@ -171,7 +171,7 @@ impl AgUiTranslator {
             EventPayload::SubagentTurnCompleted(s) => (&s.id, false),
             EventPayload::SubagentErrored(s) => (&s.id, false),
             EventPayload::NewMessage(m) => return m.branch.is_some(),
-            EventPayload::BranchStarted(_) | EventPayload::BranchClosed(_) => return true,
+            EventPayload::BranchStarted(_) | EventPayload::BranchFinished(_) => return true,
             _ => return false,
         };
         if branch {

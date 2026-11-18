@@ -43,7 +43,7 @@ impl SessionState {
         let ended: Vec<BranchId> = self
             .branches
             .iter()
-            .filter(|(id, open)| !id.is_main() && open.started.is_none() && !self.names(id))
+            .filter(|(id, open)| !id.is_main() && open.run.is_none() && !self.names(id))
             .map(|(id, _)| id.clone())
             .collect();
         for id in ended {

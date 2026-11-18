@@ -11437,18 +11437,17 @@ fn a_closed_branch_reads_its_own_leaf_until_nothing_names_it() {
                 branch: Some("b".to_string()),
             }),
             msg("x1", "u1", Some("b")),
-            EventPayload::BranchClosed(BranchClosed {
+            EventPayload::BranchFinished(BranchFinished {
                 id: "b".to_string(),
-                reason: BranchEnd::Closed,
+                outcome: RunEnd::Stopped,
                 data: serde_json::Value::Null,
                 error: None,
-                leaf: Some("x1".to_string()),
             }),
         ],
         &ctx,
     );
     let b = BranchId::from("b");
-    assert!(agg.state.started(&b).is_none(), "the branch's run ended");
+    assert!(agg.state.open_run(&b).is_none(), "the branch's run ended");
     assert_eq!(agg.state.leaf(&b), Some("x1"), "its call still reads it");
     let path: Vec<String> = agg
         .state

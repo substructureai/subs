@@ -578,7 +578,7 @@ mod tests {
             BranchId::MAIN,
             Open {
                 leaf: Some("u1".to_string()),
-                started: None,
+                run: None,
             },
         );
         s.open_interrupts.push(OpenInterrupt {

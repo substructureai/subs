@@ -441,7 +441,7 @@ fn a_diverging_reply_on_a_branch_moves_its_leaf_and_stays_off_the_chat() {
     let start = run
         .session
         .state()
-        .started(&BranchId::from("draft"))
+        .open_run(&BranchId::from("draft"))
         .unwrap()
         .from
         .clone()
@@ -471,7 +471,7 @@ fn a_diverging_reply_on_a_branch_moves_its_leaf_and_stays_off_the_chat() {
         run.session
             .state()
             .tree
-            .branch("draft")
+            .stored(&BranchId::from("draft"))
             .and_then(|b| b.leaf)
             .as_deref(),
         Some("x1")
@@ -509,7 +509,7 @@ fn drafting() -> (Run, String) {
     let start = run
         .session
         .state()
-        .started(&BranchId::from("draft"))
+        .open_run(&BranchId::from("draft"))
         .unwrap()
         .from
         .clone()
@@ -535,7 +535,7 @@ fn a_branch_reply_that_only_drops_messages_moves_its_leaf_back() {
         run.session
             .state()
             .tree
-            .branch("draft")
+            .stored(&BranchId::from("draft"))
             .and_then(|b| b.leaf)
             .as_deref(),
         Some(start.as_str())
