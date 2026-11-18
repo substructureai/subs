@@ -152,7 +152,8 @@ stream with that to watch the child.
 | Event | Meaning |
 | --- | --- |
 | `state.updated` | A decision wrote new state. |
-| `config.updated` | A decision wrote a new config. |
+| `config.updated` | A decision wrote a new config. What was placed above it still counts. |
+| `config.reset` | `{ id, parent_id?, branch, config? }`. A branch with its own config, or none, starts over from here: its config is this one, context placed above it no longer counts, and messages and state above it still do. |
 
 ## Context
 
@@ -203,7 +204,7 @@ the same attempt.
 
 | Event | Meaning |
 | --- | --- |
-| `branch.started` | `{ id, from?, parent?, agent, name?, mode, depth, detached?, turn_id?, subagent?, leaf? }`. A [branch](./125-branches.md) started, or one that ran before went on from `leaf`. `depth` counts the branches it sits in, itself included, and `detached` holds for it and everything below a detached branch. |
+| `branch.started` | `{ id, from?, parent?, name?, mode, depth, detached?, turn_id?, subagent?, leaf? }`. A [branch](./125-branches.md) started, or one that ran before went on from `leaf`. `depth` counts the branches it sits in, itself included, and `detached` holds for it and everything below a detached branch. |
 | `branch.finished` | `{ id, outcome, data?, error? }`. The work on a branch ended: `outcome` is `done`, `failed`, `voided`, or `stopped`. The branch stays, and starting it again goes on from its leaf. |
 
 A `message.new` with `branch` is written on that branch. It does not move the

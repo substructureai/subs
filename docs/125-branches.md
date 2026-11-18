@@ -169,7 +169,8 @@ interrupt holds only the branch it was raised on.
 
 | Event | Meaning |
 | --- | --- |
-| `branch.started` | `{ id, from?, parent?, agent, name?, mode, depth, detached?, turn_id?, subagent?, leaf? }`. With `leaf`, work on a branch that ran before goes on from there. |
+| `branch.started` | `{ id, from?, parent?, name?, mode, depth, detached?, turn_id?, subagent?, leaf? }`. With `leaf`, work on a branch that ran before goes on from there. |
+| `config.reset` | A branch with its own config, or none, starts over at its fork: context placed above no longer counts. |
 | `branch.finished` | `{ id, outcome, data?, error? }`. The work on a branch ended: `outcome` is `done`, `failed`, `voided`, or `stopped`. |
 | `message.new` | With `branch`, a branch message. It does not move the head. |
 
