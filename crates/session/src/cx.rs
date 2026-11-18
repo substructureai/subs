@@ -1,13 +1,13 @@
 use std::ops::Deref;
 
 use crate::ids::Ids;
-use crate::state::SessionState;
+use crate::state::{BranchId, SessionState, MAIN_BRANCH};
 
 #[derive(Clone, Copy)]
 pub struct Cx<'a> {
     state: &'a SessionState,
     ids: &'a Ids,
-    scope: Option<&'a str>,
+    scope: &'a BranchId,
 }
 
 impl<'a> Cx<'a> {
@@ -15,23 +15,19 @@ impl<'a> Cx<'a> {
         Self {
             state,
             ids,
-            scope: None,
+            scope: &MAIN_BRANCH,
         }
     }
 
-    pub fn scoped(self, branch: Option<&'a str>) -> Self {
+    pub fn scoped(self, branch: &'a BranchId) -> Self {
         Self {
             scope: branch,
             ..self
         }
     }
 
-    pub fn scope(&self) -> Option<&'a str> {
+    pub fn scope(&self) -> &'a BranchId {
         self.scope
-    }
-
-    pub fn scope_branch(&self) -> Option<String> {
-        self.scope.map(str::to_string)
     }
 
     pub fn state(&self) -> &'a SessionState {

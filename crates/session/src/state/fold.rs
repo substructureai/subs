@@ -10,7 +10,7 @@ impl SessionState {
 
     #[cfg(test)]
     pub fn seed_config(&mut self, config: AgentConfig) {
-        let parent = self.head_id.clone();
+        let parent = self.leaf(&BranchId::MAIN).map(str::to_string);
         let id = format!("seed-config-{}", self.tree.unwritten().count());
         self.seed(crate::tree::Node {
             place: crate::tree::Place {
@@ -33,18 +33,12 @@ impl SessionState {
     fn grow(&mut self, node: &crate::tree::Node) {
         let id = node.id().to_string();
         let user = node.message().is_some_and(|m| m.role == Role::User);
-        match node.branch() {
-            Some(b) => {
-                if let Some(branch) = self.branches.get_mut(b) {
-                    branch.leaf = Some(id);
-                }
-            }
-            None => {
-                if user {
-                    self.status = SessionStatus::Idle;
-                }
-                self.head_id = Some(id);
-            }
+        let branch = BranchId::from(node.branch());
+        if user && branch.is_main() {
+            self.status = SessionStatus::Idle;
+        }
+        if let Some(open) = self.branches.get_mut(&branch) {
+            open.leaf = Some(id);
         }
     }
 
@@ -53,11 +47,11 @@ impl SessionState {
         id: &str,
         tracking: EffectTracking,
         payload: EffectPayload,
-        branch: Option<&str>,
+        branch: &BranchId,
     ) {
         let anchor = match payload {
             EffectPayload::ConnectorSync(_) => None,
-            _ => self.scope_node(branch),
+            _ => self.leaf(branch).map(str::to_string),
         };
         let turn = match self.detached(branch) {
             true => None,
@@ -69,7 +63,7 @@ impl SessionState {
                 id: id.to_string(),
                 tracking,
                 asked_at: anchor,
-                branch: branch.map(str::to_string),
+                branch: branch.clone(),
                 turn,
                 payload,
             },
@@ -114,7 +108,7 @@ impl SessionState {
                 call.defer_tools_strategy = payload.defer_tools_strategy;
             }
         } else {
-            if !self.detached(payload.branch.as_deref()) {
+            if !self.detached(&BranchId::from(payload.branch.clone())) {
                 self.on_turn(|t| t.calls.llm.count += 1);
             }
             self.insert_effect(
@@ -133,7 +127,7 @@ impl SessionState {
                     unanswered: Vec::new(),
                     defer_tools_strategy: payload.defer_tools_strategy,
                 }),
-                payload.branch.as_deref(),
+                &BranchId::from(payload.branch.clone()),
             );
             if let Some(e) = self.effect_mut(EffectKind::LlmCall, &payload.id) {
                 e.asked_at = payload.at.clone();
@@ -195,12 +189,12 @@ impl SessionState {
                 tc.arguments = payload.arguments.clone();
             }
         } else {
-            if !self.detached(payload.branch.as_deref()) {
+            if !self.detached(&BranchId::from(payload.branch.clone())) {
                 self.on_turn(|t| t.calls.tool.count += 1);
             }
             let script_language = match payload.target {
                 Some(ConnectorTarget::Code) => self
-                    .at_scope(payload.branch.as_deref())
+                    .on(&BranchId::from(payload.branch.clone()))
                     .config()
                     .and_then(|c| c.codemode)
                     .unwrap_or_default(),
@@ -224,7 +218,7 @@ impl SessionState {
                     script_asked: Vec::new(),
                     recorded: false,
                 }),
-                payload.branch.as_deref(),
+                &BranchId::from(payload.branch.clone()),
             );
             if let Some(script) = &payload.script {
                 if let Some(parent) = self
@@ -253,7 +247,7 @@ impl SessionState {
                 }
             }
             None => {
-                if !self.detached(p.branch.as_deref()) {
+                if !self.detached(&BranchId::from(p.branch.clone())) {
                     self.on_turn(|t| t.calls.system1.count += 1);
                 }
                 self.insert_effect(
@@ -263,7 +257,7 @@ impl SessionState {
                         system1: p.system1.clone(),
                         request: p.request.clone(),
                     }),
-                    p.branch.as_deref(),
+                    &BranchId::from(p.branch.clone()),
                 )
             }
         }
@@ -274,7 +268,7 @@ impl SessionState {
         if let Some(existing) = self.effect_mut(EffectKind::Subagent, &payload.id) {
             existing.tracking.requeue();
         } else {
-            if !self.detached(payload.branch.as_deref()) {
+            if !self.detached(&BranchId::from(payload.branch.clone())) {
                 self.on_turn(|t| t.calls.subagent.count += 1);
             }
             self.insert_effect(
@@ -289,7 +283,7 @@ impl SessionState {
                     is_error: false,
                     mode: payload.mode,
                 }),
-                payload.branch.as_deref(),
+                &BranchId::from(payload.branch.clone()),
             );
         }
         self.enqueue(ctx.sequence, EffectKind::Subagent, &payload.id);
@@ -307,14 +301,14 @@ impl SessionState {
                 reason: payload.reason.clone(),
                 payload: payload.payload.clone(),
                 anchor: payload.anchor.clone(),
-                branch: payload.branch.clone(),
+                branch: BranchId::from(payload.branch.clone()),
             });
         }
-        let lane = self.lane(payload.branch.as_deref());
+        let lane = self.lane(&BranchId::from(payload.branch.clone()));
         let held: Vec<(EffectKind, String)> = self
             .effects_of(EffectKind::Decision)
             .filter(|e| e.tracking.status() == EffectStatus::Pending)
-            .filter(|e| self.lane(e.branch.as_deref()) == lane)
+            .filter(|e| self.lane(&e.branch) == lane)
             .map(|e| (EffectKind::Decision, e.id.clone()))
             .collect();
         for key in held {
@@ -354,7 +348,10 @@ impl SessionState {
             _ => {}
         }
         let retry_policy = self.worker_retry.clone().unwrap_or(RetryPolicy::no_retry());
-        let branch = p.branch.clone().or_else(|| self.trigger_branch(&p.trigger));
+        let branch = match &p.branch {
+            Some(b) => BranchId::from(b.as_str()),
+            None => self.trigger_branch(&p.trigger).unwrap_or_default(),
+        };
         self.insert_effect(
             &p.id,
             EffectTracking::new_queued(retry_policy),
@@ -365,7 +362,7 @@ impl SessionState {
                 dispatched_seq: None,
                 turn: None,
             }),
-            branch.as_deref(),
+            &branch,
         );
         self.enqueue(ctx.sequence, EffectKind::Decision, &p.id);
         if let Trigger::TurnFinished {
@@ -423,7 +420,7 @@ impl SessionState {
                 self.events = payload.events.clone();
             }
             EventPayload::NewMessage(payload) => {
-                self.answered(&payload.message, payload.branch.as_deref());
+                self.answered(&payload.message, &BranchId::from(payload.branch.clone()));
             }
             EventPayload::BranchStarted(p) => {
                 if let Some(l) = self.limited.as_mut().filter(|l| l.open()) {
@@ -431,22 +428,22 @@ impl SessionState {
                         l.summary = Some(p.id.clone());
                     }
                 }
-                if !self.branches.contains_key(&p.id) {
-                    self.branches
-                        .insert(p.id.clone(), BranchState::started(p, ctx.sequence));
-                }
+                self.branches
+                    .entry(BranchId::from(p.id.as_str()))
+                    .or_insert_with(|| Open {
+                        leaf: p.leaf.clone(),
+                        started: Some(BranchState::started(p, ctx.sequence)),
+                    });
             }
             EventPayload::BranchClosed(p) => {
-                self.branches.remove(&p.id);
+                self.branches.remove(&BranchId::from(p.id.as_str()));
             }
-            EventPayload::BranchMoved(payload) => match payload.branch.as_deref() {
-                Some(b) => {
-                    if let Some(branch) = self.branches.get_mut(b) {
-                        branch.leaf = Some(payload.leaf.clone());
-                    }
+            EventPayload::BranchMoved(payload) => {
+                let branch = BranchId::from(payload.branch.clone());
+                if let Some(open) = self.branches.get_mut(&branch) {
+                    open.leaf = Some(payload.leaf.clone());
                 }
-                None => self.head_id = Some(payload.leaf.clone()),
-            },
+            }
             EventPayload::LlmCallRequested(payload) => self.apply_llm_requested(payload, ctx),
             EventPayload::LlmCallDispatched(payload) => self.apply_llm_dispatched(payload, ctx),
             EventPayload::StateUpdated(_) | EventPayload::ConfigUpdated(_) => {}
@@ -459,9 +456,12 @@ impl SessionState {
                 }
             }
             EventPayload::LlmCallCompleted(payload) => {
-                let branch = self.effect_branch(EffectKind::LlmCall, &payload.id);
+                let branch = self
+                    .effect(EffectKind::LlmCall, &payload.id)
+                    .map(|e| e.branch.clone())
+                    .unwrap_or_default();
                 match &payload.response.usage {
-                    Some(usage) if branch.is_none() => {
+                    Some(usage) if branch.is_main() => {
                         self.last_read = Some(LastRead {
                             call_id: payload.id.clone(),
                             tokens: usage.input,
@@ -469,7 +469,7 @@ impl SessionState {
                     }
                     _ => {}
                 }
-                let in_turn = !self.detached(branch.as_deref());
+                let in_turn = !self.detached(&branch);
                 self.track_usage(&payload.response.usage);
                 if in_turn {
                     self.track_turn_usage(&payload.response.usage);
@@ -518,10 +518,9 @@ impl SessionState {
             }
             EventPayload::System1CallCompleted(p) => {
                 let usage = &p.response.usage;
-                let in_turn = !self.detached(
-                    self.effect_branch(EffectKind::System1Call, &p.id)
-                        .as_deref(),
-                );
+                let in_turn = !self
+                    .effect(EffectKind::System1Call, &p.id)
+                    .is_some_and(|e| self.detached(&e.branch));
                 self.token_usage.add(usage);
                 if in_turn {
                     self.on_turn(|t| t.usage.add(usage));
@@ -684,7 +683,7 @@ impl SessionState {
                             error: None,
                             auth: None,
                         }),
-                        None,
+                        &BranchId::MAIN,
                     );
                 }
                 if let Some(e) = self.effect_mut(EffectKind::ConnectorSync, &p.path.to_string()) {
@@ -771,7 +770,7 @@ impl SessionState {
                     p.turn_id.clone(),
                     ctx.sequence,
                     now,
-                    self.head_id.clone(),
+                    self.leaf(&BranchId::MAIN).map(str::to_string),
                     p.metadata.clone(),
                 ));
             }

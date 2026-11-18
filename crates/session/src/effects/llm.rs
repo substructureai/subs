@@ -8,7 +8,7 @@ use crate::protocol::{
     RetryPolicy, Role, StoredContent,
 };
 use crate::schedule::Dep;
-use crate::state::{EffectKind, QueueEntry, SessionState};
+use crate::state::{BranchId, EffectKind, QueueEntry, SessionState};
 use crate::Caller;
 
 pub struct LlmSpec;
@@ -80,7 +80,7 @@ impl KindSpec for LlmSpec {
         };
         let out = state.outgoing(id);
         let placed = effect.llm().is_some_and(|c| c.reads_from.is_some());
-        let leaf = state.scope_node(effect.branch.as_deref());
+        let leaf = state.leaf(&effect.branch).map(str::to_string);
         let mut events = Vec::new();
         if let Some(out) = out
             .as_ref()
@@ -90,7 +90,7 @@ impl KindSpec for LlmSpec {
                 node: crate::tree::Place {
                     id: state.ids().next(),
                     parent_id: out.node.clone(),
-                    branch: effect.branch.clone(),
+                    branch: effect.branch.clone().into(),
                 },
                 call: id.to_string(),
                 placed: out.placed.clone(),
@@ -120,13 +120,13 @@ impl KindSpec for LlmSpec {
 
     fn deps(&self, state: &SessionState, entry: &QueueEntry) -> Vec<Dep> {
         let effect = state.effect(EffectKind::LlmCall, &entry.id);
-        if let Some(branch) = effect.and_then(|e| e.branch.as_deref()) {
-            return super::connector::owed(state.at_scope(Some(branch)));
+        if let Some(branch) = effect.map(|e| &e.branch).filter(|b| !b.is_main()) {
+            return super::connector::owed(state.on(branch));
         }
         let node = effect
-            .and_then(|e| e.asked_at.clone())
-            .or_else(|| state.head_id.clone());
-        super::connector::owed(state.at(node.as_deref()))
+            .and_then(|e| e.asked_at.as_deref())
+            .or_else(|| state.leaf(&BranchId::MAIN));
+        super::connector::owed(state.at(node))
     }
 
     fn retry(&self, state: &SessionState, id: &str) -> Vec<EventPayload> {
@@ -147,7 +147,7 @@ impl KindSpec for LlmSpec {
             handler: call.handler,
             format: call.format,
             defer_tools_strategy: call.defer_tools_strategy,
-            branch: effect.branch.clone(),
+            branch: effect.branch.clone().into(),
         })]
     }
 }
@@ -209,7 +209,7 @@ pub fn request(
         return Ok(Vec::new());
     }
     let defer_tools_strategy = state
-        .at_scope(state.scope())
+        .on(state.scope())
         .config()
         .map(|c| c.defer_strategy())
         .unwrap_or_default();
@@ -218,13 +218,13 @@ pub fn request(
         attempt: 0,
         llm,
         spec: crate::state::LlmCallSpec::from(&request),
-        at: state.scope_node(state.scope()),
+        at: state.leaf(state.scope()).map(str::to_string),
         stream,
         retry,
         handler,
         format,
         defer_tools_strategy,
-        branch: state.scope_branch(),
+        branch: state.scope().clone().into(),
     })])
 }
 

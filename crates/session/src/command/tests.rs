@@ -1,6 +1,6 @@
 use crate::connectors::ConnectionPath;
 use crate::protocol::StoredResult;
-use crate::state::SessionStatus;
+use crate::state::{BranchId, SessionStatus};
 use std::collections::HashMap;
 
 use crate::protocol::{
@@ -1702,7 +1702,7 @@ fn normalize_folds_a_client_tool_echo_onto_its_recorded_node() {
         "tool echo adopts the recorded node id"
     );
     assert_eq!(
-        agg.state.land(&messages, None).shared,
+        agg.state.land(&messages, &BranchId::MAIN).shared,
         3,
         "only the new user turn is news"
     );
@@ -1780,7 +1780,7 @@ fn edit_with_tail_replay_keeps_the_tool_result() {
         "the replayed tool result folds onto w1"
     );
     assert_eq!(
-        agg.state.land(&messages, None).shared,
+        agg.state.land(&messages, &BranchId::MAIN).shared,
         0,
         "the whole edited branch is news, the tool result with it"
     );
@@ -1985,7 +1985,7 @@ fn a_merge_re_records_known_ids_past_the_first_new_node() {
         },
         &machine(),
     );
-    assert_eq!(agg.state.head_id.as_deref(), Some("u2"));
+    assert_eq!(agg.state.leaf(&BranchId::MAIN), Some("u2"));
 
     let events = dispatch(
         &mut agg,
@@ -2042,7 +2042,7 @@ fn a_merge_re_records_known_ids_past_the_first_new_node() {
         copy.content.as_ref().map(Content::text_owned).as_deref(),
         Some("more")
     );
-    assert_eq!(agg.state.head_id.as_deref(), Some(copy_id));
+    assert_eq!(agg.state.leaf(&BranchId::MAIN), Some(copy_id));
 }
 
 #[test]
@@ -2184,7 +2184,7 @@ fn a_resend_of_a_prior_assistant_turn_appends_without_forking() {
         },
         &machine(),
     );
-    assert_eq!(agg.state.head_id.as_deref(), Some("call-1"));
+    assert_eq!(agg.state.leaf(&BranchId::MAIN), Some("call-1"));
 
     let events = submit_messages(
         &mut agg,
@@ -2196,7 +2196,7 @@ fn a_resend_of_a_prior_assistant_turn_appends_without_forking() {
     );
     let messages = transcript_messages(&events).expect("a transcript decision");
     assert_eq!(
-        agg.state.land(&messages, None).shared,
+        agg.state.land(&messages, &BranchId::MAIN).shared,
         2,
         "only the new user turn is news"
     );
@@ -3731,7 +3731,7 @@ fn admin() -> Caller {
 fn declare_client_tool(agg: &mut Session, name: &str) {
     let declared = agg
         .state
-        .at_head()
+        .on(&BranchId::MAIN)
         .config()
         .is_some_and(|c| c.tools.iter().any(|t| t.name == name));
     if declared {
@@ -5574,7 +5574,7 @@ fn a_session_opens_with_the_config_its_creation_carries() {
         "creation seeds the config: {events:#?}"
     );
     assert_eq!(
-        agg.state.at_head().config().map(|c| c.model),
+        agg.state.on(&BranchId::MAIN).config().map(|c| c.model),
         Some("inline-model".to_string())
     );
 }
@@ -5802,7 +5802,7 @@ fn worker_append_action_writes_a_tree_node() {
             .any(|e| matches!(e, EventPayload::NewMessage(m) if m.message.id == "u1")),
         "append writes a NewMessage; got {events:?}"
     );
-    assert_eq!(agg.state.head_id.as_deref(), Some("u1"));
+    assert_eq!(agg.state.leaf(&BranchId::MAIN), Some("u1"));
 }
 
 #[test]
@@ -5873,8 +5873,7 @@ fn tool_result_action(id: &str) -> Action {
 
 fn delivered_transcript(agg: &Session) -> Vec<DraftMessage> {
     agg.state
-        .head_id
-        .as_deref()
+        .leaf(&BranchId::MAIN)
         .map(|h| agg.state.message_tree().path_to(h))
         .unwrap_or_default()
         .into_iter()
@@ -6006,7 +6005,11 @@ fn parallel_tool_finishes_keep_results_on_one_path() {
 
     drive_worker(&mut agg, &mut bases);
 
-    let head = agg.state.head_id.clone().expect("a head");
+    let head = agg
+        .state
+        .leaf(&BranchId::MAIN)
+        .map(str::to_string)
+        .expect("a head");
     let path = agg.state.message_tree().path_to(&head);
     let seen: Vec<&str> = path
         .iter()
@@ -7216,7 +7219,10 @@ fn changed_state_anchors_at_the_merged_head() {
         Some("a1"),
         "the version follows the response's messages"
     );
-    assert_eq!(agg.state.at_head().worker_state().0, json!({"v": 1}));
+    assert_eq!(
+        agg.state.on(&BranchId::MAIN).worker_state().0,
+        json!({"v": 1})
+    );
 }
 
 #[test]
@@ -7240,7 +7246,10 @@ fn omitted_state_keeps_the_current_version() {
         None,
     );
     assert!(state_updates(&events).is_empty());
-    assert_eq!(agg.state.at_head().worker_state().0, json!({"v": 1}));
+    assert_eq!(
+        agg.state.on(&BranchId::MAIN).worker_state().0,
+        json!({"v": 1})
+    );
 }
 
 fn agent_updates(events: &[EventPayload]) -> Vec<&ConfigUpdated> {
@@ -7824,11 +7833,15 @@ fn a_terminally_failed_fetch_releases_the_turn_rather_than_parking_it() {
         "an unreachable connector unblocks the worker to decide; got {events:?}"
     );
     assert!(
-        !agg.state.at_head().has_pending_connector_sync(),
+        !agg.state.on(&BranchId::MAIN).has_pending_connector_sync(),
         "a terminal failure is settled, so it parks nothing further"
     );
     assert!(
-        agg.state.at_head().connector_tools().tools.is_empty(),
+        agg.state
+            .on(&BranchId::MAIN)
+            .connector_tools()
+            .tools
+            .is_empty(),
         "a failed fetch contributes no tools"
     );
 }
@@ -7855,7 +7868,7 @@ fn a_retryable_failure_keeps_parking_until_it_is_exhausted() {
         promotions(&events).is_empty(),
         "a retry is still unsettled, so it still parks; got {events:?}"
     );
-    assert!(agg.state.at_head().has_pending_connector_sync());
+    assert!(agg.state.on(&BranchId::MAIN).has_pending_connector_sync());
     assert!(
         super::schedule::wake_at(&agg.state, Utc::now()).is_some(),
         "the retry is scheduled, so the session wakes for it"
@@ -8003,7 +8016,7 @@ fn session_with_searched_connector(id: &str, tools: &[&str]) -> Session {
 
 fn offered(agg: &Session) -> Vec<String> {
     agg.state
-        .at_head()
+        .on(&BranchId::MAIN)
         .connector_tools()
         .tools
         .into_iter()
@@ -8014,7 +8027,7 @@ fn offered(agg: &Session) -> Vec<String> {
 
 fn held(agg: &Session) -> Vec<String> {
     agg.state
-        .at_head()
+        .on(&BranchId::MAIN)
         .connector_tools()
         .tools
         .into_iter()
@@ -8051,7 +8064,7 @@ fn a_search_answers_at_the_anchor_of_the_call() {
                 0,
                 Utc::now(),
             )),
-            parent_id: agg.state.head_id.clone(),
+            parent_id: agg.state.leaf(&BranchId::MAIN).map(str::to_string),
             copied_from: None,
             branch: None,
         })],
@@ -8065,14 +8078,14 @@ fn a_search_answers_at_the_anchor_of_the_call() {
             },
             node: crate::tree::Place {
                 id: "config-2".to_string(),
-                parent_id: agg.state.head_id.clone(),
+                parent_id: agg.state.leaf(&BranchId::MAIN).map(str::to_string),
                 branch: None,
             },
         })],
         &ctx,
     );
     assert!(
-        agg.state.at_head().searchable_tools().is_empty(),
+        agg.state.on(&BranchId::MAIN).searchable_tools().is_empty(),
         "the head has dropped the connection, so a new call would find nothing"
     );
 
@@ -8494,7 +8507,7 @@ fn subagent_session(defer: Option<bool>, prefix: Option<bool>) -> Session {
 fn a_subagent_is_offered_as_a_connector_tool() {
     let agg = subagent_session(None, None);
     assert_eq!(offered(&agg), ["helper", "subagent_wait"]);
-    let tools = agg.state.at_head().connector_tools().tools;
+    let tools = agg.state.on(&BranchId::MAIN).connector_tools().tools;
     assert_eq!(tools[0].kind, crate::protocol::ConnectorToolKind::Subagent);
     assert_eq!(
         tools[0].connector,
@@ -8552,7 +8565,7 @@ fn call_tool_faults_read_a_subagents_message_schema() {
     let agg = subagent_session(Some(true), None);
     let fault = agg
         .state
-        .at_head()
+        .on(&BranchId::MAIN)
         .call_tool_fault(r#"{"name":"helper","arguments":{"question":"x"}}"#)
         .expect("bad arguments fault");
     assert!(
@@ -8561,7 +8574,7 @@ fn call_tool_faults_read_a_subagents_message_schema() {
     );
     assert!(
         agg.state
-            .at_head()
+            .on(&BranchId::MAIN)
             .call_tool_fault(r#"{"name":"helper","arguments":{"message":"go"}}"#)
             .is_none(),
         "a valid subagent call is no fault"
@@ -8613,7 +8626,7 @@ fn a_subagent_and_an_unprefixed_connector_tool_both_lose_a_shared_name() {
         ),
         &system(),
     );
-    let merged = agg.state.at_head().connector_tools();
+    let merged = agg.state.on(&BranchId::MAIN).connector_tools();
     assert!(
         merged.tools.iter().all(|t| t.name != "helper"),
         "picking one of the two would route the model arbitrarily"
@@ -8808,7 +8821,7 @@ fn a_worker_tool_takes_a_search_name_and_the_other_half_survives() {
     );
     settle_sync(&mut agg, "sentry", &["search_issues"]);
 
-    let merged = agg.state.at_head().connector_tools();
+    let merged = agg.state.on(&BranchId::MAIN).connector_tools();
     assert_eq!(
         offered(&agg),
         ["call_tool"],
@@ -8911,7 +8924,7 @@ fn a_connection_overrides_the_agents_default() {
     settle_sync(&mut agg, "sentry", &["search_issues"]);
     assert_eq!(
         agg.state
-            .at_head()
+            .on(&BranchId::MAIN)
             .connector_tools()
             .tools
             .iter()
@@ -9027,7 +9040,7 @@ fn tool_search_picks_which_engine_tools_the_agent_gets() {
     let offered = |search: DeferToolsStrategy| -> Vec<String> {
         let agg = create_session_with_config("sess-1", "tenant-a", "user-1", Some(agent(search)));
         agg.state
-            .at_head()
+            .on(&BranchId::MAIN)
             .connector_tools()
             .tools
             .into_iter()
@@ -9268,7 +9281,7 @@ fn a_deferred_connector_tool_carries_its_output_contract() {
     );
     let tool = agg
         .state
-        .at_head()
+        .on(&BranchId::MAIN)
         .connector_tools()
         .tools
         .into_iter()
@@ -9544,7 +9557,7 @@ fn a_declared_tool_keeps_its_name_and_its_handler_against_a_connector() {
         ToolHandler::Worker,
         "the config claims the name, so the connector never takes it"
     );
-    let merged = agg.state.at_head().connector_tools();
+    let merged = agg.state.on(&BranchId::MAIN).connector_tools();
     assert!(merged.tools.is_empty());
     assert_eq!(
         merged.collisions,
@@ -9556,7 +9569,10 @@ fn a_declared_tool_keeps_its_name_and_its_handler_against_a_connector() {
 #[test]
 fn a_filter_change_re_derives_without_another_fetch() {
     let mut agg = session_with_connectors(&["sentry"], &["search_issues", "create_issue"]);
-    assert_eq!(agg.state.at_head().connector_tools().tools.len(), 2);
+    assert_eq!(
+        agg.state.on(&BranchId::MAIN).connector_tools().tools.len(),
+        2
+    );
 
     let narrowed = AgentConfig {
         mcp: vec![McpServer {
@@ -9584,7 +9600,7 @@ fn a_filter_change_re_derives_without_another_fetch() {
     );
     let names: Vec<String> = agg
         .state
-        .at_head()
+        .on(&BranchId::MAIN)
         .connector_tools()
         .tools
         .into_iter()
@@ -9614,7 +9630,10 @@ fn changed_agent_config_anchors_at_head_and_dedups() {
         Some("a1"),
         "the config follows the response's messages"
     );
-    assert_eq!(agg.state.at_head().config(), Some(agent_config("m1")));
+    assert_eq!(
+        agg.state.on(&BranchId::MAIN).config(),
+        Some(agent_config("m1"))
+    );
 
     let d2 = open_decision(&mut agg, "again");
     let events = submit_agent(
@@ -9654,7 +9673,10 @@ fn omitted_agent_keeps_the_current_config() {
         None,
     );
     assert!(agent_updates(&events).is_empty());
-    assert_eq!(agg.state.at_head().config(), Some(agent_config("m1")));
+    assert_eq!(
+        agg.state.on(&BranchId::MAIN).config(),
+        Some(agent_config("m1"))
+    );
 }
 
 #[test]
@@ -9739,7 +9761,7 @@ fn create_session_writes_seeded_state_before_session_start() {
         "the seed is written before session.start; got {events:?}"
     );
     assert_eq!(
-        agg.state.at_head().worker_state().0,
+        agg.state.on(&BranchId::MAIN).worker_state().0,
         json!({ "plan": "pro" }),
         "session.start reads the seeded state"
     );
@@ -9774,7 +9796,10 @@ fn create_session_without_a_seed_writes_no_state() {
         &system(),
     );
     assert!(state_updates(&events).is_empty());
-    assert_eq!(agg.state.at_head().worker_state(), WorkerState::default());
+    assert_eq!(
+        agg.state.on(&BranchId::MAIN).worker_state(),
+        WorkerState::default()
+    );
 }
 
 #[test]
@@ -9895,7 +9920,10 @@ fn session_start_config_is_visible_to_a_queued_client_decision() {
         )),
         "the queued client decision is promoted; got {events:?}"
     );
-    assert_eq!(agg.state.at_head().config(), Some(agent_config("m1")));
+    assert_eq!(
+        agg.state.on(&BranchId::MAIN).config(),
+        Some(agent_config("m1"))
+    );
 }
 
 #[test]
@@ -10023,7 +10051,10 @@ fn client_message_parks_while_session_start_retry_is_scheduled() {
         )),
         "the queued client decision is promoted; got {events:?}"
     );
-    assert_eq!(agg.state.at_head().config(), Some(agent_config("m1")));
+    assert_eq!(
+        agg.state.on(&BranchId::MAIN).config(),
+        Some(agent_config("m1"))
+    );
 }
 
 #[test]
@@ -10186,7 +10217,10 @@ fn a_fork_writes_its_state_after_its_messages_and_an_omitted_state_carries() {
         ],
         Some(json!({"v": 2})),
     );
-    assert_eq!(agg.state.at_head().worker_state().0, json!({"v": 2}));
+    assert_eq!(
+        agg.state.on(&BranchId::MAIN).worker_state().0,
+        json!({"v": 2})
+    );
 
     let d3 = open_decision(&mut agg, "redo");
     let events = submit_state(
@@ -10208,7 +10242,10 @@ fn a_fork_writes_its_state_after_its_messages_and_an_omitted_state_carries() {
         Some("u1"),
         "the fork keeps the state saved after u1"
     );
-    assert_eq!(agg.state.at_head().worker_state().0, json!({"v": 3}));
+    assert_eq!(
+        agg.state.on(&BranchId::MAIN).worker_state().0,
+        json!({"v": 3})
+    );
 
     let d4 = open_decision(&mut agg, "retry");
     let events = submit_state(
@@ -10227,7 +10264,7 @@ fn a_fork_writes_its_state_after_its_messages_and_an_omitted_state_carries() {
         "both forks hang after the state saved with u1"
     );
     assert_eq!(
-        agg.state.at_head().worker_state().0,
+        agg.state.on(&BranchId::MAIN).worker_state().0,
         json!({"v": 3}),
         "an omitted state keeps what the worker saw"
     );
@@ -10289,7 +10326,7 @@ fn a_reset_lands_before_the_first_message_and_keeps_the_state_sent_with_it() {
 
     let texts: Vec<_> = agg
         .state
-        .at_head()
+        .on(&BranchId::MAIN)
         .transcript()
         .iter()
         .map(|m| {
@@ -10304,7 +10341,10 @@ fn a_reset_lands_before_the_first_message_and_keeps_the_state_sent_with_it() {
         events.is_empty() || agg.state.has_node("u1"),
         "the old line stays in the tree"
     );
-    assert_eq!(agg.state.at_head().worker_state().0, json!({"v": 3}));
+    assert_eq!(
+        agg.state.on(&BranchId::MAIN).worker_state().0,
+        json!({"v": 3})
+    );
 }
 
 #[test]
@@ -10326,7 +10366,7 @@ fn a_compaction_records_the_summary_then_copies_of_the_kept_messages() {
 
     let path: Vec<String> = agg
         .state
-        .at_head()
+        .on(&BranchId::MAIN)
         .transcript()
         .iter()
         .map(|m| {
@@ -10337,7 +10377,11 @@ fn a_compaction_records_the_summary_then_copies_of_the_kept_messages() {
         })
         .collect();
     assert_eq!(path, vec!["Summary: said hi.", "more"]);
-    let kept = agg.state.head_id.clone().expect("a head");
+    let kept = agg
+        .state
+        .leaf(&BranchId::MAIN)
+        .map(str::to_string)
+        .expect("a head");
     assert_ne!(
         kept, "u2",
         "the kept message is a fresh copy on the new branch"
@@ -10361,9 +10405,12 @@ fn an_edit_of_the_first_message_reads_the_setup() {
     let mut agg =
         create_session_with_config("sess-1", "tenant-a", "user-1", Some(agent_config("m1")));
     long_chat(&mut agg);
-    assert_eq!(agg.state.at_head().worker_state().0, json!({"v": 1}));
     assert_eq!(
-        agg.state.at_head().config().map(|c| c.model),
+        agg.state.on(&BranchId::MAIN).worker_state().0,
+        json!({"v": 1})
+    );
+    assert_eq!(
+        agg.state.on(&BranchId::MAIN).config().map(|c| c.model),
         Some("m2".to_string())
     );
 
@@ -10379,13 +10426,13 @@ fn an_edit_of_the_first_message_reads_the_setup() {
             .is_some_and(|p| p.message().is_none()),
         "it hangs where the first message hung"
     );
-    assert_eq!(agg.state.at_head().transcript().len(), 1);
+    assert_eq!(agg.state.on(&BranchId::MAIN).transcript().len(), 1);
     assert!(
-        agg.state.at_head().worker_state().0.is_null(),
+        agg.state.on(&BranchId::MAIN).worker_state().0.is_null(),
         "state written on the old branch stays there"
     );
     assert_eq!(
-        agg.state.at_head().config().map(|c| c.model),
+        agg.state.on(&BranchId::MAIN).config().map(|c| c.model),
         Some("m1".to_string()),
         "the session.start config holds on every branch"
     );
@@ -10406,7 +10453,7 @@ fn a_reset_that_sends_config_keeps_it() {
     );
 
     assert_eq!(
-        agg.state.at_head().config().map(|c| c.model),
+        agg.state.on(&BranchId::MAIN).config().map(|c| c.model),
         Some("m2".to_string())
     );
 }
@@ -10465,12 +10512,12 @@ fn truncating_view_moves_head_and_forks_the_regenerated_reply() {
         ],
         None,
     );
-    assert_eq!(agg.state.head_id.as_deref(), Some("a1"));
+    assert_eq!(agg.state.leaf(&BranchId::MAIN), Some("a1"));
 
     let d2 = open_decision(&mut agg, "regen");
     let events = submit_state(&mut agg, d2, vec![node_msg("u1", Role::User, "hi")], None);
     assert_eq!(head_moves(&events), ["u1"], "got {events:?}");
-    assert_eq!(agg.state.head_id.as_deref(), Some("u1"));
+    assert_eq!(agg.state.leaf(&BranchId::MAIN), Some("u1"));
 
     let d3 = open_decision(&mut agg, "next");
     submit_state(
@@ -10482,7 +10529,7 @@ fn truncating_view_moves_head_and_forks_the_regenerated_reply() {
         ],
         None,
     );
-    assert_eq!(agg.state.head_id.as_deref(), Some("a2"));
+    assert_eq!(agg.state.leaf(&BranchId::MAIN), Some("a2"));
     let tree = agg.state.message_tree();
     let a2 = tree.nodes.iter().find(|n| n.message.id == "a2").unwrap();
     assert_eq!(
@@ -10516,7 +10563,7 @@ fn full_resend_does_not_move_the_head() {
         None,
     );
     assert!(head_moves(&events).is_empty(), "got {events:?}");
-    assert_eq!(agg.state.head_id.as_deref(), Some("a1"));
+    assert_eq!(agg.state.leaf(&BranchId::MAIN), Some("a1"));
 }
 
 #[test]
@@ -10527,7 +10574,7 @@ fn viewless_decision_keeps_the_head() {
     let d2 = open_decision(&mut agg, "more");
     let events = submit_state(&mut agg, d2, vec![], None);
     assert!(head_moves(&events).is_empty(), "got {events:?}");
-    assert_eq!(agg.state.head_id.as_deref(), Some("u1"));
+    assert_eq!(agg.state.leaf(&BranchId::MAIN), Some("u1"));
 }
 
 #[test]
@@ -10549,7 +10596,7 @@ fn truncation_voids_work_anchored_on_the_abandoned_branch() {
     let events = submit_state(&mut agg, d2, vec![node_msg("u1", Role::User, "hi")], None);
     let path: Vec<String> = agg
         .state
-        .at_head()
+        .on(&BranchId::MAIN)
         .transcript()
         .into_iter()
         .map(|m| m.id)
@@ -11197,7 +11244,7 @@ fn global_interrupt_gates_all_new_views() {
     interrupt(&mut agg, "int-1");
     assert_eq!(
         agg.state.open_interrupt("int-1").unwrap().anchor,
-        agg.state.head_id,
+        agg.state.leaf(&BranchId::MAIN).map(str::to_string),
         "it anchors on the conversation's start"
     );
     let err = agg
@@ -11280,7 +11327,7 @@ fn escape_to_e1(agg: &mut Session) {
 fn two_parked_branches_coexist_and_resume_independently() {
     let mut agg = parked_session();
     escape_to_e1(&mut agg);
-    assert_eq!(agg.state.head_id.as_deref(), Some("e1"));
+    assert_eq!(agg.state.leaf(&BranchId::MAIN), Some("e1"));
     assert!(!agg.state.head_parked(), "the new branch starts unparked");
 
     interrupt(&mut agg, "int-2");
@@ -11412,7 +11459,7 @@ fn worker_interrupt_anchors_at_the_merged_head() {
         })
         .expect("the action raises the interrupt");
     assert_eq!(anchor.as_deref(), Some("x1"), "anchored at head_after");
-    assert_eq!(agg.state.head_id.as_deref(), Some("x1"));
+    assert_eq!(agg.state.leaf(&BranchId::MAIN), Some("x1"));
     assert!(agg.state.head_parked());
 }
 
@@ -12511,7 +12558,7 @@ fn a_declared_tool_named_skill_shadows_the_engines_and_is_a_collision() {
         defer: None,
     });
     let agg = create_session_with_config("sess-1", "tenant-a", "user-1", Some(cfg));
-    let merged = agg.state.at_head().connector_tools();
+    let merged = agg.state.on(&BranchId::MAIN).connector_tools();
     assert!(
         merged.collisions.contains(&"skill".to_string()),
         "reported, so the warning has something to say: {:?}",
@@ -12954,7 +13001,11 @@ fn skilled_config(source: crate::protocol::SkillSource) -> AgentConfig {
 }
 
 fn dispatched_tools(agg: &mut Session, call_id: &str) -> Vec<String> {
-    let tools = agg.state.at_head().config().and_then(|c| c.tools_as_llm());
+    let tools = agg
+        .state
+        .on(&BranchId::MAIN)
+        .config()
+        .and_then(|c| c.tools_as_llm());
     dispatch(
         agg,
         CommandPayload::RequestLlmCall {
@@ -13076,7 +13127,7 @@ fn a_skills_tools_wait_until_it_loads() {
 
     load_worker_skill(&mut agg, "tc-1", "visits");
     assert!(
-        agg.state.at_head().locked_tools().is_empty(),
+        agg.state.on(&BranchId::MAIN).locked_tools().is_empty(),
         "loading the skill brings its tools"
     );
     finish_llm(&mut agg, "call-1");
@@ -13250,7 +13301,7 @@ fn a_skill_loaded_through_call_tool_unlocks_its_tools() {
         ),
         &machine(),
     );
-    assert!(agg.state.at_head().locked_tools().is_empty());
+    assert!(agg.state.on(&BranchId::MAIN).locked_tools().is_empty());
 }
 
 fn coding_session() -> Session {
@@ -13492,7 +13543,7 @@ fn a_scripts_calls_meet_the_tools_contract() {
 #[test]
 fn code_mode_builds_only_what_scripts_reach() {
     let agg = coding_session();
-    let at = agg.state.at_head();
+    let at = agg.state.on(&BranchId::MAIN);
     let engine: Vec<String> = at
         .connector_tools()
         .tools
@@ -13834,7 +13885,7 @@ fn a_script_starts_a_subagent_and_reads_its_answer() {
     assert_eq!(script.calls[0].output, "done");
     assert!(
         agg.state
-            .at_head()
+            .on(&BranchId::MAIN)
             .transcript()
             .iter()
             .all(|m| m.tool_call_id.as_deref() != Some(call.as_str())),
@@ -13917,7 +13968,7 @@ fn a_skill_a_script_loads_answers_with_the_tools_it_names() {
     config.codemode = Some(crate::codemode::Language::Javascript);
     let mut agg = create_session_with_config("sess-1", "tenant-a", "user-1", Some(config));
     assert!(
-        agg.state.at_head().locked_tools().is_empty(),
+        agg.state.on(&BranchId::MAIN).locked_tools().is_empty(),
         "in code mode a skill holds back nothing"
     );
     run_code(&mut agg, "...");
@@ -14588,7 +14639,7 @@ fn a_continuation_of_a_tree_call_leaves_the_prompt_to_the_tree() {
         ..node_msg("t1", Role::Tool, "noon")
     };
     record(&mut agg, "tool done", vec![u1, a1, t1]);
-    let transcript = agg.state.at_head().transcript();
+    let transcript = agg.state.on(&BranchId::MAIN).transcript();
     let calls = HashMap::from([(
         "call-1".to_string(),
         agg.state

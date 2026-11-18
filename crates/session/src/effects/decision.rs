@@ -51,7 +51,7 @@ impl KindSpec for DecisionSpec {
     }
 
     fn terminal(&self, state: &Cx<'_>, id: &str, e: &SettleError) -> Vec<EventPayload> {
-        if let Some(branch) = state.decision_branch(id) {
+        if let Some(branch) = state.decision_branch(id).name() {
             return state.finish_branch(
                 state.ids(),
                 branch,
@@ -116,8 +116,7 @@ impl KindSpec for DecisionSpec {
             .effects_of(EffectKind::Decision)
             .filter(|e| {
                 let Some(wd) = e.decision() else { return false };
-                (e.tracking.status() == EffectStatus::Pending
-                    && state.lane(wd.branch.as_deref()) == lane)
+                (e.tracking.status() == EffectStatus::Pending && state.lane(&wd.branch) == lane)
                     || (matches!(wd.trigger, Trigger::SessionStart)
                         && e.tracking.status() == EffectStatus::RetryScheduled
                         && e.id != entry.id)
@@ -126,10 +125,8 @@ impl KindSpec for DecisionSpec {
                 decision_id: e.id.clone(),
             })
             .collect();
-        let branch = state
-            .worker_decision(&entry.id)
-            .and_then(|d| d.branch.as_deref());
-        deps.extend(super::connector::owed(state.at_scope(branch)));
+        let branch = state.decision_branch(&entry.id);
+        deps.extend(super::connector::owed(state.on(branch)));
         deps.sort_by_key(Dep::label);
         deps.dedup();
         deps
@@ -210,7 +207,7 @@ impl SessionState {
     pub fn drop_queued_decisions(&self) -> Vec<EventPayload> {
         self.queued_decisions()
             .into_iter()
-            .filter(|e| !self.detached(e.branch.as_deref()))
+            .filter(|e| !self.detached(&e.branch))
             .filter(|e| e.decision().is_none_or(|d| d.trigger.is_turn_work()))
             .map(|e| self.decision_dropped(&e.id))
             .collect()

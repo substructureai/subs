@@ -11,7 +11,7 @@ use substructure_session::{Command, CommandResult, Entry, Session, Settings, Sto
 use tokio::sync::{mpsc, oneshot};
 
 use crate::protocol::MessageTree;
-use substructure_session::state::SessionState;
+use substructure_session::state::{BranchId, SessionState};
 
 use crate::runtime::event_store::{BroadcastBus, EventBus, EventFilter, EventTap, StoreError};
 pub use crate::runtime::inbox::{execute, ExecuteError, ExecuteInput, ExecuteOutput};
@@ -514,7 +514,7 @@ impl Sessions {
             let state = session.state();
             let at = match leaf {
                 Some(leaf) => Some(state.tree.newest(&leaf)),
-                None => state.head_id.clone(),
+                None => state.leaf(&BranchId::MAIN).map(str::to_string),
             };
             let tree = state.at(at.as_deref()).message_tree();
             let versions = state.versions(&tree);

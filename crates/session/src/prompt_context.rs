@@ -384,6 +384,7 @@ mod tests {
         AgentConfig, AgentPlugin, ErrorCode, ErrorInfo, McpServer, McpToolSyncFailure, RetryPolicy,
         SkillMeta, StoredContent,
     };
+    use crate::state::BranchId;
     use crate::state::{ApplyContext, SessionState};
 
     fn apply(state: &mut SessionState, seq: u64, payload: EventPayload) {
@@ -474,7 +475,10 @@ mod tests {
     }
 
     fn owed_ids(state: &SessionState) -> Vec<String> {
-        owed(state.at_head()).into_iter().map(|c| c.id).collect()
+        owed(state.on(&BranchId::MAIN))
+            .into_iter()
+            .map(|c| c.id)
+            .collect()
     }
 
     fn sentry() -> ConnectionPath {
@@ -535,7 +539,7 @@ mod tests {
         let state = failed_state(McpToolSyncFailure::Warn, None);
         assert_eq!(owed_ids(&state), ["mcp.sentry:unavailable:unreachable"]);
         assert_eq!(
-            owed(state.at_head())[0].content,
+            owed(state.on(&BranchId::MAIN))[0].content,
             "{\"mcp_server\":\"mcp.sentry\",\"unavailable\":true,\"reason\":\"unreachable\"}"
         );
     }
@@ -543,7 +547,7 @@ mod tests {
     #[test]
     fn the_remotes_own_error_never_reaches_the_prompt() {
         let state = failed_state(McpToolSyncFailure::Warn, None);
-        let content = &owed(state.at_head())[0].content;
+        let content = &owed(state.on(&BranchId::MAIN))[0].content;
         assert!(!content.contains("502"), "{content}");
         assert!(!content.contains("script"), "{content}");
     }
@@ -561,10 +565,10 @@ mod tests {
     fn a_silent_connection_is_not_named() {
         let state = failed_state(McpToolSyncFailure::Silent, None);
         assert!(owed_ids(&state).is_empty());
-        let config = state.at_head().config().expect("config");
+        let config = state.on(&BranchId::MAIN).config().expect("config");
         assert!(
             state
-                .at_head()
+                .on(&BranchId::MAIN)
                 .unavailable_connector_paths(&config)
                 .is_empty(),
             "silent covers the search answer too"
@@ -574,7 +578,7 @@ mod tests {
     #[test]
     fn announcing_no_servers_still_reports_one_that_is_missing() {
         let mut s = failed_state(McpToolSyncFailure::Warn, None);
-        let mut config = s.at_head().config().expect("config");
+        let mut config = s.on(&BranchId::MAIN).config().expect("config");
         config.mcp_announce = McpAnnounce::Never;
         apply(
             &mut s,
@@ -610,7 +614,7 @@ mod tests {
     fn a_down_connection_is_named_in_the_search_answer() {
         let state = failed_state(McpToolSyncFailure::Warn, None);
         let answered = crate::engine_tools::answer(
-            state.at_head(),
+            state.on(&BranchId::MAIN),
             crate::protocol::ConnectorToolKind::Find,
             "{\"query\":\"issues\"}",
         )
@@ -631,7 +635,7 @@ mod tests {
     fn a_call_to_an_unknown_tool_says_a_connection_is_down_without_claiming_the_tool() {
         let state = failed_state(McpToolSyncFailure::Warn, None);
         let fault = state
-            .at_head()
+            .on(&BranchId::MAIN)
             .call_tool_fault("{\"name\":\"sentry_list_issues\"}")
             .expect("fault");
         assert!(fault.contains("no tool `sentry_list_issues`"), "{fault}");
@@ -690,7 +694,7 @@ mod tests {
     fn a_plugins_settled_server_is_announced_like_any_connection() {
         let state = plugin_state(true);
         assert_eq!(owed_ids(&state), ["plugin.pdf", "plugin.pdf.mcp.renderer"]);
-        let owed = owed(state.at_head());
+        let owed = owed(state.on(&BranchId::MAIN));
         assert!(
             owed[1]
                 .content
@@ -713,7 +717,7 @@ mod tests {
     #[test]
     fn the_catalog_carries_every_skill_description() {
         let state = plugin_state(false);
-        let catalog = &owed(state.at_head())[0].content;
+        let catalog = &owed(state.on(&BranchId::MAIN))[0].content;
         assert!(catalog.matches("long long").count() >= 2, "{catalog}");
         assert!(catalog.contains("pdf:text-extraction"), "{catalog}");
     }
@@ -829,7 +833,7 @@ mod tests {
                 attempt: 0,
                 llm: "claude".to_string(),
                 spec: crate::state::LlmCallSpec::from(&request),
-                at: state.head_id.clone(),
+                at: state.leaf(&BranchId::MAIN).map(str::to_string),
                 stream: false,
                 retry: RetryPolicy::no_retry(),
                 handler: Default::default(),
@@ -1029,7 +1033,7 @@ mod tests {
                 },
             }),
         );
-        let owed = owed(s.at_head());
+        let owed = owed(s.on(&BranchId::MAIN));
         let plugin = owed
             .iter()
             .find(|c| c.id == "plugin.org")

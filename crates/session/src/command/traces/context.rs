@@ -111,14 +111,14 @@ fn turn_saying(t: &mut Trace, n: usize, asked: &str, read: u64) {
 }
 
 fn scope(t: &Trace) -> Option<&str> {
-    t.agg.state.decision_branch(&t.live_decision())
+    t.agg.state.decision_branch(&t.live_decision()).name()
 }
 
 fn proposed(t: &Trace, trigger: &DecisionTrigger) -> DecisionResponse {
     propose(
         trigger,
         &Proposing {
-            state: t.agg.state.at_scope(scope(t)),
+            state: t.agg.state.on(&BranchId::from(scope(t))),
             pending_calls: 0,
             scope: scope(t),
             detached: false,
@@ -128,7 +128,7 @@ fn proposed(t: &Trace, trigger: &DecisionTrigger) -> DecisionResponse {
 }
 
 fn wire(t: &Trace) -> DecisionTrigger {
-    let at = t.agg.state.at_scope(scope(t));
+    let at = t.agg.state.on(&BranchId::from(scope(t)));
     crate::request::wire_trigger(
         t.live_trigger(),
         &at.transcript(),
@@ -269,7 +269,7 @@ fn a_quiet_session_starts_over_with_the_turns_own_messages() {
         });
     assert!(copied.flatten().is_some(), "the turn's message is a copy");
     assert!(
-        t.agg.state.at_head().config().is_some(),
+        t.agg.state.on(&BranchId::MAIN).config().is_some(),
         "the config carries over"
     );
     assert_eq!(emitted(&t), ["context.limited", "context.replaced"]);
@@ -310,7 +310,7 @@ fn a_full_session_is_summarized_and_keeps_its_recent_messages() {
     plan(&mut t, "sum-1");
     assert!(t.agg.state.is_summary_call("sum-1"));
     let branch = t.agg.state.effect(EffectKind::LlmCall, "sum-1").unwrap();
-    assert_eq!(branch.branch.as_deref(), Some("call-3.summary"));
+    assert_eq!(branch.branch.name(), Some("call-3.summary"));
     answered(&mut t, "sum-1", "they asked twice", 50);
     assert_eq!(path(&t).len(), 5, "the summary is not an answer");
     summarized(&mut t);
@@ -468,7 +468,7 @@ fn a_replace_sets_a_new_branch_any_time() {
         ]
     );
     assert_eq!(emitted(&t), ["context.replaced"]);
-    assert!(t.agg.state.at_head().config().is_some());
+    assert!(t.agg.state.on(&BranchId::MAIN).config().is_some());
 }
 
 fn summarizing() -> Vec<ContextStrategy> {
@@ -505,11 +505,14 @@ fn a_held_tree_call_runs_on_the_new_branch_and_is_told_its_context_once() {
     plan(&mut t, "sum-1");
     let summary = t.agg.state.effect(EffectKind::LlmCall, "sum-1").unwrap();
     assert!(
-        summary.branch.is_some(),
+        !summary.branch.is_main(),
         "a summary is written on its own branch"
     );
     assert_eq!(
-        t.agg.state.at_scope(summary.branch.as_deref()).config(),
+        t.agg
+            .state
+            .on(&BranchId::from(summary.branch.name()))
+            .config(),
         None
     );
     assert_eq!(
@@ -530,7 +533,12 @@ fn a_held_tree_call_runs_on_the_new_branch_and_is_told_its_context_once() {
     assert_eq!(read[0], "be brief");
     assert_eq!(listings(&t, "call-3"), 1, "{read:?}");
     assert_eq!(read[2..], path(&t), "then the new branch");
-    let head = t.agg.state.head_id.clone().unwrap();
+    let head = t
+        .agg
+        .state
+        .leaf(&BranchId::MAIN)
+        .map(str::to_string)
+        .unwrap();
     let read_at = t
         .agg
         .state

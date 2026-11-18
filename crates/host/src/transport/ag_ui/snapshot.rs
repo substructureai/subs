@@ -2,6 +2,7 @@ use crate::protocol::{Content, Message, MessageTree, Role, StoredContent};
 use crate::session::state::SessionState;
 
 use super::events::{AgUiEvent, AgUiInterrupt, RunOutcome, SnapshotMessage};
+use substructure_session::state::BranchId;
 
 pub fn session_messages(tree: &MessageTree) -> Vec<SnapshotMessage> {
     match &tree.head_id {
@@ -37,7 +38,7 @@ fn to_snapshot(message: Message) -> SnapshotMessage {
 
 pub fn open_interrupts(session: &SessionState) -> Vec<AgUiInterrupt> {
     session
-        .at_head()
+        .on(&BranchId::MAIN)
         .interrupts_for()
         .into_iter()
         .map(AgUiInterrupt::from_open)
@@ -95,6 +96,7 @@ mod tests {
     use crate::protocol::{InterruptOrigin, NewMessage, ToolCall, ToolCallFunction};
     use crate::session::state::OpenInterrupt;
     use serde_json::{json, Value};
+    use substructure_session::state::Open;
     use uuid::Uuid;
 
     fn node(id: u128, parent: Option<u128>, mut message: Message) -> NewMessage {
@@ -265,7 +267,13 @@ mod tests {
                 entry: substructure_session::tree::Node::of_message(node),
             });
         }
-        s.head_id = tree.head_id.clone();
+        s.branches.insert(
+            BranchId::MAIN,
+            Open {
+                leaf: tree.head_id.clone(),
+                started: None,
+            },
+        );
         s
     }
 
@@ -276,14 +284,14 @@ mod tests {
             reason: "confirmation".to_string(),
             payload,
             anchor: anchor.map(str::to_string),
-            branch: None,
+            branch: BranchId::MAIN,
         }
     }
 
     #[test]
     fn parked_head_reports_every_open_interrupt_on_its_path() {
         let mut s = session_of(linear(vec![user("send the email")]));
-        let head = s.head_id.clone();
+        let head = s.leaf(&BranchId::MAIN).map(str::to_string);
         s.open_interrupts.push(open(
             "int-1",
             head.as_deref(),

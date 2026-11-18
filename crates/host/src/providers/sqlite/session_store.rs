@@ -945,6 +945,7 @@ mod cold {
     use substructure_session::{Command, Settings, Work};
 
     use super::*;
+    use substructure_session::state::BranchId;
 
     struct Cold {
         _dir: tempfile::TempDir,
@@ -1094,7 +1095,7 @@ mod cold {
         fn path(&self) -> Vec<DraftMessage> {
             self.session
                 .state()
-                .at_head()
+                .on(&BranchId::MAIN)
                 .transcript()
                 .into_iter()
                 .map(DraftMessage::from)
@@ -1256,7 +1257,7 @@ mod cold {
         let contexts = loaded
             .state()
             .tree
-            .up(loaded.state().head_id.as_deref())
+            .up(loaded.state().leaf(&BranchId::MAIN))
             .filter(|n| matches!(n.fact, Fact::Context { .. }))
             .count();
         assert_eq!(contexts, 2, "one node per request, none for the retry");
@@ -1311,7 +1312,10 @@ mod cold {
         ));
         c.drain();
         assert!(
-            !c.session.state().branches.contains_key("side"),
+            !c.session
+                .state()
+                .branches
+                .contains_key(&BranchId::from("side")),
             "it closed"
         );
 
@@ -1322,7 +1326,7 @@ mod cold {
             .unwrap()
             .expect("the log keeps it");
         assert!(record.closed.is_some());
-        let at = record.state.at().map(str::to_string);
+        let at = record.leaf.or(record.state.from);
         let read = c.session.state().at(at.as_deref());
         assert_eq!(read.config().map(|a| a.model), Some("m2".into()));
         let ancestors = c

@@ -85,8 +85,8 @@ pub struct OpenInterrupt {
     pub reason: String,
     pub payload: serde_json::Value,
     pub anchor: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "BranchId::is_main")]
+    pub branch: BranchId,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -152,20 +152,80 @@ pub fn resolve_on_path<'a, V: Anchored>(
     })
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct BranchId(Option<String>);
+
+pub static MAIN_BRANCH: BranchId = BranchId::MAIN;
+
+impl BranchId {
+    pub const MAIN: BranchId = BranchId(None);
+
+    pub fn name(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
+
+    pub fn is_main(&self) -> bool {
+        self.0.is_none()
+    }
+}
+
+impl From<Option<String>> for BranchId {
+    fn from(name: Option<String>) -> Self {
+        BranchId(name)
+    }
+}
+
+impl From<Option<&str>> for BranchId {
+    fn from(name: Option<&str>) -> Self {
+        BranchId(name.map(str::to_string))
+    }
+}
+
+impl From<&str> for BranchId {
+    fn from(name: &str) -> Self {
+        BranchId(Some(name.to_string()))
+    }
+}
+
+impl From<&String> for BranchId {
+    fn from(name: &String) -> Self {
+        BranchId(Some(name.clone()))
+    }
+}
+
+impl From<String> for BranchId {
+    fn from(name: String) -> Self {
+        BranchId(Some(name))
+    }
+}
+
+impl From<BranchId> for Option<String> {
+    fn from(id: BranchId) -> Self {
+        id.0
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Open {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leaf: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started: Option<BranchState>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BranchState {
     pub node: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent: Option<String>,
+    #[serde(default, skip_serializing_if = "BranchId::is_main")]
+    pub parent: BranchId,
     pub agent: BranchConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub mode: BranchMode,
     pub seq: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub leaf: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -180,12 +240,11 @@ impl BranchState {
         BranchState {
             node: p.node.clone(),
             from: p.from.clone(),
-            parent: p.parent.clone(),
+            parent: BranchId::from(p.parent.clone()),
             agent: p.agent.clone(),
             name: p.name.clone(),
             mode: p.mode,
             seq,
-            leaf: p.leaf.clone(),
             turn_id: p.turn_id.clone(),
             subagent: p.subagent.clone(),
             depth: p.depth,
@@ -193,18 +252,14 @@ impl BranchState {
         }
     }
 
-    pub fn at(&self) -> Option<&str> {
-        self.leaf.as_deref().or(self.from.as_deref())
-    }
-
-    pub fn view(&self, id: &str) -> BranchView {
+    pub fn view(&self, id: &str, leaf: Option<String>) -> BranchView {
         BranchView {
             id: id.to_string(),
             name: self.name.clone(),
             mode: self.mode,
             from: self.from.clone(),
-            leaf: self.leaf.clone(),
-            parent: self.parent.clone(),
+            leaf,
+            parent: self.parent.name().map(str::to_string),
         }
     }
 }
@@ -339,6 +394,27 @@ impl EventMeta {
     }
 }
 
+mod branch_table {
+    use super::{BranchId, Open};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
+
+    pub fn serialize<S: Serializer>(
+        table: &BTreeMap<BranchId, Open>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        table.iter().collect::<Vec<_>>().serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<BTreeMap<BranchId, Open>, D::Error> {
+        Ok(Vec::<(BranchId, Open)>::deserialize(d)?
+            .into_iter()
+            .collect())
+    }
+}
+
 mod effect_table {
     use super::{EffectKind, EffectState};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -428,9 +504,6 @@ pub struct SessionState {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub deliveries: BTreeMap<String, crate::delivery::Delivery>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub head_id: Option<String>,
-
     #[serde(skip)]
     pub tree: crate::tree::Tree,
 
@@ -439,8 +512,8 @@ pub struct SessionState {
 
     pub session_start_failed: bool,
 
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub branches: BTreeMap<String, BranchState>,
+    #[serde(with = "branch_table")]
+    pub branches: BTreeMap<BranchId, Open>,
 }
 
 impl SessionState {
@@ -470,67 +543,67 @@ impl SessionState {
             recent_turns: Vec::new(),
             last_turn_failed: false,
             detached_turns: Vec::new(),
-            head_id: None,
             tree: crate::tree::Tree::default(),
             open_interrupts: Vec::new(),
             session_start_failed: false,
-            branches: BTreeMap::new(),
+            branches: BTreeMap::from([(BranchId::MAIN, Open::default())]),
         }
     }
 
-    pub fn open_branch(&self, id: &str) -> Option<&BranchState> {
-        self.branches.get(id)
+    pub fn started(&self, branch: &BranchId) -> Option<&BranchState> {
+        self.branches.get(branch)?.started.as_ref()
+    }
+
+    pub fn side_branches(&self) -> impl Iterator<Item = (&str, &BranchState)> {
+        self.branches
+            .iter()
+            .filter_map(|(id, open)| Some((id.name()?, open.started.as_ref()?)))
     }
 
     pub fn parallel_branches(&self) -> bool {
-        self.at_head()
+        self.on(&BranchId::MAIN)
             .config()
             .and_then(|c| c.parallel_branches)
             .unwrap_or(false)
     }
 
-    pub fn lane(&self, branch: Option<&str>) -> Option<String> {
-        branch
-            .filter(|_| self.parallel_branches())
-            .map(str::to_string)
+    pub fn lane(&self, branch: &BranchId) -> BranchId {
+        match self.parallel_branches() {
+            true => branch.clone(),
+            false => BranchId::MAIN,
+        }
     }
 
-    pub fn detached(&self, branch: Option<&str>) -> bool {
-        branch
-            .and_then(|b| self.branches.get(b))
-            .is_some_and(|b| b.detached)
+    pub fn detached(&self, branch: &BranchId) -> bool {
+        self.started(branch).is_some_and(|b| b.detached)
     }
 
-    pub fn held_by_branches(&self, parent: Option<&str>) -> usize {
-        self.branches
-            .values()
-            .filter(|b| b.mode == BranchMode::Blocking)
-            .filter(|b| b.parent.as_deref() == parent)
+    pub fn held_by_branches(&self, parent: &BranchId) -> usize {
+        self.side_branches()
+            .filter(|(_, b)| b.mode == BranchMode::Blocking && b.parent == *parent)
             .count()
     }
 
-    pub fn node_branch(&self, id: &str) -> Option<String> {
-        self.tree
-            .get(id)
-            .and_then(|n| n.branch().map(str::to_string))
+    pub fn node_branch(&self, id: &str) -> BranchId {
+        BranchId::from(
+            self.tree
+                .get(id)
+                .and_then(|n| n.branch().map(str::to_string)),
+        )
     }
 
-    pub fn decision_branch(&self, id: &str) -> Option<&str> {
-        self.worker_decision(id).and_then(|d| d.branch.as_deref())
+    pub fn decision_branch(&self, id: &str) -> &BranchId {
+        self.worker_decision(id).map_or(&MAIN_BRANCH, |d| &d.branch)
     }
 
-    fn effect_branch(&self, kind: EffectKind, id: &str) -> Option<String> {
-        self.effect(kind, id).and_then(|e| e.branch.clone())
-    }
-
-    pub fn trigger_branch(&self, trigger: &Trigger) -> Option<String> {
+    pub fn trigger_branch(&self, trigger: &Trigger) -> Option<BranchId> {
         match trigger {
             Trigger::BranchFinished { id, .. } => {
-                self.branches.get(id).and_then(|b| b.parent.clone())
+                Some(self.started(&BranchId::from(id.as_str()))?.parent.clone())
             }
             _ => {
                 let (kind, id) = trigger_effect(trigger)?;
-                self.effect_branch(kind, id)
+                Some(self.effect(kind, id)?.branch.clone())
             }
         }
     }
@@ -560,12 +633,12 @@ impl SessionState {
     }
 
     pub fn check_invariants(&self) -> Result<(), String> {
-        let mut lanes: BTreeMap<Option<String>, usize> = BTreeMap::new();
+        let mut lanes: BTreeMap<BranchId, usize> = BTreeMap::new();
         for e in self
             .effects_of(EffectKind::Decision)
             .filter(|e| e.tracking.status == EffectStatus::Pending)
         {
-            *lanes.entry(self.lane(e.branch.as_deref())).or_default() += 1;
+            *lanes.entry(self.lane(&e.branch)).or_default() += 1;
         }
         if lanes.values().any(|n| *n > 1) {
             return Err(format!("decision slot violated: {lanes:?} live decisions"));
@@ -575,12 +648,13 @@ impl SessionState {
             .filter(|e| e.tracking.status == EffectStatus::Pending)
             .filter_map(|e| e.decision())
             .any(|d| {
-                let node = match d.branch.as_deref() {
-                    Some(b) if !self.branches.contains_key(b) => self
-                        .tree
-                        .branch(b)
-                        .and_then(|r| r.state.at().map(str::to_string)),
-                    b => self.scope_node(b),
+                let node = match self.branches.contains_key(&d.branch) {
+                    true => self.leaf(&d.branch).map(str::to_string),
+                    false => d
+                        .branch
+                        .name()
+                        .and_then(|b| self.tree.branch(b))
+                        .and_then(|r| r.leaf.or(r.state.from)),
                 };
                 self.at(node.as_deref()).has_pending_connector_sync()
             })
@@ -621,21 +695,18 @@ impl SessionState {
     }
 
     pub fn head_parked(&self) -> bool {
-        self.at_head().active_interrupt_for().is_some()
+        self.on(&BranchId::MAIN).active_interrupt_for().is_some()
     }
 
     pub fn branch_interrupt(&self) -> Option<&OpenInterrupt> {
         self.open_interrupts.iter().find(|i| {
-            i.anchor
-                .as_deref()
-                .and(i.branch.as_deref())
-                .is_some_and(|b| self.open_branch(b).is_some() && !self.detached(Some(b)))
+            i.anchor.is_some() && self.started(&i.branch).is_some() && !self.detached(&i.branch)
         })
     }
 
     pub fn projected_status(&self) -> SessionStatus {
         match self
-            .at_head()
+            .on(&BranchId::MAIN)
             .active_interrupt_for()
             .or_else(|| self.branch_interrupt())
         {
@@ -669,7 +740,7 @@ impl SessionState {
             && (summary == Some(id)
                 || self
                     .effect(EffectKind::LlmCall, id)
-                    .is_some_and(|e| e.branch.as_deref() == summary))
+                    .is_some_and(|e| e.branch.name() == summary))
     }
 
     pub fn holds(&self, id: &str) -> bool {
@@ -685,10 +756,10 @@ impl SessionState {
     /// The interrupt that holds work anchored at `anchor`, if one does.
     pub fn anchor_interrupt(&self, anchor: Option<&str>) -> Option<&OpenInterrupt> {
         match anchor {
-            Some(a) if !self.at_head().anchor_on_path(Some(a)) => {
+            Some(a) if !self.on(&BranchId::MAIN).anchor_on_path(Some(a)) => {
                 self.at(Some(a)).active_interrupt_for()
             }
-            _ => self.at_head().active_interrupt_for(),
+            _ => self.on(&BranchId::MAIN).active_interrupt_for(),
         }
     }
 
@@ -725,12 +796,12 @@ impl SessionState {
         }
         if let Trigger::ClientTranscript { .. } = trigger {
             return self
-                .at(self.read_point(trigger, None).at.as_deref())
+                .at(self.read_point(trigger, &BranchId::MAIN).at.as_deref())
                 .active_interrupt_for();
         }
         let at = match self.trigger_anchor(trigger) {
-            Some(a) if !self.at_head().anchor_on_path(Some(a)) => self.at(Some(a)),
-            _ => self.at_head(),
+            Some(a) if !self.on(&BranchId::MAIN).anchor_on_path(Some(a)) => self.at(Some(a)),
+            _ => self.on(&BranchId::MAIN),
         };
         at.active_interrupt_for()
     }
@@ -826,11 +897,11 @@ impl SessionState {
     }
 
     pub fn tool_handler_for(&self, name: &str) -> ToolHandler {
-        self.at_head().tool_handler(name)
+        self.on(&BranchId::MAIN).tool_handler(name)
     }
 
     pub fn connector_tool_for(&self, name: &str) -> Option<ConnectorTool> {
-        self.at_head().connector_tool(name)
+        self.on(&BranchId::MAIN).connector_tool(name)
     }
 
     pub fn connector_tools_for_config(&self, config: &AgentConfig) -> filter::Merged {
@@ -959,7 +1030,7 @@ impl SessionState {
     }
 
     pub fn retry_config(&self) -> Option<RetryConfig> {
-        self.at_head().retry_config()
+        self.on(&BranchId::MAIN).retry_config()
     }
 
     pub fn depth(&self) -> u32 {
@@ -996,7 +1067,7 @@ impl SessionState {
                 let d = e.decision()?;
                 Some(MetaDecision {
                     decision_id: e.id.clone(),
-                    branch: d.branch.clone(),
+                    branch: d.branch.clone().into(),
                     status: e.tracking.status(),
                     finished: matches!(
                         d.trigger,

@@ -17,6 +17,7 @@ use crate::protocol::{
 };
 use crate::protocol::{ErrorInfo, HeldCall};
 use crate::retry::RetryTarget;
+use crate::state::BranchId;
 use crate::system1::System1Request;
 use crate::Caller;
 
@@ -345,7 +346,7 @@ impl SessionState {
         stranded: impl Fn(EffectKind, &EffectTracking, Option<&str>) -> bool,
     ) -> Vec<EventPayload> {
         self.void_effects_where(|e| {
-            e.branch.is_none() && stranded(e.kind(), &e.tracking, e.asked_at.as_deref())
+            e.branch.is_main() && stranded(e.kind(), &e.tracking, e.asked_at.as_deref())
         })
     }
 
@@ -374,21 +375,20 @@ impl SessionState {
             .collect()
     }
 
-    fn void_stranded_work(&self, scope: Option<&str>) -> Vec<EventPayload> {
-        let node = self.scope_node(scope);
-        let path = node
-            .as_deref()
+    fn void_stranded_work(&self, scope: &BranchId) -> Vec<EventPayload> {
+        let path = self
+            .leaf(scope)
             .map(|n| self.path_ids(n))
             .unwrap_or_default();
         let on_path = |anchor: Option<&str>| SessionState::anchored_on(&path, anchor);
         let mut events = self.void_effects_where(|e| {
-            e.branch.as_deref() == scope
+            e.branch == *scope
                 && crate::effects::stops(e.kind(), &e.tracking)
                 && !on_path(e.asked_at.as_deref())
         });
         for e in self.effects_of(EffectKind::Decision) {
             let Some(wd) = e.decision() else { continue };
-            if wd.branch.as_deref() == scope
+            if wd.branch == *scope
                 && matches!(
                     e.tracking.status(),
                     EffectStatus::Queued | EffectStatus::RetryScheduled
@@ -432,7 +432,7 @@ pub struct Working {
     events: Vec<(EventPayload, EventMeta)>,
     waiting: Option<String>,
     joining: Option<String>,
-    scope: Option<String>,
+    scope: BranchId,
 }
 
 impl std::ops::Deref for Working {
@@ -454,7 +454,7 @@ impl Working {
             events: Vec::new(),
             waiting: None,
             joining: None,
-            scope: None,
+            scope: BranchId::MAIN,
         }
     }
 
@@ -487,7 +487,7 @@ impl Working {
     }
 
     fn cx(&self) -> Cx<'_> {
-        Cx::new(&self.state, &self.ids).scoped(self.scope.as_deref())
+        Cx::new(&self.state, &self.ids).scoped(&self.scope)
     }
 
     fn then(&mut self, step: impl FnOnce(&Cx<'_>) -> Vec<EventPayload>) -> &mut Self {
@@ -660,21 +660,17 @@ impl Working {
         payload: serde_json::Value,
     ) {
         let scope = self.scope.clone();
-        if self
-            .at_scope(scope.as_deref())
-            .active_interrupt_for()
-            .is_some()
-        {
+        if self.on(&scope).active_interrupt_for().is_some() {
             return;
         }
-        let anchor = self.scope_node(scope.as_deref());
+        let anchor = self.leaf(&scope).map(str::to_string);
         self.emit(EventPayload::SessionInterrupted(SessionInterrupted {
             interrupt_id,
             origin,
             reason,
             payload,
             anchor: anchor.clone(),
-            branch: scope,
+            branch: scope.into(),
         }));
         self.void_llm_calls_for_interrupt(anchor);
     }
@@ -826,7 +822,7 @@ impl Working {
                     let messages = request.messages.clone();
                     match self.start_branch(start, messages) {
                         Ok(branch) => self.run_on(
-                            Some(branch),
+                            BranchId::from(branch),
                             CommandPayload::RequestLlmCall {
                                 call_id: id,
                                 llm,
@@ -857,17 +853,17 @@ impl Working {
                     self.promote_branch(&id);
                     Ok(())
                 }
-                Action::ReplaceContext { .. } if scope.is_some() => {
+                Action::ReplaceContext { .. } if !scope.is_main() => {
                     tracing::warn!("context.replace on a branch; ignored");
                     Ok(())
                 }
-                Action::Done { data } if scope.is_some() => {
-                    let branch = scope.unwrap_or_default();
+                Action::Done { data } if !scope.is_main() => {
+                    let branch = scope.name().unwrap_or_default().to_string();
                     self.then(|s| s.finish_branch(s.ids(), &branch, data, None));
                     Ok(())
                 }
-                Action::Fail { error } if scope.is_some() => {
-                    self.fail_branch(&scope.unwrap_or_default(), error);
+                Action::Fail { error } if !scope.is_main() => {
+                    self.fail_branch(scope.name().unwrap_or_default(), error);
                     Ok(())
                 }
                 Action::ReplaceContext { summary, messages } => {
@@ -918,7 +914,7 @@ impl Working {
                 }
                 Action::SyncConnector { path: id } => {
                     let named = self
-                        .at_head()
+                        .on(&BranchId::MAIN)
                         .config()
                         .is_some_and(|c| self.state.servers_for(&c).iter().any(|m| m.path == id));
                     let settled = self
@@ -1013,7 +1009,14 @@ impl Working {
                     events,
                 })));
                 self.then(|s| {
-                    s.write_response(s.ids(), Vec::new(), state, agent.map(|a| *a), None, None)
+                    s.write_response(
+                        s.ids(),
+                        Vec::new(),
+                        state,
+                        agent.map(|a| *a),
+                        &BranchId::MAIN,
+                        None,
+                    )
                 });
                 self.queue_decision(Trigger::SessionStart);
             }
@@ -1127,7 +1130,7 @@ impl Working {
                         }
                     };
                     return self.run_on(
-                        Some(branch),
+                        BranchId::from(branch),
                         CommandPayload::RequestLlmCall {
                             call_id,
                             llm,
@@ -1146,7 +1149,7 @@ impl Working {
                     request,
                     stream,
                 };
-                if self.scope.is_none() && self.held_for_room(&held) {
+                if self.scope.is_main() && self.held_for_room(&held) {
                     return Ok(());
                 }
                 self.try_then(|s| {
@@ -1308,11 +1311,10 @@ impl Working {
                 {
                     return Err(SessionError::SessionAccessDenied);
                 }
-                let parked_head = self.at_head().anchor_on_path(open.anchor.as_deref());
-                let branch = open
-                    .branch
-                    .clone()
-                    .filter(|b| self.open_branch(b).is_some());
+                let parked_head = self
+                    .on(&BranchId::MAIN)
+                    .anchor_on_path(open.anchor.as_deref());
+                let branch = Some(open.branch.clone()).filter(|b| self.started(b).is_some());
                 self.emit(EventPayload::InterruptResumed(InterruptResumed {
                     interrupt_id: interrupt_id.clone(),
                     payload: payload.clone(),
@@ -1323,7 +1325,7 @@ impl Working {
                 };
                 match branch {
                     Some(b) => {
-                        self.queue_decision_on(trigger, Some(b));
+                        self.queue_decision_on(trigger, b.into());
                     }
                     None if parked_head => {
                         self.queue_decision(trigger);
@@ -1351,31 +1353,26 @@ impl Working {
                 let answered = self
                     .worker_decision(&decision_id)
                     .map(|d| d.trigger.clone());
-                let scope = self.decision_branch(&decision_id).map(str::to_string);
+                let scope = self.decision_branch(&decision_id).clone();
                 let completed = EventPayload::DecisionCompleted(DecisionCompleted {
                     id: decision_id.clone(),
                 });
-                if scope
-                    .as_deref()
-                    .is_some_and(|b| self.open_branch(b).is_none())
-                {
+                if !scope.is_main() && self.started(&scope).is_none() {
                     self.emit(completed);
                     return Ok(());
                 }
                 let read = answered
                     .as_ref()
-                    .and_then(|t| self.read_point(t, scope.as_deref()).at);
+                    .and_then(|t| self.read_point(t, &scope).at);
                 let on = scope.clone();
                 self.then(|_| vec![completed])
-                    .then(|s| {
-                        s.write_response(s.ids(), transcript, state, agent, on.as_deref(), read)
-                    })
-                    .then(|s| s.void_stranded_work(scope.as_deref()));
+                    .then(|s| s.write_response(s.ids(), transcript, state, agent, &on, read))
+                    .then(|s| s.void_stranded_work(&scope));
                 let outer = std::mem::replace(&mut self.scope, scope.clone());
                 self.apply_actions(actions, &decision_id, answered);
                 self.scope = outer;
                 self.then(|s| effects::tool::unanswered(s));
-                if let Some(branch) = scope {
+                if let Some(branch) = scope.name().map(str::to_string) {
                     self.then(|s| s.quiet_branch(s.ids(), &branch));
                 }
                 Ok(())

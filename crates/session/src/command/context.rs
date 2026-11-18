@@ -4,7 +4,7 @@ use crate::decision::Trigger;
 use crate::events::*;
 use crate::ids::Ids;
 use crate::protocol::{DraftMessage, HeldCall, NewMessage, Role, WorkerState};
-use crate::state::SessionState;
+use crate::state::{BranchId, SessionState};
 
 impl Working {
     pub(super) fn held_for_room(&mut self, call: &HeldCall) -> bool {
@@ -32,7 +32,7 @@ impl Working {
             tracing::warn!("context.replace with no summary and no messages; ignored");
             return;
         }
-        let before = self.at_head().transcript();
+        let before = self.on(&BranchId::MAIN).transcript();
         let reason = self.limited.as_ref().filter(|l| l.open()).map(|l| l.reason);
         let (written, summary, copies) = self.restart(&self.ids, summary, messages);
         let kept = written
@@ -41,7 +41,7 @@ impl Working {
             .count()
             - usize::from(summary.is_some());
         self.emit_all(written);
-        self.then(|s| s.void_stranded_work(None));
+        self.then(|s| s.void_stranded_work(&BranchId::MAIN));
         let dropped = before
             .iter()
             .filter(|m| m.role != Role::System)
@@ -63,7 +63,7 @@ impl SessionState {
         summary: Option<String>,
         messages: Vec<DraftMessage>,
     ) -> (Vec<EventPayload>, Option<ContextSummary>, usize) {
-        let here = self.at_head();
+        let here = self.on(&BranchId::MAIN);
         let mut parent: Option<String> = None;
         let mut events = Vec::with_capacity(messages.len() + 3);
         let place = |parent: &mut Option<String>| {

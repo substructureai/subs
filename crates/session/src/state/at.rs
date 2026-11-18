@@ -5,22 +5,15 @@ impl SessionState {
         At { state: self, node }
     }
 
-    pub fn at_head(&self) -> At<'_, '_> {
-        self.at(self.head_id.as_deref())
+    pub fn leaf(&self, branch: &BranchId) -> Option<&str> {
+        let open = self.branches.get(branch)?;
+        open.leaf
+            .as_deref()
+            .or_else(|| open.started.as_ref()?.from.as_deref())
     }
 
-    pub fn at_scope<'a>(&'a self, branch: Option<&'a str>) -> At<'a, 'a> {
-        match branch.and_then(|b| self.branches.get(b)) {
-            Some(b) => self.at(b.at()),
-            None => self.at_head(),
-        }
-    }
-
-    pub fn scope_node(&self, branch: Option<&str>) -> Option<String> {
-        match branch.and_then(|b| self.branches.get(b)) {
-            Some(b) => b.at().map(str::to_string),
-            None => self.head_id.clone(),
-        }
+    pub fn on(&self, branch: &BranchId) -> At<'_, '_> {
+        self.at(self.leaf(branch))
     }
 
     pub fn outgoing(&self, id: &str) -> Option<Outgoing> {
@@ -53,7 +46,7 @@ impl SessionState {
     }
 
     pub fn message_tree(&self) -> MessageTree {
-        self.at_head().message_tree()
+        self.on(&BranchId::MAIN).message_tree()
     }
 
     pub fn versions(&self, tree: &MessageTree) -> BTreeMap<String, Vec<String>> {
@@ -698,18 +691,32 @@ mod open_llm_calls_tests {
         let mut s = SessionState::new("sess-1".to_string());
         s.seed_message(node(user("u1"), None).entry);
         s.seed_message(node(assistant_calling("call-1", "tc-1"), Some("u1")).entry);
-        s.head_id = Some("call-1".to_string());
+        s.branches.insert(
+            BranchId::MAIN,
+            Open {
+                leaf: Some("call-1".to_string()),
+                started: None,
+            },
+        );
         s.put_effect(call_state("call-1"));
 
         assert!(
-            s.at_head().open_llm_calls().contains_key("call-1"),
+            s.on(&BranchId::MAIN)
+                .open_llm_calls()
+                .contains_key("call-1"),
             "unanswered tool call keeps the parent open"
         );
 
         s.seed_message(node(tool_answer("t1", "tc-1"), Some("call-1")).entry);
-        s.head_id = Some("t1".to_string());
+        s.branches.insert(
+            BranchId::MAIN,
+            Open {
+                leaf: Some("t1".to_string()),
+                started: None,
+            },
+        );
         assert!(
-            s.at_head().open_llm_calls().is_empty(),
+            s.on(&BranchId::MAIN).open_llm_calls().is_empty(),
             "recorded answer closes the call"
         );
     }

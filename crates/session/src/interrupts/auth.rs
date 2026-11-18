@@ -92,6 +92,7 @@ mod tests {
         AgentConfig, DecisionAction, Issuer, McpAuthFailure, McpServer, RetryPolicy, SessionOwner,
         Subject,
     };
+    use crate::state::BranchId;
     use crate::state::{ApplyContext, OpenInterrupt, SessionState};
 
     fn ctx() -> ApplyContext {
@@ -156,9 +157,10 @@ mod tests {
 
     #[test]
     fn a_connection_that_needs_a_person_is_asked_about_by_name() {
-        let action =
-            prompt(needing_auth(AuthNeed::Reauthorize, McpAuthFailure::Interrupt).at_head())
-                .expect("it asks");
+        let action = prompt(
+            needing_auth(AuthNeed::Reauthorize, McpAuthFailure::Interrupt).on(&BranchId::MAIN),
+        )
+        .expect("it asks");
         let DecisionAction::Interrupt {
             interrupt_id,
             payload,
@@ -176,9 +178,10 @@ mod tests {
 
     #[test]
     fn a_rejected_token_names_the_command_an_operator_runs() {
-        let action =
-            prompt(needing_auth(AuthNeed::TokenRejected, McpAuthFailure::Interrupt).at_head())
-                .expect("it asks");
+        let action = prompt(
+            needing_auth(AuthNeed::TokenRejected, McpAuthFailure::Interrupt).on(&BranchId::MAIN),
+        )
+        .expect("it asks");
         let DecisionAction::Interrupt { payload, .. } = action else {
             panic!("expected an interrupt");
         };
@@ -188,10 +191,10 @@ mod tests {
 
     #[test]
     fn a_connection_configured_to_degrade_is_never_asked_about() {
-        assert!(
-            prompt(needing_auth(AuthNeed::Reauthorize, McpAuthFailure::Degrade).at_head())
-                .is_none()
-        );
+        assert!(prompt(
+            needing_auth(AuthNeed::Reauthorize, McpAuthFailure::Degrade).on(&BranchId::MAIN)
+        )
+        .is_none());
     }
 
     #[test]
@@ -203,13 +206,13 @@ mod tests {
             reason: "hold".to_string(),
             payload: serde_json::Value::Null,
             anchor: None,
-            branch: None,
+            branch: BranchId::MAIN,
         });
-        assert!(prompt(state.at_head()).is_none());
+        assert!(prompt(state.on(&BranchId::MAIN)).is_none());
     }
 
     #[test]
     fn a_session_with_nothing_wrong_is_not_asked_about() {
-        assert!(prompt(SessionState::new("s1".to_string()).at_head()).is_none());
+        assert!(prompt(SessionState::new("s1".to_string()).on(&BranchId::MAIN)).is_none());
     }
 }

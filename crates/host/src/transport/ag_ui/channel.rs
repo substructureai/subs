@@ -22,6 +22,7 @@ use crate::transport::auth::AuthResolver;
 use crate::transport::channel::{Channel, ChannelContext, ChannelKind};
 use crate::transport::http::{client_auth_middleware, client_cors, runtime_error_response};
 use crate::{Caller, HandleClientInput, SubmitClientPayload};
+use substructure_session::state::BranchId;
 
 pub struct AgUiChannel {
     auth: Arc<dyn AuthResolver>,
@@ -88,7 +89,7 @@ async fn run(
     let open: Vec<String> = match ctx.get_session(caller.tenant_id(), &session_id).await {
         Ok(session) => crate::runtime::sessions::read(std::sync::Arc::new(session), |state| {
             state
-                .at_head()
+                .on(&BranchId::MAIN)
                 .interrupts_for()
                 .into_iter()
                 .map(|i| i.interrupt_id.clone())

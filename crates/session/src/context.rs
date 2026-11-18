@@ -6,7 +6,7 @@ use crate::protocol::{
     AgentConfig, BranchMode, BranchRequest, Content, ContextConfig, ContextReason, ContextStrategy,
     ContextStrategyKind, DecisionAction, DraftMessage, HeldCall, LlmRequest, Message, Role,
 };
-use crate::state::{EffectKind, SessionState};
+use crate::state::{BranchId, EffectKind, SessionState};
 
 pub const RESERVE_TOKENS: u64 = 16_000;
 pub const KEEP_TOKENS: u64 = 20_000;
@@ -106,7 +106,7 @@ pub fn strategy(config: Option<&AgentConfig>, kind: ContextStrategyKind) -> Cont
 }
 
 fn held(state: &SessionState, call: &HeldCall) -> HeldCall {
-    let out = state.at_head().outgoing(&call.id);
+    let out = state.on(&BranchId::MAIN).outgoing(&call.id);
     HeldCall {
         request: LlmRequest {
             messages: out.prompt.into_iter().map(DraftMessage::from).collect(),
@@ -126,7 +126,7 @@ pub fn limit(state: &SessionState, call: &HeldCall, now: DateTime<Utc>) -> Optio
     if passes || kept || state.tracking(EffectKind::LlmCall, &call.id).is_some() {
         return None;
     }
-    let at = state.at_head();
+    let at = state.on(&BranchId::MAIN);
     let config = at.config();
     let context = context_of(config.as_ref())?;
     let path = at.transcript();
@@ -159,10 +159,10 @@ pub fn overflow(state: &SessionState, id: &str) -> Option<ContextLimited> {
     }
     let effect = state
         .effect(EffectKind::LlmCall, id)
-        .filter(|e| e.branch.is_none())?;
+        .filter(|e| e.branch.is_main())?;
     let call = effect.llm()?;
     let request = call.sent_request();
-    let config = state.at_head().config();
+    let config = state.on(&BranchId::MAIN).config();
     Some(ContextLimited {
         reason: ContextReason::Overflow,
         strategy: Some(ContextStrategyKind::Summarize),
@@ -277,12 +277,13 @@ fn tail(text: String, chars: Option<usize>) -> String {
 
 pub fn summary_size(state: &SessionState, id: &str) -> usize {
     let chars = |path: &[Message]| path.iter().map(|m| text(m).chars().count()).sum();
-    let leaf = match state.branches.get(id) {
-        Some(open) => Some(open.at().map(str::to_string)),
+    let key = BranchId::from(id);
+    let leaf = match state.started(&key) {
+        Some(_) => Some(state.leaf(&key).map(str::to_string)),
         None => state
             .tree
             .branch(id)
-            .map(|closed| closed.state.at().map(str::to_string)),
+            .map(|closed| closed.leaf.or(closed.state.from)),
     };
     match leaf {
         Some(leaf) => chars(&state.at(leaf.as_deref()).transcript()),

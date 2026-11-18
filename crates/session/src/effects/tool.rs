@@ -12,7 +12,7 @@ use crate::protocol::{
 };
 use crate::protocol::{RetryOverride, RetryPolicy};
 use crate::schedule::Dep;
-use crate::state::{inner_arguments, At, CallTarget, EffectKind, SessionState};
+use crate::state::{inner_arguments, At, BranchId, CallTarget, EffectKind, SessionState};
 use crate::tool_contract::{classify_arguments, declared_tool, output_violation, DeclaredTool};
 use crate::Caller;
 
@@ -153,7 +153,7 @@ impl KindSpec for ToolSpec {
             target: tc.target.clone(),
             retry: t.retry_policy.clone(),
             script: tc.script.clone(),
-            branch: effect.branch.clone(),
+            branch: effect.branch.clone().into(),
         })]
     }
 }
@@ -339,9 +339,9 @@ fn scripted(
 ) -> EventPayload {
     let parent = state.effect(EffectKind::ToolCall, &script.parent);
     let anchor = parent.and_then(|e| e.asked_at.clone());
-    let branch = parent.and_then(|e| e.branch.clone());
-    let here = match &branch {
-        Some(b) => state.at_scope(Some(b)),
+    let branch = parent.map(|e| e.branch.clone()).unwrap_or_default();
+    let here = match parent.map(|e| &e.branch).filter(|b| !b.is_main()) {
+        Some(branch) => state.on(branch),
         None => state.at(anchor.as_deref()),
     };
     let config = here.config();
@@ -381,15 +381,7 @@ fn scripted(
             None => None,
         });
     let called = asked;
-    let mut call = requested(
-        state,
-        id,
-        name,
-        arguments,
-        None,
-        Some(script),
-        branch.as_deref(),
-    );
+    let mut call = requested(state, id, name, arguments, None, Some(script), &branch);
     if let Some(script) = call.script.as_mut() {
         script.called =
             (call.name != called.name || call.arguments != called.arguments).then_some(called);
@@ -448,7 +440,7 @@ pub fn request(
     name: String,
     arguments: String,
     retry: Option<RetryOverride>,
-    branch: Option<&str>,
+    branch: &BranchId,
     caller: &Caller,
 ) -> Result<Vec<EventPayload>, SessionError> {
     SessionState::ensure_internal(caller)?;
@@ -481,9 +473,9 @@ fn requested(
     arguments: String,
     retry: Option<&RetryOverride>,
     script: Option<ScriptCaller>,
-    branch: Option<&str>,
+    branch: &BranchId,
 ) -> ToolCallRequested {
-    let here = state.at_scope(branch);
+    let here = state.on(branch);
     let (name, arguments) = engine_call(here, name, arguments);
     let engine_tool = here
         .connector_tool(&name)
@@ -564,7 +556,7 @@ fn requested(
         target,
         retry,
         script,
-        branch: branch.map(str::to_string),
+        branch: branch.clone().into(),
     }
 }
 

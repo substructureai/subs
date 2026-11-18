@@ -42,15 +42,11 @@ impl SessionState {
         }
     }
 
-    pub(super) fn answered(&mut self, message: &Message, branch: Option<&str>) {
+    pub(super) fn answered(&mut self, message: &Message, branch: &BranchId) {
         let Some(answer) = message.tool_call_id.as_deref() else {
             return;
         };
-        for e in self
-            .effects
-            .values_mut()
-            .filter(|e| e.branch.as_deref() == branch)
-        {
+        for e in self.effects.values_mut().filter(|e| e.branch == *branch) {
             match &mut e.payload {
                 EffectPayload::LlmCall(call) => call.unanswered.retain(|id| id != answer),
                 EffectPayload::ToolCall(tool) if e.id == answer => tool.recorded = true,
@@ -222,7 +218,7 @@ impl SessionState {
                     stream: None,
                     agent_id: None,
                     session_id: None,
-                    branch: e.branch.clone(),
+                    branch: e.branch.clone().into(),
                 };
                 match &e.payload {
                     EffectPayload::ToolCall(c) => {
@@ -452,8 +448,8 @@ pub struct EffectState {
     pub tracking: EffectTracking,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asked_at: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "BranchId::is_main")]
+    pub branch: BranchId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn: Option<String>,
     pub payload: EffectPayload,
@@ -523,7 +519,7 @@ impl EffectState {
             id: id.into(),
             tracking,
             asked_at: None,
-            branch: None,
+            branch: BranchId::MAIN,
             turn: None,
             payload,
         }
@@ -705,8 +701,8 @@ pub(super) fn trigger_effect(trigger: &Trigger) -> Option<(EffectKind, &str)> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerDecisionState {
     pub trigger: Trigger,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "BranchId::is_main")]
+    pub branch: BranchId,
     pub source_event_sequence: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatched_seq: Option<u64>,

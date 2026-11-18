@@ -7,7 +7,7 @@ use crate::protocol::{AgentConfig, RetryPolicy};
 use crate::retry::RetryTarget;
 use crate::schedule::Dep;
 use crate::state::EffectTracking;
-use crate::state::{At, EffectKind, SessionState};
+use crate::state::{At, BranchId, EffectKind, SessionState};
 
 pub struct ConnectorSpec;
 
@@ -162,7 +162,7 @@ impl SessionState {
         offered: &[RemoteTool],
         prefix: Option<&str>,
     ) {
-        let Some(config) = self.at_head().config() else {
+        let Some(config) = self.on(&BranchId::MAIN).config() else {
             return;
         };
         let Some(connector) = self

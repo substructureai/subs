@@ -10,7 +10,7 @@ use crate::protocol::{
     ClientAppend, ClientContext, ClientMessage, ClientMessages, ClientPayload, Content,
     DraftMessage, EffectStatus, NewMessage, QueueMode, Role,
 };
-use crate::state::{EffectKind, SessionState};
+use crate::state::{BranchId, EffectKind, SessionState};
 use crate::Caller;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,20 +45,20 @@ impl SessionState {
         transcript: Vec<DraftMessage>,
         state: Option<WorkerState>,
         config: Option<AgentConfig>,
-        scope: Option<&str>,
+        scope: &BranchId,
         read: Option<String>,
     ) -> Vec<EventPayload> {
-        let leaf = self.scope_node(scope);
-        let transcript = match scope {
-            None => self.normalize_client_view(transcript),
-            Some(_) => transcript,
+        let leaf = self.leaf(scope).map(str::to_string);
+        let transcript = match scope.is_main() {
+            true => self.normalize_client_view(transcript),
+            false => transcript,
         };
         let landed = match transcript.is_empty() {
             true => Landed::stay(leaf.clone()),
             false => self.land(&transcript, scope),
         };
         let moved = landed.at != leaf;
-        let branch = scope.map(str::to_string);
+        let branch: Option<String> = scope.clone().into();
         let mut cursor = landed.at.clone();
         let mut events = Vec::new();
         for draft in transcript.into_iter().skip(landed.shared) {
@@ -115,12 +115,12 @@ impl SessionState {
         events
     }
 
-    pub(crate) fn land(&self, view: &[DraftMessage], scope: Option<&str>) -> Landed {
+    pub(crate) fn land(&self, view: &[DraftMessage], scope: &BranchId) -> Landed {
         self.land_view(view, scope, false)
     }
 
-    fn land_view(&self, view: &[DraftMessage], scope: Option<&str>, regenerate: bool) -> Landed {
-        let leaf = self.scope_node(scope);
+    fn land_view(&self, view: &[DraftMessage], scope: &BranchId, regenerate: bool) -> Landed {
+        let leaf = self.leaf(scope).map(str::to_string);
         let line = std::cell::OnceCell::new();
         let on_line = |id: &str| {
             line.get_or_init(|| {
@@ -131,16 +131,14 @@ impl SessionState {
             .contains(id)
         };
         let full = self.tree.shared(view, |_, node| {
-            scope.is_some() || node.branch().is_none() || on_line(node.id())
+            !scope.is_main() || node.branch().is_none() || on_line(node.id())
         });
         let shared = match regenerate && full == view.len() {
             true => settled(view).len(),
             false => full,
         };
         let last = |n: usize| n.checked_sub(1).and_then(|i| view[i].id.as_deref());
-        let floor = scope
-            .and_then(|b| self.branches.get(b))
-            .and_then(|b| b.from.as_deref());
+        let floor = self.started(scope).and_then(|b| b.from.as_deref());
         if let Some(at) = self.tree.fork_on(leaf.as_deref(), last(full), floor) {
             let at = match shared == full {
                 true => at,
@@ -155,8 +153,8 @@ impl SessionState {
                 shared,
             };
         }
-        match (scope, last(shared)) {
-            (None, Some(message)) => {
+        match (scope.is_main(), last(shared)) {
+            (true, Some(message)) => {
                 let (at, forks) = self.tree.tail(message);
                 Landed {
                     at: Some(at),
@@ -173,13 +171,13 @@ impl SessionState {
     }
 
     fn view_point(&self, view: &[DraftMessage]) -> Landed {
-        self.land_view(view, None, true)
+        self.land_view(view, &BranchId::MAIN, true)
     }
 
-    pub fn read_point(&self, trigger: &Trigger, branch: Option<&str>) -> Landed {
-        match (branch, trigger) {
-            (None, Trigger::ClientTranscript { messages, .. }) => self.view_point(messages),
-            _ => Landed::stay(self.scope_node(branch)),
+    pub fn read_point(&self, trigger: &Trigger, branch: &BranchId) -> Landed {
+        match (branch.is_main(), trigger) {
+            (true, Trigger::ClientTranscript { messages, .. }) => self.view_point(messages),
+            _ => Landed::stay(self.leaf(branch).map(str::to_string)),
         }
     }
 
@@ -190,8 +188,7 @@ impl SessionState {
                 !self.has_node(id)
                     || head
                         .get_or_init(|| {
-                            self.head_id
-                                .as_deref()
+                            self.leaf(&BranchId::MAIN)
                                 .map(|h| self.path_ids(h))
                                 .unwrap_or_default()
                         })
@@ -250,8 +247,7 @@ impl SessionState {
                 let tool_call = m.tool_call_id.as_deref().filter(|_| m.role == Role::Tool);
                 let recorded = tool_call.filter(|_| unknown).and_then(|tcid| {
                     let path = on_path.get_or_insert_with(|| {
-                        self.head_id
-                            .as_deref()
+                        self.leaf(&BranchId::MAIN)
                             .map(|h| self.path_ids(h))
                             .unwrap_or_default()
                     });
@@ -410,7 +406,7 @@ impl SessionState {
         let queued = vec![EventPayload::DecisionQueued(DecisionQueued {
             id: waiting.decision_id.to_string(),
             trigger,
-            branch: decision.branch.clone(),
+            branch: decision.branch.clone().into(),
         })];
         (queued, Some(waiting.turn_id.to_string()))
     }

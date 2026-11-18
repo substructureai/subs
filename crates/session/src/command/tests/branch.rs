@@ -233,7 +233,10 @@ fn turn_with_side_call(mode: BranchMode) -> Session {
 #[test]
 fn a_fork_reads_the_conversation_and_then_its_own_messages() {
     let agg = turn_with_side_call(BranchMode::Detached);
-    let branch = agg.state.open_branch("title").expect("the branch started");
+    let branch = agg
+        .state
+        .started(&BranchId::from("title"))
+        .expect("the branch started");
     assert_eq!(branch.from.as_deref(), Some("u1"));
     assert_eq!(
         agg.state.message_tree().head_id.as_deref(),
@@ -243,12 +246,12 @@ fn a_fork_reads_the_conversation_and_then_its_own_messages() {
     let own = agg
         .state
         .tree
-        .message_at(branch.leaf.as_deref())
+        .message_at(agg.state.leaf(&BranchId::from("title")))
         .expect("its message is its own node");
-    assert_eq!(agg.state.node_branch(&own).as_deref(), Some("title"));
+    assert_eq!(agg.state.node_branch(&own).name(), Some("title"));
 
     let call = agg.state.effect(EffectKind::LlmCall, "t1").unwrap();
-    assert_eq!(call.branch.as_deref(), Some("title"));
+    assert_eq!(call.branch.name(), Some("title"));
     assert_eq!(call.asked_at.as_deref(), Some(own.as_str()));
 
     let chat = prompt_texts(&agg, "c1");
@@ -278,13 +281,13 @@ fn a_detached_branch_reports_back_without_a_turn() {
     echo(&mut agg);
     assert!(agg.state.open_turn().is_none(), "the turn ended");
     assert!(
-        agg.state.open_branch("title").is_some(),
+        agg.state.started(&BranchId::from("title")).is_some(),
         "and the branch lives on"
     );
 
     reply(&mut agg, "t1", said("Paris weather", 120));
     let (d, _) = live_decision(&agg);
-    assert_eq!(agg.state.decision_branch(&d), Some("title"));
+    assert_eq!(agg.state.decision_branch(&d).name(), Some("title"));
     let proposed = proposed_for(&agg, &d);
     assert!(matches!(
         proposed.actions.as_slice(),
@@ -299,7 +302,7 @@ fn a_detached_branch_reports_back_without_a_turn() {
         Trigger::BranchFinished { ok: true, ref data, .. } if data == &serde_json::json!("Paris weather")
     ));
     assert_eq!(
-        agg.state.head_id.as_deref(),
+        agg.state.leaf(&BranchId::MAIN),
         Some("c1"),
         "the reply never reached the chat"
     );
@@ -378,7 +381,7 @@ fn a_detached_branch_outlives_a_cancel() {
         &frontend(),
     );
     assert!(agg.state.open_turn().is_none());
-    assert!(agg.state.open_branch("title").is_some());
+    assert!(agg.state.started(&BranchId::from("title")).is_some());
     assert!(agg
         .state
         .tracking(EffectKind::LlmCall, "t1")
@@ -403,14 +406,14 @@ fn a_branch_runs_its_tools_on_itself() {
     reply(&mut agg, "t1", calling("lookup", "tc-b"));
     echo(&mut agg);
     let tool = agg.state.effect(EffectKind::ToolCall, "tc-b").unwrap();
-    assert_eq!(tool.branch.as_deref(), Some("title"));
+    assert_eq!(tool.branch.name(), Some("title"));
     while live_decision_kind(&agg).is_some_and(|t| matches!(t, Trigger::ToolExecute { .. })) {
         let (d, _) = live_decision(&agg);
         submit_decision(&mut agg, d, vec![], vec![tool_result_action("tc-b")]);
     }
     let (d, trigger) = live_decision(&agg);
     assert!(matches!(trigger, Trigger::ToolFinished { .. }));
-    assert_eq!(agg.state.decision_branch(&d), Some("title"));
+    assert_eq!(agg.state.decision_branch(&d).name(), Some("title"));
     echo(&mut agg);
 
     let next = agg
@@ -418,20 +421,18 @@ fn a_branch_runs_its_tools_on_itself() {
         .effects_of(EffectKind::LlmCall)
         .find(|e| e.id != "c1" && e.id != "t1")
         .expect("the branch calls the model again");
-    assert_eq!(next.branch.as_deref(), Some("title"));
+    assert_eq!(next.branch.name(), Some("title"));
     let leaf = agg
         .state
-        .open_branch("title")
+        .leaf(&BranchId::from("title"))
         .unwrap()
-        .leaf
-        .clone()
-        .unwrap();
+        .to_string();
     assert_eq!(
         next.asked_at,
         agg.state.tree.message_at(Some(&leaf)),
         "it reads the branch, tool result included"
     );
-    assert_eq!(agg.state.head_id.as_deref(), Some("c1"));
+    assert_eq!(agg.state.leaf(&BranchId::MAIN), Some("c1"));
 }
 
 fn live_decision_kind(agg: &Session) -> Option<Trigger> {
@@ -488,7 +489,7 @@ fn a_root_branch_with_no_config_sends_its_messages_as_written() {
     );
     assert_eq!(prompt_texts(&agg, "j1"), vec!["You judge.", "Is 2+2=4?"]);
     assert_eq!(
-        agg.state.at_scope(Some("judge")).config(),
+        agg.state.on(&BranchId::from(Some("judge"))).config(),
         None,
         "a root runs with no config"
     );
@@ -517,11 +518,14 @@ fn a_fork_reads_the_config_as_it_was_when_it_started() {
         &machine(),
     );
     assert_eq!(
-        agg.state.at_head().config().map(|c| c.model),
+        agg.state.on(&BranchId::MAIN).config().map(|c| c.model),
         Some("m2".to_string())
     );
     assert_eq!(
-        agg.state.at_scope(Some("title")).config().map(|c| c.model),
+        agg.state
+            .on(&BranchId::from(Some("title")))
+            .config()
+            .map(|c| c.model),
         Some("m1".to_string()),
         "a later write on the conversation does not reach the branch"
     );
@@ -532,11 +536,9 @@ fn the_conversation_cannot_land_on_an_open_branch() {
     let mut agg = turn_with_side_call(BranchMode::Detached);
     let own = agg
         .state
-        .open_branch("title")
+        .leaf(&BranchId::from("title"))
         .unwrap()
-        .leaf
-        .clone()
-        .unwrap();
+        .to_string();
     reply(&mut agg, "c1", said("Sunny.", 100));
     let (d, _) = live_decision(&agg);
     let landing: Vec<DraftMessage> = agg
@@ -547,7 +549,7 @@ fn the_conversation_cannot_land_on_an_open_branch() {
         .map(DraftMessage::from)
         .collect();
     submit_decision(&mut agg, d, landing, vec![]);
-    assert_ne!(agg.state.head_id.as_deref(), Some(own.as_str()));
+    assert_ne!(agg.state.leaf(&BranchId::MAIN), Some(own.as_str()));
 }
 
 #[test]
@@ -564,7 +566,7 @@ fn a_branch_with_work_out_cannot_be_promoted() {
         }],
     );
     assert_eq!(agg.state.message_tree().head_id.as_deref(), Some("u1"));
-    assert!(agg.state.open_branch("title").is_some());
+    assert!(agg.state.started(&BranchId::from("title")).is_some());
 }
 
 #[test]
@@ -575,11 +577,9 @@ fn an_open_branch_stays_loaded_when_the_conversation_moves_on() {
     echo(&mut agg);
     let own = agg
         .state
-        .open_branch("title")
+        .leaf(&BranchId::from("title"))
         .unwrap()
-        .leaf
-        .clone()
-        .unwrap();
+        .to_string();
     assert!(agg.state.has_node(&own));
 }
 
@@ -623,14 +623,17 @@ fn an_explicit_call_runs_on_its_own_branch_as_written() {
             ],
         )],
     );
-    let branch = agg.state.open_branch("x1").expect("its own branch");
+    let branch = agg
+        .state
+        .started(&BranchId::from("x1"))
+        .expect("its own branch");
     assert_eq!(
         branch.from, None,
         "a system message first: nothing to share"
     );
     assert_eq!(branch.agent, BranchConfig::None);
     assert_eq!(prompt_texts(&agg, "x1"), ["my rules", "what time is it?"]);
-    assert_eq!(agg.state.head_id.as_deref(), Some("u1"));
+    assert_eq!(agg.state.leaf(&BranchId::MAIN), Some("u1"));
 
     reply(&mut agg, "x1", calling("clock", "tc-1"));
     echo(&mut agg);
@@ -650,7 +653,7 @@ fn an_explicit_call_runs_on_its_own_branch_as_written() {
         ["my rules", "what time is it?", "", "result-tc-1"],
         "the worker's prompt and what followed, as written"
     );
-    assert_eq!(agg.state.head_id.as_deref(), Some("u1"));
+    assert_eq!(agg.state.leaf(&BranchId::MAIN), Some("u1"));
     assert!(agg.state.placed().is_empty(), "no config told it anything");
 }
 
@@ -671,7 +674,7 @@ fn an_explicit_prompt_that_starts_with_the_conversation_forks_from_it() {
             ],
         )],
     );
-    let branch = agg.state.open_branch("x1").unwrap();
+    let branch = agg.state.started(&BranchId::from("x1")).unwrap();
     assert_eq!(
         branch.from.as_deref(),
         Some("u1"),
@@ -707,7 +710,7 @@ fn an_explicit_prompt_edited_on_the_way_is_copied_from_there() {
             vec![node_msg("u1", Role::User, "what time is it in Paris?")],
         )],
     );
-    let branch = agg.state.open_branch("x1").unwrap();
+    let branch = agg.state.started(&BranchId::from("x1")).unwrap();
     assert_eq!(branch.from, None);
     assert_eq!(prompt_texts(&agg, "x1"), ["what time is it in Paris?"]);
 }
@@ -822,7 +825,7 @@ fn delegated(agent: &str, branch: crate::protocol::SubagentBranch) -> (Session, 
     assert!(sa.on_branch.is_some(), "on a branch, not a session");
     let (d, trigger) = live_decision(&agg);
     assert!(matches!(trigger, Trigger::BranchStarted { .. }));
-    assert_eq!(agg.state.decision_branch(&d), Some(branch.as_str()));
+    assert_eq!(agg.state.decision_branch(&d).name(), Some(branch.as_str()));
     echo(&mut agg);
     (agg, branch)
 }
@@ -830,7 +833,7 @@ fn delegated(agent: &str, branch: crate::protocol::SubagentBranch) -> (Session, 
 fn branch_call_id(agg: &Session, branch: &str) -> String {
     agg.state
         .effects_of(EffectKind::LlmCall)
-        .find(|e| e.branch.as_deref() == Some(branch))
+        .find(|e| e.branch.name() == Some(branch))
         .map(|e| e.id.clone())
         .expect("the branch calls the model")
 }
@@ -838,7 +841,7 @@ fn branch_call_id(agg: &Session, branch: &str) -> String {
 #[test]
 fn a_forked_subagent_reads_the_conversation_and_answers_its_call() {
     let (mut agg, branch) = delegated("researcher", crate::protocol::SubagentBranch::Head);
-    let b = agg.state.open_branch(&branch).unwrap();
+    let b = agg.state.started(&BranchId::from(&branch)).unwrap();
     assert_eq!(b.from.as_deref(), Some("c1"), "it forks at the call");
     assert_eq!(b.agent, BranchConfig::Inherit);
 
@@ -865,7 +868,7 @@ fn a_forked_subagent_reads_the_conversation_and_answers_its_call() {
         Trigger::SubagentFinished { ok: true, ref result, .. } if result.as_deref() == Some("Three causes.")
     ));
     echo(&mut agg);
-    let chat = agg.state.at_head().transcript();
+    let chat = agg.state.on(&BranchId::MAIN).transcript();
     let answered = chat
         .iter()
         .find(|m| m.tool_call_id.as_deref() == Some("tc-r"))
@@ -878,14 +881,14 @@ fn a_forked_subagent_reads_the_conversation_and_answers_its_call() {
     let again = agg
         .state
         .effects_of(EffectKind::LlmCall)
-        .any(|e| e.branch.is_none() && e.id != "c1");
+        .any(|e| e.branch.is_main() && e.id != "c1");
     assert!(again, "the conversation goes on with the answer");
 }
 
 #[test]
 fn a_root_subagent_runs_clean_as_its_own_config() {
     let (agg, branch) = delegated("poet", crate::protocol::SubagentBranch::Root);
-    let b = agg.state.open_branch(&branch).unwrap();
+    let b = agg.state.started(&BranchId::from(&branch)).unwrap();
     assert_eq!(b.from, None);
     let call = branch_call_id(&agg, &branch);
     assert_eq!(
@@ -903,7 +906,7 @@ fn a_subagent_on_a_branch_ends_with_its_turn() {
         CommandPayload::CancelSession { drop_queued: false },
         &frontend(),
     );
-    assert!(agg.state.open_branch(&branch).is_none());
+    assert!(agg.state.started(&BranchId::from(&branch)).is_none());
     assert_eq!(
         agg.state
             .tracking(EffectKind::Subagent, "tc-r")
@@ -939,7 +942,7 @@ fn a_detached_subagent_on_a_branch_reports_back_as_a_message() {
     echo(&mut agg);
     let branch = agg.state.subagent("tc-r").unwrap().session_id.clone();
     assert_eq!(
-        agg.state.open_branch(&branch).unwrap().mode,
+        agg.state.started(&BranchId::from(&branch)).unwrap().mode,
         BranchMode::Detached
     );
 
@@ -949,7 +952,7 @@ fn a_detached_subagent_on_a_branch_reports_back_as_a_message() {
         };
         let on_branch = {
             let (d, _) = live_decision(&agg);
-            agg.state.decision_branch(&d).is_some()
+            !agg.state.decision_branch(&d).is_main()
         };
         if on_branch && matches!(trigger, Trigger::BranchStarted { .. }) {
             echo(&mut agg);
@@ -963,7 +966,7 @@ fn a_detached_subagent_on_a_branch_reports_back_as_a_message() {
     let call = branch_call_id(&agg, &branch);
     reply(&mut agg, &call, said("Found it.", 100));
     echo(&mut agg);
-    assert!(agg.state.open_branch(&branch).is_none());
+    assert!(agg.state.started(&BranchId::from(&branch)).is_none());
     let notice = agg
         .state
         .queued_decisions()
@@ -973,12 +976,12 @@ fn a_detached_subagent_on_a_branch_reports_back_as_a_message() {
             _ => None,
         })
         .expect("the result waits for the conversation's turn");
-    assert_eq!(notice.0, None);
+    assert!(notice.0.is_main());
     assert!(text_of(&notice.1[0].clone().recorded(String::new())).contains("Found it."));
 }
 
-fn pending_lanes(agg: &Session) -> Vec<Option<String>> {
-    let mut lanes: Vec<Option<String>> = agg
+fn pending_lanes(agg: &Session) -> Vec<BranchId> {
+    let mut lanes: Vec<BranchId> = agg
         .state
         .effects_of(EffectKind::Decision)
         .filter(|e| e.tracking.status() == EffectStatus::Pending)
@@ -1023,16 +1026,16 @@ fn branches_in_parallel_are_decided_at_once() {
     let agg = two_drafts(true);
     assert_eq!(
         pending_lanes(&agg),
-        vec![Some("draft-a".to_string()), Some("draft-b".to_string())]
+        vec![BranchId::from("draft-a"), BranchId::from("draft-b")]
     );
 }
 
 #[test]
 fn branches_are_decided_one_at_a_time_unless_asked() {
     let mut agg = two_drafts(false);
-    assert_eq!(pending_lanes(&agg), vec![Some("draft-a".to_string())]);
+    assert_eq!(pending_lanes(&agg), vec![BranchId::from("draft-a")]);
     echo(&mut agg);
-    assert_eq!(pending_lanes(&agg), vec![Some("draft-b".to_string())]);
+    assert_eq!(pending_lanes(&agg), vec![BranchId::from("draft-b")]);
 }
 
 #[test]
@@ -1042,13 +1045,13 @@ fn an_interrupt_on_one_branch_holds_only_that_branch() {
         .state
         .effects_of(EffectKind::Decision)
         .find(|e| {
-            e.branch.as_deref() == Some("draft-a") && e.tracking.status() == EffectStatus::Pending
+            e.branch.name() == Some("draft-a") && e.tracking.status() == EffectStatus::Pending
         })
         .map(|e| e.id.clone())
         .unwrap();
     let a_view = agg
         .state
-        .at_scope(Some("draft-a"))
+        .on(&BranchId::from(Some("draft-a")))
         .transcript()
         .into_iter()
         .map(DraftMessage::from)
@@ -1064,9 +1067,9 @@ fn an_interrupt_on_one_branch_holds_only_that_branch() {
             payload: serde_json::Value::Null,
         }],
     );
-    assert_eq!(pending_lanes(&agg), vec![Some("draft-b".to_string())]);
+    assert_eq!(pending_lanes(&agg), vec![BranchId::from("draft-b")]);
     assert!(
-        agg.state.open_branch("draft-a").is_some(),
+        agg.state.started(&BranchId::from("draft-a")).is_some(),
         "held, not ended"
     );
 }
@@ -1088,13 +1091,13 @@ fn a_message_a_client_edits_in_place_starts_a_new_path() {
     submit_decision(&mut agg, d, messages, vec![]);
     let path: Vec<String> = agg
         .state
-        .at_head()
+        .on(&BranchId::MAIN)
         .transcript()
         .iter()
         .map(text_of)
         .collect();
     assert_eq!(path, ["hi there"]);
-    assert_ne!(agg.state.head_id.as_deref(), Some("u1"));
+    assert_ne!(agg.state.leaf(&BranchId::MAIN), Some("u1"));
 }
 
 #[test]
@@ -1168,20 +1171,23 @@ fn a_call_with_messages_inside_a_branch_starts_a_child_that_reports_to_it() {
     let mut agg = turn_with_side_call(BranchMode::Detached);
     reply(&mut agg, "t1", said("Paris weather", 100));
     let (d, _) = live_decision(&agg);
-    assert_eq!(agg.state.decision_branch(&d), Some("title"));
+    assert_eq!(agg.state.decision_branch(&d).name(), Some("title"));
     submit_decision(
         &mut agg,
         d,
         vec![],
         vec![explicit("x2", vec![node_msg("", Role::User, "shorter")])],
     );
-    let child = agg.state.open_branch("x2").expect("a child branch");
-    assert_eq!(child.parent.as_deref(), Some("title"));
+    let child = agg
+        .state
+        .started(&BranchId::from("x2"))
+        .expect("a child branch");
+    assert_eq!(child.parent.name(), Some("title"));
     assert_eq!(prompt_texts(&agg, "x2"), ["shorter"]);
 
     reply(&mut agg, "x2", said("Paris", 10));
     let (d, _) = live_decision(&agg);
-    assert_eq!(agg.state.decision_branch(&d), Some("x2"));
+    assert_eq!(agg.state.decision_branch(&d).name(), Some("x2"));
     let events = submit_decision(&mut agg, d, vec![], vec![]);
     assert_eq!(branch_closed(&events, "x2"), Some(BranchEnd::Done));
     let (_, on) = branch_finished(&events).expect("the child reports back");
@@ -1202,9 +1208,9 @@ fn a_call_with_messages_too_deep_for_a_branch_is_answered_with_an_error() {
             vec![],
             vec![explicit(&id, vec![node_msg("", Role::User, "deeper")])],
         );
-        if agg.state.open_branch(&id).is_none() {
+        if agg.state.started(&BranchId::from(&id)).is_none() {
             assert_eq!(
-                agg.state.branch_depth(Some(&calling)),
+                agg.state.branch_depth(&BranchId::from(&calling)),
                 crate::command::branch::MAX_BRANCH_DEPTH
             );
             let refused = events.iter().find_map(|e| match e {

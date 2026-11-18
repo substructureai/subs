@@ -89,6 +89,7 @@ pub type NodeRef = Arc<Logged<Node>>;
 #[derive(Debug, Clone)]
 pub struct BranchRecord {
     pub state: BranchState,
+    pub leaf: Option<String>,
     pub closed: Option<BranchEnd>,
 }
 
@@ -407,11 +408,12 @@ impl BranchChange<'_> {
         match self {
             BranchChange::Started(p) => Some(BranchRecord {
                 state: BranchState::started(p, seq),
+                leaf: p.leaf.clone(),
                 closed: None,
             }),
             BranchChange::Closed(p) => known.map(|mut record| {
                 if let Some(leaf) = &p.leaf {
-                    record.state.leaf = Some(leaf.clone());
+                    record.leaf = Some(leaf.clone());
                 }
                 record.closed = Some(p.reason);
                 record

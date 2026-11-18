@@ -133,6 +133,7 @@ mod tests {
     use super::*;
     use crate::protocol::{InterruptOrigin, Issuer, Requester, Subject};
     use crate::runtime::session::state::OpenInterrupt;
+    use substructure_session::state::BranchId;
 
     const SESSION: &str = "slack:C1:1.0";
 
@@ -173,7 +174,7 @@ mod tests {
                 "metadata": { "options": options },
             }),
             anchor: None,
-            branch: None,
+            branch: BranchId::MAIN,
         }
     }
 

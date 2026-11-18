@@ -124,8 +124,11 @@ impl Session {
             }
         }
         let worker = self.state.worker.clone();
-        let branch_id = worker_decision.branch.as_deref();
-        let branch = branch_id.and_then(|b| Some(self.state.branches.get(b)?.view(b)));
+        let branch_id = &worker_decision.branch;
+        let branch = branch_id.name().and_then(|b| {
+            let leaf = self.state.leaf(branch_id).map(str::to_string);
+            Some(self.state.started(branch_id)?.view(b, leaf))
+        });
         let read = self.state.read_point(&trigger, branch_id);
         let at = self.state.at(read.at.as_deref());
         let _ = seq;
@@ -163,7 +166,7 @@ impl Session {
             &Proposing {
                 state: at,
                 pending_calls,
-                scope: branch_id,
+                scope: branch_id.name(),
                 detached,
             },
         )
@@ -181,11 +184,11 @@ impl Session {
             calls: meta
                 .calls
                 .iter()
-                .filter(|c| c.branch.as_deref() == branch_id)
+                .filter(|c| c.branch.as_deref() == branch_id.name())
                 .cloned()
                 .collect(),
             pending_calls,
-            joining: branch_id.is_none() && self.state.waiting_join().is_some(),
+            joining: branch_id.is_main() && self.state.waiting_join().is_some(),
             transcript,
             ancestry: meta.ancestry.clone(),
             span: span.clone(),

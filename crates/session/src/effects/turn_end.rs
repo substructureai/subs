@@ -11,7 +11,7 @@ use crate::protocol::{
     ResumeStatus, Role,
 };
 use crate::schedule::Dep;
-use crate::state::{EffectKind, SessionState, Turn};
+use crate::state::{BranchId, EffectKind, SessionState, Turn};
 
 pub struct TurnEndSpec;
 
@@ -50,7 +50,7 @@ pub const CANCELLED_AT_TURN_END: &str = "cancelled: the turn ended";
 
 impl SessionState {
     pub fn close_open_calls(&self, ids: &Ids, answering: Option<&Trigger>) -> Vec<EventPayload> {
-        let at = self.at_head();
+        let at = self.on(&BranchId::MAIN);
         let transcript = at.transcript();
         let answered: HashSet<&str> = transcript
             .iter()
@@ -83,7 +83,7 @@ impl SessionState {
             })
             .collect();
         let mut events = Vec::new();
-        let mut parent = self.head_id.clone();
+        let mut parent = self.leaf(&BranchId::MAIN).map(str::to_string);
         let mut closed = HashSet::new();
         for call in transcript.iter().flat_map(|m| &m.tool_calls) {
             if answered.contains(call.id.as_str()) || !closed.insert(call.id.clone()) {
@@ -123,7 +123,7 @@ impl SessionState {
                         | EffectKind::System1Call
                 )
             })
-            .filter(|e| e.branch.is_none())
+            .filter(|e| e.branch.is_main())
             .filter(|e| closed.contains(&e.id) || at.anchor_on_path(e.asked_at.as_deref()))
             .filter(|e| e.tracking.is_unsettled())
             .map(|e| (e.kind(), e.id.clone()))
@@ -176,7 +176,7 @@ impl SessionState {
     pub fn open_work(&self) -> Vec<(EffectKind, &str)> {
         self.effects
             .values()
-            .filter(|e| !self.detached(e.branch.as_deref()))
+            .filter(|e| !self.detached(&e.branch))
             .filter(|e| match e.decision() {
                 Some(d) => d.trigger.is_turn_work(),
                 None => matches!(
@@ -227,7 +227,7 @@ impl SessionState {
         events.extend(self.void_effects(|_, tracking, _| tracking.is_unsettled()));
         events.extend(
             self.effects_of(EffectKind::Decision)
-                .filter(|e| !self.detached(e.branch.as_deref()))
+                .filter(|e| !self.detached(&e.branch))
                 .filter(|e| {
                     let Some(d) = e.decision() else { return false };
                     let waits =
@@ -251,7 +251,7 @@ impl SessionState {
             || !self.open_interrupts.is_empty()
             || self.effects.values().any(|e| {
                 e.tracking.is_unsettled()
-                    && !self.detached(e.branch.as_deref())
+                    && !self.detached(&e.branch)
                     && !matches!(
                         e.decision().map(|d| &d.trigger),
                         Some(Trigger::SessionStart)

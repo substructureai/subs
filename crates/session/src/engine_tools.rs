@@ -208,6 +208,7 @@ mod tests {
     use crate::events::{ConfigUpdated, EventPayload};
     use crate::plugins::{PluginSet, Skill};
     use crate::protocol::{AgentConfig, AgentPlugin, SkillMeta};
+    use crate::state::BranchId;
     use crate::state::{ApplyContext, SessionState};
 
     fn state_with_plugin() -> SessionState {
@@ -281,7 +282,7 @@ mod tests {
     #[test]
     fn a_script_reads_a_skills_files_as_files() {
         let answer = skill_answer(
-            state_with_plugin().at_head(),
+            state_with_plugin().on(&BranchId::MAIN),
             bundles().get("pdf"),
             r#"{"name":"pdf:form-filling","file":"references/FORMS.md"}"#,
             true,
@@ -295,7 +296,7 @@ mod tests {
             "{answer:?}"
         );
         let loaded = skill_answer(
-            state_with_plugin().at_head(),
+            state_with_plugin().on(&BranchId::MAIN),
             bundles().get("pdf"),
             r#"{"name":"pdf:form-filling"}"#,
             true,
@@ -312,7 +313,7 @@ mod tests {
     #[test]
     fn a_skill_answers_with_its_body_and_file_listing() {
         let answer = skill_answer(
-            state_with_plugin().at_head(),
+            state_with_plugin().on(&BranchId::MAIN),
             bundles().get("pdf"),
             r#"{"name":"pdf:form-filling"}"#,
             false,
@@ -331,7 +332,7 @@ mod tests {
     #[test]
     fn a_file_read_answers_with_the_content() {
         let answer = skill_answer(
-            state_with_plugin().at_head(),
+            state_with_plugin().on(&BranchId::MAIN),
             bundles().get("pdf"),
             r#"{"name":"pdf:form-filling","file":"references/FORMS.md"}"#,
             false,
@@ -355,26 +356,32 @@ mod tests {
         let state = state_with_plugin();
         let arguments = r#"{"name":"pdf:form-filling","file":"references/FORMS.md"}"#;
         assert_eq!(
-            stored_file(state.at_head(), set.get("pdf"), arguments),
+            stored_file(state.on(&BranchId::MAIN), set.get("pdf"), arguments),
             Some(stored),
             "the host is told which blob to read"
         );
         let answer = skill_answer(
-            state.at_head(),
+            state.on(&BranchId::MAIN),
             set.get("pdf"),
             arguments,
             false,
             Some("field rules"),
         );
         assert_eq!(answer, StoredResult::text("field rules"));
-        let unread = skill_answer(state.at_head(), set.get("pdf"), arguments, false, None);
+        let unread = skill_answer(
+            state.on(&BranchId::MAIN),
+            set.get("pdf"),
+            arguments,
+            false,
+            None,
+        );
         assert!(unread.is_error, "{unread:?}");
     }
 
     #[test]
     fn a_binary_answers_with_its_blob() {
         let answer = skill_answer(
-            state_with_plugin().at_head(),
+            state_with_plugin().on(&BranchId::MAIN),
             bundles().get("pdf"),
             r#"{"name":"pdf:form-filling","file":"references/sample.pdf"}"#,
             false,
@@ -409,7 +416,7 @@ mod tests {
         ];
         for (arguments, expected) in cases {
             let answer = skill_answer(
-                state_with_plugin().at_head(),
+                state_with_plugin().on(&BranchId::MAIN),
                 bundles().get("pdf"),
                 arguments,
                 false,

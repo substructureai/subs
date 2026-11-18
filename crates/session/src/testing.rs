@@ -13,7 +13,7 @@ use crate::protocol::{
     SessionOwner, StoredResult, Subject,
 };
 use crate::span::SpanContext;
-use crate::state::{ApplyContext, EffectKind, SessionState};
+use crate::state::{ApplyContext, BranchId, EffectKind, SessionState};
 use crate::{Caller, CommitContext, Session};
 
 pub const TENANT: &str = "tenant-a";
@@ -490,30 +490,37 @@ impl World {
 
     fn promotable(&self) -> Vec<String> {
         let state = &self.agg.state;
-        let mut ids: Vec<String> =
-            self.branch_ids
-                .iter()
-                .filter(|id| {
-                    let leaf = match state.open_branch(id) {
-                        Some(open) => open.leaf.clone(),
-                        None => state.tree.branch(id).and_then(|r| r.state.leaf),
-                    };
-                    let own = leaf
-                        .and_then(|leaf| state.tree.get(&leaf))
-                        .is_some_and(|n| n.branch() == Some(id.as_str()));
-                    let busy = state.effects.values().any(|e| {
-                        e.branch.as_deref() == Some(id.as_str()) && e.tracking.is_unsettled()
-                    });
-                    own && !busy
-                })
-                .cloned()
-                .collect();
+        let mut ids: Vec<String> = self
+            .branch_ids
+            .iter()
+            .filter(|id| {
+                let key = BranchId::from(id.as_str());
+                let leaf = match state.started(&key) {
+                    Some(_) => state.branches[&key].leaf.clone(),
+                    None => state.tree.branch(id).and_then(|r| r.leaf),
+                };
+                let own = leaf
+                    .and_then(|leaf| state.tree.get(&leaf))
+                    .is_some_and(|n| n.branch() == Some(id.as_str()));
+                let busy = state
+                    .effects
+                    .values()
+                    .any(|e| e.branch.name() == Some(id.as_str()) && e.tracking.is_unsettled());
+                own && !busy
+            })
+            .cloned()
+            .collect();
         ids.sort();
         ids
     }
 
     fn branch_id(&mut self, index: usize, new: bool) -> String {
-        let mut known: Vec<String> = self.agg.state.branches.keys().cloned().collect();
+        let mut known: Vec<String> = self
+            .agg
+            .state
+            .side_branches()
+            .map(|(id, _)| id.to_string())
+            .collect();
         known.extend(self.branch_ids.iter().cloned());
         known.sort();
         known.dedup();
@@ -1098,18 +1105,14 @@ impl crate::Store for Counted {
     }
 }
 
-fn transcripts(session: &Session) -> Vec<(Option<String>, Vec<String>)> {
+fn transcripts(session: &Session) -> Vec<(BranchId, Vec<String>)> {
     let state = session.state();
-    std::iter::once(None)
-        .chain(state.branches.keys().cloned().map(Some))
+    state
+        .branches
+        .keys()
         .map(|b| {
-            let ids = state
-                .at_scope(b.as_deref())
-                .transcript()
-                .into_iter()
-                .map(|m| m.id)
-                .collect();
-            (b, ids)
+            let ids = state.on(b).transcript().into_iter().map(|m| m.id).collect();
+            (b.clone(), ids)
         })
         .collect()
 }

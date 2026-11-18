@@ -29,7 +29,7 @@ impl Proposing<'_> {
         self.state
             .session()
             .effects_of(crate::state::EffectKind::LlmCall)
-            .any(|e| e.branch.as_deref() == self.scope && e.tracking.is_unsettled())
+            .any(|e| e.branch.name() == self.scope && e.tracking.is_unsettled())
     }
 
     pub fn waiting_calls(&self) -> usize {
@@ -876,6 +876,7 @@ mod tests {
         AgentTool, Approve, Handler, LlmRequest, McpServer, NewMessage, RetryPolicy, Subagent,
         ToolCallFunction, ToolInput, SUBAGENT,
     };
+    use crate::state::BranchId;
     use crate::state::{
         ConnectorSyncState, EffectPayload, EffectTracking, LlmCallSpec, SessionState, ToolCallState,
     };
@@ -889,7 +890,7 @@ mod tests {
         let mut parent: Option<String> = None;
         if let Some(config) = config {
             s.seed_config(config.clone());
-            parent = s.head_id.clone();
+            parent = s.leaf(&BranchId::MAIN).map(str::to_string);
         }
         for m in transcript {
             s.seed_message(NewMessage {
@@ -900,7 +901,6 @@ mod tests {
             });
             parent = Some(m.id.clone());
         }
-        s.head_id = parent;
         for effect in llm_calls.values() {
             s.put_effect(effect.clone());
         }
@@ -915,7 +915,7 @@ mod tests {
         super::propose(
             trigger,
             &Proposing {
-                state: state.at_head(),
+                state: state.on(&BranchId::MAIN),
                 pending_calls,
                 scope: None,
                 detached: false,

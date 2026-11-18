@@ -125,6 +125,8 @@ pub struct StreamSessionEventsParams {
 mod tests {
     use super::*;
     use crate::session::state::SessionState;
+    use substructure_session::state::BranchId;
+    use substructure_session::state::Open;
 
     #[test]
     fn client_input_accepts_a_tool_result() {
@@ -152,7 +154,7 @@ mod tests {
                 reason: "confirmation".to_string(),
                 payload: serde_json::Value::Null,
                 anchor: anchor.map(str::to_string),
-                branch: None,
+                branch: BranchId::MAIN,
             });
         s
     }
@@ -215,7 +217,13 @@ mod tests {
         s.tree.seed(node("u1", Role::User, None));
         s.tree.seed(node("a1", Role::Assistant, Some("u1")));
         s.tree.seed(node("a2", Role::Assistant, Some("u1")));
-        s.head_id = Some("a1".to_string());
+        s.branches.insert(
+            BranchId::MAIN,
+            Open {
+                leaf: Some("a1".to_string()),
+                started: None,
+            },
+        );
         let json = serde_json::to_value(session_response("s1".into(), &view_of(s))).unwrap();
         let ids: Vec<&str> = json["messages"]
             .as_array()

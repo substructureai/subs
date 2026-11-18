@@ -8,6 +8,7 @@ use super::state::{
 };
 use crate::connectors::ConnectionPath;
 use crate::protocol::EffectStatus;
+use crate::state::BranchId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Dep {
@@ -72,9 +73,9 @@ pub fn plan(state: &SessionState, now: DateTime<Utc>) -> Vec<ScheduleStep> {
 }
 
 fn owed_fetches(state: &SessionState) -> Vec<ScheduleStep> {
-    let mut owed = state.at_head().unsynced_connectors();
+    let mut owed = Vec::new();
     for id in state.branches.keys() {
-        for path in state.at_scope(Some(id)).unsynced_connectors() {
+        for path in state.on(id).unsynced_connectors() {
             if !owed.contains(&path) {
                 owed.push(path);
             }
@@ -102,8 +103,8 @@ fn is_resume_decision(state: &SessionState, entry: &QueueEntry) -> bool {
 
 fn walk(state: &SessionState) -> Vec<ScheduleStep> {
     let mut steps = Vec::new();
-    let lanes = |e: &crate::state::EffectState| state.lane(e.branch.as_deref());
-    let mut taken: std::collections::HashSet<Option<String>> = state
+    let lanes = |e: &crate::state::EffectState| state.lane(&e.branch);
+    let mut taken: std::collections::HashSet<BranchId> = state
         .effects_of(EffectKind::Decision)
         .filter(|e| e.tracking.status() == EffectStatus::Pending)
         .map(lanes)
@@ -290,7 +291,8 @@ mod tests {
     use crate::retry::RetryTarget;
     use crate::state::{
         ConnectorSyncState, EffectPayload, EffectState, EffectTracking, LlmCallSpec, LlmCallState,
-        OpenInterrupt, QueueEntry, SubagentCallState, ToolCallState, Turn, WorkerDecisionState,
+        Open, OpenInterrupt, QueueEntry, SubagentCallState, ToolCallState, Turn,
+        WorkerDecisionState,
     };
 
     fn epoch() -> DateTime<Utc> {
@@ -393,7 +395,7 @@ mod tests {
                 source_event_sequence: seq,
                 dispatched_seq: None,
                 turn: None,
-                branch: None,
+                branch: BranchId::MAIN,
             }),
         ));
     }
@@ -572,14 +574,20 @@ mod tests {
             copied_from: None,
             branch: None,
         });
-        s.head_id = Some("u1".to_string());
+        s.branches.insert(
+            BranchId::MAIN,
+            Open {
+                leaf: Some("u1".to_string()),
+                started: None,
+            },
+        );
         s.open_interrupts.push(OpenInterrupt {
             interrupt_id: "int-1".to_string(),
             origin: InterruptOrigin::Frontend,
             reason: "pause".to_string(),
             payload: serde_json::Value::Null,
             anchor: Some("u1".to_string()),
-            branch: None,
+            branch: BranchId::MAIN,
         });
         add_decision(&mut s, "d-1", EffectStatus::Queued, client_message());
         add_tool(&mut s, "tc-1", EffectStatus::Queued);

@@ -12,7 +12,7 @@ use crate::protocol::{
     Content, DraftMessage, ErrorCode, ErrorInfo, RetryPolicy, Role, SpawnMode, SubagentBranch,
     SubagentMode, Usage,
 };
-use crate::state::{json_to_string, EffectKind, SessionState};
+use crate::state::{json_to_string, BranchId, EffectKind, SessionState};
 use crate::Caller;
 
 pub use crate::prompts::answers::DETACHED_STARTED;
@@ -106,7 +106,7 @@ impl KindSpec for SubagentSpec {
             message: sa.message.clone(),
             retry: t.retry_policy.clone(),
             mode: sa.mode,
-            branch: effect.branch.clone(),
+            branch: effect.branch.clone().into(),
             on_branch: sa.on_branch.clone(),
         })]
     }
@@ -187,8 +187,8 @@ pub fn request(
             },
         )])
     };
-    let config = state.at_scope(state.scope()).config().unwrap_or_default();
-    let budget = state.at_head().config().unwrap_or_default();
+    let config = state.on(state.scope()).config().unwrap_or_default();
+    let budget = state.on(&BranchId::MAIN).config().unwrap_or_default();
     if !budget.may_spawn_subagent(state.depth() + state.branch_depth(state.scope()) as u32) {
         let limit = budget.depth_limit();
         return answer(ErrorInfo::new(
@@ -226,7 +226,7 @@ pub fn request(
         Some(SubagentMode::Blocking) => SpawnMode::Blocking,
         Some(SubagentMode::Detached) => SpawnMode::Detached,
     };
-    if mode == SpawnMode::Detached && state.scope().is_some() {
+    if mode == SpawnMode::Detached && !state.scope().is_main() {
         return answer(ErrorInfo::new(
             ErrorCode::Unroutable,
             errors::DETACHED_ON_BRANCH.to_string(),
@@ -252,7 +252,7 @@ pub fn request(
                 message: None,
                 retry: spawn.retry,
                 mode: SpawnMode::Wait,
-                branch: state.scope_branch(),
+                branch: state.scope().clone().into(),
                 on_branch: None,
             })]);
         };
@@ -322,7 +322,7 @@ pub fn request(
         message: spawn.message,
         retry: spawn.retry,
         mode,
-        branch: state.scope_branch(),
+        branch: state.scope().clone().into(),
         on_branch,
     })])
 }

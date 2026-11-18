@@ -6,7 +6,7 @@ use crate::effects::{self, decision_queued_on};
 use crate::events::*;
 use crate::ids::Ids;
 use crate::protocol::{BranchMode, DraftMessage, EffectStatus, ErrorCode, ErrorInfo, NewMessage};
-use crate::state::{EffectKind, SessionState};
+use crate::state::{BranchId, EffectKind, SessionState};
 use crate::Caller;
 
 pub const MAX_BRANCH_DEPTH: usize = 5;
@@ -25,12 +25,11 @@ impl SessionState {
         let mut found = vec![id.to_string()];
         let mut at = 0;
         while at < found.len() {
-            let parent = found[at].clone();
+            let parent = BranchId::from(found[at].as_str());
             found.extend(
-                self.branches
-                    .iter()
-                    .filter(|(_, b)| b.parent.as_deref() == Some(parent.as_str()))
-                    .map(|(child, _)| child.clone()),
+                self.side_branches()
+                    .filter(|(_, b)| b.parent == parent)
+                    .map(|(child, _)| child.to_string()),
             );
             at += 1;
         }
@@ -58,10 +57,8 @@ impl SessionState {
         (path.last().map(|id| id.to_string()), path.len())
     }
 
-    pub fn branch_depth(&self, branch: Option<&str>) -> usize {
-        branch
-            .and_then(|b| self.branches.get(b))
-            .map_or(0, |b| b.depth)
+    pub fn branch_depth(&self, branch: &BranchId) -> usize {
+        self.started(branch).map_or(0, |b| b.depth)
     }
 
     pub fn close_branch(
@@ -71,18 +68,20 @@ impl SessionState {
         data: serde_json::Value,
         error: Option<ErrorInfo>,
     ) -> Vec<EventPayload> {
-        if self.open_branch(id).is_none() {
+        if self.started(&BranchId::from(id)).is_none() {
             return Vec::new();
         }
-        let closing = self.branch_and_below(id);
-        let closing: HashSet<&str> = closing.iter().map(String::as_str).collect();
+        let closing: HashSet<BranchId> = self
+            .branch_and_below(id)
+            .into_iter()
+            .map(BranchId::from)
+            .collect();
         let mut events = self.void_effects_where(|e| {
-            e.branch.as_deref().is_some_and(|b| closing.contains(b))
-                && effects::stops(e.kind(), &e.tracking)
+            closing.contains(&e.branch) && effects::stops(e.kind(), &e.tracking)
         });
         events.extend(
             self.effects_of(EffectKind::Decision)
-                .filter(|e| e.branch.as_deref().is_some_and(|b| closing.contains(b)))
+                .filter(|e| closing.contains(&e.branch))
                 .filter(|e| {
                     matches!(
                         e.tracking.status(),
@@ -93,7 +92,10 @@ impl SessionState {
         );
         for b in self.branch_and_below(id).into_iter().rev() {
             let own = b == id;
-            let leaf = self.branches.get(&b).and_then(|b| b.leaf.clone());
+            let leaf = self
+                .branches
+                .get(&BranchId::from(b.as_str()))
+                .and_then(|open| open.leaf.clone());
             events.push(EventPayload::BranchClosed(BranchClosed {
                 leaf,
                 id: b,
@@ -116,7 +118,8 @@ impl SessionState {
         data: serde_json::Value,
         error: Option<ErrorInfo>,
     ) -> Vec<EventPayload> {
-        let Some(branch) = self.open_branch(id) else {
+        let key = BranchId::from(id);
+        let Some(branch) = self.started(&key) else {
             return Vec::new();
         };
         let reason = match error {
@@ -131,7 +134,7 @@ impl SessionState {
             data: data.clone(),
             error: error.clone(),
             from: branch.from.clone(),
-            leaf: branch.leaf.clone(),
+            leaf: self.branches.get(&key).and_then(|open| open.leaf.clone()),
         };
         let parent = branch.parent.clone();
         if let Some(call) = branch.subagent.clone() {
@@ -140,33 +143,28 @@ impl SessionState {
             return events;
         }
         let mut events = self.close_branch(id, reason, data, error);
-        let voided = parent
-            .as_deref()
-            .is_some_and(|p| self.open_branch(p).is_none());
+        let voided = !parent.is_main() && self.started(&parent).is_none();
         if !voided {
-            events.push(decision_queued_on(ids, trigger, parent));
+            events.push(decision_queued_on(ids, trigger, parent.into()));
         }
         events
     }
 
     pub fn void_turn_branches(&self) -> Vec<EventPayload> {
-        self.branches
-            .iter()
+        self.side_branches()
             .filter(|(_, b)| b.mode == BranchMode::Blocking)
-            .filter(|(_, b)| !self.detached(b.parent.as_deref()))
-            .filter(|(_, b)| b.parent.is_none())
+            .filter(|(_, b)| !self.detached(&b.parent))
+            .filter(|(_, b)| b.parent.is_main())
             .flat_map(|(id, _)| {
                 self.close_branch(id, BranchEnd::Voided, serde_json::Value::Null, None)
             })
             .collect()
     }
 
-    pub fn void_stranded_branches(&self, scope: Option<&str>) -> Vec<EventPayload> {
-        let node = self.scope_node(scope);
-        let at = self.at(node.as_deref());
-        self.branches
-            .iter()
-            .filter(|(_, b)| b.parent.as_deref() == scope)
+    pub fn void_stranded_branches(&self, scope: &BranchId) -> Vec<EventPayload> {
+        let at = self.on(scope);
+        self.side_branches()
+            .filter(|(_, b)| b.parent == *scope)
             .filter(|(_, b)| b.mode == BranchMode::Blocking)
             .filter(|(_, b)| b.from.is_some() && !at.anchor_on_path(b.from.as_deref()))
             .flat_map(|(id, _)| {
@@ -176,22 +174,22 @@ impl SessionState {
     }
 
     pub fn quiet_branch(&self, ids: &Ids, id: &str) -> Vec<EventPayload> {
-        if self.open_branch(id).is_none() {
+        let key = BranchId::from(id);
+        if self.started(&key).is_none() {
             return Vec::new();
         }
         let busy = self.effects.values().any(|e| {
-            e.branch.as_deref() == Some(id)
+            e.branch == key
                 && match e.decision() {
                     Some(_) => e.tracking.is_unsettled(),
                     None => e.kind() != EffectKind::ConnectorSync && e.tracking.is_unsettled(),
                 }
         });
-        let waits = self.held_by_branches(Some(id)) > 0
+        let waits = self.held_by_branches(&key) > 0
             || self
-                .branches
-                .values()
-                .any(|b| b.parent.as_deref() == Some(id) && b.mode == BranchMode::Detached);
-        let parked = self.at_scope(Some(id)).active_interrupt_for().is_some();
+                .side_branches()
+                .any(|(_, b)| b.parent == key && b.mode == BranchMode::Detached);
+        let parked = self.on(&key).active_interrupt_for().is_some();
         if busy || waits || parked {
             return Vec::new();
         }
@@ -206,15 +204,16 @@ impl Working {
         messages: Vec<DraftMessage>,
     ) -> Result<String, Unstarted> {
         let parent = self.scope.clone();
-        if self.branches.contains_key(&start.id) || self.tree.branch(&start.id).is_some() {
+        let key = BranchId::from(start.id.as_str());
+        if self.branches.contains_key(&key) || self.tree.branch(&start.id).is_some() {
             return Err(Unstarted::Known);
         }
-        if self.branch_depth(parent.as_deref()) >= MAX_BRANCH_DEPTH {
+        if self.branch_depth(&parent) >= MAX_BRANCH_DEPTH {
             return Err(refused("The branch would be nested too deep."));
         }
         let from = match &start.from {
             BranchFrom::Root => None,
-            BranchFrom::Head => self.scope_node(parent.as_deref()),
+            BranchFrom::Head => self.leaf(&parent).map(str::to_string),
             BranchFrom::Node(node) => Some(node.clone()),
         };
         if let Some(node) = from.as_deref() {
@@ -242,7 +241,7 @@ impl Working {
             (agent, _) => agent.clone(),
         };
         let turn_id = match start.mode {
-            BranchMode::Blocking if !self.detached(parent.as_deref()) => {
+            BranchMode::Blocking if !self.detached(&parent) => {
                 self.active_turn_id().map(str::to_string)
             }
             _ => None,
@@ -251,13 +250,13 @@ impl Working {
             self.then(|s| effects::connector::sync(s, config));
         }
         let node = self.ids.next();
-        let depth = self.branch_depth(parent.as_deref()) + 1;
-        let detached = start.mode == BranchMode::Detached || self.detached(parent.as_deref());
+        let depth = self.branch_depth(&parent) + 1;
+        let detached = start.mode == BranchMode::Detached || self.detached(&parent);
         self.emit(EventPayload::BranchStarted(Box::new(BranchStarted {
             id: start.id.clone(),
             node: node.clone(),
             from: from.clone(),
-            parent,
+            parent: parent.into(),
             agent,
             name: start.name.clone(),
             mode: start.mode,
@@ -267,7 +266,7 @@ impl Working {
             subagent: None,
             leaf: None,
         })));
-        let mut parent_id = self.scope_node(Some(&start.id));
+        let mut parent_id = self.leaf(&key).map(str::to_string);
         for draft in messages {
             let copied_from = draft.id.clone().filter(|id| self.has_node(id));
             let message = match copied_from {
@@ -290,7 +289,7 @@ impl Working {
         call_id: &str,
         messages: Vec<DraftMessage>,
     ) -> Result<String, Unstarted> {
-        if self.branches.contains_key(call_id) {
+        if self.branches.contains_key(&BranchId::from(call_id)) {
             return Ok(call_id.to_string());
         }
         let (from, shared) = self.recorded_prefix(&messages);
@@ -309,7 +308,7 @@ impl Working {
 
     pub(super) fn unstarted(&mut self, call: &str, unstarted: Unstarted) {
         if let Unstarted::Refused(error) = unstarted {
-            let scope = self.scope.clone();
+            let scope = self.scope.clone().into();
             self.queue_decision_on(Trigger::llm_err(call.to_string(), error), scope);
         }
     }
@@ -337,7 +336,7 @@ impl Working {
         let started = EffectKind::Subagent.spec();
         self.then(|s| started.settle(s, call, effects::Outcome::SubagentStarted));
         let turn_id = match mode {
-            BranchMode::Blocking if !self.detached(parent.as_deref()) => {
+            BranchMode::Blocking if !self.detached(&parent) => {
                 self.active_turn_id().map(str::to_string)
             }
             _ => None,
@@ -351,14 +350,16 @@ impl Working {
             name: None,
             reasoning: None,
         });
-        let known = self
-            .branches
-            .get(&branch)
-            .cloned()
-            .or_else(|| self.tree.branch(&branch).map(|r| r.state));
+        let key = BranchId::from(branch.as_str());
+        let known = match self.started(&key) {
+            Some(b) => Some((b.clone(), self.leaf(&key).map(str::to_string))),
+            None => self.tree.branch(&branch).map(|r| {
+                let leaf = r.leaf.or_else(|| r.state.from.clone());
+                (r.state, leaf)
+            }),
+        };
         let (from, agent, mut own, node) = match known {
-            Some(b) => {
-                let leaf = b.at().map(str::to_string);
+            Some((b, leaf)) => {
                 if leaf.as_deref().is_some_and(|l| !self.has_node(l)) {
                     let error = ErrorInfo::new(
                         ErrorCode::Unroutable,
@@ -384,13 +385,13 @@ impl Working {
             ),
         };
         let fresh = own.is_none();
-        let depth = self.branch_depth(parent.as_deref()) + 1;
-        let detached = mode == BranchMode::Detached || self.detached(parent.as_deref());
+        let depth = self.branch_depth(&parent) + 1;
+        let detached = mode == BranchMode::Detached || self.detached(&parent);
         self.emit(EventPayload::BranchStarted(Box::new(BranchStarted {
             id: branch.clone(),
             node: node.clone(),
             from: from.clone(),
-            parent,
+            parent: parent.into(),
             agent: agent.clone(),
             name: Some(agent_id),
             mode,
@@ -426,7 +427,7 @@ impl Working {
         }
         messages.push(task);
         if fresh {
-            own = self.scope_node(Some(&branch));
+            own = self.leaf(&key).map(str::to_string);
         }
         for draft in messages {
             let message = draft.record(&self.ids);
@@ -438,7 +439,7 @@ impl Working {
                 branch: Some(branch.clone()),
             }));
         }
-        let name = self.branches.get(&branch).and_then(|b| b.name.clone());
+        let name = self.started(&key).and_then(|b| b.name.clone());
         self.queue_decision_on(
             Trigger::BranchStarted {
                 id: branch.clone(),
@@ -451,7 +452,7 @@ impl Working {
 
     pub(super) fn run_on(
         &mut self,
-        branch: Option<String>,
+        branch: BranchId,
         cmd: CommandPayload,
         caller: &Caller,
     ) -> Result<(), super::SessionError> {
@@ -462,18 +463,19 @@ impl Working {
     }
 
     pub(super) fn promote_branch(&mut self, id: &str) {
-        let record = match self.branches.get(id) {
-            Some(open) => Some((open.clone(), None)),
-            None => self.tree.branch(id).map(|r| (r.state, r.closed)),
+        let key = BranchId::from(id);
+        let record = match self.started(&key) {
+            Some(open) => Some((open.clone(), self.branches[&key].leaf.clone(), None)),
+            None => self.tree.branch(id).map(|r| (r.state, r.leaf, r.closed)),
         };
-        let Some((branch, closed)) = record else {
+        let Some((branch, leaf, closed)) = record else {
             tracing::warn!(branch = id, "branch.promote names no branch");
             return;
         };
         let promotable = matches!(closed, None | Some(BranchEnd::Done))
-            && branch.parent.is_none()
+            && branch.parent.is_main()
             && self.branch_and_below(id).len() == 1;
-        let Some(leaf) = branch.leaf.clone().filter(|_| promotable) else {
+        let Some(leaf) = leaf.filter(|_| promotable) else {
             tracing::warn!(
                 branch = id,
                 "only an open or finished branch the conversation started, with a message of its own and none open below it, can be promoted"
@@ -483,7 +485,7 @@ impl Working {
         let busy = self
             .effects
             .values()
-            .any(|e| e.branch.as_deref() == Some(id) && e.tracking.is_unsettled());
+            .any(|e| e.branch == key && e.tracking.is_unsettled());
         if busy {
             tracing::warn!(branch = id, "a branch with work open cannot be promoted");
             return;
@@ -503,7 +505,7 @@ impl Working {
             leaf,
             branch: None,
         }));
-        self.then(|s| s.void_stranded_work(None));
+        self.then(|s| s.void_stranded_work(&BranchId::MAIN));
     }
 
     pub(super) fn fail_branch(&mut self, id: &str, error: ErrorInfo) {

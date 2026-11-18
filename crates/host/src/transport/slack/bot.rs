@@ -28,6 +28,7 @@ use crate::session::SessionEvent;
 use crate::transport::channel::{ChannelContext, ChannelKind};
 use crate::transport::consent::{CliConsent, Consent, WayIn};
 use crate::{Caller, HandleClientInput, RuntimeError};
+use substructure_session::state::BranchId;
 
 const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 const MAX_PDF_BYTES: u64 = 10 * 1024 * 1024;
@@ -851,7 +852,7 @@ impl SlackBot {
         };
         match ctx.get_session(&ws.tenant_id, session_id).await {
             Ok(session) => crate::runtime::sessions::read(std::sync::Arc::new(session), |state| {
-                state.at_head().transcript()
+                state.on(&BranchId::MAIN).transcript()
             })
             .await
             .unwrap_or_default(),
@@ -876,7 +877,7 @@ impl SlackBot {
             return;
         };
         let open = crate::runtime::sessions::read(std::sync::Arc::new(session), |state| {
-            state.at_head().active_interrupt_for().cloned()
+            state.on(&BranchId::MAIN).active_interrupt_for().cloned()
         })
         .await;
         let Ok(Some(open)) = open else {

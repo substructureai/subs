@@ -13,6 +13,7 @@ use substructure_session::protocol::{
     ClientAction, ClientAppend, ClientMessages, DecisionTrigger, Message, WorkerState,
 };
 use substructure_session::request::WorkerDecisionRequest;
+use substructure_session::state::BranchId;
 use substructure_session::{settle, Command, MemoryStore, Session, Settings, Store, Work};
 
 const TENANT: &str = "tenant-a";
@@ -1331,7 +1332,7 @@ mod branches {
     }
 
     fn state_value(session: &Session) -> serde_json::Value {
-        session.state().at_head().worker_state().0
+        session.state().on(&BranchId::MAIN).worker_state().0
     }
 
     fn view(store: &MemoryStore, session: &mut Session, n: usize, messages: Vec<DraftMessage>) {
@@ -1410,7 +1411,7 @@ mod branches {
     fn head_ids(session: &Session) -> Vec<String> {
         session
             .state()
-            .at_head()
+            .on(&BranchId::MAIN)
             .transcript()
             .into_iter()
             .map(|m| m.id)
@@ -1519,7 +1520,7 @@ mod branches {
         let (store, mut session) = two_turns();
         let path: Vec<DraftMessage> = session
             .state()
-            .at_head()
+            .on(&BranchId::MAIN)
             .transcript()
             .into_iter()
             .map(DraftMessage::from)
@@ -1566,7 +1567,7 @@ mod branches {
         let (store, mut session) = two_turns();
         let path: Vec<DraftMessage> = session
             .state()
-            .at_head()
+            .on(&BranchId::MAIN)
             .transcript()
             .into_iter()
             .map(DraftMessage::from)
@@ -1790,7 +1791,7 @@ mod branches {
             turn(&store, &mut session, n);
             let path: Vec<DraftMessage> = session
                 .state()
-                .at_head()
+                .on(&BranchId::MAIN)
                 .transcript()
                 .into_iter()
                 .map(DraftMessage::from)
