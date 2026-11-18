@@ -1468,3 +1468,57 @@ fn a_branch_whose_run_failed_is_promoted_from_its_stored_leaf() {
     );
     assert_eq!(agg.state.leaf(&BranchId::MAIN), Some(leaf.as_str()));
 }
+
+#[test]
+fn a_call_that_brings_its_messages_again_without_ids_writes_only_what_is_new() {
+    let mut agg = configured();
+    let ask = |agg: &mut Session, messages: Vec<DraftMessage>| {
+        dispatch(
+            agg,
+            CommandPayload::RequestLlmCall {
+                llm: "claude".to_string(),
+                call_id: "x1".to_string(),
+                request: request_with(messages),
+                stream: false,
+                retry: RetryPolicy::no_retry(),
+                handler: LlmHandler::Server,
+                format: None,
+            },
+            &system(),
+        )
+    };
+    let written = |events: &[EventPayload]| -> Vec<NewMessage> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                EventPayload::NewMessage(m) => Some(m.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    ask(&mut agg, vec![node_msg("", Role::User, "a title")]);
+    reply(&mut agg, "x1", said("A title", 10));
+    let (d, _) = live_decision(&agg);
+    submit_decision(&mut agg, d, vec![], vec![]);
+    let leaf = agg
+        .state
+        .tree
+        .stored(&BranchId::from("x1"))
+        .and_then(|s| s.leaf);
+
+    let again = ask(
+        &mut agg,
+        vec![
+            node_msg("", Role::User, "a title"),
+            node_msg("", Role::User, "shorter"),
+        ],
+    );
+    let new = written(&again);
+    assert_eq!(
+        new.len(),
+        1,
+        "the brought prompt is matched by what it says"
+    );
+    assert_eq!(new[0].parent_id, leaf);
+    assert_eq!(prompt_texts(&agg, "x1"), ["a title", "shorter"]);
+}

@@ -348,8 +348,24 @@ impl Working {
                 }
             }
         }
+        let messages = self.recognised(&key, messages);
         self.then(|s| s.write_response(s.ids(), messages, None, None, &key, None));
         Ok(call_id.to_string())
+    }
+
+    fn recognised(&self, branch: &BranchId, mut messages: Vec<DraftMessage>) -> Vec<DraftMessage> {
+        let path = self.on(branch).transcript();
+        for (draft, held) in messages.iter_mut().zip(&path) {
+            let known = match &draft.id {
+                Some(id) => *id == held.id,
+                None => same(draft, held),
+            };
+            if !known {
+                break;
+            }
+            draft.id = Some(held.id.clone());
+        }
+        messages
     }
 
     pub(super) fn refuse_call(&mut self, call: &str, error: ErrorInfo) {
