@@ -26,7 +26,6 @@ pub fn up(conn: &Connection) -> rusqlite::Result<()> {
             tenant_id  TEXT NOT NULL,
             session_id TEXT NOT NULL,
             seq        INTEGER NOT NULL,
-            version    INTEGER NOT NULL,
             node_id    TEXT,
             parent_id  TEXT,
             kind       INTEGER,

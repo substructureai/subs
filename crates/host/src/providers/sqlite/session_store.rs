@@ -222,9 +222,9 @@ impl SqliteSessionStore {
         let mut insert = tx
             .prepare_cached(
                 "INSERT INTO session_events
-                    (tenant_id, session_id, seq, version, node_id, parent_id, kind, branch,
+                    (tenant_id, session_id, seq, node_id, parent_id, kind, branch,
                      prev, answers, envelope, payload)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             )
             .map_err(unavailable)?;
         let mut above = tx
@@ -252,7 +252,6 @@ impl SqliteSessionStore {
                     self.tenant_id,
                     self.session_id,
                     event.seq as i64,
-                    entry.version as i64,
                     node.map(Node::id),
                     node.and_then(Node::parent),
                     node.map(kind),
