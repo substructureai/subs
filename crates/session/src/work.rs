@@ -220,9 +220,9 @@ impl Session {
         }
     }
 
-    pub fn open_work(&self) -> Vec<Work> {
+    pub fn open_work(&self) -> Result<Vec<Work>, crate::StoreError> {
         let state = &self.state;
-        state
+        let work = state
             .effects
             .iter()
             .filter_map(|((kind, id), effect)| {
@@ -259,7 +259,8 @@ impl Session {
                     _ => None,
                 }
             })
-            .collect()
+            .collect();
+        self.checked(work)
     }
 
     pub fn work(&self, events: &[SessionEvent]) -> Vec<Work> {
@@ -323,11 +324,12 @@ impl Session {
         }
     }
 
-    pub fn mail(&self, events: &[SessionEvent]) -> Vec<Mail> {
-        events
+    pub fn mail(&self, events: &[SessionEvent]) -> Result<Vec<Mail>, crate::StoreError> {
+        let mail = events
             .iter()
             .flat_map(|event| self.mail_for(event))
-            .collect()
+            .collect();
+        self.checked(mail)
     }
 
     fn mail_for(&self, event: &SessionEvent) -> Vec<Mail> {

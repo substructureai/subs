@@ -31,6 +31,7 @@ proptest = { version = "1.11.0", optional = true }
 testing = ["dep:proptest"]
 
 [dev-dependencies]
+substructure-session = { path = ".", features = ["testing"] }
 proptest = "1.11.0"
 toml = "0.8"
 tempfile = "3"

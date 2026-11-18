@@ -159,14 +159,8 @@ impl Tree {
         }
     }
 
-    pub fn poisoned(&self) -> Option<StoreError> {
+    pub(crate) fn poisoned(&self) -> Option<StoreError> {
         self.poisoned.lock().ok()?.take()
-    }
-
-    pub fn is_poisoned(&self) -> bool {
-        self.poisoned
-            .lock()
-            .is_ok_and(|poisoned| poisoned.is_some())
     }
 
     fn read<T: Default>(&self, read: impl FnOnce(&dyn Nodes) -> Result<T, StoreError>) -> T {

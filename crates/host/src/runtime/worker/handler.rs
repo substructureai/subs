@@ -536,31 +536,31 @@ mod tests {
         let mut agg = two_calls_awaiting_approval().await;
         assert!(
             agg.session
-                .state()
+                .view()
                 .open_interrupt("mcp-approve:tc-1")
                 .is_some(),
             "the first call is asked about; open: {:?}",
-            agg.session.state().open_interrupts
+            agg.session.view().open_interrupts
         );
         assert!(
-            agg.session.state().tool_call("tc-1").is_none()
-                && agg.session.state().tool_call("tc-2").is_none(),
+            agg.session.view().tool_call("tc-1").is_none()
+                && agg.session.view().tool_call("tc-2").is_none(),
             "nothing runs while a question is open"
         );
 
         let events = dispatch(&mut agg, resume("mcp-approve:tc-1", true), &system());
         drive(&mut agg, events).await;
         assert!(
-            agg.session.state().tool_call("tc-1").is_some(),
+            agg.session.view().tool_call("tc-1").is_some(),
             "the approved call is dispatched"
         );
         assert!(
             agg.session
-                .state()
+                .view()
                 .open_interrupt("mcp-approve:tc-2")
                 .is_some(),
             "and the next question follows it; open: {:?}",
-            agg.session.state().open_interrupts
+            agg.session.view().open_interrupts
         );
 
         let events = dispatch(
@@ -586,12 +586,12 @@ mod tests {
         drive(&mut agg, events).await;
 
         assert!(
-            agg.session.state().open_interrupts.is_empty(),
+            agg.session.view().open_interrupts.is_empty(),
             "a call already away must not be asked about again; open: {:?}",
-            agg.session.state().open_interrupts
+            agg.session.view().open_interrupts
         );
         assert!(
-            agg.session.state().tool_call("tc-2").is_none(),
+            agg.session.view().tool_call("tc-2").is_none(),
             "the declined call never runs"
         );
         let prompt = last_prompt(&agg).expect("the model is prompted with both outcomes");
@@ -623,7 +623,7 @@ mod tests {
     }
 
     fn last_prompt(agg: &Agg) -> Option<Vec<crate::protocol::Message>> {
-        let state = agg.session.state();
+        let state = agg.session.view();
         let call = state
             .effects_of(EffectKind::LlmCall)
             .filter(|e| e.id != "call-1")

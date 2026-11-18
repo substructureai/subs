@@ -1110,23 +1110,27 @@ impl crate::Store for Counted {
     }
 }
 
-fn transcripts(session: &Session, used: &[String]) -> Vec<(BranchId, Vec<String>)> {
-    let state = session.state();
-    let read = |at: crate::state::At<'_, '_>| at.transcript().into_iter().map(|m| m.id).collect();
-    let mut all: Vec<(BranchId, Vec<String>)> = state
-        .branches
-        .keys()
-        .map(|b| (b.clone(), read(state.on(b))))
-        .collect();
-    for id in used.iter().map(BranchId::from) {
-        let stored = state.tree.stored(&id).and_then(|s| s.leaf.or(s.from));
-        all.push((id, read(state.at(stored.as_deref()))));
-    }
-    all
+fn transcripts(session: &Session, used: &[String]) -> Result<Vec<(BranchId, Vec<String>)>, String> {
+    session
+        .read(|state| {
+            let read =
+                |at: crate::state::At<'_, '_>| at.transcript().into_iter().map(|m| m.id).collect();
+            let mut all: Vec<(BranchId, Vec<String>)> = state
+                .branches
+                .keys()
+                .map(|b| (b.clone(), read(state.on(b))))
+                .collect();
+            for id in used.iter().map(BranchId::from) {
+                let stored = state.tree.stored(&id).and_then(|s| s.leaf.or(s.from));
+                all.push((id, read(state.at(stored.as_deref()))));
+            }
+            all
+        })
+        .map_err(|e| e.to_string())
 }
 
 fn work(session: &Session) -> serde_json::Value {
-    serde_json::to_value(session.open_work()).unwrap()
+    serde_json::to_value(session.open_work().map_err(|e| e.to_string())).unwrap()
 }
 
 #[cfg(test)]
@@ -1160,7 +1164,11 @@ pub fn check(
                 "{call} sent other bytes than it fingerprinted\ncommands:\n{commands}"
             );
         }
-        for item in world.agg.open_work() {
+        let open = world
+            .agg
+            .open_work()
+            .map_err(|e| TestCaseError::fail(e.to_string()))?;
+        for item in open {
             if !matches!(
                 item,
                 crate::Work::CallLlm { .. } | crate::Work::CallSystem1 { .. }

@@ -25,7 +25,7 @@ pub type SharedStore = Arc<dyn Store + Send + Sync>;
 pub type SessionKey = (String, String);
 
 pub struct SessionView {
-    pub state: View,
+    pub state: substructure_session::state::SessionState,
     pub status: substructure_session::state::SessionStatus,
     pub tree: MessageTree,
     pub versions: std::collections::BTreeMap<String, Vec<String>>,
@@ -511,17 +511,15 @@ impl Sessions {
             if !session.exists() {
                 return Ok(None);
             }
-            let state = session.state();
-            let at = match leaf {
-                Some(leaf) => Some(state.tree.newest(&leaf)),
-                None => state.leaf(&BranchId::MAIN).map(str::to_string),
-            };
-            let tree = state.at(at.as_deref()).message_tree();
-            let versions = state.versions(&tree);
-            let status = state.projected_status();
-            if let Some(error) = state.tree.poisoned() {
-                return Err(error.into());
-            }
+            let (tree, versions, status) = session.read(|state| {
+                let at = match leaf {
+                    Some(leaf) => Some(state.tree.newest(&leaf)),
+                    None => state.leaf(&BranchId::MAIN).map(str::to_string),
+                };
+                let tree = state.at(at.as_deref()).message_tree();
+                let versions = state.versions(&tree);
+                (tree, versions, state.projected_status())
+            })?;
             Ok(Some(SessionView {
                 status,
                 state: session.into_state(),
@@ -852,15 +850,9 @@ pub async fn read<T: Send + 'static>(
     session: Arc<Session>,
     f: impl FnOnce(&View) -> T + Send + 'static,
 ) -> Result<T, StoreError> {
-    tokio::task::spawn_blocking(move || {
-        let read = f(session.state());
-        match session.state().tree.poisoned() {
-            Some(error) => Err(error),
-            None => Ok(read),
-        }
-    })
-    .await
-    .unwrap_or_else(|e| Err(StoreError::Unavailable(e.to_string())))
+    tokio::task::spawn_blocking(move || session.read(f))
+        .await
+        .unwrap_or_else(|e| Err(StoreError::Unavailable(e.to_string())))
 }
 
 async fn blocking<T: Send + 'static>(
@@ -1040,7 +1032,7 @@ mod tests {
             Err(ExecuteError::Command(SessionError::SessionAlreadyCreated))
         ));
         let loaded = s.load("t", "s1").await.unwrap().unwrap();
-        assert_eq!(loaded.state().agent_id.as_deref(), Some("agent"));
+        assert_eq!(loaded.view().agent_id.as_deref(), Some("agent"));
         assert!(s.load("t", "nobody").await.unwrap().is_none());
     }
 
@@ -1309,6 +1301,7 @@ mod tests {
                 let session = s.load("t", "s1").await.unwrap().unwrap();
                 let decision_id = session
                     .open_work()
+                    .unwrap()
                     .into_iter()
                     .find_map(|w| match w {
                         Work::AskWorker { work, .. } => Some(work.id),
@@ -1358,7 +1351,6 @@ mod tests {
         .await;
 
         let view = s.view("t", "s1", None).await.unwrap().unwrap();
-        assert_eq!(view.state.tree.unwritten().count(), 0);
         let ids = |tree: &MessageTree| -> Vec<String> {
             tree.nodes.iter().map(|n| n.message.id.clone()).collect()
         };

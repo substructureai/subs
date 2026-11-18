@@ -323,7 +323,10 @@ impl Reader for MailReader {
         events: &[SessionEvent],
     ) -> Result<(), DeliveryError> {
         for event in events {
-            for mail in session.mail(std::slice::from_ref(event)) {
+            let mail = session
+                .mail(std::slice::from_ref(event))
+                .map_err(|e| DeliveryError::retry(Some(event.seq), e.to_string()))?;
+            for mail in mail {
                 let kind = mail.command.payload.kind();
                 let answered = sessions
                     .run(session.tenant_id(), &mail.to, mail.command)

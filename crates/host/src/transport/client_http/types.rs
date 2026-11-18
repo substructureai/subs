@@ -139,7 +139,7 @@ mod tests {
             status: state.projected_status(),
             tree: state.message_tree(),
             versions: Default::default(),
-            state,
+            state: state.state,
         }
     }
 

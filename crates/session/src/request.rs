@@ -209,9 +209,6 @@ impl Session {
             turn: worker_decision.turn.as_deref().cloned(),
             branch,
         };
-        if self.state.tree.is_poisoned() {
-            return None;
-        }
         Some((request, prompt))
     }
 

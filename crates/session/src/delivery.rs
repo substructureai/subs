@@ -319,7 +319,7 @@ impl Session {
             false => self.work(&store.events_at(&seqs)?),
         };
         Ok(self
-            .open_work()
+            .open_work()?
             .into_iter()
             .map(|work| {
                 rebuilt
@@ -340,9 +340,6 @@ impl Session {
         let head = self.seq;
         if restarted && reader.restart == Restart::ResendOpen {
             let items = self.resend(store)?;
-            if let Some(error) = self.state.tree.poisoned() {
-                return Err(error.into());
-            }
             if !items.is_empty() {
                 return Ok(Next {
                     batch: Some(Batch {
@@ -367,10 +364,7 @@ impl Session {
             let Some(through) = read.last().map(|e| e.seq) else {
                 return Ok(Next::idle(Vec::new()));
             };
-            let items = self.work(&read);
-            if let Some(error) = self.state.tree.poisoned() {
-                return Err(error.into());
-            }
+            let items = self.checked(self.work(&read))?;
             if items.is_empty() {
                 store.set_cursor(&reader.name, through)?;
                 continue;

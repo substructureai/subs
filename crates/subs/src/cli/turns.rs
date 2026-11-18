@@ -222,7 +222,7 @@ impl Turns for LocalTurns {
         let Ok(session) = self.rt.get_session(DEFAULT_TENANT, &self.session_id).await else {
             return Ok(Vec::new());
         };
-        Ok(snapshot::open_interrupts(session.state()))
+        Ok(session.read(snapshot::open_interrupts)?)
     }
 
     async fn settled(&self) {

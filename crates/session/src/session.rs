@@ -8,7 +8,7 @@ use crate::entry::{Accepted, Command, CommandId, CommandResult, Entry, Handled, 
 use crate::events::EventPayload;
 use crate::ids::Ids;
 use crate::span::SpanContext;
-use crate::state::{waiting_on_client, ApplyContext, EventMeta, View};
+use crate::state::{waiting_on_client, ApplyContext, EventMeta, SessionState, View};
 use crate::store::{Store, StoreError};
 
 pub struct CommitContext {
@@ -160,12 +160,29 @@ impl Session {
         &self.tenant_id
     }
 
-    pub fn state(&self) -> &View {
+    pub fn state(&self) -> &SessionState {
+        &self.state.state
+    }
+
+    pub fn into_state(self) -> SessionState {
+        self.state.state
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub fn view(&self) -> &View {
         &self.state
     }
 
-    pub fn into_state(self) -> View {
-        self.state
+    /// Reads through the tree. A read the store failed is the error.
+    pub fn read<T>(&self, f: impl FnOnce(&View) -> T) -> Result<T, StoreError> {
+        self.checked(f(&self.state))
+    }
+
+    pub(crate) fn checked<T>(&self, value: T) -> Result<T, StoreError> {
+        match self.state.tree.poisoned() {
+            Some(error) => Err(error),
+            None => Ok(value),
+        }
     }
 
     pub fn seq(&self) -> u64 {
@@ -296,9 +313,7 @@ impl Session {
     ) -> Result<(Option<Draft>, CommandResult), Error> {
         let mut working = Working::new(self.state.clone(), self.seq, now);
         let ran = working.run(command.payload.clone(), &command.caller);
-        if let Some(error) = working.tree_failed() {
-            return Err(error.into());
-        }
+        working.checked()?;
         let (state, events, result) = match ran {
             Ok(()) => {
                 let waiting = working.waiting_turn().map(str::to_string);
@@ -338,9 +353,7 @@ impl Session {
         };
         let mut working = Working::new(self.state.clone(), self.seq, now);
         let ran = working.run(CommandPayload::Wake { now }, &caller);
-        if let Some(error) = working.tree_failed() {
-            return Err(error.into());
-        }
+        working.checked()?;
         if ran.is_err() {
             return Ok(None);
         }

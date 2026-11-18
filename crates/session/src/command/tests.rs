@@ -2372,7 +2372,7 @@ fn a_call_the_worker_asks_again_reads_its_branch_anew() {
             node_msg("u1", Role::User, "hi"),
             node_msg("u2", Role::User, "shorter"),
         ];
-        match agg.open_work().into_iter().find_map(|w| match w {
+        match agg.open_work().unwrap().into_iter().find_map(|w| match w {
             crate::work::Work::AskWorker { request, .. } => Some(request.decision_id),
             _ => None,
         }) {
@@ -2464,6 +2464,7 @@ fn a_retry_sends_the_tools_it_sent_though_they_would_now_differ() {
 
 fn sent_texts(agg: &Session, id: &str) -> Vec<String> {
     agg.open_work()
+        .unwrap()
         .into_iter()
         .find_map(|w| match w {
             crate::Work::CallLlm { call, .. } if call.call_id == id => Some(call.request.messages),
@@ -3008,6 +3009,7 @@ fn a_subagent_carries_its_parents_events_url() {
 
     let subagent = agg
         .open_work()
+        .unwrap()
         .into_iter()
         .find_map(|work| match work {
             crate::work::Work::StartSubagent { subagent, .. } => Some(subagent),
@@ -12926,7 +12928,7 @@ fn a_subagent_retry_is_a_new_attempt_and_a_stale_answer_is_ignored() {
     };
     dispatch(&mut agg, request, &system);
     let attempt = |agg: &Session| {
-        agg.open_work().iter().find_map(|w| match w {
+        agg.open_work().unwrap().iter().find_map(|w| match w {
             crate::work::Work::StartSubagent { work, .. } => work.attempt,
             _ => None,
         })
@@ -13030,6 +13032,7 @@ fn a_system1_call_reads_the_conversation_and_answers_in_a_decision() {
     );
     let work = agg
         .open_work()
+        .unwrap()
         .into_iter()
         .find_map(|w| match w {
             crate::Work::CallSystem1 { call, .. } => Some(call),
@@ -13412,7 +13415,7 @@ fn a_skills_tools_wait_until_it_loads() {
         "loading the skill brings its tools"
     );
     finish_llm(&mut agg, "call-1");
-    while let Some(decision) = agg.open_work().into_iter().find_map(|w| match w {
+    while let Some(decision) = agg.open_work().unwrap().into_iter().find_map(|w| match w {
         crate::work::Work::AskWorker { request, .. } => Some(request.decision_id),
         _ => None,
     }) {
@@ -13679,7 +13682,7 @@ fn settle_tool(agg: &mut Session, id: &str, result: &str) -> Vec<EventPayload> {
 }
 
 fn script_work(agg: &Session) -> Option<crate::work::Script> {
-    let queued = agg.open_work().into_iter().any(|w| {
+    let queued = agg.open_work().unwrap().into_iter().any(|w| {
         matches!(w, crate::work::Work::CallTool { call, .. }
             if call.tool_call_id == "tc-1" && matches!(call.target, crate::work::ToolTarget::Script))
     });
@@ -14041,6 +14044,7 @@ fn the_engine_proposes_running_a_scripts_calls() {
     );
     let proposed = agg
         .open_work()
+        .unwrap()
         .into_iter()
         .find_map(|w| match w {
             crate::Work::AskWorker { work, request, .. } if work.id == decision => {
@@ -14080,6 +14084,7 @@ fn a_worker_can_refuse_a_scripts_call_and_one_it_skips_fails() {
 
 fn proposed_for(agg: &Session, decision: &str) -> crate::protocol::DecisionResponse {
     agg.open_work()
+        .unwrap()
         .into_iter()
         .find_map(|w| match w {
             crate::Work::AskWorker { work, request, .. } if work.id == decision => {
@@ -14297,7 +14302,7 @@ fn code_mode_sends_the_same_tools_on_every_call() {
     );
     load_skill_in_script(&mut agg, "visits");
     finish_llm(&mut agg, "call-1");
-    while let Some(decision) = agg.open_work().into_iter().find_map(|w| match w {
+    while let Some(decision) = agg.open_work().unwrap().into_iter().find_map(|w| match w {
         crate::work::Work::AskWorker { request, .. } => Some(request.decision_id),
         _ => None,
     }) {
@@ -14388,7 +14393,7 @@ fn code_mode_lists_each_skill_with_its_tools_once_in_the_conversation() {
     );
     load_skill_in_script(&mut agg, "visits");
     finish_llm(&mut agg, "call-1");
-    while let Some(decision) = agg.open_work().into_iter().find_map(|w| match w {
+    while let Some(decision) = agg.open_work().unwrap().into_iter().find_map(|w| match w {
         crate::work::Work::AskWorker { request, .. } => Some(request.decision_id),
         _ => None,
     }) {

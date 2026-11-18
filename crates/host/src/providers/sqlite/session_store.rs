@@ -751,6 +751,7 @@ mod tests {
         let decide = |session: &mut Session, id: &str, transcript: Vec<DraftMessage>| {
             let decision_id = session
                 .open_work()
+                .unwrap()
                 .into_iter()
                 .find_map(|w| match w {
                     Work::AskWorker { work, .. } => Some(work.id),
@@ -1003,10 +1004,14 @@ mod cold {
         }
 
         fn asked(&self) -> Option<WorkerDecisionRequest> {
-            self.session.open_work().into_iter().find_map(|w| match w {
-                Work::AskWorker { request, .. } => Some(*request),
-                _ => None,
-            })
+            self.session
+                .open_work()
+                .unwrap()
+                .into_iter()
+                .find_map(|w| match w {
+                    Work::AskWorker { request, .. } => Some(*request),
+                    _ => None,
+                })
         }
 
         fn reply(&mut self, view: Vec<DraftMessage>, state: Option<serde_json::Value>) {
@@ -1077,7 +1082,7 @@ mod cold {
 
         fn path(&self) -> Vec<DraftMessage> {
             self.session
-                .state()
+                .view()
                 .on(&BranchId::MAIN)
                 .transcript()
                 .into_iter()
@@ -1093,8 +1098,8 @@ mod cold {
             let loaded =
                 Session::load(self.store.as_ref(), "s1", "t", Settings::default()).unwrap();
             assert_eq!(
-                serde_json::to_value(loaded.open_work()).unwrap(),
-                serde_json::to_value(self.session.open_work()).unwrap(),
+                serde_json::to_value(loaded.open_work().unwrap()).unwrap(),
+                serde_json::to_value(self.session.open_work().unwrap()).unwrap(),
                 "the work built from a reload is the work built live"
             );
             loaded
@@ -1119,8 +1124,8 @@ mod cold {
         let loaded = Session::load(cold.store.as_ref(), "s1", "t", Settings::default()).unwrap();
         assert_eq!(loaded.version(), cold.session.version());
         assert_eq!(
-            serde_json::to_value(loaded.state()).unwrap(),
-            serde_json::to_value(cold.session.state()).unwrap()
+            serde_json::to_value(loaded.view()).unwrap(),
+            serde_json::to_value(cold.session.view()).unwrap()
         );
         assert!(cold.store.handled(&"again".into()).unwrap().is_some());
     }
@@ -1169,11 +1174,11 @@ mod cold {
 
         let loaded = c.reloaded();
         assert_eq!(
-            serde_json::to_value(loaded.state()).unwrap(),
-            serde_json::to_value(c.session.state()).unwrap(),
+            serde_json::to_value(loaded.view()).unwrap(),
+            serde_json::to_value(c.session.view()).unwrap(),
             "a load from the log is the live state"
         );
-        assert_eq!(loaded.state().tree.versions("u2"), ["u2", "e2"]);
+        assert_eq!(loaded.view().tree.versions("u2"), ["u2", "e2"]);
     }
 
     fn call(id: &str, retry: RetryPolicy) -> Action {
@@ -1233,14 +1238,14 @@ mod cold {
 
         let loaded = c.reloaded();
         assert_eq!(
-            serde_json::to_value(loaded.state()).unwrap(),
-            serde_json::to_value(c.session.state()).unwrap(),
+            serde_json::to_value(loaded.view()).unwrap(),
+            serde_json::to_value(c.session.view()).unwrap(),
             "a load from the log is the live state"
         );
         let contexts = loaded
-            .state()
+            .view()
             .tree
-            .up(loaded.state().leaf(&BranchId::MAIN))
+            .up(loaded.view().leaf(&BranchId::MAIN))
             .filter(|n| matches!(n.fact, Fact::Context { .. }))
             .count();
         assert_eq!(contexts, 2, "one node per request, none for the retry");
@@ -1296,7 +1301,7 @@ mod cold {
         c.drain();
         assert!(
             !c.session
-                .state()
+                .view()
                 .branches
                 .contains_key(&BranchId::from("side")),
             "it closed"
@@ -1309,7 +1314,7 @@ mod cold {
             .unwrap()
             .expect("the log keeps it");
         let at = stored.leaf.or(stored.from);
-        let read = c.session.state().at(at.as_deref());
+        let read = c.session.view().at(at.as_deref());
         assert_eq!(read.config().map(|a| a.model), Some("m2".into()));
         let ancestors = c
             .store

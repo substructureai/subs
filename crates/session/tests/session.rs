@@ -14,7 +14,9 @@ use substructure_session::protocol::{
 };
 use substructure_session::request::WorkerDecisionRequest;
 use substructure_session::state::BranchId;
-use substructure_session::{settle, Command, MemoryStore, Session, Settings, Store, Work};
+use substructure_session::{
+    settle, Command, MemoryStore, Session, Settings, Store, StoreError, Work,
+};
 
 const TENANT: &str = "tenant-a";
 
@@ -196,8 +198,8 @@ fn a_snapshot_gives_the_same_session_as_the_log() {
     let loaded = load(&store, settings);
     assert_eq!(loaded.version(), 3);
     assert_eq!(
-        serde_json::to_value(loaded.state()).unwrap(),
-        serde_json::to_value(session.state()).unwrap()
+        serde_json::to_value(loaded.view()).unwrap(),
+        serde_json::to_value(session.view()).unwrap()
     );
     let decoded = Session::from_json(&session.to_json().unwrap()).unwrap();
     assert_eq!(decoded.seq(), session.seq());
@@ -337,7 +339,7 @@ fn open_work_is_what_a_restart_sends_again() {
         .unwrap();
 
     assert!(matches!(
-        load(&store, Settings::default()).open_work().as_slice(),
+        load(&store, Settings::default()).open_work().unwrap().as_slice(),
         [Work::AskWorker { work, .. }] if work.kind == EffectKind::Decision
     ));
 }
@@ -380,6 +382,7 @@ fn say_with(id: &str, turn: &str, queue: QueueMode, metadata: &[(&str, &str)]) -
 fn finish_open_decision(store: &MemoryStore, session: &mut Session, id: &str) {
     let decision_id = session
         .open_work()
+        .unwrap()
         .into_iter()
         .find_map(|w| match w {
             Work::AskWorker { work, .. } => Some(work.id),
@@ -435,7 +438,7 @@ fn a_voided_subagent_call_mails_its_child_a_cancel() {
         )
         .unwrap();
     let child = session
-        .state()
+        .view()
         .subagent("call-sa")
         .unwrap()
         .session_id
@@ -455,7 +458,7 @@ fn a_voided_subagent_call_mails_its_child_a_cancel() {
         .written
         .unwrap()
         .events;
-    let mail = session.mail(&cancelled);
+    let mail = session.mail(&cancelled).unwrap();
     assert!(
         mail.iter()
             .any(|m| m.to == child
@@ -537,6 +540,7 @@ fn a_decision_carries_the_metadata_of_its_turn() {
 
     let turn = session
         .open_work()
+        .unwrap()
         .into_iter()
         .find_map(|w| match w {
             Work::AskWorker { request, .. } => request.turn,
@@ -678,7 +682,7 @@ fn a_decision_sent_again_after_a_restart_sees_the_config_written_before_it_went_
         )
         .unwrap();
 
-    let resent = load(&store, Settings::default()).open_work();
+    let resent = load(&store, Settings::default()).open_work().unwrap();
 
     let Some(Work::AskWorker { request, .. }) = resent.into_iter().next() else {
         panic!("the message's decision is open");
@@ -1250,6 +1254,7 @@ mod branches {
     fn open_decision(session: &Session) -> String {
         session
             .open_work()
+            .unwrap()
             .into_iter()
             .find_map(|w| match w {
                 Work::AskWorker { work, .. } => Some(work.id),
@@ -1332,7 +1337,7 @@ mod branches {
     }
 
     fn state_value(session: &Session) -> serde_json::Value {
-        session.state().on(&BranchId::MAIN).worker_state().0
+        session.view().on(&BranchId::MAIN).worker_state().0
     }
 
     fn view(store: &MemoryStore, session: &mut Session, n: usize, messages: Vec<DraftMessage>) {
@@ -1358,10 +1363,16 @@ mod branches {
 
     fn drain(store: &MemoryStore, session: &mut Session) {
         for n in 0..10 {
-            let Some(decision_id) = session.open_work().into_iter().find_map(|w| match w {
-                Work::AskWorker { work, .. } => Some(work.id),
-                _ => None,
-            }) else {
+            let Some(decision_id) =
+                session
+                    .open_work()
+                    .unwrap()
+                    .into_iter()
+                    .find_map(|w| match w {
+                        Work::AskWorker { work, .. } => Some(work.id),
+                        _ => None,
+                    })
+            else {
                 return;
             };
             let payload = CommandPayload::SubmitWorkerDecision {
@@ -1396,6 +1407,7 @@ mod branches {
     fn asked(session: &Session) -> WorkerDecisionRequest {
         session
             .open_work()
+            .unwrap()
             .into_iter()
             .find_map(|w| match w {
                 Work::AskWorker { request, .. } => Some(*request),
@@ -1410,7 +1422,7 @@ mod branches {
 
     fn head_ids(session: &Session) -> Vec<String> {
         session
-            .state()
+            .view()
             .on(&BranchId::MAIN)
             .transcript()
             .into_iter()
@@ -1491,7 +1503,7 @@ mod branches {
         );
         assert_eq!(head_ids(&session), ["u1", "a1", "e2", "b2"]);
         assert_eq!(
-            session.state().tree.unwritten().count(),
+            session.view().tree.unwritten().count(),
             0,
             "the session holds no nodes between commands"
         );
@@ -1519,7 +1531,7 @@ mod branches {
     fn a_save_between_turns_survives_an_edit_after_it() {
         let (store, mut session) = two_turns();
         let path: Vec<DraftMessage> = session
-            .state()
+            .view()
             .on(&BranchId::MAIN)
             .transcript()
             .into_iter()
@@ -1566,7 +1578,7 @@ mod branches {
     fn switching_back_finds_a_save_just_before_the_versions_last_message() {
         let (store, mut session) = two_turns();
         let path: Vec<DraftMessage> = session
-            .state()
+            .view()
             .on(&BranchId::MAIN)
             .transcript()
             .into_iter()
@@ -1642,7 +1654,7 @@ mod branches {
         );
         assert_eq!(
             session
-                .state()
+                .view()
                 .tree
                 .get("r2")
                 .and_then(|n| n.parent().map(str::to_string))
@@ -1698,11 +1710,11 @@ mod branches {
     fn an_edit_leaves_only_the_active_branch_in_memory() {
         let (store, session) = started();
 
-        let tree = session.state().message_tree();
+        let tree = session.view().message_tree();
         assert_eq!(tree.head_id.as_deref(), Some("b1"));
-        assert!(session.state().has_node("u1"));
+        assert!(session.view().has_node("u1"));
         assert!(
-            session.state().has_node("a1"),
+            session.view().has_node("a1"),
             "the old branch keeps its last message"
         );
         let a1 = store
@@ -1734,18 +1746,15 @@ mod branches {
         );
 
         assert!(events.iter().any(|e| matches!(e, Logged::BranchMoved(_))));
-        assert_eq!(
-            session.state().message_tree().head_id.as_deref(),
-            Some("a1")
-        );
-        assert!(session.state().has_node("b1"), "the edited branch is kept");
+        assert_eq!(session.view().message_tree().head_id.as_deref(), Some("a1"));
+        assert!(session.view().has_node("b1"), "the edited branch is kept");
         assert_eq!(
             state_value(&session),
             serde_json::json!({ "branch": "first" })
         );
         let reloaded = load(&store, Settings::default());
         assert_eq!(
-            reloaded.state().message_tree().head_id.as_deref(),
+            reloaded.view().message_tree().head_id.as_deref(),
             Some("a1")
         );
         assert_eq!(
@@ -1790,7 +1799,7 @@ mod branches {
         for n in 3..23 {
             turn(&store, &mut session, n);
             let path: Vec<DraftMessage> = session
-                .state()
+                .view()
                 .on(&BranchId::MAIN)
                 .transcript()
                 .into_iter()
@@ -1802,7 +1811,7 @@ mod branches {
                 .collect();
             settled(&store, &mut session, n, path, None);
         }
-        assert!(session.state().message_tree().nodes.len() > 40);
+        assert!(session.view().message_tree().nodes.len() > 40);
 
         turn(&store, &mut session, 30);
         settled(
@@ -1816,9 +1825,165 @@ mod branches {
             Some(serde_json::json!({ "reset": true })),
         );
 
-        assert_eq!(session.state().message_tree().nodes.len(), 2);
+        assert_eq!(session.view().message_tree().nodes.len(), 2);
         let reloaded = load(&store, Settings::default());
-        assert_eq!(reloaded.state().message_tree().nodes.len(), 2);
+        assert_eq!(reloaded.view().message_tree().nodes.len(), 2);
         assert_eq!(state_value(&reloaded), serde_json::json!({ "reset": true }));
     }
+}
+
+struct Unreadable<'a>(&'a MemoryStore);
+
+struct NoNodes;
+
+impl substructure_session::tree::Nodes for NoNodes {
+    fn node(&self, _: &str) -> Result<Option<substructure_session::tree::NodeRef>, StoreError> {
+        Err(gone())
+    }
+    fn ancestors(
+        &self,
+        _: &str,
+        _: usize,
+    ) -> Result<Vec<substructure_session::tree::NodeRef>, StoreError> {
+        Err(gone())
+    }
+    fn children(
+        &self,
+        _: &str,
+        _: Option<&str>,
+    ) -> Result<Vec<substructure_session::tree::NodeRef>, StoreError> {
+        Err(gone())
+    }
+    fn answers(&self, _: &str) -> Result<Vec<substructure_session::tree::NodeRef>, StoreError> {
+        Err(gone())
+    }
+    fn stored(
+        &self,
+        _: &BranchId,
+    ) -> Result<Option<substructure_session::tree::Stored>, StoreError> {
+        Err(gone())
+    }
+    fn versions(
+        &self,
+        _: Option<&str>,
+        _: Option<&str>,
+    ) -> Result<Vec<substructure_session::tree::NodeRef>, StoreError> {
+        Err(gone())
+    }
+}
+
+fn gone() -> StoreError {
+    StoreError::Unavailable("nodes are gone".into())
+}
+
+impl Store for Unreadable<'_> {
+    fn append(&self, entry: &substructure_session::Entry) -> Result<(), StoreError> {
+        self.0.append(entry)
+    }
+    fn read(&self, after_seq: u64) -> Result<substructure_session::Tail, StoreError> {
+        self.0.read(after_seq)
+    }
+    fn events(
+        &self,
+        after_seq: u64,
+        max: usize,
+    ) -> Result<Vec<substructure_session::SessionEvent>, StoreError> {
+        self.0.events(after_seq, max)
+    }
+    fn events_at(
+        &self,
+        seqs: &[u64],
+    ) -> Result<Vec<substructure_session::SessionEvent>, StoreError> {
+        self.0.events_at(seqs)
+    }
+    fn snapshot(&self, session: &Session) -> Result<(), StoreError> {
+        self.0.snapshot(session)
+    }
+    fn latest(&self) -> Result<Option<Session>, StoreError> {
+        self.0.latest()
+    }
+    fn cursors(&self) -> Result<std::collections::BTreeMap<String, u64>, StoreError> {
+        self.0.cursors()
+    }
+    fn set_cursor(&self, consumer: &str, seq: u64) -> Result<(), StoreError> {
+        self.0.set_cursor(consumer, seq)
+    }
+    fn nodes(&self) -> std::sync::Arc<dyn substructure_session::tree::Nodes> {
+        std::sync::Arc::new(NoNodes)
+    }
+    fn handled(
+        &self,
+        id: &substructure_session::CommandId,
+    ) -> Result<Option<(substructure_session::CommandResult, chrono::DateTime<Utc>)>, StoreError>
+    {
+        self.0.handled(id)
+    }
+}
+
+#[test]
+fn a_tree_the_store_cannot_read_fails_the_read_and_writes_nothing() {
+    let store = MemoryStore::new();
+    let mut session = load(&store, Settings::default());
+    session.run(&store, Utc::now(), create("c1")).unwrap();
+    session
+        .run(&store, Utc::now(), say("m1", "t1", QueueMode::Refuse))
+        .unwrap();
+    let decision_id = session
+        .open_work()
+        .unwrap()
+        .into_iter()
+        .find_map(|w| match w {
+            Work::AskWorker { work, .. } => Some(work.id),
+            _ => None,
+        })
+        .expect("a decision is open");
+    let answered = session
+        .run(
+            &store,
+            Utc::now(),
+            Command::system(
+                "d1",
+                TENANT,
+                CommandPayload::SubmitWorkerDecision {
+                    decision_id,
+                    transcript: vec![DraftMessage {
+                        id: Some("u1".into()),
+                        role: Role::User,
+                        content: Some(Content::Text("hi".into())),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        name: None,
+                        reasoning: None,
+                    }],
+                    actions: vec![Action::Done {
+                        data: serde_json::Value::Null,
+                    }],
+                    state: None,
+                    agent: None,
+                },
+            ),
+        )
+        .unwrap();
+    assert!(answered.result.is_ok(), "{:?}", answered.result);
+    assert_eq!(
+        session.read(|view| view.on(&BranchId::MAIN).transcript().len()),
+        Ok(1)
+    );
+
+    let unreadable = Unreadable(&store);
+    let mut loaded = Session::load(&unreadable, "s1", TENANT, Settings::default())
+        .expect("a load reads no nodes");
+    assert!(loaded
+        .read(|view| view.on(&BranchId::MAIN).transcript().len())
+        .is_err());
+
+    let version = store.read(0).unwrap().version;
+    assert!(loaded
+        .run(&unreadable, Utc::now(), say("m2", "t2", QueueMode::Refuse))
+        .is_err());
+    assert_eq!(
+        store.read(0).unwrap().version,
+        version,
+        "nothing is written"
+    );
 }

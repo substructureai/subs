@@ -120,7 +120,7 @@ impl Run {
 
     fn live(&self) -> String {
         self.session
-            .state()
+            .view()
             .effects_of(EffectKind::Decision)
             .find(|e| e.tracking.status() == EffectStatus::Pending)
             .map(|e| e.id.clone())
@@ -130,7 +130,7 @@ impl Run {
     fn live_trigger(&self) -> Trigger {
         let id = self.live();
         self.session
-            .state()
+            .view()
             .worker_decision(&id)
             .unwrap()
             .trigger
@@ -163,7 +163,7 @@ impl Run {
 
     fn path(&self, branch: Option<&str>) -> Vec<DraftMessage> {
         self.session
-            .state()
+            .view()
             .on(&BranchId::from(branch))
             .transcript()
             .into_iter()
@@ -230,7 +230,7 @@ fn a_finished_draft_is_promoted_from_the_log_and_a_reload_agrees() {
     assert!(matches!(run.live_trigger(), Trigger::BranchFinished { .. }));
     assert!(
         !run.session
-            .state()
+            .view()
             .branches
             .contains_key(&BranchId::from("draft-b")),
         "a finished branch leaves the state"
@@ -263,12 +263,12 @@ fn a_finished_draft_is_promoted_from_the_log_and_a_reload_agrees() {
 
     let reloaded = Session::load(&run.store, "s1", TENANT, Settings::default()).unwrap();
     assert_eq!(
-        reloaded.state().leaf(&BranchId::MAIN),
-        run.session.state().leaf(&BranchId::MAIN)
+        reloaded.view().leaf(&BranchId::MAIN),
+        run.session.view().leaf(&BranchId::MAIN)
     );
     assert_eq!(
-        serde_json::to_value(reloaded.state()).unwrap()["branches"],
-        serde_json::to_value(run.session.state()).unwrap()["branches"]
+        serde_json::to_value(reloaded.view()).unwrap()["branches"],
+        serde_json::to_value(run.session.view()).unwrap()["branches"]
     );
 }
 
@@ -343,7 +343,7 @@ fn a_subagent_on_a_branch_goes_on_from_the_log_where_it_left_off() {
     run.decide(d, view, vec![spawn("tc-r", "dig", None)]);
     let branch = run
         .session
-        .state()
+        .view()
         .subagent("tc-r")
         .unwrap()
         .session_id
@@ -424,11 +424,7 @@ fn a_diverging_reply_on_a_branch_moves_its_leaf_and_stays_off_the_chat() {
         )],
     );
     run.reply("b1", "Waves fold into foam");
-    let head = run
-        .session
-        .state()
-        .leaf(&BranchId::MAIN)
-        .map(str::to_string);
+    let head = run.session.view().leaf(&BranchId::MAIN).map(str::to_string);
 
     let d = run.live();
     let mut view = run.path(Some("draft"));
@@ -440,7 +436,7 @@ fn a_diverging_reply_on_a_branch_moves_its_leaf_and_stays_off_the_chat() {
     view.push(text(Some("x1"), Role::Assistant, "Tides pull at the moon"));
     let start = run
         .session
-        .state()
+        .view()
         .open_run(&BranchId::from("draft"))
         .unwrap()
         .from
@@ -460,16 +456,13 @@ fn a_diverging_reply_on_a_branch_moves_its_leaf_and_stays_off_the_chat() {
     assert_eq!(written[0].parent_id.as_deref(), Some(start.as_str()));
     assert_eq!(written[0].branch.as_deref(), Some("draft"));
     assert_eq!(
-        run.session
-            .state()
-            .leaf(&BranchId::MAIN)
-            .map(str::to_string),
+        run.session.view().leaf(&BranchId::MAIN).map(str::to_string),
         head,
         "the chat does not move"
     );
     assert_eq!(
         run.session
-            .state()
+            .view()
             .tree
             .stored(&BranchId::from("draft"))
             .and_then(|b| b.leaf)
@@ -508,7 +501,7 @@ fn drafting() -> (Run, String) {
     run.reply("b1", "Waves fold into foam");
     let start = run
         .session
-        .state()
+        .view()
         .open_run(&BranchId::from("draft"))
         .unwrap()
         .from
@@ -533,7 +526,7 @@ fn a_branch_reply_that_only_drops_messages_moves_its_leaf_back() {
     );
     assert_eq!(
         run.session
-            .state()
+            .view()
             .tree
             .stored(&BranchId::from("draft"))
             .and_then(|b| b.leaf)
@@ -545,11 +538,7 @@ fn a_branch_reply_that_only_drops_messages_moves_its_leaf_back() {
 #[test]
 fn a_branch_reply_never_forks_above_the_branch() {
     let (mut run, start) = drafting();
-    let head = run
-        .session
-        .state()
-        .leaf(&BranchId::MAIN)
-        .map(str::to_string);
+    let head = run.session.view().leaf(&BranchId::MAIN).map(str::to_string);
     let d = run.live();
     let events = run.decide(
         d,
@@ -566,10 +555,7 @@ fn a_branch_reply_never_forks_above_the_branch() {
     assert_eq!(written.len(), 1, "got {events:?}");
     assert_eq!(written[0].parent_id.as_deref(), Some(start.as_str()));
     assert_eq!(
-        run.session
-            .state()
-            .leaf(&BranchId::MAIN)
-            .map(str::to_string),
+        run.session.view().leaf(&BranchId::MAIN).map(str::to_string),
         head
     );
 }

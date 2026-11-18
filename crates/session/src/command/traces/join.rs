@@ -58,6 +58,7 @@ impl Trace {
         let id = self.live_decision();
         self.agg
             .open_work()
+            .unwrap()
             .into_iter()
             .find_map(|w| match w {
                 crate::Work::AskWorker { work, request, .. } if work.id == id => Some(*request),

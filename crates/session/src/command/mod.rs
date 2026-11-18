@@ -479,8 +479,8 @@ impl Working {
         Ok(self)
     }
 
-    pub fn tree_failed(&self) -> Option<crate::store::StoreError> {
-        self.state.tree.poisoned()
+    pub fn checked(&self) -> Result<(), crate::store::StoreError> {
+        self.state.tree.poisoned().map_or(Ok(()), Err)
     }
 
     pub fn waiting_turn(&self) -> Option<&str> {
