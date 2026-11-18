@@ -106,7 +106,7 @@ impl SessionState {
     /// The request the model gets: its prompt, and the tools it was sent.
     pub fn sent_request(&self, id: &str) -> Option<LlmRequest> {
         let call = self.llm_call(id)?;
-        let mut request = call.spec.to_request(call.prompt.clone());
+        let mut request = call.spec.to_request(self.prompt(id)?);
         request.tools = self.tools_sent(id);
         Some(request)
     }
@@ -559,7 +559,6 @@ impl EffectState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmCallState {
-    pub prompt: Vec<Message>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatched_seq: Option<u64>,
     pub llm: String,

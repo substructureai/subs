@@ -623,13 +623,12 @@ mod tests {
     }
 
     fn last_prompt(agg: &Agg) -> Option<Vec<crate::protocol::Message>> {
-        agg.session
-            .state()
+        let state = agg.session.state();
+        let call = state
             .effects_of(EffectKind::LlmCall)
             .filter(|e| e.id != "call-1")
-            .last()
-            .and_then(|e| e.llm())
-            .map(|c| c.prompt.clone())
+            .last()?;
+        state.prompt(&call.id)
     }
 
     #[tokio::test]

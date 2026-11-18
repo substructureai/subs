@@ -94,7 +94,7 @@ kind of call:
 
 | Event | Meaning |
 | --- | --- |
-| `llm.call.requested` | A call was recorded. Its prompt is built from the path up to the node `at`, and `spec` holds the model, tools and settings. A call that brought messages wrote them to a branch of its own first, and `at` is on that branch. |
+| `llm.call.requested` | A call was recorded. `at` is the leaf it was asked at, and `spec` holds the model, tools and settings. Its prompt is built when it is first dispatched, from its branch's leaf then. With `attempt` 0 on a call that has a context node, the worker asked again and the call places anew; a retry from the engine carries a later attempt and reads the node it has. A call that brought messages wrote them to a branch of its own first, and `at` is on that branch. |
 | `llm.call.dispatched` | The call went out. `fingerprint` is a hash of the prompt it sent, with the message ids left out. |
 | `llm.call.completed` | The call returned. |
 | `llm.call.errored` | The call failed. |

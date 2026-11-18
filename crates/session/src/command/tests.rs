@@ -2329,6 +2329,139 @@ fn a_retried_call_sends_what_it_sent_before() {
     assert_eq!(agg.state.tools_sent("llm-1"), tools);
 }
 
+#[test]
+fn a_call_the_worker_asks_again_reads_its_branch_anew() {
+    let ask = |agg: &mut Session, retry: RetryPolicy| {
+        dispatch(
+            agg,
+            CommandPayload::RequestLlmCall {
+                llm: "claude".to_string(),
+                call_id: "llm-1".to_string(),
+                request: test_llm_request(),
+                stream: false,
+                retry,
+                handler: LlmHandler::Server,
+                format: None,
+            },
+            &system(),
+        )
+    };
+    let retrying = RetryPolicy {
+        max_attempts: 3,
+        backoff_base_secs: 60,
+        backoff_max_secs: 60,
+        ..RetryPolicy::no_retry()
+    };
+    for retry in [RetryPolicy::no_retry(), retrying] {
+        let mut agg = create_session("sess-1", "tenant-a", "user-1");
+        append_via_worker(&mut agg, vec![node_msg("u1", Role::User, "hi")]);
+        ask(&mut agg, retry.clone());
+        assert_eq!(sent_texts(&agg, "llm-1"), ["hi"]);
+        let retryable = retry.max_attempts > 1;
+        dispatch(
+            &mut agg,
+            CommandPayload::settle(
+                EffectKind::LlmCall,
+                "llm-1".to_string(),
+                Some(0),
+                SettleError::new(ErrorInfo::internal("refused".to_string()), retryable),
+            ),
+            &system(),
+        );
+        let messages = vec![
+            node_msg("u1", Role::User, "hi"),
+            node_msg("u2", Role::User, "shorter"),
+        ];
+        match agg.open_work().into_iter().find_map(|w| match w {
+            crate::work::Work::AskWorker { request, .. } => Some(request.decision_id),
+            _ => None,
+        }) {
+            Some(decision) => {
+                submit_state(&mut agg, decision, messages, None);
+            }
+            None => append_via_worker(&mut agg, messages),
+        }
+        let events = ask(&mut agg, retry);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, EventPayload::ContextPlaced(_))),
+            "{retryable}: a new asking places anew"
+        );
+        assert_eq!(sent_texts(&agg, "llm-1"), ["hi", "shorter"], "{retryable}");
+    }
+}
+
+#[test]
+fn a_retry_sends_the_tools_it_sent_though_they_would_now_differ() {
+    let mut agg = session_with_connectors(&["sentry"], &["search_issues"]);
+    append_via_worker(&mut agg, vec![node_msg("u1", Role::User, "hi")]);
+    let fingerprint = |events: &[EventPayload]| {
+        events.iter().find_map(|e| match e {
+            EventPayload::LlmCallDispatched(d) => d.fingerprint.clone(),
+            _ => None,
+        })
+    };
+    let first = dispatch(
+        &mut agg,
+        CommandPayload::RequestLlmCall {
+            llm: "claude".to_string(),
+            call_id: "llm-1".to_string(),
+            request: test_llm_request(),
+            stream: false,
+            retry: RetryPolicy {
+                max_attempts: 3,
+                backoff_base_secs: 1,
+                backoff_max_secs: 1,
+                ..RetryPolicy::no_retry()
+            },
+            handler: LlmHandler::Server,
+            format: None,
+        },
+        &system(),
+    );
+    let sent = agg.state.tools_sent("llm-1");
+    dispatch(
+        &mut agg,
+        CommandPayload::settle(
+            EffectKind::LlmCall,
+            "llm-1".to_string(),
+            Some(0),
+            SettleError::new(ErrorInfo::internal("provider hiccup".to_string()), true),
+        ),
+        &system(),
+    );
+    let other = crate::protocol::LlmTool {
+        name: "elsewhere".to_string(),
+        description: String::new(),
+        input: None,
+        output: None,
+        defer: false,
+    };
+    agg.state
+        .effect_mut(EffectKind::LlmCall, "llm-1")
+        .and_then(|e| e.llm_mut())
+        .expect("held for its retry")
+        .spec
+        .tools = Some(vec![other]);
+    let leaf = agg.state.leaf(&BranchId::MAIN).map(str::to_string);
+    let spec = agg.state.llm_call("llm-1").unwrap().spec.tools.clone();
+    assert_ne!(
+        agg.state.at(leaf.as_deref()).sends(spec).0,
+        sent,
+        "worked out again, the tools would differ"
+    );
+    let later = Utc::now() + chrono::Duration::seconds(120);
+    let events = dispatch(&mut agg, CommandPayload::Wake { now: later }, &system());
+    assert!(fingerprint(&first).is_some());
+    assert_eq!(
+        fingerprint(&events),
+        fingerprint(&first),
+        "the retry sends what it sent"
+    );
+    assert_eq!(agg.state.tools_sent("llm-1"), sent);
+}
+
 fn sent_texts(agg: &Session, id: &str) -> Vec<String> {
     agg.open_work()
         .into_iter()
@@ -8131,7 +8264,7 @@ fn a_connection_is_announced_once_in_the_system_prefix() {
             },
             &system(),
         );
-        agg.state.llm_call(id).unwrap().prompt.clone()
+        agg.state.prompt(id).unwrap()
     };
 
     let first = call(&mut agg, "call-1");
@@ -8178,7 +8311,7 @@ fn send_at_head(agg: &mut Session, id: &str) -> Vec<Message> {
         },
         &system(),
     );
-    agg.state.llm_call(id).unwrap().prompt.clone()
+    agg.state.prompt(id).unwrap()
 }
 
 fn context_ids(prompt: &[Message]) -> Vec<String> {
@@ -8317,7 +8450,7 @@ fn announce_never_says_nothing() {
         &system(),
     );
     assert!(
-        agg.state.llm_call("call-1").unwrap().prompt.is_empty(),
+        agg.state.prompt("call-1").unwrap().is_empty(),
         "the engine adds nothing"
     );
 }
@@ -9458,6 +9591,53 @@ fn strict_order_holds_work_behind_a_gated_call() {
         ["llm", "tool"],
         "the queue releases in arrival order; got {events:?}"
     );
+}
+
+#[test]
+fn a_call_held_behind_a_sync_reads_what_landed_on_its_branch_meanwhile() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let d = open_decision(&mut agg, "hi");
+    dispatch(
+        &mut agg,
+        CommandPayload::SubmitWorkerDecision {
+            decision_id: d,
+            transcript: vec![node_msg("u1", Role::User, "hi")],
+            actions: vec![
+                call_llm_action("call-1", LlmHandler::Server),
+                call_llm_action("call-2", LlmHandler::Server),
+            ],
+            state: None,
+            agent: Some(connector_config(&["sentry"])),
+        },
+        &machine(),
+    );
+    let asked = |call: &str| {
+        agg.state
+            .effect(EffectKind::LlmCall, call)
+            .and_then(|e| e.asked_at.clone())
+    };
+    assert_eq!(
+        asked("call-1"),
+        asked("call-2"),
+        "both are asked at one node"
+    );
+    settle_sync(&mut agg, "sentry", &["search_issues"]);
+    let node = |call: &str| {
+        let id = agg
+            .state
+            .llm_call(call)
+            .and_then(|c| c.reads_from.clone())
+            .expect("dispatched");
+        agg.state.tree.get(&id).expect("the node")
+    };
+    assert_eq!(
+        node("call-2").parent(),
+        Some(node("call-1").id()),
+        "the later call reads its branch when it goes, through what the first left there"
+    );
+    let first = sent(&agg, "call-1");
+    let second = sent(&agg, "call-2");
+    assert_eq!(second, first, "and sends the same prompt");
 }
 
 #[test]
@@ -12593,7 +12773,7 @@ fn the_catalog_rides_the_first_prompt_once() {
             },
             &system(),
         );
-        agg.state.llm_call(id).unwrap().prompt.clone()
+        agg.state.prompt(id).unwrap()
     };
 
     let first = prompt(&mut agg, "call-1");
@@ -13258,9 +13438,8 @@ fn an_agents_own_skill_is_listed_once_and_answered_from_the_skills_bundle() {
     dispatched_tools(&mut agg, "call-1");
     let listed: Vec<String> = agg
         .state
-        .llm_call("call-1")
+        .prompt("call-1")
         .expect("the call")
-        .prompt
         .iter()
         .filter_map(|m| match &m.content {
             Some(Content::Text(t)) if t.contains("\"skill\":\"visits\"") => Some(t.clone()),
@@ -13269,10 +13448,11 @@ fn an_agents_own_skill_is_listed_once_and_answered_from_the_skills_bundle() {
         .collect();
     assert_eq!(listed.len(), 1, "one entry for the skill: {listed:?}");
     dispatched_tools(&mut agg, "call-2");
-    let second = agg.state.llm_call("call-2").expect("the call");
+    let second = agg.state.prompt("call-2").expect("the call");
+    let first = agg.state.prompt("call-1").expect("the call");
     assert_eq!(
-        serde_json::to_value(&second.prompt).unwrap(),
-        serde_json::to_value(&agg.state.llm_call("call-1").expect("the call").prompt).unwrap(),
+        serde_json::to_value(&second).unwrap(),
+        serde_json::to_value(&first).unwrap(),
         "a later prompt carries the entry as the earlier call wrote it"
     );
     assert!(
@@ -13295,11 +13475,7 @@ fn searched_skills_are_found_beside_tools_and_not_listed() {
     let mut agg = create_session_with_config("sess-1", "tenant-a", "user-1", Some(config));
     dispatched_tools(&mut agg, "call-1");
     assert!(
-        agg.state
-            .llm_call("call-1")
-            .expect("the call")
-            .prompt
-            .is_empty(),
+        agg.state.prompt("call-1").expect("the call").is_empty(),
         "no skill is listed in the prompt"
     );
 
@@ -14180,9 +14356,8 @@ fn code_mode_lists_each_skill_with_its_tools_once_in_the_conversation() {
     let mut agg = create_session_with_config("sess-1", "tenant-a", "user-1", Some(config));
     let catalog = |agg: &Session, call: &str| -> Vec<String> {
         agg.state
-            .llm_call(call)
+            .prompt(call)
             .expect("the call")
-            .prompt
             .iter()
             .filter_map(|m| match &m.content {
                 Some(crate::protocol::Content::Text(t)) if t.contains("in `run_code`") => {
@@ -14605,8 +14780,9 @@ fn send(agg: &mut Session, id: &str, messages: Vec<DraftMessage>) {
 }
 
 fn sent(agg: &Session, id: &str) -> Vec<(Role, String)> {
-    let call = agg.state.llm_call(id).expect("the call");
-    call.prompt
+    agg.state
+        .prompt(id)
+        .expect("the call")
         .iter()
         .map(|m| {
             let text = m.content.as_ref().map(Content::text_owned);
@@ -14846,13 +15022,13 @@ fn a_dispatch_records_a_fingerprint_of_the_prompt() {
             _ => None,
         })
         .expect("a fingerprint");
-    let call = agg.state.llm_call("call-1").unwrap();
+    let prompt = agg.state.prompt("call-1").unwrap();
     let tools = agg.state.tools_sent("call-1");
     assert_eq!(
         recorded,
-        crate::prompt_context::fingerprint(&call.prompt, &tools)
+        crate::prompt_context::fingerprint(&prompt, &tools)
     );
-    let mut renamed = call.prompt.clone();
+    let mut renamed = prompt.clone();
     renamed[0].id = "other".to_string();
     assert_eq!(
         recorded,

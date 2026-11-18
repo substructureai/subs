@@ -100,15 +100,6 @@ pub struct Session {
     pub(crate) version: u64,
     #[serde(skip)]
     settings: Settings,
-    #[cfg(test)]
-    #[serde(skip)]
-    pub(crate) sent: std::collections::BTreeMap<
-        String,
-        (
-            Vec<crate::protocol::Message>,
-            Option<Vec<crate::protocol::LlmTool>>,
-        ),
-    >,
 }
 
 impl Session {
@@ -124,8 +115,6 @@ impl Session {
             wake_at: None,
             version: 0,
             settings,
-            #[cfg(test)]
-            sent: Default::default(),
         }
     }
 
@@ -463,13 +452,6 @@ impl Session {
                     sequence: seq,
                 },
             );
-            #[cfg(test)]
-            if let EventPayload::LlmCallDispatched(d) = &payload {
-                if let Some(call) = self.state.llm_call(&d.id) {
-                    let tools = self.state.tools_sent(&d.id);
-                    self.sent.insert(d.id.clone(), (call.prompt.clone(), tools));
-                }
-            }
             emitted.push((payload, self.state.event_meta(context.occurred_at)));
         }
         let events = self.stamp(emitted, &context.span, context.occurred_at, None);

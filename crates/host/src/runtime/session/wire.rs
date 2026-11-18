@@ -1470,7 +1470,6 @@ mod tests {
                 unanswered: Vec::new(),
                 format: None,
                 llm: "claude".to_string(),
-                prompt: vec![],
                 spec: LlmCallSpec {
                     model: "m".to_string(),
                     tools: Some(vec![LlmTool {

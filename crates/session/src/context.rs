@@ -284,10 +284,7 @@ pub fn summary_size(state: &SessionState, id: &str) -> usize {
     };
     match leaf {
         Some(leaf) => chars(&state.at(leaf.as_deref()).transcript()),
-        None => state
-            .llm_call(id)
-            .map(|call| chars(&call.prompt))
-            .unwrap_or_default(),
+        None => state.prompt(id).map(|p| chars(&p)).unwrap_or_default(),
     }
 }
 

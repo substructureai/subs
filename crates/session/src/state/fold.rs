@@ -96,7 +96,9 @@ impl SessionState {
             existing.tracking.requeue();
             existing.asked_at = payload.at.clone();
             if let Some(call) = existing.llm_mut() {
-                call.prompt = Vec::new();
+                if payload.attempt == 0 {
+                    call.reads_from = None;
+                }
                 call.llm = payload.llm.clone();
                 call.spec = spec;
                 call.stream = payload.stream;
@@ -112,7 +114,6 @@ impl SessionState {
                 &payload.id,
                 EffectTracking::new_queued(payload.retry.clone()),
                 EffectPayload::LlmCall(LlmCallState {
-                    prompt: Vec::new(),
                     llm: payload.llm.clone(),
                     spec,
                     stream: payload.stream,
@@ -135,35 +136,10 @@ impl SessionState {
         self.enqueue(ctx.sequence, EffectKind::LlmCall, &payload.id);
     }
 
-    fn settle_prompt(&mut self, id: &str) {
-        if let Some(call) = self
-            .effect_mut(EffectKind::LlmCall, id)
-            .and_then(|e| e.llm_mut())
-        {
-            call.prompt = Vec::new();
-        }
-    }
-
     fn apply_llm_dispatched(&mut self, payload: &LlmCallDispatched, ctx: &ApplyContext) {
-        let Some(prompt) = self.prompt(&payload.id) else {
-            self.dequeue(EffectKind::LlmCall, &payload.id);
-            return;
-        };
-        if let Some(recorded) = &payload.fingerprint {
-            let built = prompt_context::fingerprint(&prompt, &self.tools_sent(&payload.id));
-            if *recorded != built {
-                tracing::warn!(
-                    call_id = %payload.id,
-                    %recorded,
-                    %built,
-                    "the prompt built for a call is not the prompt it sent"
-                );
-            }
-        }
         if let Some(effect) = self.effect_mut(EffectKind::LlmCall, &payload.id) {
             effect.tracking.dispatch(ctx.occurred_at);
             if let Some(call) = effect.llm_mut() {
-                call.prompt = prompt;
                 call.dispatched_seq = Some(ctx.sequence);
             }
         }
@@ -380,9 +356,6 @@ impl SessionState {
                 effect.tracking.void();
             }
         }
-        if kind == EffectKind::LlmCall {
-            self.settle_prompt(&p.id);
-        }
         if kind == EffectKind::ToolCall {
             for e in self.effects.values_mut() {
                 match &mut e.payload {
@@ -486,7 +459,6 @@ impl SessionState {
                 if let Some(e) = self.effect_mut(EffectKind::LlmCall, &payload.id) {
                     e.tracking.complete();
                 }
-                self.settle_prompt(&payload.id);
                 if let Some(call) = self
                     .effect_mut(EffectKind::LlmCall, &payload.id)
                     .and_then(|e| e.llm_mut())
@@ -503,12 +475,6 @@ impl SessionState {
                 self.on_turn(|t| t.calls.llm.errors += 1);
                 if let Some(e) = self.effect_mut(EffectKind::LlmCall, &payload.id) {
                     e.tracking.record_error(payload.retryable, now);
-                }
-                if self
-                    .tracking(EffectKind::LlmCall, &payload.id)
-                    .is_some_and(|t| t.status() == EffectStatus::Failed)
-                {
-                    self.settle_prompt(&payload.id);
                 }
             }
             EventPayload::System1CallRequested(p) => self.apply_system1_requested(p, ctx),

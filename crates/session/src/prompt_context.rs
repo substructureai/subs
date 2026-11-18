@@ -876,7 +876,7 @@ mod tests {
         for (i, event) in dispatched.into_iter().enumerate() {
             apply(state, seq + 1 + i as u64, event);
         }
-        state.llm_call(id).unwrap().prompt.clone()
+        state.prompt(id).unwrap()
     }
 
     #[test]

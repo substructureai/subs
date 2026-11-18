@@ -184,10 +184,8 @@ fn text_of(message: &Message) -> String {
 }
 
 fn prompt_texts(agg: &Session, call: &str) -> Vec<String> {
-    agg.sent
-        .get(call)
-        .map(|(prompt, _)| prompt.clone())
-        .or_else(|| agg.state.prompt(call))
+    agg.state
+        .prompt(call)
         .expect("the call builds a prompt")
         .iter()
         .map(text_of)
@@ -723,7 +721,7 @@ fn dispatched_fingerprint(events: &[EventPayload], id: &str) -> Option<String> {
 }
 
 #[test]
-fn a_settled_call_keeps_no_prompt() {
+fn the_state_holds_no_text_of_a_call_in_flight() {
     let mut agg = configured();
     user_turn(&mut agg, "u1", "what is the weather in Paris?", "turn-1");
     let (d, _) = live_decision(&agg);
@@ -740,35 +738,23 @@ fn a_settled_call_keeps_no_prompt() {
             ),
         ],
     );
-    let sent: Vec<(String, String)> = ["c1", "t1"]
-        .iter()
-        .map(|id| {
-            (
-                id.to_string(),
-                dispatched_fingerprint(&events, id).expect("dispatched"),
-            )
-        })
-        .collect();
-    assert!(
-        !agg.state.llm_call("c1").unwrap().prompt.is_empty(),
-        "open: kept"
-    );
-
-    reply(&mut agg, "c1", said("Sunny.", 100));
-    echo(&mut agg);
-    echo(&mut agg);
-    reply(&mut agg, "t1", said("Paris weather", 100));
-    for (id, fingerprint) in sent {
-        assert!(
-            agg.state.llm_call(&id).is_none_or(|c| c.prompt.is_empty()),
-            "{id} settled: the state keeps no prompt"
-        );
+    for id in ["c1", "t1"] {
+        let prompt = agg.state.prompt(id).expect("in flight");
         assert_eq!(
-            crate::prompt_context::fingerprint(&agg.sent[&id].0, &agg.sent[&id].1),
-            fingerprint,
-            "{id}"
+            Some(crate::prompt_context::fingerprint(
+                &prompt,
+                &agg.state.tools_sent(id)
+            )),
+            dispatched_fingerprint(&events, id),
+            "{id}: the reader builds what was sent"
         );
     }
+    let state = serde_json::to_string(&agg.state).unwrap();
+    assert!(!state.contains("Paris"), "no message text in the state");
+    assert!(
+        !state.contains("short title"),
+        "no message text in the state"
+    );
 }
 
 fn with_subagents(branch: crate::protocol::SubagentBranch, id: &str) -> Session {

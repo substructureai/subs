@@ -1055,7 +1055,7 @@ mod tests {
         }
     }
 
-    fn call_state(call_id: &str, prompt: Vec<Message>) -> EffectState {
+    fn call_state(call_id: &str) -> EffectState {
         use crate::state::{EffectPayload, LlmCallState};
         EffectState::new(
             call_id,
@@ -1066,7 +1066,6 @@ mod tests {
                 unanswered: Vec::new(),
                 format: None,
                 llm: "claude".to_string(),
-                prompt,
                 spec: LlmCallSpec {
                     model: "test-model".to_string(),
                     tools: None,
@@ -1318,7 +1317,7 @@ mod tests {
             msg("u1", Role::User, "hi"),
             assistant_with_calls("call-1", &[("tc-1", "researcher")]),
         ];
-        let llm_calls = HashMap::from([("call-1".to_string(), call_state("call-1", vec![]))]);
+        let llm_calls = HashMap::from([("call-1".to_string(), call_state("call-1"))]);
         let trigger = DecisionTrigger::SubagentFinished {
             id: "tc-1".to_string(),
             ok: true,
@@ -1390,7 +1389,7 @@ mod tests {
             msg("u1", Role::User, "hi"),
             assistant_with_calls("call-1", &[("tc-1", "hallucinated")]),
         ];
-        let mut call = call_state("call-1", vec![]);
+        let mut call = call_state("call-1");
         call.llm_mut().unwrap().spec.tools = Some(vec![crate::protocol::LlmTool {
             name: "get_time".to_string(),
             description: "d".to_string(),
@@ -1453,7 +1452,7 @@ mod tests {
             msg("u1", Role::User, "hi"),
             assistant_with_calls("call-1", &[("tc-1", "skill")]),
         ];
-        let mut call = call_state("call-1", vec![msg("u1", Role::User, "hi")]);
+        let mut call = call_state("call-1");
         let llm = call.llm_mut().unwrap();
         llm.spec.tools = Some(vec![tool("find_bookings"), tool("skill")]);
         let llm_calls = HashMap::from([("call-1".to_string(), call)]);
@@ -1487,16 +1486,7 @@ mod tests {
             msg("u1", Role::User, "hi"),
             assistant_with_calls("call-1", &[("tc-1", "get_time")]),
         ];
-        let llm_calls = HashMap::from([(
-            "call-1".to_string(),
-            call_state(
-                "call-1",
-                vec![
-                    msg("s1", Role::System, "be brief"),
-                    msg("u1", Role::User, "hi"),
-                ],
-            ),
-        )]);
+        let llm_calls = HashMap::from([("call-1".to_string(), call_state("call-1"))]);
 
         let p = propose(
             &tool_finished_trigger("tc-1", "get_time", Ok("3pm")),
@@ -1529,7 +1519,7 @@ mod tests {
             msg("u1", Role::User, "hi"),
             assistant_with_calls("call-1", &[("tc-1", "get_time")]),
         ];
-        let llm_calls = HashMap::from([("call-1".to_string(), call_state("call-1", vec![]))]);
+        let llm_calls = HashMap::from([("call-1".to_string(), call_state("call-1"))]);
 
         let p = propose(
             &tool_finished_trigger("tc-1", "get_time", Err("clock offline")),
@@ -2214,7 +2204,7 @@ mod tests {
                 msg("u1", Role::User, "hi"),
                 assistant_with_calls("call-1", &[("tc-1", "sentry__delete")]),
             ],
-            HashMap::from([("call-1".to_string(), call_state("call-1", vec![]))]),
+            HashMap::from([("call-1".to_string(), call_state("call-1"))]),
         )
     }
 
@@ -2304,7 +2294,7 @@ mod tests {
                     &[("tc-1", "sentry__delete"), ("tc-2", "sentry__delete")],
                 ),
             ],
-            HashMap::from([("call-1".to_string(), call_state("call-1", vec![]))]),
+            HashMap::from([("call-1".to_string(), call_state("call-1"))]),
         )
     }
 
@@ -2643,7 +2633,7 @@ mod tests {
                 &[("tc-1", "sentry__search"), ("tc-2", "sentry__delete")],
             ),
         ];
-        let llm_calls = HashMap::from([("call-1".to_string(), call_state("call-1", vec![]))]);
+        let llm_calls = HashMap::from([("call-1".to_string(), call_state("call-1"))]);
         let p = answer(
             "tc-2",
             serde_json::json!({ "approved": false }),

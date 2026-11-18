@@ -180,11 +180,16 @@ fn lowered(action: DecisionAction, id: &str) -> Action {
 }
 
 fn requested(t: &Trace, id: &str) -> Vec<String> {
+    let tree = &t.agg.state.tree;
+    let node = tree
+        .unwritten()
+        .filter(|n| matches!(&n.fact, crate::tree::Fact::Context { call, .. } if call == id))
+        .max_by_key(|n| tree.up(Some(n.id())).count())
+        .expect("requested");
     t.agg
-        .sent
-        .get(id)
-        .expect("requested")
-        .0
+        .state
+        .at(Some(node.id()))
+        .prompt(id)
         .iter()
         .map(|m| {
             m.content

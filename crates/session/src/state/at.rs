@@ -701,7 +701,6 @@ mod open_llm_calls_tests {
                 unanswered: Vec::new(),
                 format: None,
                 llm: "claude".to_string(),
-                prompt: vec![],
                 spec: LlmCallSpec {
                     model: "m".to_string(),
                     tools: None,
