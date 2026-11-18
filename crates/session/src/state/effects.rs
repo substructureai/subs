@@ -1,23 +1,33 @@
 use super::*;
 
 impl SessionState {
-    pub(super) fn release(&mut self) {
-        let held: std::collections::HashSet<(EffectKind, String)> = self
-            .effects_of(EffectKind::Decision)
+    /// What open work names: a decision its trigger's call, a running script
+    /// the calls it made.
+    fn named(&self) -> std::collections::HashSet<(EffectKind, String)> {
+        let running: std::collections::HashSet<&str> = self
+            .effects_of(EffectKind::ToolCall)
+            .filter(|e| e.tracking.is_unsettled())
+            .map(|e| e.id.as_str())
+            .collect();
+        self.effects_of(EffectKind::Decision)
             .filter_map(|e| trigger_effect(&e.decision()?.trigger))
             .map(|(kind, id)| (kind, id.to_string()))
             .chain(
-                self.effects_of(EffectKind::LlmCall)
-                    .filter_map(EffectState::llm)
-                    .flat_map(|c| c.unanswered.iter())
-                    .map(|id| (EffectKind::ToolCall, id.clone())),
+                self.effects_of(EffectKind::ToolCall)
+                    .filter(|e| {
+                        e.tool()
+                            .and_then(|t| t.script.as_ref())
+                            .is_some_and(|s| running.contains(s.parent.as_str()))
+                    })
+                    .map(|e| (EffectKind::ToolCall, e.id.clone())),
             )
-            .collect();
-        let running: std::collections::HashSet<String> = self
-            .effects_of(EffectKind::ToolCall)
-            .filter(|e| e.tracking.is_unsettled())
-            .map(|e| e.id.clone())
-            .collect();
+            .collect()
+    }
+
+    /// An effect leaves when it is settled, its result is recorded if it is a
+    /// tool call, and nothing open names it.
+    pub(super) fn release(&mut self) {
+        let named = self.named();
         let released: Vec<(EffectKind, String)> = self
             .effects
             .iter()
@@ -27,12 +37,8 @@ impl SessionState {
                         key.0,
                         EffectKind::Decision | EffectKind::ConnectorSync | EffectKind::Subagent
                     )
-                    && !held.contains(*key)
-                    && e.llm().is_none_or(|c| c.unanswered.is_empty())
-                    && e.tool().is_none_or(|t| match &t.script {
-                        Some(script) => !running.contains(&script.parent),
-                        None => t.recorded,
-                    })
+                    && !named.contains(*key)
+                    && e.tool().is_none_or(|t| t.script.is_some() || t.recorded)
             })
             .map(|(key, _)| key.clone())
             .collect();
@@ -57,7 +63,6 @@ impl SessionState {
         };
         for e in self.effects.values_mut().filter(|e| e.branch == *branch) {
             match &mut e.payload {
-                EffectPayload::LlmCall(call) => call.unanswered.retain(|id| id != answer),
                 EffectPayload::ToolCall(tool) if e.id == answer => tool.recorded = true,
                 _ => {}
             }
@@ -544,8 +549,6 @@ pub struct LlmCallState {
     pub defer_tools_strategy: DeferToolsStrategy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reads_from: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub unanswered: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

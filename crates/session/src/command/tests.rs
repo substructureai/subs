@@ -14921,6 +14921,79 @@ fn an_explicit_call_first_leaves_the_context_for_the_tree_call() {
 }
 
 #[test]
+fn a_call_leaves_once_its_answer_is_decided_and_the_next_asks_as_it_did() {
+    let mut agg = skilled_session();
+    let u1 = node_msg("u1", Role::User, "hi");
+    record(&mut agg, "hi", vec![u1.clone()]);
+    let time = LlmTool {
+        name: "get_time".to_string(),
+        description: String::new(),
+        input: None,
+        output: None,
+        defer: false,
+    };
+    dispatch(
+        &mut agg,
+        CommandPayload::RequestLlmCall {
+            llm: "claude".to_string(),
+            call_id: "call-1".to_string(),
+            request: LlmRequest {
+                temperature: Some(0.3),
+                tools: Some(vec![time.clone()]),
+                ..request_with(vec![])
+            },
+            stream: false,
+            retry: RetryPolicy::no_retry(),
+            handler: LlmHandler::Server,
+            format: None,
+        },
+        &system(),
+    );
+    finish_llm(&mut agg, "call-1");
+    let decision = agg
+        .open_work()
+        .unwrap()
+        .into_iter()
+        .find_map(|w| match w {
+            crate::work::Work::AskWorker { request, .. } => Some(request.decision_id),
+            _ => None,
+        })
+        .expect("the answer is decided");
+    let a1 = DraftMessage {
+        tool_calls: Some(vec![asks_the_time()]),
+        ..node_msg("call-1", Role::Assistant, "")
+    };
+    submit_state(&mut agg, decision, vec![u1, a1], None);
+    assert!(
+        agg.state.llm_call("call-1").is_none(),
+        "the call leaves while its tool call is open"
+    );
+    assert!(
+        agg.state
+            .tools_sent("call-1")
+            .is_some_and(|t| t.iter().any(|t| t.name == "get_time")),
+        "what it was sent is read from its node"
+    );
+
+    let transcript = agg.state.on(&BranchId::MAIN).transcript();
+    let crate::protocol::DecisionAction::CallLlm {
+        llm,
+        model,
+        temperature,
+        tools,
+        ..
+    } = crate::propose::reissue("tc-1", &[], &transcript, agg.state.on(&BranchId::MAIN))
+        .expect("the next call")
+    else {
+        panic!("an llm.call");
+    };
+    assert_eq!(llm.as_deref(), Some("claude"));
+    assert_eq!(model.as_deref(), Some("test-model"));
+    assert_eq!(temperature, Some(0.3));
+    assert_eq!(tools, Some(vec![time]), "the tools it asked for");
+}
+
+#[test]
 fn a_continuation_of_a_tree_call_leaves_the_prompt_to_the_tree() {
     let mut agg = skilled_session();
     let u1 = node_msg("u1", Role::User, "hi");

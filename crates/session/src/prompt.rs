@@ -114,10 +114,15 @@ impl At<'_, '_> {
 
     /// What `call` asked for and was sent, from its context node on this
     /// path.
-    pub fn sent(&self, call: &str) -> Option<CallSent> {
-        let node = self.up().find(|node| {
+    /// `call`'s context node on this path.
+    pub fn context(&self, call: &str) -> Option<crate::tree::NodeRef> {
+        self.up().find(|node| {
             matches!(&node.fact, crate::tree::Fact::Context { call: here, .. } if here == call)
-        })?;
+        })
+    }
+
+    pub fn sent(&self, call: &str) -> Option<CallSent> {
+        let node = self.context(call)?;
         let crate::tree::Fact::Context { asked, .. } = &node.fact else {
             return None;
         };
@@ -166,13 +171,15 @@ pub fn fingerprint(prompt: &[Message], tools: &Option<Vec<crate::protocol::LlmTo
 
 impl View {
     pub fn prompt(&self, id: &str) -> Option<Vec<Message>> {
-        let effect = self.effect(EffectKind::LlmCall, id)?;
-        let node = effect
-            .llm()?
-            .reads_from
-            .as_deref()
-            .or(effect.asked_at.as_deref());
-        Some(self.at(node).prompt(id))
+        let node = match self.effect(EffectKind::LlmCall, id) {
+            Some(effect) => effect
+                .llm()?
+                .reads_from
+                .clone()
+                .or_else(|| effect.asked_at.clone()),
+            None => Some(self.at(Some(id)).context(id)?.id().to_string()),
+        };
+        Some(self.at(node.as_deref()).prompt(id))
     }
 }
 

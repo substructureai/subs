@@ -95,7 +95,6 @@ impl SessionState {
                     format: payload.format,
                     reads_from: None,
                     dispatched_seq: None,
-                    unanswered: Vec::new(),
                     defer_tools_strategy: payload.defer_tools_strategy,
                 }),
                 &BranchId::from(payload.branch.clone()),
@@ -314,7 +313,6 @@ impl SessionState {
         if kind == EffectKind::ToolCall {
             for e in self.effects.values_mut() {
                 match &mut e.payload {
-                    EffectPayload::LlmCall(call) => call.unanswered.retain(|id| *id != p.id),
                     EffectPayload::ToolCall(tool) if e.id == p.id => tool.recorded = true,
                     _ => {}
                 }
@@ -408,17 +406,6 @@ impl SessionState {
                 }
                 if let Some(e) = self.effect_mut(EffectKind::LlmCall, &payload.id) {
                     e.tracking.complete();
-                }
-                if let Some(call) = self
-                    .effect_mut(EffectKind::LlmCall, &payload.id)
-                    .and_then(|e| e.llm_mut())
-                {
-                    call.unanswered = payload
-                        .response
-                        .tool_calls
-                        .iter()
-                        .map(|c| c.id.clone())
-                        .collect();
                 }
             }
             EventPayload::LlmCallErrored(payload) => {
