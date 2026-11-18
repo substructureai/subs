@@ -256,7 +256,7 @@ impl SqliteSessionStore {
                     node.map(Node::id),
                     node.and_then(Node::parent),
                     node.map(kind),
-                    indexed.branch,
+                    indexed.branch(),
                     prev,
                     indexed.answers(),
                     envelope,
@@ -270,7 +270,7 @@ impl SqliteSessionStore {
     fn write_branches(&self, tx: &Transaction, entry: &Entry) -> Result<(), StoreError> {
         for event in &entry.events {
             let indexed = index(event.seq, &event.payload);
-            let key = indexed.branch.unwrap_or_default();
+            let key = indexed.branch().unwrap_or_default();
             if let Some(started) = indexed.started.filter(|_| !indexed.continues()) {
                 tx.execute(
                     "INSERT INTO session_branches (tenant_id, session_id, branch_id, from_node)

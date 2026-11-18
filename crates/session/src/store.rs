@@ -104,7 +104,7 @@ impl Store for MemoryStore {
                 space.nodes.insert(indexed.seq, node.clone());
             }
             if indexed.moves() {
-                let key = BranchId::from(indexed.branch);
+                let key = BranchId::from(indexed.branch());
                 let known = space.leaves.remove(&key);
                 if let Some(stored) = indexed.stored(known) {
                     space.leaves.insert(key, stored);

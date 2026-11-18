@@ -206,7 +206,7 @@ impl Tree {
                 .entry(node.id().to_string())
                 .or_insert_with(|| node.clone());
         }
-        let key = BranchId::from(indexed.branch);
+        let key = BranchId::from(indexed.branch());
         if let Some(p) = indexed.started.filter(|_| !indexed.continues()) {
             self.pending.insert(
                 key.clone(),
@@ -435,11 +435,15 @@ pub struct Indexed<'a> {
     pub seq: u64,
     pub node: Option<NodeRef>,
     pub started: Option<&'a BranchStarted>,
-    pub branch: Option<&'a str>,
+    moved: Option<&'a str>,
     pub leaf: Option<String>,
 }
 
 impl Indexed<'_> {
+    pub fn branch(&self) -> Option<&str> {
+        self.moved.or_else(|| self.node.as_ref()?.branch())
+    }
+
     pub fn stored(&self, known: Option<Stored>) -> Option<Stored> {
         let mut stored = match self.started {
             Some(p) if p.leaf.is_none() => Some(Stored {
@@ -471,18 +475,13 @@ impl Indexed<'_> {
 }
 
 pub fn index(seq: u64, event: &EventPayload) -> Indexed<'_> {
-    let (started, branch) = match event {
+    let node = Node::of_event(event).map(|entry| Arc::new(Logged { seq, entry }));
+    let (started, moved) = match event {
         EventPayload::BranchStarted(p) => (Some(&**p), Some(p.id.as_str())),
         EventPayload::BranchFinished(p) => (None, Some(p.id.as_str())),
         EventPayload::BranchMoved(p) => (None, p.branch.as_deref()),
-        EventPayload::NewMessage(m) => (None, m.branch.as_deref()),
-        EventPayload::StateUpdated(v) => (None, v.node.branch.as_deref()),
-        EventPayload::ConfigUpdated(v) => (None, v.node.branch.as_deref()),
-        EventPayload::ConfigReset(v) => (None, v.node.branch.as_deref()),
-        EventPayload::ContextPlaced(c) => (None, c.node.branch.as_deref()),
         _ => (None, None),
     };
-    let node = Node::of_event(event).map(|entry| Arc::new(Logged { seq, entry }));
     let leaf = match event {
         EventPayload::BranchMoved(p) => Some(p.leaf.clone()),
         EventPayload::BranchStarted(p) if p.leaf.is_some() => p.leaf.clone(),
@@ -492,7 +491,7 @@ pub fn index(seq: u64, event: &EventPayload) -> Indexed<'_> {
         seq,
         node,
         started,
-        branch,
+        moved,
         leaf,
     }
 }

@@ -339,9 +339,6 @@ impl SessionState {
                 self.worker = payload.worker.clone();
                 self.events = payload.events.clone();
             }
-            EventPayload::NewMessage(payload) => {
-                self.answered(&payload.message, &BranchId::from(payload.branch.clone()));
-            }
             EventPayload::BranchStarted(p) => {
                 if let Some(l) = self.limited.as_mut().filter(|l| l.open()) {
                     if p.parent.is_none() && crate::context::is_summary_branch(&l.call.id, &p.id) {
@@ -378,17 +375,11 @@ impl SessionState {
             }
             EventPayload::LlmCallRequested(payload) => self.apply_llm_requested(payload, ctx),
             EventPayload::LlmCallDispatched(payload) => self.apply_llm_dispatched(payload, ctx),
-            EventPayload::StateUpdated(_)
+            EventPayload::NewMessage(_)
+            | EventPayload::StateUpdated(_)
             | EventPayload::ConfigUpdated(_)
-            | EventPayload::ConfigReset(_) => {}
-            EventPayload::ContextPlaced(payload) => {
-                if let Some(call) = self
-                    .effect_mut(EffectKind::LlmCall, &payload.call)
-                    .and_then(|e| e.llm_mut())
-                {
-                    call.reads_from = Some(payload.node.id.clone());
-                }
-            }
+            | EventPayload::ConfigReset(_)
+            | EventPayload::ContextPlaced(_) => {}
             EventPayload::LlmCallCompleted(payload) => {
                 let branch = self
                     .effect(EffectKind::LlmCall, &payload.id)
@@ -780,6 +771,20 @@ impl SessionState {
         }
         let indexed = crate::tree::index(ctx.sequence, event);
         if let Some(node) = &indexed.node {
+            match &node.fact {
+                crate::tree::Fact::Message { message, .. } => {
+                    self.answered(message, &BranchId::from(node.branch()))
+                }
+                crate::tree::Fact::Context { call, .. } => {
+                    if let Some(call) = self
+                        .effect_mut(EffectKind::LlmCall, call)
+                        .and_then(|e| e.llm_mut())
+                    {
+                        call.reads_from = Some(node.id().to_string());
+                    }
+                }
+                _ => {}
+            }
             self.grow(&node.entry);
         }
         indexed
