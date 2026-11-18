@@ -436,7 +436,19 @@ impl SessionState {
                     });
             }
             EventPayload::BranchClosed(p) => {
-                self.branches.remove(&BranchId::from(p.id.as_str()));
+                let id = BranchId::from(p.id.as_str());
+                match self.names(&id) {
+                    true => {
+                        if let Some(open) = self.branches.get_mut(&id) {
+                            if let Some(started) = open.started.take() {
+                                open.leaf = open.leaf.take().or(started.from);
+                            }
+                        }
+                    }
+                    false => {
+                        self.branches.remove(&id);
+                    }
+                }
             }
             EventPayload::BranchMoved(payload) => {
                 let branch = BranchId::from(payload.branch.clone());

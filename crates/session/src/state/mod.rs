@@ -554,6 +554,11 @@ impl SessionState {
         self.branches.get(branch)?.started.as_ref()
     }
 
+    pub fn names(&self, branch: &BranchId) -> bool {
+        self.effects.values().any(|e| e.branch == *branch)
+            || self.open_interrupts.iter().any(|i| i.branch == *branch)
+    }
+
     pub fn side_branches(&self) -> impl Iterator<Item = (&str, &BranchState)> {
         self.branches
             .iter()
@@ -647,17 +652,7 @@ impl SessionState {
             .effects_of(EffectKind::Decision)
             .filter(|e| e.tracking.status == EffectStatus::Pending)
             .filter_map(|e| e.decision())
-            .any(|d| {
-                let node = match self.branches.contains_key(&d.branch) {
-                    true => self.leaf(&d.branch).map(str::to_string),
-                    false => d
-                        .branch
-                        .name()
-                        .and_then(|b| self.tree.branch(b))
-                        .and_then(|r| r.leaf.or(r.state.from)),
-                };
-                self.at(node.as_deref()).has_pending_connector_sync()
-            })
+            .any(|d| self.on(&d.branch).has_pending_connector_sync())
         {
             return Err(
                 "a decision is live while a fetch its config owes is in flight".to_string(),

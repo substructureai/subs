@@ -289,7 +289,7 @@ impl Working {
         call_id: &str,
         messages: Vec<DraftMessage>,
     ) -> Result<String, Unstarted> {
-        if self.branches.contains_key(&BranchId::from(call_id)) {
+        if self.started(&BranchId::from(call_id)).is_some() {
             return Ok(call_id.to_string());
         }
         let (from, shared) = self.recorded_prefix(&messages);

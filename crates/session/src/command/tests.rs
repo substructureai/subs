@@ -11383,6 +11383,102 @@ fn resume_with_a_live_escape_decision_queues_the_trigger() {
 }
 
 #[test]
+fn a_closed_branch_reads_its_own_leaf_until_nothing_names_it() {
+    let mut agg = create_session("sess-1", "tenant-a", "user-1");
+    let ctx = CommitContext {
+        span: SpanContext::root(),
+        occurred_at: Utc::now(),
+    };
+    let ids = crate::ids::Ids::new("t", 0, Utc::now());
+    let msg = |id: &str, parent: &str, branch: Option<&str>| {
+        EventPayload::NewMessage(NewMessage {
+            message: node_msg(id, Role::User, "m").record(&ids),
+            parent_id: Some(parent.to_string()),
+            copied_from: None,
+            branch: branch.map(str::to_string),
+        })
+    };
+    agg.commit(
+        vec![EventPayload::NewMessage(NewMessage {
+            message: node_msg("u1", Role::User, "m").record(&ids),
+            parent_id: None,
+            copied_from: None,
+            branch: None,
+        })],
+        &ctx,
+    );
+    agg.commit(
+        vec![
+            EventPayload::BranchStarted(Box::new(BranchStarted {
+                id: "b".to_string(),
+                node: "b-start".to_string(),
+                from: Some("u1".to_string()),
+                parent: None,
+                agent: crate::decision::BranchConfig::Inherit,
+                name: None,
+                mode: crate::protocol::BranchMode::Detached,
+                depth: 1,
+                detached: true,
+                turn_id: None,
+                subagent: None,
+                leaf: None,
+            })),
+            EventPayload::LlmCallRequested(LlmCallRequested {
+                defer_tools_strategy: Default::default(),
+                llm: "claude".to_string(),
+                format: None,
+                id: "c-b".to_string(),
+                attempt: 0,
+                spec: crate::state::LlmCallSpec::from(&request_with(vec![])),
+                at: Some("u1".to_string()),
+                stream: false,
+                retry: RetryPolicy::no_retry(),
+                handler: LlmHandler::Server,
+                branch: Some("b".to_string()),
+            }),
+            msg("x1", "u1", Some("b")),
+            EventPayload::BranchClosed(BranchClosed {
+                id: "b".to_string(),
+                reason: BranchEnd::Closed,
+                data: serde_json::Value::Null,
+                error: None,
+                leaf: Some("x1".to_string()),
+            }),
+        ],
+        &ctx,
+    );
+    let b = BranchId::from("b");
+    assert!(agg.state.started(&b).is_none(), "the branch's run ended");
+    assert_eq!(agg.state.leaf(&b), Some("x1"), "its call still reads it");
+    let path: Vec<String> = agg
+        .state
+        .on(&b)
+        .transcript()
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    assert_eq!(path, ["u1", "x1"]);
+
+    agg.commit(
+        vec![
+            EventPayload::CallVoided(CallVoided {
+                kind: EffectKind::LlmCall,
+                id: "c-b".to_string(),
+            }),
+            EventPayload::DecisionDropped(DecisionDropped {
+                id: "none".to_string(),
+                messages: Vec::new(),
+            }),
+        ],
+        &ctx,
+    );
+    assert!(
+        !agg.state.branches.contains_key(&b),
+        "and leaves once nothing names it"
+    );
+}
+
+#[test]
 fn interrupt_voiding_is_scoped_to_the_parked_path() {
     let mut agg = create_session("sess-1", "tenant-a", "user-1");
     let ctx = CommitContext {

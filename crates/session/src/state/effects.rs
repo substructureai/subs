@@ -40,6 +40,15 @@ impl SessionState {
             self.remove_effect(kind, &id);
             self.dequeue(kind, &id);
         }
+        let ended: Vec<BranchId> = self
+            .branches
+            .iter()
+            .filter(|(id, open)| !id.is_main() && open.started.is_none() && !self.names(id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ended {
+            self.branches.remove(&id);
+        }
     }
 
     pub(super) fn answered(&mut self, message: &Message, branch: &BranchId) {

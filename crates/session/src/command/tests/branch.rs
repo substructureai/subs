@@ -1363,3 +1363,33 @@ fn a_message_branch_spawns_within_the_sessions_subagent_limit() {
     });
     assert!(refused, "{events:?}");
 }
+
+#[test]
+fn every_branch_reads_the_same_way() {
+    let mut agg = turn_with_side_call(BranchMode::Blocking);
+    let texts = |at: crate::state::At<'_, '_>| -> Vec<String> {
+        at.transcript().iter().map(text_of).collect()
+    };
+    let main = agg.state.on(&BranchId::MAIN);
+    let title = agg.state.on(&BranchId::from("title"));
+    assert_eq!(texts(main), ["what is the weather in Paris?"]);
+    assert_eq!(
+        texts(title),
+        ["what is the weather in Paris?", "Write a short title."]
+    );
+    assert_eq!(
+        title.config().map(|c| c.model),
+        main.config().map(|c| c.model),
+        "a branch that inherits reads its parent's config"
+    );
+
+    let first = agg.state.leaf(&BranchId::MAIN).unwrap().to_string();
+    reply(&mut agg, "c1", said("Sunny.", 10));
+    echo(&mut agg);
+    assert_ne!(agg.state.leaf(&BranchId::MAIN), Some(first.as_str()));
+    assert_eq!(
+        texts(agg.state.at(Some(&first))),
+        ["what is the weather in Paris?"],
+        "an older leaf reads the conversation as it was"
+    );
+}
