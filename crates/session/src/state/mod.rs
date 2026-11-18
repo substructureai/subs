@@ -972,7 +972,7 @@ impl SessionState {
                 .script
                 .as_ref()
                 .and_then(|s| self.tool_call(&s.parent))
-                .map(|parent| parent.script_language)
+                .and_then(|parent| parent.script_language())
                 .unwrap_or_default();
             return Some(super::engine_tools::script_find(
                 at,

@@ -477,8 +477,10 @@ pub enum ConnectorTarget {
     /// A tool a skill holds back, called before that skill loaded. The engine
     /// answers it with an error and runs nothing.
     Locked,
-    /// `run_code`.
-    Code,
+    /// `run_code`, whose script is in `language`.
+    Code {
+        language: crate::codemode::Language,
+    },
     /// A call a script may not make. The engine answers it with `reason`.
     Refused {
         reason: String,
@@ -500,7 +502,7 @@ impl ConnectorTarget {
             Self::Skill { .. } => ConnectorToolKind::Skill,
             Self::Attachment => ConnectorToolKind::Attachment,
             Self::Locked | Self::Refused { .. } => ConnectorToolKind::Call,
-            Self::Code => ConnectorToolKind::Code,
+            Self::Code { .. } => ConnectorToolKind::Code,
         }
     }
 }

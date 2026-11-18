@@ -144,7 +144,7 @@ stream with that to watch the child.
 
 | Event | Payload |
 | --- | --- |
-| `session.interrupted` | `{ interrupt_id, origin, reason, payload, anchor?, branch? }`. `anchor` is the head it pauses, on `branch`. Without it, every branch pauses. |
+| `session.interrupted` | `{ interrupt_id, origin, reason, payload, anchor?, branch? }`. `anchor` is the head it pauses, on `branch`. Without it, every branch pauses. A `decision.dropped` follows for each decision it held. |
 | `session.interrupt_resumed` | `{ interrupt_id, payload }`. |
 
 ## State and config

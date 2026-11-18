@@ -632,8 +632,6 @@ pub struct ToolCallState {
     pub is_error: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub script: Option<ScriptCaller>,
-    /// For `run_code`: the language its script is in.
-    pub script_language: crate::codemode::Language,
     /// For `run_code`: CPU its script's runs have used.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub script_cpu_ms: u64,
@@ -650,6 +648,16 @@ pub struct ToolCallState {
     pub script_asked: Vec<ScriptAsk>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub recorded: bool,
+}
+
+impl ToolCallState {
+    /// For `run_code`: the language its script is in.
+    pub fn script_language(&self) -> Option<crate::codemode::Language> {
+        match self.target {
+            Some(ConnectorTarget::Code { language }) => Some(language),
+            _ => None,
+        }
+    }
 }
 
 pub(crate) fn is_zero(n: &u64) -> bool {

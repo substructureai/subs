@@ -156,14 +156,6 @@ impl SessionState {
             if !self.detached(&BranchId::from(payload.branch.clone())) {
                 self.on_turn(|t| t.calls.tool.count += 1);
             }
-            let script_language = match payload.target {
-                Some(ConnectorTarget::Code) => self
-                    .on(&BranchId::from(payload.branch.clone()))
-                    .config()
-                    .and_then(|c| c.codemode)
-                    .unwrap_or_default(),
-                _ => Default::default(),
-            };
             self.insert_effect(
                 &payload.id,
                 EffectTracking::new_queued(payload.retry.clone()),
@@ -175,7 +167,6 @@ impl SessionState {
                     result: None,
                     is_error: false,
                     script: payload.script.clone(),
-                    script_language,
                     script_cpu_ms: 0,
                     script_file_bytes: 0,
                     script_skill_files: None,
@@ -267,16 +258,6 @@ impl SessionState {
                 anchor: payload.anchor.clone(),
                 branch: BranchId::from(payload.branch.clone()),
             });
-        }
-        let lane = self.lane(&BranchId::from(payload.branch.clone()));
-        let held: Vec<(EffectKind, String)> = self
-            .effects_of(EffectKind::Decision)
-            .filter(|e| e.tracking.status() == EffectStatus::Pending)
-            .filter(|e| self.lane(&e.branch) == lane)
-            .map(|e| (EffectKind::Decision, e.id.clone()))
-            .collect();
-        for key in held {
-            self.effects.remove(&key);
         }
     }
 

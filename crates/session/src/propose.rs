@@ -1011,7 +1011,6 @@ mod tests {
                 result: None,
                 is_error: false,
                 script: None,
-                script_language: Default::default(),
                 script_cpu_ms: 0,
                 script_file_bytes: 0,
                 script_skill_files: None,

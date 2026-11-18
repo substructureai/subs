@@ -664,6 +664,13 @@ impl Working {
             return;
         }
         let anchor = self.leaf(&scope).map(str::to_string);
+        let lane = self.lane(&scope);
+        let held: Vec<EventPayload> = self
+            .effects_of(EffectKind::Decision)
+            .filter(|e| e.tracking.status() == EffectStatus::Pending)
+            .filter(|e| self.lane(&e.branch) == lane)
+            .map(|e| self.decision_dropped(&e.id))
+            .collect();
         self.emit(EventPayload::SessionInterrupted(SessionInterrupted {
             interrupt_id,
             origin,
@@ -672,6 +679,9 @@ impl Working {
             anchor: anchor.clone(),
             branch: scope.into(),
         }));
+        for dropped in held {
+            self.emit(dropped);
+        }
         self.void_llm_calls_for_interrupt(anchor);
     }
 

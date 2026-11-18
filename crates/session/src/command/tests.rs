@@ -13727,7 +13727,10 @@ fn run_code_runs_its_script_in_the_engine() {
         _ => None,
     });
     let requested = requested.expect("run_code is requested");
-    assert_eq!(requested.target, Some(ConnectorTarget::Code));
+    assert!(matches!(
+        requested.target,
+        Some(ConnectorTarget::Code { .. })
+    ));
     assert_eq!(requested.handler, ToolHandler::Server);
     let script = script_work(&agg).expect("the script is sent to run");
     assert_eq!(script.code, "return 1;");

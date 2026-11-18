@@ -461,8 +461,8 @@ impl Session {
                     .unwrap_or_else(|_| serde_json::json!({})),
                 requester: Requester::of_owner(state.owner.as_ref()),
             },
-            ConnectorTarget::Code if !state.script_runs(id) => return None,
-            ConnectorTarget::Code => ToolTarget::Script,
+            ConnectorTarget::Code { .. } if !state.script_runs(id) => return None,
+            ConnectorTarget::Code { .. } => ToolTarget::Script,
             ConnectorTarget::Subagent => return None,
             _ => ToolTarget::Local,
         };
@@ -497,7 +497,7 @@ impl Session {
     fn scripts_released(&self) -> Vec<Work> {
         self.state
             .effects_of(EffectKind::ToolCall)
-            .filter(|e| e.tool().and_then(|t| t.target.as_ref()) == Some(&ConnectorTarget::Code))
+            .filter(|e| e.tool().and_then(|t| t.script_language()).is_some())
             .filter_map(|e| self.tool(&e.id, e.tracking.retry.attempts))
             .collect()
     }
@@ -507,7 +507,7 @@ impl Session {
     pub fn script(&self, id: &str, limits: &crate::codemode::Limits) -> Option<Script> {
         let state = &self.state;
         let effect = self.open(EffectKind::ToolCall, id, None)?;
-        if effect.tool()?.target != Some(ConnectorTarget::Code) || !state.script_runs(id) {
+        if effect.tool()?.script_language().is_none() || !state.script_runs(id) {
             return None;
         }
         let arguments: serde_json::Value = serde_json::from_str(&effect.tool()?.arguments).ok()?;
@@ -543,7 +543,7 @@ impl Session {
             .collect();
         Some(Script {
             version: crate::codemode::VERSION,
-            language: effect.tool()?.script_language,
+            language: effect.tool()?.script_language()?,
             code: arguments.get("code")?.as_str()?.to_string(),
             calls,
             spent,

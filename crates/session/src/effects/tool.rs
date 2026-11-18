@@ -195,7 +195,7 @@ fn with_skill_tools(state: &SessionState, id: &str, mut result: StoredResult) ->
         .script
         .as_ref()
         .and_then(|s| state.tool_call(&s.parent))
-        .map(|parent| parent.script_language)
+        .and_then(|parent| parent.script_language())
         .unwrap_or_default();
     let tools: Vec<&crate::protocol::LlmTool> = tools.iter().collect();
     if let Some(block) = codemode::declarations(language, &tools) {
@@ -230,7 +230,7 @@ fn script_step(
         || !state.script_asked(parent).is_empty();
     let is_script = state
         .tool_call(parent)
-        .is_some_and(|t| t.target == Some(ConnectorTarget::Code));
+        .is_some_and(|t| t.script_language().is_some());
     if stale || !is_script {
         return Vec::new();
     }
@@ -501,7 +501,9 @@ fn requested(
         Some(tool) if tool.kind == ConnectorToolKind::Call => unwrap_call(here, name, arguments),
         Some(tool) if tool.kind == ConnectorToolKind::Code => {
             let target = match argument(&arguments, "code") {
-                Some(_) => ConnectorTarget::Code,
+                Some(_) => ConnectorTarget::Code {
+                    language: here.config().and_then(|c| c.codemode).unwrap_or_default(),
+                },
                 None => ConnectorTarget::Refused {
                     reason: crate::prompts::codemode::code_missing(&name),
                 },
@@ -544,7 +546,7 @@ fn requested(
         None => (name.clone(), arguments, here.tool_handler(&name), None),
     };
     let retry = match target {
-        Some(ConnectorTarget::Code) => codemode::retry(),
+        Some(ConnectorTarget::Code { .. }) => codemode::retry(),
         _ => RetryPolicy::resolve(retry, here.retry_config().as_ref(), handler.retry_target()),
     };
     ToolCallRequested {
