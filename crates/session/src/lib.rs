@@ -19,6 +19,7 @@ pub mod json;
 pub mod message;
 pub mod mime;
 pub mod plugins;
+pub mod prompt;
 pub mod prompt_context;
 pub mod prompts;
 pub mod propose;

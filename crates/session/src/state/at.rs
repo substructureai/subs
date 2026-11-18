@@ -16,16 +16,6 @@ impl SessionState {
         self.at(self.leaf(branch))
     }
 
-    pub fn prompt(&self, id: &str) -> Option<Vec<Message>> {
-        let effect = self.effect(EffectKind::LlmCall, id)?;
-        let node = effect
-            .llm()?
-            .reads_from
-            .as_deref()
-            .or(effect.asked_at.as_deref());
-        Some(self.at(node).prompt(id))
-    }
-
     pub fn path_ids(&self, node: &str) -> std::collections::HashSet<String> {
         self.tree.path_ids(node)
     }
@@ -111,12 +101,6 @@ pub struct SkillCall {
     pub scripted: bool,
 }
 
-#[derive(Debug, Clone)]
-pub struct Placing {
-    pub prompt: Vec<Message>,
-    pub placed: Vec<prompt_context::Placed>,
-}
-
 #[derive(Clone, Copy)]
 pub struct At<'a, 'n> {
     state: &'a SessionState,
@@ -132,7 +116,7 @@ impl<'a, 'n> At<'a, 'n> {
         self.node
     }
 
-    fn up(&self) -> crate::tree::Ancestors<'a> {
+    pub(crate) fn up(&self) -> crate::tree::Ancestors<'a> {
         self.state.tree.up(self.node)
     }
 
@@ -307,32 +291,6 @@ impl<'a, 'n> At<'a, 'n> {
             .collect()
     }
 
-    /// In code mode, the one tool the model gets: `run_code`, declaring the
-    /// tools a script calls that are not deferred. It does not change while
-    /// the session runs, but for tools that connect later.
-    /// The tools a call asking for `asked` is sent from here, and how its
-    /// context node records them.
-    pub fn sends(&self, asked: Option<Vec<LlmTool>>) -> (Option<Vec<LlmTool>>, crate::tree::Tools) {
-        let tools = match self.run_code() {
-            Some(run_code) => Some(vec![run_code]),
-            None => sent_tools(asked, &self.connector_tools().tools, &self.locked_tools()),
-        };
-        let recorded = self.up().find_map(|node| match &node.fact {
-            crate::tree::Fact::Context { tools: here, .. } => {
-                Some((node.id().to_string(), here.clone()))
-            }
-            _ => None,
-        });
-        let record = match recorded {
-            Some((_, crate::tree::Tools::As(set))) if self.state.tree.tools(&set) == tools => {
-                crate::tree::Tools::As(set)
-            }
-            Some((id, crate::tree::Tools::Set(set))) if set == tools => crate::tree::Tools::As(id),
-            _ => crate::tree::Tools::Set(tools.clone()),
-        };
-        (tools, record)
-    }
-
     pub fn run_code(&self) -> Option<LlmTool> {
         let language = self.config()?.codemode?;
         let tools = self.searchable_tools();
@@ -459,63 +417,6 @@ impl<'a, 'n> At<'a, 'n> {
             .into_iter()
             .flat_map(|p| p.ids)
             .collect()
-    }
-
-    pub fn prompt(&self, call: &str) -> Vec<Message> {
-        let view: Vec<DraftMessage> = self
-            .transcript()
-            .into_iter()
-            .map(DraftMessage::from)
-            .collect();
-        let mut prompt: Vec<Message> = match self.config() {
-            Some(config) => config.prompt_for(&view),
-            None => view,
-        }
-        .into_iter()
-        .enumerate()
-        .map(|(i, m)| m.recorded(format!("{call}:{i}")))
-        .collect();
-        prompt_context::restore(&mut prompt, &self.placed_on_path());
-        prompt
-    }
-
-    pub fn place(&self, call: &str) -> Placing {
-        let mut prompt = self.prompt(call);
-        let mut placed = Vec::new();
-        let open = prompt_context::Open {
-            system: self.system_prefix_open(),
-            inline: self.inline_open(),
-        };
-        prompt_context::merge(
-            &mut prompt,
-            &mut placed,
-            call,
-            open,
-            prompt_context::owed(*self),
-        );
-        Placing { prompt, placed }
-    }
-
-    pub fn system_prefix_open(&self) -> bool {
-        for node in self.up() {
-            match &node.fact {
-                crate::tree::Fact::Context { .. } => return false,
-                crate::tree::Fact::Reset { .. } => break,
-                _ => {}
-            }
-        }
-        true
-    }
-
-    fn inline_open(&self) -> bool {
-        for node in self.up() {
-            match &node.fact {
-                crate::tree::Fact::Context { .. } => return false,
-                crate::tree::Fact::Message { .. } => return true,
-                _ => {}
-            }
-        }
-        true
     }
 
     pub fn call_tool_target(&self, named: &str) -> Option<CallTarget> {
@@ -1047,26 +948,4 @@ mod tree_tests {
         let parents: Vec<_> = tree.nodes.iter().map(|n| n.parent_id.clone()).collect();
         assert_eq!(parents, vec![None, Some("u1".to_string())]);
     }
-}
-
-/// The tools a call sends: those it asked for, then its connections', but
-/// those a skill holds back.
-fn sent_tools(
-    asked: Option<Vec<LlmTool>>,
-    connector_tools: &[ConnectorTool],
-    locked: &BTreeMap<String, Vec<String>>,
-) -> Option<Vec<LlmTool>> {
-    let mut sent = asked;
-    if !connector_tools.is_empty() {
-        let tools = sent.get_or_insert_with(Vec::new);
-        for tool in connector_tools {
-            if !tools.iter().any(|t| t.name == tool.name) {
-                tools.push(tool.to_llm_tool());
-            }
-        }
-    }
-    if let Some(tools) = sent.as_mut() {
-        tools.retain(|t| !locked.contains_key(&t.name));
-    }
-    sent
 }

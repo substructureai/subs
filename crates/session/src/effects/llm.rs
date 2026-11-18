@@ -105,7 +105,7 @@ impl KindSpec for LlmSpec {
         events.push(EventPayload::LlmCallDispatched(LlmCallDispatched {
             id: id.to_string(),
             attempt: effect.tracking.retry.attempts,
-            fingerprint: Some(crate::prompt_context::fingerprint(&prompt, &tools)),
+            fingerprint: Some(crate::prompt::fingerprint(&prompt, &tools)),
         }));
         events
     }

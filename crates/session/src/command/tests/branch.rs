@@ -741,7 +741,7 @@ fn the_state_holds_no_text_of_a_call_in_flight() {
     for id in ["c1", "t1"] {
         let prompt = agg.state.prompt(id).expect("in flight");
         assert_eq!(
-            Some(crate::prompt_context::fingerprint(
+            Some(crate::prompt::fingerprint(
                 &prompt,
                 &agg.state.tools_sent(id)
             )),

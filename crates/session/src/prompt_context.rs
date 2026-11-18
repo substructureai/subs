@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::protocol::{Content, DraftMessage, McpAnnounce, Message, Role, StoredContent};
+use crate::protocol::{Content, McpAnnounce, Message, Role, StoredContent};
 use crate::state::At;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -234,18 +234,6 @@ pub fn restore(prompt: &mut Vec<Message>, placed: &[Placed]) {
     }
 }
 
-pub fn fingerprint(prompt: &[Message], tools: &Option<Vec<crate::protocol::LlmTool>>) -> String {
-    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
-    for m in prompt {
-        let mut m = DraftMessage::from(m.clone());
-        m.id = None;
-        hasher.update(&serde_json::to_vec(&m).unwrap_or_default());
-        hasher.update(b"\n");
-    }
-    hasher.update(&serde_json::to_vec(tools).unwrap_or_default());
-    format!("{:016x}", hasher.digest())
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct Open {
     pub system: bool,
@@ -387,6 +375,7 @@ mod tests {
         ConfigUpdated, ConnectorSyncCompleted, ConnectorSyncErrored, ConnectorSyncRequested,
         EventPayload,
     };
+    use crate::prompt::fingerprint;
     use crate::protocol::{
         AgentConfig, AgentPlugin, ErrorCode, ErrorInfo, McpServer, McpToolSyncFailure, RetryPolicy,
         SkillMeta, StoredContent,

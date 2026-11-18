@@ -15025,21 +15025,12 @@ fn a_dispatch_records_a_fingerprint_of_the_prompt() {
         .expect("a fingerprint");
     let prompt = agg.state.prompt("call-1").unwrap();
     let tools = agg.state.tools_sent("call-1");
-    assert_eq!(
-        recorded,
-        crate::prompt_context::fingerprint(&prompt, &tools)
-    );
+    assert_eq!(recorded, crate::prompt::fingerprint(&prompt, &tools));
     let mut renamed = prompt.clone();
     renamed[0].id = "other".to_string();
-    assert_eq!(
-        recorded,
-        crate::prompt_context::fingerprint(&renamed, &tools)
-    );
+    assert_eq!(recorded, crate::prompt::fingerprint(&renamed, &tools));
     renamed[0].content = Some(Content::Text("be long".to_string()));
-    assert_ne!(
-        recorded,
-        crate::prompt_context::fingerprint(&renamed, &tools)
-    );
+    assert_ne!(recorded, crate::prompt::fingerprint(&renamed, &tools));
 }
 
 mod branch;

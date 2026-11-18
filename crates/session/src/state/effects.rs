@@ -94,23 +94,6 @@ impl SessionState {
         self.effect(EffectKind::LlmCall, id).and_then(|e| e.llm())
     }
 
-    /// The tools a call was sent, or asked for before it was dispatched.
-    pub fn tools_sent(&self, id: &str) -> Option<Vec<LlmTool>> {
-        let call = self.llm_call(id)?;
-        match call.reads_from.as_deref() {
-            Some(node) => self.tree.tools(node),
-            None => call.spec.tools.clone(),
-        }
-    }
-
-    /// The request the model gets: its prompt, and the tools it was sent.
-    pub fn sent_request(&self, id: &str) -> Option<LlmRequest> {
-        let call = self.llm_call(id)?;
-        let mut request = call.spec.to_request(self.prompt(id)?);
-        request.tools = self.tools_sent(id);
-        Some(request)
-    }
-
     pub fn tool_call(&self, id: &str) -> Option<&ToolCallState> {
         self.effect(EffectKind::ToolCall, id).and_then(|e| e.tool())
     }
