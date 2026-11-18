@@ -273,7 +273,7 @@ pub fn wake_at(state: &View, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         .effects
         .values()
         .filter(|e| match &e.payload {
-            EffectPayload::ConnectorSync(_) => true,
+            EffectPayload::ConnectorSync => true,
             EffectPayload::Decision(d) => !state.decision_parked(&d.trigger),
             _ => !state.anchor_parked(e.asked_at.as_deref()),
         })
@@ -291,9 +291,8 @@ mod tests {
     };
     use crate::retry::RetryTarget;
     use crate::state::{
-        ConnectorSyncState, EffectPayload, EffectState, EffectTracking, LlmCallSpec, LlmCallState,
-        Open, OpenInterrupt, QueueEntry, SubagentCallState, ToolCallState, Turn,
-        WorkerDecisionState,
+        EffectPayload, EffectState, EffectTracking, LlmCallSpec, LlmCallState, Open, OpenInterrupt,
+        QueueEntry, SubagentCallState, ToolCallState, Turn, WorkerDecisionState,
     };
 
     fn epoch() -> DateTime<Utc> {
@@ -497,14 +496,10 @@ mod tests {
         s.put_effect(EffectState::new(
             "mcp.conn-1",
             tracking(EffectStatus::Pending),
-            EffectPayload::ConnectorSync(ConnectorSyncState {
-                tools: vec![],
-                prefix: None,
-                error: None,
-                auth: None,
-                instructions: None,
-            }),
+            EffectPayload::ConnectorSync,
         ));
+        s.connections
+            .insert(ConnectionPath::Mcp("conn-1".into()), Default::default());
         add_llm(&mut s, "call-1", EffectStatus::Queued);
         add_tool(&mut s, "tc-1", EffectStatus::Queued);
         queue(&mut s, EffectKind::LlmCall, "call-1");

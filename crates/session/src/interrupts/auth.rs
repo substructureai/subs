@@ -37,7 +37,7 @@ fn needing(at: At) -> Option<(ConnectionPath, AuthNeed)> {
         if server.auth_failure == McpAuthFailure::Degrade {
             return None;
         }
-        let need = state.connector_sync(&server.path)?.auth?;
+        let need = state.connection(&server.path)?.auth?;
         state
             .open_interrupt(&interrupt_id(&server.path))
             .is_none()

@@ -901,9 +901,10 @@ impl Working {
                         .on(&BranchId::MAIN)
                         .config()
                         .is_some_and(|c| self.state.servers_for(&c).iter().any(|m| m.path == id));
-                    let settled = self
-                        .tracking(EffectKind::ConnectorSync, &id.to_string())
-                        .is_some_and(|t| !t.is_in_flight());
+                    let settled = self.connections.contains_key(&id)
+                        && self
+                            .tracking(EffectKind::ConnectorSync, &id.to_string())
+                            .is_none_or(|t| !t.is_in_flight());
                     if !named || !settled {
                         tracing::warn!(
                             connection = %id,

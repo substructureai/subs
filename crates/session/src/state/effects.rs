@@ -33,10 +33,7 @@ impl SessionState {
             .iter()
             .filter(|(key, e)| {
                 !e.tracking.is_unsettled()
-                    && !matches!(
-                        key.0,
-                        EffectKind::Decision | EffectKind::ConnectorSync | EffectKind::Subagent
-                    )
+                    && !matches!(key.0, EffectKind::Decision | EffectKind::Subagent)
                     && !named.contains(*key)
                     && e.tool().is_none_or(|t| t.script.is_some() || t.recorded)
             })
@@ -176,9 +173,8 @@ impl SessionState {
         answered
     }
 
-    pub fn connector_sync(&self, path: &ConnectionPath) -> Option<&ConnectorSyncState> {
-        self.effect(EffectKind::ConnectorSync, &path.to_string())
-            .and_then(|e| e.connector())
+    pub fn connection(&self, path: &ConnectionPath) -> Option<&Connection> {
+        self.connections.get(path)
     }
 
     pub fn worker_decision(&self, id: &str) -> Option<&WorkerDecisionState> {
@@ -239,7 +235,7 @@ impl SessionState {
                         wire.handler = Some(c.handler.into());
                         wire.stream = Some(c.stream);
                     }
-                    EffectPayload::ConnectorSync(_) => wire.name = Some(e.id.clone()),
+                    EffectPayload::ConnectorSync => wire.name = Some(e.id.clone()),
                     EffectPayload::System1Call(c) => wire.name = Some(c.system1.clone()),
                     EffectPayload::Decision(_) => return None,
                 }
@@ -466,7 +462,7 @@ pub enum EffectPayload {
     LlmCall(LlmCallState),
     ToolCall(ToolCallState),
     Subagent(SubagentCallState),
-    ConnectorSync(ConnectorSyncState),
+    ConnectorSync,
     Decision(WorkerDecisionState),
     System1Call(System1CallState),
 }
@@ -477,7 +473,7 @@ impl EffectPayload {
             EffectPayload::LlmCall(_) => EffectKind::LlmCall,
             EffectPayload::ToolCall(_) => EffectKind::ToolCall,
             EffectPayload::Subagent(_) => EffectKind::Subagent,
-            EffectPayload::ConnectorSync(_) => EffectKind::ConnectorSync,
+            EffectPayload::ConnectorSync => EffectKind::ConnectorSync,
             EffectPayload::Decision(_) => EffectKind::Decision,
             EffectPayload::System1Call(_) => EffectKind::System1Call,
         }
@@ -513,7 +509,6 @@ payload_views! {
     llm, llm_mut => LlmCall(LlmCallState),
     tool, tool_mut => ToolCall(ToolCallState),
     subagent, subagent_mut => Subagent(SubagentCallState),
-    connector, connector_mut => ConnectorSync(ConnectorSyncState),
     decision, decision_mut => Decision(WorkerDecisionState),
     system1, system1_mut => System1Call(System1CallState),
 }
@@ -661,8 +656,11 @@ pub struct System1CallState {
     pub request: System1Request,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConnectorSyncState {
+/// What a connection answered when it was last synced.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Connection {
+    pub status: Synced,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<RemoteTool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix: Option<String>,
@@ -672,6 +670,15 @@ pub struct ConnectorSyncState {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<AuthNeed>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Synced {
+    #[default]
+    Asked,
+    Ready,
+    Failed,
 }
 
 pub(super) fn trigger_effect(trigger: &Trigger) -> Option<(EffectKind, &str)> {

@@ -21,7 +21,7 @@ impl SessionState {
         branch: &BranchId,
     ) {
         let anchor = match payload {
-            EffectPayload::ConnectorSync(_) => None,
+            EffectPayload::ConnectorSync => None,
             _ => self.leaf(branch).map(str::to_string),
         };
         let turn = match self.detached(branch) {
@@ -572,54 +572,51 @@ impl SessionState {
             }
             EventPayload::CallVoided(p) => self.apply_call_voided(p),
             EventPayload::ConnectorSyncRequested(p) => {
+                self.connections.entry(p.path.clone()).or_default().status = Synced::Asked;
                 if !self.has_effect(EffectKind::ConnectorSync, &p.path.to_string()) {
                     self.insert_effect(
                         &p.path.to_string(),
                         EffectTracking::new(p.retry.clone(), now),
-                        EffectPayload::ConnectorSync(ConnectorSyncState {
-                            tools: Vec::new(),
-                            prefix: None,
-                            instructions: None,
-                            error: None,
-                            auth: None,
-                        }),
+                        EffectPayload::ConnectorSync,
                         &BranchId::MAIN,
                     );
                 }
                 if let Some(e) = self.effect_mut(EffectKind::ConnectorSync, &p.path.to_string()) {
-                    match e.tracking.status() {
-                        EffectStatus::Failed | EffectStatus::Completed => e.tracking.restart(now),
-                        _ => e.tracking.dispatch(now),
-                    }
+                    e.tracking.dispatch(now);
                 }
             }
             EventPayload::ConnectorSyncCompleted(p) => {
+                let connection = self.connections.entry(p.path.clone()).or_default();
+                connection.status = Synced::Ready;
+                connection.tools = p.tools.clone();
+                connection.prefix = p.prefix.clone();
+                connection.instructions = p.instructions.clone();
+                connection.error = None;
+                connection.auth = None;
                 if let Some(e) = self.effect_mut(EffectKind::ConnectorSync, &p.path.to_string()) {
                     e.tracking.complete();
-                    if let Some(sync) = e.connector_mut() {
-                        sync.tools = p.tools.clone();
-                        sync.prefix = p.prefix.clone();
-                        sync.instructions = p.instructions.clone();
-                        sync.error = None;
-                        sync.auth = None;
-                    }
                 }
+                self.release();
             }
             EventPayload::ConnectorSyncErrored(p) => {
-                if let Some(e) = self.effect_mut(EffectKind::ConnectorSync, &p.path.to_string()) {
-                    e.tracking.record_error(p.retryable, now);
-                    if let Some(sync) = e.connector_mut() {
-                        sync.error = Some(p.error.message.clone());
-                        sync.auth = p.auth;
-                    }
+                let failed = self
+                    .effect_mut(EffectKind::ConnectorSync, &p.path.to_string())
+                    .map(|e| {
+                        e.tracking.record_error(p.retryable, now);
+                        e.tracking.status() == EffectStatus::Failed
+                    })
+                    .unwrap_or(false);
+                let connection = self.connections.entry(p.path.clone()).or_default();
+                connection.error = Some(p.error.message.clone());
+                connection.auth = p.auth;
+                if failed {
+                    connection.status = Synced::Failed;
+                    self.release();
                 }
             }
             EventPayload::ConnectorAuthFailed(p) => {
-                if let Some(sync) = self
-                    .effect_mut(EffectKind::ConnectorSync, &p.path.to_string())
-                    .and_then(EffectState::connector_mut)
-                {
-                    sync.auth = Some(p.auth);
+                if let Some(connection) = self.connections.get_mut(&p.path) {
+                    connection.auth = Some(p.auth);
                 }
             }
             EventPayload::SessionCancelled => {

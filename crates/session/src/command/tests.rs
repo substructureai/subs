@@ -7581,6 +7581,23 @@ fn declaring_a_connector_fetches_it_and_parks_the_turn() {
 }
 
 #[test]
+fn a_finished_sync_leaves_the_work_and_its_tools_are_still_offered() {
+    let mut agg = session_with_connectors(&["sentry"], &["search_issues"]);
+    assert!(
+        agg.state
+            .tracking(EffectKind::ConnectorSync, "mcp.sentry")
+            .is_none(),
+        "the sync is done work"
+    );
+    assert!(offered(&agg).contains(&"sentry__search_issues".to_string()));
+    let tools = dispatched_tools(&mut agg, "call-1");
+    assert!(
+        tools.contains(&"sentry__search_issues".to_string()),
+        "the next call is sent the connection's tools: {tools:?}"
+    );
+}
+
+#[test]
 fn syncing_a_connection_again_revives_its_settled_failure() {
     let mut agg = create_session_with_config(
         "sess-1",
@@ -7599,11 +7616,18 @@ fn syncing_a_connection_again_revives_its_settled_failure() {
         ),
         &system(),
     );
-    assert_eq!(
+    assert!(
         agg.state
             .tracking(EffectKind::ConnectorSync, "mcp.sentry")
-            .map(|t| t.status()),
-        Some(EffectStatus::Failed),
+            .is_none(),
+        "a sync that failed for good leaves the work"
+    );
+    assert_eq!(
+        agg.state
+            .connection(&ConnectionPath::Mcp("sentry".into()))
+            .map(|c| c.status),
+        Some(crate::state::Synced::Failed),
+        "and the connection reads as unavailable"
     );
 
     let d = open_decision(&mut agg, "hi");
@@ -7625,7 +7649,7 @@ fn syncing_a_connection_again_revives_its_settled_failure() {
     let tracking = agg
         .state
         .tracking(EffectKind::ConnectorSync, "mcp.sentry")
-        .expect("the same entry, re-armed");
+        .expect("fresh work");
     assert_eq!(tracking.status(), EffectStatus::Pending);
     assert_eq!(
         tracking.retry.attempts, 0,
@@ -7635,7 +7659,7 @@ fn syncing_a_connection_again_revives_its_settled_failure() {
     settle_sync(&mut agg, "sentry", &["search_issues"]);
     assert!(
         agg.state
-            .connector_sync(&ConnectionPath::Mcp("sentry".into()))
+            .connection(&ConnectionPath::Mcp("sentry".into()))
             .is_some_and(|c| c.auth.is_none() && !c.tools.is_empty()),
         "the offer lands and the connection is authorized again"
     );
@@ -7674,7 +7698,7 @@ fn syncing_a_connection_again_clears_an_auth_failure_a_call_found() {
     );
     assert_eq!(
         agg.state
-            .connector_sync(&ConnectionPath::Mcp("sentry".into()))
+            .connection(&ConnectionPath::Mcp("sentry".into()))
             .and_then(|c| c.auth),
         Some(AuthNeed::Reauthorize),
         "the fetch is still Completed; only the credential died"
@@ -7699,7 +7723,7 @@ fn syncing_a_connection_again_clears_an_auth_failure_a_call_found() {
 
     let sync = agg
         .state
-        .connector_sync(&ConnectionPath::Mcp("sentry".into()))
+        .connection(&ConnectionPath::Mcp("sentry".into()))
         .expect("still one entry");
     assert_eq!(sync.auth, None, "the fetch that succeeded proves the fix");
     assert_eq!(sync.tools.len(), 2, "and its offer replaces the old one");
@@ -7751,7 +7775,7 @@ fn a_call_refused_for_its_credential_marks_the_connection_not_just_the_call() {
     );
     assert!(
         agg.state
-            .connector_sync(&ConnectionPath::Mcp("sentry".into()))
+            .connection(&ConnectionPath::Mcp("sentry".into()))
             .is_some_and(|c| c.auth.is_none()),
         "the connection starts clean: its fetch succeeded"
     );
@@ -7773,7 +7797,7 @@ fn a_call_refused_for_its_credential_marks_the_connection_not_just_the_call() {
 
     assert_eq!(
         agg.state
-            .connector_sync(&ConnectionPath::Mcp("sentry".into()))
+            .connection(&ConnectionPath::Mcp("sentry".into()))
             .and_then(|c| c.auth),
         Some(AuthNeed::Reauthorize),
         "the connection now needs authorizing, however the call settled"
@@ -7813,7 +7837,7 @@ fn a_plain_call_failure_leaves_the_connection_authorized() {
 
     assert!(
         agg.state
-            .connector_sync(&ConnectionPath::Mcp("sentry".into()))
+            .connection(&ConnectionPath::Mcp("sentry".into()))
             .is_some_and(|c| c.auth.is_none()),
         "a tool saying no is not the credential being refused"
     );
@@ -12617,10 +12641,8 @@ fn a_plugins_server_re_fetches_when_a_person_authorizes_it() {
         &system(),
     );
     assert_eq!(
-        agg.state
-            .tracking(EffectKind::ConnectorSync, &path.to_string())
-            .map(|t| t.status()),
-        Some(EffectStatus::Failed),
+        agg.state.connection(&path).map(|c| c.status),
+        Some(crate::state::Synced::Failed),
     );
 
     let d = open_decision(&mut agg, "hi");

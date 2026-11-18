@@ -121,7 +121,7 @@ pub fn sync(state: &SessionState, config: &AgentConfig) -> Vec<EventPayload> {
     state
         .servers_for(config)
         .iter()
-        .filter(|c| !state.has_effect(EffectKind::ConnectorSync, &c.path.to_string()))
+        .filter(|c| !state.connections.contains_key(&c.path))
         .map(|c| {
             EventPayload::ConnectorSyncRequested(ConnectorSyncRequested {
                 path: c.path.clone(),

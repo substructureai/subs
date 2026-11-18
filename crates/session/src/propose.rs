@@ -917,7 +917,7 @@ mod tests {
     };
     use crate::state::BranchId;
     use crate::state::{
-        ConnectorSyncState, EffectPayload, EffectTracking, LlmCallSpec, ToolCallState,
+        Connection, EffectPayload, EffectTracking, LlmCallSpec, Synced, ToolCallState,
     };
 
     fn state_of(
@@ -1035,17 +1035,13 @@ mod tests {
         }
     }
 
-    fn sentry_sync(sync: ConnectorSyncState) -> EffectState {
-        let mut tracking = EffectTracking::new(RetryPolicy::no_retry(), Utc::now());
-        match sync.auth {
-            Some(_) => tracking.record_error(false, Utc::now()),
-            None => tracking.complete(),
-        }
-        EffectState::new(
-            ConnectionPath::Mcp("sentry".into()).to_string(),
-            tracking,
-            EffectPayload::ConnectorSync(sync),
-        )
+    fn sentry(s: &mut View, mut connection: Connection) {
+        connection.status = match connection.auth {
+            Some(_) => Synced::Failed,
+            None => Synced::Ready,
+        };
+        s.connections
+            .insert(ConnectionPath::Mcp("sentry".into()), connection);
     }
 
     fn gated_state(
@@ -1056,13 +1052,17 @@ mod tests {
     ) -> View {
         let config = with_sentry(config, defer);
         let mut s = state_of(transcript, llm_calls, Some(&config));
-        s.put_effect(sentry_sync(ConnectorSyncState {
-            tools: vec![remote("search", false), remote("delete", true)],
-            prefix: Some("sentry".to_string()),
-            instructions: None,
-            error: None,
-            auth: None,
-        }));
+        sentry(
+            &mut s,
+            Connection {
+                tools: vec![remote("search", false), remote("delete", true)],
+                prefix: Some("sentry".to_string()),
+                instructions: None,
+                error: None,
+                auth: None,
+                ..Default::default()
+            },
+        );
         s
     }
 
@@ -2803,13 +2803,17 @@ mod tests {
     fn needing_auth_state(transcript: &[Message], config: Option<&AgentConfig>) -> View {
         let config = with_sentry(config, false);
         let mut s = state_of(transcript, &HashMap::new(), Some(&config));
-        s.put_effect(sentry_sync(ConnectorSyncState {
-            tools: Vec::new(),
-            prefix: None,
-            instructions: None,
-            error: Some("401".to_string()),
-            auth: Some(AuthNeed::Reauthorize),
-        }));
+        sentry(
+            &mut s,
+            Connection {
+                tools: Vec::new(),
+                prefix: None,
+                instructions: None,
+                error: Some("401".to_string()),
+                auth: Some(AuthNeed::Reauthorize),
+                ..Default::default()
+            },
+        );
         s
     }
 

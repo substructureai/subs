@@ -199,7 +199,7 @@ impl<'a, 'n> At<'a, 'n> {
             .servers_for(&config)
             .into_iter()
             .find(|c| c.path == *connector_id)?;
-        let sync = self.state.connector_sync(connector_id)?;
+        let sync = self.state.connection(connector_id)?;
         Some(Source {
             server,
             offered: sync.tools.clone(),
@@ -216,8 +216,8 @@ impl<'a, 'n> At<'a, 'n> {
             .iter()
             .filter(|c| {
                 self.state
-                    .effect(EffectKind::ConnectorSync, &c.path.to_string())
-                    .is_some_and(|e| e.tracking.is_ready())
+                    .connection(&c.path)
+                    .is_some_and(|s| s.status == Synced::Ready)
             })
             .filter_map(|c| self.connector_source(&c.path))
             .collect()
@@ -342,13 +342,8 @@ impl<'a, 'n> At<'a, 'n> {
             .into_iter()
             .filter(|c| c.tool_sync_failure.warns())
             .filter_map(|c| {
-                let effect = self
-                    .state
-                    .effect(EffectKind::ConnectorSync, &c.path.to_string())?;
-                if effect.tracking.status() != EffectStatus::Failed {
-                    return None;
-                }
-                Some((c.path.clone(), effect.connector().and_then(|s| s.auth)))
+                let connection = self.state.connection(&c.path)?;
+                (connection.status == Synced::Failed).then(|| (c.path.clone(), connection.auth))
             })
             .collect()
     }
@@ -447,11 +442,7 @@ impl<'a, 'n> At<'a, 'n> {
         self.state
             .servers_for(&config)
             .iter()
-            .filter(|c| {
-                !self
-                    .state
-                    .has_effect(EffectKind::ConnectorSync, &c.path.to_string())
-            })
+            .filter(|c| !self.state.connections.contains_key(&c.path))
             .map(|c| c.path.clone())
             .collect()
     }

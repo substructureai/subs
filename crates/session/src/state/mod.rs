@@ -480,6 +480,9 @@ pub struct SessionState {
     #[serde(with = "effect_table", default = "BTreeMap::new")]
     pub effects: BTreeMap<(EffectKind, String), EffectState>,
 
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub connections: BTreeMap<ConnectionPath, Connection>,
+
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub schedule_queue: Vec<QueueEntry>,
 
@@ -530,6 +533,7 @@ impl SessionState {
             worker: None,
             events: None,
             effects: BTreeMap::new(),
+            connections: BTreeMap::new(),
             schedule_queue: Vec::new(),
             turn: None,
             turns: 0,
@@ -741,9 +745,8 @@ impl SessionState {
             ));
         }
         resolutions.extend(servers.iter().filter_map(|connector| {
-            let effect = self.effect(EffectKind::ConnectorSync, &connector.path.to_string())?;
-            let sync = effect.connector()?;
-            effect.tracking.is_ready().then(|| {
+            let sync = self.connection(&connector.path)?;
+            (sync.status == Synced::Ready).then(|| {
                 filter::resolve(
                     connector,
                     &sync.tools,
