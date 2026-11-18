@@ -187,7 +187,6 @@ pub enum Trigger {
     #[serde(rename = "llm.execute")]
     LlmExecute {
         id: String,
-        request: LlmRequest,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         format: Option<LlmFormat>,
         #[serde(default)]

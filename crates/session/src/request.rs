@@ -16,6 +16,22 @@ use crate::span::SpanContext;
 use crate::state::EventMeta;
 use crate::tool_contract::{classify_arguments, declared_tool, DeclaredTool};
 
+/// What a call was sent, read where a decision is built.
+pub trait Sent {
+    fn tools(&self, call: &str) -> Option<Vec<LlmTool>>;
+    fn request(&self, call: &str) -> Option<LlmRequest>;
+}
+
+impl Sent for crate::state::SessionState {
+    fn tools(&self, call: &str) -> Option<Vec<LlmTool>> {
+        self.tools_sent(call)
+    }
+
+    fn request(&self, call: &str) -> Option<LlmRequest> {
+        self.sent_request(call)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingPrompt {
     pub request: LlmRequest,
@@ -144,9 +160,7 @@ impl Session {
         ) {
             attachments::mark(messages, rules, &message_tree);
         }
-        let (mut trigger, prompt) = wire_trigger(trigger, &transcript, &message_tree, &|id| {
-            self.state.tools_sent(id)
-        });
+        let (mut trigger, prompt) = wire_trigger(trigger, &transcript, &message_tree, &self.state);
         if let DecisionTrigger::ClientTranscript { new_from, .. } = &mut trigger {
             *new_from = read.shared;
         }
@@ -245,7 +259,7 @@ pub fn wire_trigger(
     trigger: Trigger,
     active_path: &[Message],
     tree: &MessageTree,
-    sent: &dyn Fn(&str) -> Option<Vec<LlmTool>>,
+    sent: &dyn Sent,
 ) -> (DecisionTrigger, Option<PendingPrompt>) {
     let mut pending = None;
     let trigger = match trigger {
@@ -297,7 +311,7 @@ pub fn wire_trigger(
             attempt,
             deadline,
         } => {
-            let schema = match declared_tool(&id, &name, active_path, sent) {
+            let schema = match declared_tool(&id, &name, active_path, |id| sent.tools(id)) {
                 DeclaredTool::Declared(t) => t.input,
                 _ => None,
             };
@@ -313,13 +327,13 @@ pub fn wire_trigger(
         }
         Trigger::LlmExecute {
             id,
-            request,
             format,
             defer_tools_strategy,
             stream,
             attempt,
             deadline,
         } => {
+            let request = sent.request(&id).unwrap_or_default();
             let neutral = serde_json::to_value(&request).unwrap_or_default();
             pending = Some(PendingPrompt {
                 request,

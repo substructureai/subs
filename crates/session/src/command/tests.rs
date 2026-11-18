@@ -9661,16 +9661,14 @@ fn a_worker_run_call_gets_its_execute_decision_at_dispatch_with_the_tools() {
     );
 
     let events = settle_sync(&mut agg, "sentry", &["search_issues"]);
-    let request = events
-        .iter()
-        .find_map(|e| match e {
-            EventPayload::DecisionQueued(p) => match &p.trigger {
-                Trigger::LlmExecute { request, .. } => Some(request.clone()),
-                _ => None,
-            },
-            _ => None,
-        })
-        .expect("dispatch queues the execute decision");
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            EventPayload::DecisionQueued(p) if matches!(p.trigger, Trigger::LlmExecute { .. })
+        )),
+        "dispatch queues the execute decision"
+    );
+    let request = agg.state.sent_request("call-1").expect("the call");
     let offered: Vec<String> = request
         .tools
         .unwrap_or_default()

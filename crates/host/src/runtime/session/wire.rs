@@ -620,20 +620,34 @@ mod tests {
     use crate::runtime::session::state::EffectState;
     use substructure_session::request::wire_trigger;
 
+    #[derive(Default)]
+    struct Asked {
+        calls: HashMap<String, EffectState>,
+        request: Option<crate::protocol::LlmRequest>,
+    }
+
+    impl substructure_session::request::Sent for Asked {
+        fn tools(&self, call: &str) -> Option<Vec<crate::protocol::LlmTool>> {
+            self.calls
+                .get(call)
+                .and_then(|e| e.llm())
+                .and_then(|c| c.spec.tools.clone())
+        }
+
+        fn request(&self, _: &str) -> Option<crate::protocol::LlmRequest> {
+            self.request.clone()
+        }
+    }
+
     async fn to_wire_trigger(
         trigger: Trigger,
         active_path: &[Message],
         tree: &MessageTree,
-        open_llm_calls: &HashMap<String, EffectState>,
+        asked: &Asked,
         blobs: &dyn BlobStore,
         tenant_id: &str,
     ) -> Result<DecisionTrigger, LlmCallError> {
-        let (mut wire, prompt) = wire_trigger(trigger, active_path, tree, &|id| {
-            open_llm_calls
-                .get(id)
-                .and_then(|e| e.llm())
-                .and_then(|c| c.spec.tools.clone())
-        });
+        let (mut wire, prompt) = wire_trigger(trigger, active_path, tree, asked);
         finish_prompt(&mut wire, prompt, blobs, tenant_id).await?;
         Ok(wire)
     }
@@ -952,7 +966,6 @@ mod tests {
             Trigger::LlmExecute {
                 defer_tools_strategy: Default::default(),
                 id: "llm-1".to_string(),
-                request: request.clone(),
                 format: Some(LlmFormat::Anthropic),
                 stream: true,
                 attempt: 0,
@@ -960,7 +973,10 @@ mod tests {
             },
             &[],
             &MessageTree::default(),
-            &HashMap::new(),
+            &Asked {
+                request: Some(request.clone()),
+                ..Default::default()
+            },
             &crate::runtime::blob::NOWHERE,
             "t1",
         )
@@ -986,14 +1002,16 @@ mod tests {
                 defer_tools_strategy: Default::default(),
                 format: None,
                 id: "llm-1".to_string(),
-                request: request.clone(),
                 stream: true,
                 attempt: 0,
                 deadline: None,
             },
             &[],
             &MessageTree::default(),
-            &HashMap::new(),
+            &Asked {
+                request: Some(request.clone()),
+                ..Default::default()
+            },
             &crate::runtime::blob::NOWHERE,
             "t1",
         )
@@ -1304,7 +1322,7 @@ mod tests {
                 },
                 &path,
                 &tree,
-                &HashMap::new(),
+                &Asked::default(),
                 &crate::runtime::blob::NOWHERE,
                 "t1",
             )
@@ -1342,7 +1360,7 @@ mod tests {
                 },
                 &path,
                 &tree,
-                &HashMap::new(),
+                &Asked::default(),
                 &crate::runtime::blob::NOWHERE,
                 "t1",
             )
@@ -1381,7 +1399,7 @@ mod tests {
                 },
                 &path,
                 &tree,
-                &HashMap::new(),
+                &Asked::default(),
                 &crate::runtime::blob::NOWHERE,
                 "t1",
             )
@@ -1404,7 +1422,7 @@ mod tests {
             },
             &[],
             &tree,
-            &HashMap::new(),
+            &Asked::default(),
             &crate::runtime::blob::NOWHERE,
             "t1",
         )
@@ -1429,7 +1447,10 @@ mod tests {
             },
             active_path,
             &MessageTree::default(),
-            open_llm_calls,
+            &Asked {
+                calls: open_llm_calls.clone(),
+                ..Default::default()
+            },
             &crate::runtime::blob::NOWHERE,
             "t1",
         )
@@ -1539,7 +1560,7 @@ mod tests {
             },
             &[],
             &MessageTree::default(),
-            &HashMap::new(),
+            &Asked::default(),
             &crate::runtime::blob::NOWHERE,
             "t1",
         )

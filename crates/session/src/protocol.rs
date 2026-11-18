@@ -1931,7 +1931,7 @@ pub fn is_false(value: &bool) -> bool {
     !*value
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[schemars(title = "LlmRequest")]
 pub struct LlmRequest {
     pub model: String,

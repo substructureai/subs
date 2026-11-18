@@ -133,7 +133,7 @@ fn wire(t: &Trace) -> DecisionTrigger {
         t.live_trigger(),
         &at.transcript(),
         &t.agg.state.message_tree(),
-        &|id| t.agg.state.tools_sent(id),
+        &t.agg.state,
     )
     .0
 }
