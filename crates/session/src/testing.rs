@@ -346,7 +346,9 @@ impl World {
                     let prompt = bare(&out.prompt);
                     for node in state.tree.up(out.node.as_deref()) {
                         match &node.fact {
-                            crate::tree::Fact::Config { .. } => break,
+                            crate::tree::Fact::Config { .. } | crate::tree::Fact::Reset { .. } => {
+                                break
+                            }
                             crate::tree::Fact::Context { call, .. }
                                 if sent
                                     .get(call)

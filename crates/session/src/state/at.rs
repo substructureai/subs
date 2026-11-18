@@ -206,7 +206,8 @@ impl<'a, 'n> At<'a, 'n> {
     pub fn config(&self) -> Option<AgentConfig> {
         self.up()
             .find_map(|n| match &n.fact {
-                crate::tree::Fact::Config { config, .. } => Some(config.clone()),
+                crate::tree::Fact::Config { config } => Some(Some(config.clone())),
+                crate::tree::Fact::Reset { config } => Some(config.clone()),
                 _ => None,
             })
             .flatten()
@@ -422,7 +423,7 @@ impl<'a, 'n> At<'a, 'n> {
         for node in self.up() {
             match &node.fact {
                 crate::tree::Fact::Context { placed: here, .. } => placed.push(here.clone()),
-                crate::tree::Fact::Config { root: true, .. } => break,
+                crate::tree::Fact::Reset { .. } => break,
                 _ => {}
             }
         }
@@ -474,7 +475,7 @@ impl<'a, 'n> At<'a, 'n> {
         for node in self.up() {
             match &node.fact {
                 crate::tree::Fact::Context { call, .. } if call != exclude => return false,
-                crate::tree::Fact::Config { root: true, .. } => break,
+                crate::tree::Fact::Reset { .. } => break,
                 _ => {}
             }
             path.insert(node.id().to_string());
@@ -772,8 +773,7 @@ mod tree_tests {
             "c0",
             None,
             Fact::Config {
-                config: Some(config("m1")),
-                root: false,
+                config: config("m1"),
             },
         );
         put(&mut s, "s1", Some("c0"), state(1));
@@ -811,13 +811,12 @@ mod tree_tests {
             "c0",
             None,
             Fact::Config {
-                config: Some(config("m1")),
-                root: false,
+                config: config("m1"),
             },
         );
         put(&mut s, "s1", Some("c0"), state(1));
         put(&mut s, "u1", Some("s1"), message("u1"));
-        let start = |config| Fact::Config { config, root: true };
+        let start = |config| Fact::Reset { config };
         put(&mut s, "b1", Some("u1"), start(Some(config("m2"))));
         put(&mut s, "b2", Some("u1"), start(None));
         let model = |at| s.at(Some(at)).config().map(|c| c.model);
@@ -825,6 +824,84 @@ mod tree_tests {
         assert_eq!(model("b2"), None);
         assert_eq!(model("u1"), Some("m1".into()));
         assert_eq!(read(&s, "b1"), serde_json::json!({ "v": 1 }));
+    }
+
+    #[test]
+    fn an_update_keeps_what_was_placed_above_and_a_reset_cuts_it() {
+        let mut s = SessionState::new("s".into());
+        put(
+            &mut s,
+            "c0",
+            None,
+            Fact::Config {
+                config: config("m1"),
+            },
+        );
+        put(&mut s, "s1", Some("c0"), state(1));
+        put(&mut s, "u1", Some("s1"), message("u1"));
+        let placed = crate::prompt_context::Placed {
+            call: "call-1".into(),
+            message: "call-1-ctx".into(),
+            placement: crate::prompt_context::Placement::System,
+            content: "a server".into(),
+            after: None,
+            ids: vec!["a server".into()],
+        };
+        put(
+            &mut s,
+            "x1",
+            Some("u1"),
+            Fact::Context {
+                call: "call-1".into(),
+                placed: vec![placed],
+            },
+        );
+        put(
+            &mut s,
+            "up",
+            Some("x1"),
+            Fact::Config {
+                config: config("m2"),
+            },
+        );
+        put(
+            &mut s,
+            "re",
+            Some("x1"),
+            Fact::Reset {
+                config: Some(config("m3")),
+            },
+        );
+
+        let updated = s.at(Some("up"));
+        assert_eq!(updated.placed_on_path().len(), 1);
+        assert!(!updated.system_prefix_open("call-2"));
+
+        let reset = s.at(Some("re"));
+        assert!(reset.placed_on_path().is_empty());
+        assert!(reset.system_prefix_open("call-2"));
+        assert_eq!(reset.config().map(|c| c.model), Some("m3".into()));
+        assert_eq!(read(&s, "re"), serde_json::json!({ "v": 1 }));
+    }
+
+    #[test]
+    fn a_reset_to_no_config_reads_none() {
+        let mut s = SessionState::new("s".into());
+        put(
+            &mut s,
+            "c0",
+            None,
+            Fact::Config {
+                config: config("m1"),
+            },
+        );
+        put(&mut s, "u1", Some("c0"), message("u1"));
+        put(&mut s, "re", Some("u1"), Fact::Reset { config: None });
+        assert!(s.at(Some("re")).config().is_none());
+        assert_eq!(
+            s.at(Some("u1")).config().map(|c| c.model),
+            Some("m1".into())
+        );
     }
 
     #[test]

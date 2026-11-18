@@ -103,6 +103,7 @@ fn the_random_sequences_reach_every_kind_of_event() {
         "branch.moved",
         "context.placed",
         "context.replaced",
+        "config.reset",
         "llm.call.completed",
         "llm.call.errored",
         "tool.call.completed",

@@ -1295,7 +1295,8 @@ fn a_call_that_brings_messages_reads_them_on_a_branch_of_its_own() {
         .expect("the call starts a branch");
     assert_eq!(started.id, "llm-1");
     assert_eq!(started.from.as_deref(), Some("u1"));
-    assert!(matches!(started.agent, crate::decision::BranchConfig::None));
+    assert!(events.iter().any(|e| matches!(e,
+        EventPayload::ConfigReset(r) if r.config.is_none() && r.node.branch.as_deref() == Some("llm-1"))));
     let written: Vec<&NewMessage> = events
         .iter()
         .filter_map(|e| match e {
@@ -11411,10 +11412,8 @@ fn a_closed_branch_reads_its_own_leaf_until_nothing_names_it() {
         vec![
             EventPayload::BranchStarted(Box::new(BranchStarted {
                 id: "b".to_string(),
-                node: "b-start".to_string(),
                 from: Some("u1".to_string()),
                 parent: None,
-                agent: crate::decision::BranchConfig::Inherit,
                 name: None,
                 mode: crate::protocol::BranchMode::Detached,
                 depth: 1,

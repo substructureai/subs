@@ -18,10 +18,7 @@ impl SessionState {
                 parent_id: parent,
                 branch: None,
             },
-            fact: crate::tree::Fact::Config {
-                config: Some(config),
-                root: false,
-            },
+            fact: crate::tree::Fact::Config { config },
         });
     }
 
@@ -458,7 +455,9 @@ impl SessionState {
             }
             EventPayload::LlmCallRequested(payload) => self.apply_llm_requested(payload, ctx),
             EventPayload::LlmCallDispatched(payload) => self.apply_llm_dispatched(payload, ctx),
-            EventPayload::StateUpdated(_) | EventPayload::ConfigUpdated(_) => {}
+            EventPayload::StateUpdated(_)
+            | EventPayload::ConfigUpdated(_)
+            | EventPayload::ConfigReset(_) => {}
             EventPayload::ContextPlaced(payload) => {
                 if let Some(call) = self
                     .effect_mut(EffectKind::LlmCall, &payload.call)

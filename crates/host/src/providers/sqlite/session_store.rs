@@ -301,6 +301,7 @@ fn kind(node: &Node) -> i64 {
         Fact::Message { .. } => 0,
         Fact::State { .. } => 1,
         Fact::Config { .. } => 2,
+        Fact::Reset { .. } => 4,
         Fact::Context { .. } => 3,
     }
 }

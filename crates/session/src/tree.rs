@@ -3,7 +3,6 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
-use crate::decision::BranchConfig;
 use crate::events::{BranchStarted, EventPayload};
 use crate::protocol::{AgentConfig, DraftMessage, Message, NewMessage, WorkerState};
 use crate::state::{BranchId, Logged};
@@ -30,9 +29,11 @@ pub enum Fact {
         state: WorkerState,
     },
     Config {
+        config: AgentConfig,
+    },
+    Reset {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         config: Option<AgentConfig>,
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        root: bool,
     },
     Context {
         call: String,
@@ -459,6 +460,7 @@ pub fn index(seq: u64, event: &EventPayload) -> Indexed<'_> {
         EventPayload::NewMessage(m) => (None, m.branch.as_deref()),
         EventPayload::StateUpdated(v) => (None, v.node.branch.as_deref()),
         EventPayload::ConfigUpdated(v) => (None, v.node.branch.as_deref()),
+        EventPayload::ConfigReset(v) => (None, v.node.branch.as_deref()),
         EventPayload::ContextPlaced(c) => (None, c.node.branch.as_deref()),
         _ => (None, None),
     };
@@ -490,8 +492,13 @@ impl Node {
             EventPayload::ConfigUpdated(v) => Node {
                 place: v.node.clone(),
                 fact: Fact::Config {
-                    config: Some(v.config.clone()),
-                    root: false,
+                    config: v.config.clone(),
+                },
+            },
+            EventPayload::ConfigReset(v) => Node {
+                place: v.node.clone(),
+                fact: Fact::Reset {
+                    config: v.config.clone(),
                 },
             },
             EventPayload::ContextPlaced(c) => Node {
@@ -499,21 +506,6 @@ impl Node {
                 fact: Fact::Context {
                     call: c.call.clone(),
                     placed: c.placed.clone(),
-                },
-            },
-            EventPayload::BranchStarted(b) if b.leaf.is_none() => Node {
-                place: Place {
-                    id: b.node.clone(),
-                    parent_id: b.from.clone(),
-                    branch: Some(b.id.clone()),
-                },
-                fact: Fact::Config {
-                    config: match &b.agent {
-                        BranchConfig::Inherit => return None,
-                        BranchConfig::None => None,
-                        BranchConfig::Config(config) => Some((**config).clone()),
-                    },
-                    root: true,
                 },
             },
             _ => return None,

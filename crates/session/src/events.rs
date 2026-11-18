@@ -83,6 +83,8 @@ pub enum EventPayload {
     StateUpdated(StateUpdated),
     #[serde(rename = "config.updated")]
     ConfigUpdated(ConfigUpdated),
+    #[serde(rename = "config.reset")]
+    ConfigReset(ConfigReset),
     #[serde(rename = "subagent.turn_completed")]
     SubagentTurnCompleted(SubagentTurnCompleted),
     #[serde(rename = "decision.queued")]
@@ -130,12 +132,10 @@ pub enum EventPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BranchStarted {
     pub id: String,
-    pub node: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
-    pub agent: BranchConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub mode: BranchMode,
@@ -646,6 +646,14 @@ pub struct StateUpdated {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigUpdated {
     pub config: AgentConfig,
+    #[serde(flatten)]
+    pub node: crate::tree::Place,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigReset {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<AgentConfig>,
     #[serde(flatten)]
     pub node: crate::tree::Place,
 }

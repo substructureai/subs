@@ -280,13 +280,10 @@ impl Working {
         if let BranchConfig::Config(config) = &agent {
             self.then(|s| effects::connector::sync(s, config));
         }
-        let node = self.ids.next();
         self.emit(EventPayload::BranchStarted(Box::new(BranchStarted {
             id: start.id.clone(),
-            node,
-            from,
+            from: from.clone(),
             parent: parent.into(),
-            agent,
             name: start.name.clone(),
             mode: start.mode,
             depth,
@@ -295,7 +292,26 @@ impl Working {
             subagent: None,
             leaf: None,
         })));
+        self.reset_branch(&start.id, from, &agent);
         Ok(())
+    }
+
+    fn reset_branch(&mut self, branch: &str, from: Option<String>, agent: &BranchConfig) {
+        let config = match agent {
+            BranchConfig::Inherit => return,
+            BranchConfig::None if from.is_none() => return,
+            BranchConfig::None => None,
+            BranchConfig::Config(config) => Some((**config).clone()),
+        };
+        let id = self.ids.next();
+        self.emit(EventPayload::ConfigReset(ConfigReset {
+            config,
+            node: crate::tree::Place {
+                id,
+                parent_id: from,
+                branch: Some(branch.to_string()),
+            },
+        }));
     }
 
     fn continue_branch(&mut self, start: &BranchStart, leaf: String) -> Result<(), ErrorInfo> {
@@ -303,13 +319,10 @@ impl Working {
         if depth > MAX_BRANCH_DEPTH {
             return Err(refused("The branch would be nested too deep."));
         }
-        let node = self.ids.next();
         self.emit(EventPayload::BranchStarted(Box::new(BranchStarted {
             id: start.id.clone(),
-            node,
             from: None,
             parent: parent.into(),
-            agent: BranchConfig::Inherit,
             name: start.name.clone(),
             mode: start.mode,
             depth,
@@ -416,16 +429,14 @@ impl Working {
             None => self.stored_leaf(&key),
         };
         let from = anchor.clone().filter(|_| on.fork && own.is_none());
-        let (agent, node) = (on.agent.clone(), self.ids.next());
+        let agent = on.agent.clone();
         let fresh = own.is_none();
         let depth = self.branch_depth(&parent) + 1;
         let detached = mode == BranchMode::Detached || self.detached(&parent);
         self.emit(EventPayload::BranchStarted(Box::new(BranchStarted {
             id: branch.clone(),
-            node: node.clone(),
             from: from.clone(),
             parent: parent.into(),
-            agent: agent.clone(),
             name: Some(agent_id),
             mode,
             depth,
@@ -434,6 +445,9 @@ impl Working {
             subagent: Some(call.to_string()),
             leaf: own.clone(),
         })));
+        if fresh {
+            self.reset_branch(&branch, from.clone(), &agent);
+        }
         if let BranchConfig::Config(config) = &agent {
             self.then(|s| effects::connector::sync(s, config));
         }
