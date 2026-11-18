@@ -16,11 +16,14 @@ impl SessionState {
         self.at(self.leaf(branch))
     }
 
-    pub fn outgoing(&self, id: &str) -> Option<Outgoing> {
+    pub fn prompt(&self, id: &str) -> Option<Vec<Message>> {
         let effect = self.effect(EffectKind::LlmCall, id)?;
-        let call = effect.llm()?;
-        let node = call.reads_from.clone().or_else(|| effect.asked_at.clone());
-        Some(self.at(node.as_deref()).outgoing(id))
+        let node = effect
+            .llm()?
+            .reads_from
+            .as_deref()
+            .or(effect.asked_at.as_deref());
+        Some(self.at(node).prompt(id))
     }
 
     pub fn path_ids(&self, node: &str) -> std::collections::HashSet<String> {
@@ -109,11 +112,9 @@ pub struct SkillCall {
 }
 
 #[derive(Debug, Clone)]
-pub struct Outgoing {
-    pub node: Option<String>,
+pub struct Placing {
     pub prompt: Vec<Message>,
     pub placed: Vec<prompt_context::Placed>,
-    pub places: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -437,55 +438,61 @@ impl<'a, 'n> At<'a, 'n> {
             .collect()
     }
 
-    pub fn outgoing(&self, id: &str) -> Outgoing {
+    pub fn prompt(&self, call: &str) -> Vec<Message> {
         let view: Vec<DraftMessage> = self
             .transcript()
             .into_iter()
             .map(DraftMessage::from)
             .collect();
-        let prompt = match self.config() {
+        let mut prompt: Vec<Message> = match self.config() {
             Some(config) => config.prompt_for(&view),
             None => view,
+        }
+        .into_iter()
+        .enumerate()
+        .map(|(i, m)| m.recorded(format!("{call}:{i}")))
+        .collect();
+        prompt_context::restore(&mut prompt, &self.placed_on_path());
+        prompt
+    }
+
+    pub fn place(&self, call: &str) -> Placing {
+        let mut prompt = self.prompt(call);
+        let mut placed = Vec::new();
+        let open = prompt_context::Open {
+            system: self.system_prefix_open(),
+            inline: self.inline_open(),
         };
-        let mut out = Outgoing {
-            node: self.node.map(str::to_string),
-            prompt: prompt
-                .into_iter()
-                .enumerate()
-                .map(|(i, m)| m.recorded(format!("{id}:{i}")))
-                .collect(),
-            placed: Vec::new(),
-            places: false,
-        };
-        prompt_context::restore(&mut out.prompt, &self.placed_on_path());
-        let open = self.system_prefix_open(id);
         prompt_context::merge(
-            &mut out.prompt,
-            &mut out.placed,
-            id,
+            &mut prompt,
+            &mut placed,
+            call,
             open,
             prompt_context::owed(*self),
         );
-        out.places = open || !out.placed.is_empty();
-        out
+        Placing { prompt, placed }
     }
 
-    pub fn system_prefix_open(&self, exclude: &str) -> bool {
-        let mut path = std::collections::HashSet::new();
+    pub fn system_prefix_open(&self) -> bool {
         for node in self.up() {
             match &node.fact {
-                crate::tree::Fact::Context { call, .. } if call != exclude => return false,
+                crate::tree::Fact::Context { .. } => return false,
                 crate::tree::Fact::Reset { .. } => break,
                 _ => {}
             }
-            path.insert(node.id().to_string());
         }
-        !self.state.effects.values().any(|e| {
-            e.id != exclude
-                && e.llm().is_some_and(|c| c.reads_from.is_none())
-                && SessionState::anchored_on(&path, e.asked_at.as_deref())
-                && e.tracking.status() != EffectStatus::Queued
-        })
+        true
+    }
+
+    fn inline_open(&self) -> bool {
+        for node in self.up() {
+            match &node.fact {
+                crate::tree::Fact::Context { .. } => return false,
+                crate::tree::Fact::Message { .. } => return true,
+                _ => {}
+            }
+        }
+        true
     }
 
     pub fn call_tool_target(&self, named: &str) -> Option<CallTarget> {
@@ -875,13 +882,62 @@ mod tree_tests {
 
         let updated = s.at(Some("up"));
         assert_eq!(updated.placed_on_path().len(), 1);
-        assert!(!updated.system_prefix_open("call-2"));
+        assert!(!updated.system_prefix_open());
 
         let reset = s.at(Some("re"));
         assert!(reset.placed_on_path().is_empty());
-        assert!(reset.system_prefix_open("call-2"));
+        assert!(reset.system_prefix_open());
         assert_eq!(reset.config().map(|c| c.model), Some("m3".into()));
         assert_eq!(read(&s, "re"), serde_json::json!({ "v": 1 }));
+    }
+
+    #[test]
+    fn context_owed_after_an_earlier_call_takes_a_message_of_its_own() {
+        let mut s = SessionState::new("s".into());
+        let skilled = AgentConfig {
+            skills: vec![crate::protocol::AgentSkill {
+                name: "visits".to_string(),
+                description: "Who visited".to_string(),
+                source: crate::protocol::SkillSource::Bundle,
+                tools: Vec::new(),
+            }],
+            ..config("m1")
+        };
+        put(&mut s, "c0", None, Fact::Config { config: skilled });
+        put(&mut s, "u1", Some("c0"), message("u1"));
+        put(
+            &mut s,
+            "x1",
+            Some("u1"),
+            Fact::Context {
+                call: "call-1".into(),
+                placed: Vec::new(),
+            },
+        );
+        let text = |prompt: Vec<Message>| -> Vec<String> {
+            prompt
+                .iter()
+                .map(|m| {
+                    m.content
+                        .as_ref()
+                        .map(|c| c.text_owned())
+                        .unwrap_or_default()
+                })
+                .collect()
+        };
+        let sent = text(s.at(Some("x1")).prompt("call-1"));
+        let placing = s.at(Some("x1")).place("call-2");
+        assert!(!placing.placed.is_empty(), "the catalog is owed");
+        assert!(placing
+            .placed
+            .iter()
+            .all(|p| p.placement == crate::prompt_context::Placement::Own));
+        let next = text(placing.prompt);
+        assert_eq!(
+            next[..sent.len()],
+            sent[..],
+            "the earlier prompt is a prefix"
+        );
     }
 
     #[test]

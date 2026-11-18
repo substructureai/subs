@@ -146,12 +146,12 @@ impl SessionState {
     }
 
     fn apply_llm_dispatched(&mut self, payload: &LlmCallDispatched, ctx: &ApplyContext) {
-        let Some(out) = self.outgoing(&payload.id) else {
+        let Some(prompt) = self.prompt(&payload.id) else {
             self.dequeue(EffectKind::LlmCall, &payload.id);
             return;
         };
         if let Some(recorded) = &payload.fingerprint {
-            let built = prompt_context::fingerprint(&out.prompt);
+            let built = prompt_context::fingerprint(&prompt);
             if *recorded != built {
                 tracing::warn!(
                     call_id = %payload.id,
@@ -161,7 +161,14 @@ impl SessionState {
                 );
             }
         }
-        let at = self.at(out.node.as_deref());
+        let node = self
+            .llm_call(&payload.id)
+            .and_then(|c| c.reads_from.clone())
+            .or_else(|| {
+                self.effect(EffectKind::LlmCall, &payload.id)
+                    .and_then(|e| e.asked_at.clone())
+            });
+        let at = self.at(node.as_deref());
         let connector_tools = at.connector_tools().tools;
         let locked = at.locked_tools();
         let run_code = at.run_code();
@@ -172,7 +179,7 @@ impl SessionState {
                     Some(run_code) => Some(vec![run_code]),
                     None => sent_tools(call.spec.tools.clone(), &connector_tools, &locked),
                 };
-                call.prompt = out.prompt;
+                call.prompt = prompt;
                 call.dispatched_seq = Some(ctx.sequence);
             }
         }

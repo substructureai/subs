@@ -78,28 +78,31 @@ impl KindSpec for LlmSpec {
         let Some(effect) = state.effect(EffectKind::LlmCall, id) else {
             return void_events(EffectKind::LlmCall, id.to_string());
         };
-        let out = state.outgoing(id);
-        let placed = effect.llm().is_some_and(|c| c.reads_from.is_some());
-        let leaf = state.leaf(&effect.branch).map(str::to_string);
+        let Some(call) = effect.llm() else {
+            return void_events(EffectKind::LlmCall, id.to_string());
+        };
         let mut events = Vec::new();
-        if let Some(out) = out
-            .as_ref()
-            .filter(|out| out.places && !placed && out.node == leaf)
-        {
-            events.push(EventPayload::ContextPlaced(ContextPlaced {
-                node: crate::tree::Place {
-                    id: state.ids().next(),
-                    parent_id: out.node.clone(),
-                    branch: effect.branch.clone().into(),
-                },
-                call: id.to_string(),
-                placed: out.placed.clone(),
-            }));
-        }
+        let prompt = match call.reads_from.as_deref() {
+            Some(node) => state.at(Some(node)).prompt(id),
+            None => {
+                let leaf = state.leaf(&effect.branch).map(str::to_string);
+                let placing = state.at(leaf.as_deref()).place(id);
+                events.push(EventPayload::ContextPlaced(ContextPlaced {
+                    node: crate::tree::Place {
+                        id: state.ids().next(),
+                        parent_id: leaf,
+                        branch: effect.branch.clone().into(),
+                    },
+                    call: id.to_string(),
+                    placed: placing.placed,
+                }));
+                placing.prompt
+            }
+        };
         events.push(EventPayload::LlmCallDispatched(LlmCallDispatched {
             id: id.to_string(),
             attempt: effect.tracking.retry.attempts,
-            fingerprint: out.map(|out| crate::prompt_context::fingerprint(&out.prompt)),
+            fingerprint: Some(crate::prompt_context::fingerprint(&prompt)),
         }));
         events
     }

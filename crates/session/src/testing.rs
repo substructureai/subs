@@ -310,8 +310,8 @@ impl World {
         for (seq, occurred_at, payload) in &self.log {
             if let EventPayload::LlmCallDispatched(d) = payload {
                 let built = state
-                    .outgoing(&d.id)
-                    .map(|out| crate::prompt_context::fingerprint(&out.prompt));
+                    .prompt(&d.id)
+                    .map(|prompt| crate::prompt_context::fingerprint(&prompt));
                 if d.fingerprint.is_some() && d.fingerprint != built {
                     return Some(d.id.clone());
                 }
@@ -342,9 +342,10 @@ impl World {
         let mut sent: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
         for (seq, occurred_at, payload) in &self.log {
             if let EventPayload::LlmCallDispatched(d) = payload {
-                if let Some(out) = state.outgoing(&d.id) {
-                    let prompt = bare(&out.prompt);
-                    for node in state.tree.up(out.node.as_deref()) {
+                if let Some(prompt) = state.prompt(&d.id) {
+                    let prompt = bare(&prompt);
+                    let node = state.llm_call(&d.id).and_then(|c| c.reads_from.clone());
+                    for node in state.tree.up(node.as_deref()) {
                         match &node.fact {
                             crate::tree::Fact::Config { .. } | crate::tree::Fact::Reset { .. } => {
                                 break

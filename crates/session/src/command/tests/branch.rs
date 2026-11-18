@@ -187,7 +187,7 @@ fn prompt_texts(agg: &Session, call: &str) -> Vec<String> {
     agg.sent
         .get(call)
         .cloned()
-        .or_else(|| agg.state.outgoing(call).map(|out| out.prompt))
+        .or_else(|| agg.state.prompt(call))
         .expect("the call builds a prompt")
         .iter()
         .map(text_of)

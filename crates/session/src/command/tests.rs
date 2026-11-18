@@ -8229,8 +8229,9 @@ fn context_follows_the_branch_a_prompt_is_on() {
         vec![u1.clone(), a1.clone(), u2.clone(), u3.clone()],
         None,
     );
+    let parent = parent_of(&agg, "u3");
     assert_eq!(
-        parent_of(&agg, "u3").as_deref(),
+        agg.state.tree.message_at(parent.as_deref()).as_deref(),
         Some("u2"),
         "the view lands on the first branch"
     );
@@ -14787,10 +14788,8 @@ fn a_retried_tree_call_is_built_again_and_places_nothing_twice() {
         panic!("a request: {again:?}");
     };
     assert!(r.at.is_some());
-    let out = agg.state.outgoing("call-1").expect("the call");
-    assert!(out.placed.is_empty(), "its context is on the tree already");
-    let texts: Vec<_> = out
-        .prompt
+    let prompt = agg.state.prompt("call-1").expect("the call");
+    let texts: Vec<_> = prompt
         .iter()
         .map(|m| {
             m.content

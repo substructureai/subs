@@ -106,10 +106,10 @@ pub fn strategy(config: Option<&AgentConfig>, kind: ContextStrategyKind) -> Cont
 }
 
 fn held(state: &SessionState, call: &HeldCall) -> HeldCall {
-    let out = state.on(&BranchId::MAIN).outgoing(&call.id);
+    let placing = state.on(&BranchId::MAIN).place(&call.id);
     HeldCall {
         request: LlmRequest {
-            messages: out.prompt.into_iter().map(DraftMessage::from).collect(),
+            messages: placing.prompt.into_iter().map(DraftMessage::from).collect(),
             ..call.request.clone()
         },
         ..call.clone()

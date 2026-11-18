@@ -245,11 +245,17 @@ pub fn fingerprint(prompt: &[Message]) -> String {
     format!("{:016x}", hasher.digest())
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct Open {
+    pub system: bool,
+    pub inline: bool,
+}
+
 pub fn merge(
     prompt: &mut Vec<Message>,
     placed: &mut Vec<Placed>,
     call_id: &str,
-    system_open: bool,
+    open: Open,
     owed: Vec<PromptContext>,
 ) {
     let mut groups: Vec<(Placement, Vec<PromptContext>)> = Vec::new();
@@ -257,7 +263,7 @@ pub fn merge(
         if groups.iter().any(|(_, g)| g.iter().any(|o| o.id == c.id)) {
             continue;
         }
-        let placement = resolve(c.placement, prompt, system_open);
+        let placement = resolve(c.placement, prompt, open);
         match groups.iter_mut().find(|(p, _)| *p == placement) {
             Some((_, group)) => group.push(c),
             None => groups.push((placement, vec![c])),
@@ -280,11 +286,11 @@ pub fn merge(
     }
 }
 
-fn resolve(wanted: Placement, prompt: &[Message], system_open: bool) -> Placement {
+fn resolve(wanted: Placement, prompt: &[Message], open: Open) -> Placement {
     match wanted {
-        Placement::System if system_open => Placement::System,
+        Placement::System if open.system => Placement::System,
         Placement::System | Placement::Inline => {
-            let host = prompt.last().is_some_and(|m| m.role == Role::User);
+            let host = open.inline && prompt.last().is_some_and(|m| m.role == Role::User);
             if host {
                 Placement::Inline
             } else {
@@ -682,7 +688,16 @@ mod tests {
             placement: Placement::System,
             content: "gone".into(),
         };
-        merge(&mut prompt, &mut Vec::new(), "call-2", false, vec![c]);
+        merge(
+            &mut prompt,
+            &mut Vec::new(),
+            "call-2",
+            Open {
+                system: false,
+                inline: true,
+            },
+            vec![c],
+        );
         assert_eq!(prompt.len(), 1, "it rode the user turn, not the prefix");
         assert!(matches!(
             prompt[0].content.as_ref().expect("content"),
@@ -794,14 +809,20 @@ mod tests {
             &mut prompt,
             &mut placed,
             "c1",
-            true,
+            Open {
+                system: true,
+                inline: true,
+            },
             vec![ctx("plugin.a", Placement::System)],
         );
         merge(
             &mut prompt,
             &mut placed,
             "c1",
-            false,
+            Open {
+                system: false,
+                inline: true,
+            },
             vec![ctx("mcp.b", Placement::Inline)],
         );
         prompt.push(text("a1", Role::Assistant, "calling"));
@@ -810,7 +831,10 @@ mod tests {
             &mut prompt,
             &mut placed,
             "c2",
-            false,
+            Open {
+                system: false,
+                inline: true,
+            },
             vec![ctx("mcp.c", Placement::Inline)],
         );
         (prompt, placed)
@@ -899,7 +923,16 @@ mod tests {
     fn context_placed_after_only_a_system_prompt_is_rebuilt_for_the_next_call() {
         let mut sent = vec![text("c1:0", Role::System, "be brief")];
         let mut placed = Vec::new();
-        merge(&mut sent, &mut placed, "c1", false, notice());
+        merge(
+            &mut sent,
+            &mut placed,
+            "c1",
+            Open {
+                system: false,
+                inline: true,
+            },
+            notice(),
+        );
         let mut next = vec![text("c2:0", Role::System, "be brief")];
         restore(&mut next, &placed);
         assert_eq!(fingerprint(&next), fingerprint(&sent));
@@ -909,7 +942,16 @@ mod tests {
     fn context_placed_into_an_empty_prompt_is_rebuilt_after_a_system_prompt() {
         let mut sent = Vec::new();
         let mut placed = Vec::new();
-        merge(&mut sent, &mut placed, "c1", false, notice());
+        merge(
+            &mut sent,
+            &mut placed,
+            "c1",
+            Open {
+                system: false,
+                inline: true,
+            },
+            notice(),
+        );
         let mut next = vec![
             text("c2:0", Role::System, "be brief"),
             text("u1", Role::User, "hi"),
@@ -973,7 +1015,10 @@ mod tests {
             &mut prompt,
             &mut placed,
             "c1",
-            true,
+            Open {
+                system: true,
+                inline: true,
+            },
             vec![ctx("a"), ctx("b"), ctx("a")],
         );
         assert_eq!(prompt.len(), 1);
