@@ -135,6 +135,7 @@ fn wire(t: &Trace) -> DecisionTrigger {
         &t.agg.state.message_tree(),
         &t.agg.state,
     )
+    .expect("a readable trigger")
     .0
 }
 

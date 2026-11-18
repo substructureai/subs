@@ -647,7 +647,8 @@ mod tests {
         blobs: &dyn BlobStore,
         tenant_id: &str,
     ) -> Result<DecisionTrigger, LlmCallError> {
-        let (mut wire, prompt) = wire_trigger(trigger, active_path, tree, asked);
+        let (mut wire, prompt) =
+            wire_trigger(trigger, active_path, tree, asked).expect("a readable trigger");
         finish_prompt(&mut wire, prompt, blobs, tenant_id).await?;
         Ok(wire)
     }

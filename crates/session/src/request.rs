@@ -160,7 +160,7 @@ impl Session {
         ) {
             attachments::mark(messages, rules, &message_tree);
         }
-        let (mut trigger, prompt) = wire_trigger(trigger, &transcript, &message_tree, &self.state);
+        let (mut trigger, prompt) = wire_trigger(trigger, &transcript, &message_tree, &self.state)?;
         if let DecisionTrigger::ClientTranscript { new_from, .. } = &mut trigger {
             *new_from = read.shared;
         }
@@ -260,7 +260,7 @@ pub fn wire_trigger(
     active_path: &[Message],
     tree: &MessageTree,
     sent: &dyn Sent,
-) -> (DecisionTrigger, Option<PendingPrompt>) {
+) -> Option<(DecisionTrigger, Option<PendingPrompt>)> {
     let mut pending = None;
     let trigger = match trigger {
         Trigger::SessionStart => DecisionTrigger::SessionStart,
@@ -333,7 +333,10 @@ pub fn wire_trigger(
             attempt,
             deadline,
         } => {
-            let request = sent.request(&id).unwrap_or_default();
+            let Some(request) = sent.request(&id) else {
+                tracing::warn!(call_id = %id, "an execute decision for a call that cannot be read");
+                return None;
+            };
             let neutral = serde_json::to_value(&request).unwrap_or_default();
             pending = Some(PendingPrompt {
                 request,
@@ -457,5 +460,5 @@ pub fn wire_trigger(
             stale: false,
         },
     };
-    (trigger, pending)
+    Some((trigger, pending))
 }
