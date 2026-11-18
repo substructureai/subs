@@ -396,6 +396,44 @@ impl Tree {
         count
     }
 
+    /// Where a view joins `onto`'s branch: after the messages it shares with
+    /// the tree, and the facts that trail them.
+    pub fn landing(&self, view: &[DraftMessage], onto: Onto<'_>, regenerate: bool) -> Landing {
+        let path = std::cell::OnceCell::new();
+        let on_path = |id: &str| {
+            path.get_or_init(|| onto.leaf.map(|l| self.path_ids(l)).unwrap_or_default())
+                .contains(id)
+        };
+        let full = self.shared(view, |_, node| {
+            BranchId::from(node.branch()) == *onto.branch || on_path(node.id())
+        });
+        let shared = match regenerate && full == view.len() {
+            true => through_last_reply(view),
+            false => full,
+        };
+        let last = |n: usize| n.checked_sub(1).and_then(|i| view[i].id.as_deref());
+        let at = match self.fork_on(onto.leaf, last(full), onto.floor) {
+            Some(at) if shared == full => at,
+            Some(_) => self.fork_on(onto.leaf, last(shared), onto.floor).flatten(),
+            None => match last(shared) {
+                Some(message) => Some(self.tail(message).0),
+                None => self.fork_on(onto.leaf, None, onto.floor).flatten(),
+            },
+        };
+        Landing { at, shared }
+    }
+
+    /// A message already follows `at` on `branch`.
+    pub fn message_follows(&self, at: Option<&str>, leaf: Option<&str>, branch: &BranchId) -> bool {
+        match at {
+            Some(at) => self
+                .children(at, branch.name())
+                .iter()
+                .any(|n| n.message().is_some()),
+            None => self.up(leaf).any(|n| n.message().is_some()),
+        }
+    }
+
     pub fn fork_on(
         &self,
         leaf: Option<&str>,
@@ -428,6 +466,25 @@ impl Tree {
             at = next.id().to_string();
         }
     }
+}
+
+pub struct Onto<'a> {
+    pub branch: &'a BranchId,
+    pub leaf: Option<&'a str>,
+    pub floor: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Landing {
+    pub at: Option<String>,
+    pub shared: usize,
+}
+
+/// How many of `view` run through its last message that is not the user's.
+fn through_last_reply(view: &[DraftMessage]) -> usize {
+    view.iter()
+        .rposition(|m| m.role != crate::protocol::Role::User)
+        .map_or(0, |i| i + 1)
 }
 
 const ANCESTORS: usize = 256;

@@ -508,6 +508,7 @@ impl View {
 #[cfg(test)]
 mod tree_tests {
     use super::*;
+    use crate::tree::Landing;
     use crate::tree::{Fact, Node, Place};
 
     fn asked() -> crate::tree::Asked {
@@ -823,6 +824,99 @@ mod tree_tests {
         assert!(s.llm_call("call-1").is_none(), "no effect holds the call");
         assert_eq!(s.tools_sent("call-1"), Some(vec![tool("skill")]));
         assert!(s.at(Some("u1")).sent("call-1").is_none(), "nor above it");
+    }
+
+    fn land(s: &View, view: &[&str], leaf: &str, floor: Option<&str>, regenerate: bool) -> Landing {
+        let view: Vec<DraftMessage> = view
+            .iter()
+            .map(|id| {
+                let role = match id.starts_with('a') {
+                    true => "assistant",
+                    false => "user",
+                };
+                serde_json::from_value(serde_json::json!({ "id": id, "role": role, "content": id }))
+                    .unwrap()
+            })
+            .collect();
+        let onto = crate::tree::Onto {
+            branch: &BranchId::MAIN,
+            leaf: Some(leaf),
+            floor,
+        };
+        s.tree.landing(&view, onto, regenerate)
+    }
+
+    fn landed(at: Option<&str>, shared: usize) -> Landing {
+        Landing {
+            at: at.map(str::to_string),
+            shared,
+        }
+    }
+
+    #[test]
+    fn a_view_lands_after_what_it_shares_and_the_facts_that_trail_it() {
+        let mut s = View::new("s".into());
+        put(&mut s, "u1", None, message("u1"));
+        put(&mut s, "s1", Some("u1"), state(1));
+        put(&mut s, "u2", Some("s1"), message("u2"));
+        put(&mut s, "s2", Some("u2"), state(2));
+        put(&mut s, "e2", Some("u1"), message("e2"));
+        put(&mut s, "x2", Some("e2"), state(3));
+
+        assert_eq!(
+            land(&s, &["u1"], "s2", None, false),
+            landed(Some("s1"), 1),
+            "on the path: just above the next message"
+        );
+        assert_eq!(
+            land(&s, &["u1", "u2"], "s2", None, false),
+            landed(Some("s2"), 2),
+            "at the end of the path: the leaf"
+        );
+        assert_eq!(
+            land(&s, &["u1", "e2"], "s2", None, false),
+            landed(Some("x2"), 2),
+            "another version: the end of it"
+        );
+        assert_eq!(
+            land(&s, &["n1"], "s2", None, false),
+            landed(None, 0),
+            "nothing shared: above the first message"
+        );
+        assert_eq!(
+            land(&s, &["n1"], "s2", Some("s1"), false),
+            landed(Some("s1"), 0),
+            "never above the fork point"
+        );
+        assert!(s
+            .tree
+            .message_follows(Some("s1"), Some("s2"), &BranchId::MAIN));
+        assert!(!s
+            .tree
+            .message_follows(Some("s2"), Some("s2"), &BranchId::MAIN));
+    }
+
+    #[test]
+    fn a_regenerated_view_lands_after_its_last_reply() {
+        let mut s = View::new("s".into());
+        put(&mut s, "u1", None, message("u1"));
+        put(
+            &mut s,
+            "a1",
+            Some("u1"),
+            Fact::Message {
+                message: serde_json::from_value(
+                    serde_json::json!({ "id": "a1", "role": "assistant", "content": "a1" }),
+                )
+                .unwrap(),
+                copied_from: None,
+            },
+        );
+        put(&mut s, "u2", Some("a1"), message("u2"));
+        assert_eq!(
+            land(&s, &["u1", "a1", "u2"], "u2", None, true),
+            landed(Some("a1"), 2)
+        );
     }
 
     #[test]

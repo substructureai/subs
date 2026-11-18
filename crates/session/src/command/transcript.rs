@@ -140,6 +140,23 @@ impl View {
 impl View {
     fn land_view(&self, view: &[DraftMessage], scope: &BranchId, regenerate: bool) -> Landed {
         let leaf = self.leaf(scope).map(str::to_string);
+        let floor = self.open_run(scope).and_then(|b| b.from.as_deref());
+        if scope.is_main() {
+            let onto = crate::tree::Onto {
+                branch: scope,
+                leaf: leaf.as_deref(),
+                floor,
+            };
+            let landing = self.tree.landing(view, onto, regenerate);
+            let forks = self
+                .tree
+                .message_follows(landing.at.as_deref(), leaf.as_deref(), scope);
+            return Landed {
+                at: landing.at,
+                shared: landing.shared,
+                forks,
+            };
+        }
         let line = std::cell::OnceCell::new();
         let on_line = |id: &str| {
             line.get_or_init(|| {
